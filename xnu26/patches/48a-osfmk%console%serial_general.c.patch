@@ -1,0 +1,31 @@
+--- a/osfmk/console/serial_general.c
++++ b/osfmk/console/serial_general.c
+@@ -165,17 +165,18 @@
+ 		info->pos += 1;
+ 	} else {
+ 		/*
+-		 * when len(line) > SERIAL_CONS_BUF_SIZE, we truncate the message
+-		 * if boot-arg 'drain_uart_sync=1' is set, then
+-		 * drain all the buffer right now and append new ch
++		 * A message longer than the buffer used to stop here unless the boot-arg
++		 * 'drain_uart_sync=1' asked for a synchronous drain, and its newline went with
++		 * the tail, so the next message continued on the same line. What this console
++		 * writes to is the loader's log in memory (see the piece for serial_console.c),
++		 * where a drain costs what a character costs, so it is unconditional: write out
++		 * what is buffered and keep the rest of the message.
+ 		 */
+-		if (serialmode & SERIALMODE_SYNCDRAIN) {
+-			info->str[info->pos] = '\0';
+-			console_write(info->str, info->pos);
+-			info->pos            = 0;
+-			info->str[info->pos] = (char)ch;
+-			info->pos += 1;
+-		}
++		info->str[info->pos] = '\0';
++		console_write(info->str, info->pos);
++		info->pos            = 0;
++		info->str[info->pos] = (char)ch;
++		info->pos += 1;
+ 	}
+ 
+ 	info->str[info->pos] = '\0';

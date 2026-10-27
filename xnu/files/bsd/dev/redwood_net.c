@@ -9,7 +9,9 @@
  * IOKit object behind it is another matter: see userland/src/net_test.m.
  *
  * What carries the frames is a link driver's business; sys/redwood_net.h is all that the two
- * know of each other. The first link is QEMU's virtio network device (redwood_virtio_net.c).
+ * know of each other. The links here are QEMU's virtio network device (redwood_virtio_net.c) and
+ * a wireless one with no radio behind it (net_wireless=1, at the end of this file); the phone's
+ * own radio will be a third.
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
@@ -368,10 +370,50 @@ redwood_net_attach(const struct redwood_net_link *link)
 	return true;
 }
 
+/*
+ * Boot-arg net_wireless=1: en0 with nothing behind it, told to be Wi-Fi all the same.
+ *
+ * What it is for is iOS's side of a radio. With such an interface in place, iOS's Wi-Fi stack
+ * goes through everything it would do for a real one -- IO80211.framework finds the service
+ * RedwoodWLANStart() makes for it, falls back to the ioctl path, wifid takes the interface and
+ * SystemConfiguration makes a network service for it -- and none of that needs a frame to pass.
+ * Frames offered to the interface are dropped and counted like any other drop.
+ *
+ * Boot-arg net_wireless_up=1 brings the link up. It stays down by default: an interface that is
+ * up makes configd start DHCP on it, which goes nowhere without a radio.
+ */
+static bool
+stub_transmit(__unused mbuf_t packet, __unused size_t length)
+{
+	return false;
+}
+
+static struct redwood_net_link stub_link = {
+	.name = "no radio (net_wireless=1)",
+	.address = { 0x02, 'n', 'e', 't', 'w', 'l' },   /* locally administered, no device's own */
+	.wireless = true,
+	.up = false,
+	.transmit = stub_transmit,
+};
+
+static void
+redwood_net_stub_init(void)
+{
+	uint32_t on = 0, up = 0;
+
+	if (!PE_parse_boot_argn("net_wireless", &on, sizeof(on)) || !on) {
+		return;
+	}
+	PE_parse_boot_argn("net_wireless_up", &up, sizeof(up));
+	stub_link.up = up != 0;
+	redwood_net_attach(&stub_link);
+}
+
 void
 redwood_net_init(void)
 {
 	PE_parse_boot_argn("net_trace", &net_trace, sizeof(net_trace));
 	PE_parse_boot_argn("net_names", &net_names, sizeof(net_names));
+	redwood_net_stub_init();
 	redwood_virtio_net_init();
 }

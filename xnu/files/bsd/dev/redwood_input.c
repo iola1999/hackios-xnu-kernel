@@ -5,6 +5,7 @@
 #include <kern/locks.h>
 #include <kern/thread_call.h>
 #include <libkern/libkern.h>
+#include <mach/mach_types.h>
 #include <miscfs/devfs/devfs.h>
 #include <sys/conf.h>
 #include <sys/errno.h>
@@ -13,6 +14,7 @@
 #include <sys/systm.h>
 #include <sys/uio.h>
 #include <pexpert/pexpert.h>
+#include <pexpert/device_tree.h>
 
 #define TOUCH_QUEUE     512             /* records; a power of two */
 
@@ -54,6 +56,81 @@ latency_lines(void)
 		touch_lat = PE_parse_boot_argn("touch_lat", &on, sizeof(on)) && on != 0;
 	}
 	return touch_lat != 0;
+}
+
+/*
+ * The two answers below are worked out once and kept, the first time by redwood_input_init(),
+ * before the GPU paths that ask on every frame and every submission are up: pe_arm_get_soc_base_phys()
+ * looks through the device tree with SecureDTFindEntry(), whose walk keeps its place in one static
+ * variable, and two threads asking at the same time move each other's walk out of the tree (the
+ * panic "Device tree pointer outside of device tree region").
+ */
+static int8_t blocks_legacy = -1, is_annibale = -1;
+
+static bool platform_blocks_legacy_drivers(void);
+static bool platform_is_annibale(void);
+
+bool
+redwood_platform_blocks_legacy_drivers(void)
+{
+	if (blocks_legacy < 0) {
+		blocks_legacy = platform_blocks_legacy_drivers();
+	}
+	return blocks_legacy;
+}
+
+bool
+redwood_platform_is_annibale(void)
+{
+	if (is_annibale < 0) {
+		is_annibale = platform_is_annibale();
+	}
+	return is_annibale;
+}
+
+/* Preserve the existing redwood and QEMU paths using their loader GIC descriptions.
+ * Other or incomplete descriptions block legacy drivers without probing hardware. */
+static bool
+platform_blocks_legacy_drivers(void)
+{
+	DTEntry entry;
+	const void *property;
+	unsigned int size;
+
+	if (SecureDTLookupEntry(NULL, "/arm-io/gic", &entry) != kSuccess ||
+	    SecureDTGetProperty(entry, "reg", &property, &size) != kSuccess || size != 4 * sizeof(uint64_t)) {
+		return true;
+	}
+	const uint64_t *reg = property;
+	vm_offset_t base = pe_arm_get_soc_base_phys();
+	if (reg[1] != 0x10000 || reg[3] != 0x100000) {
+		return true;
+	}
+	bool redwood = base == 0x00400000 && reg[0] == 0x17600000 && reg[2] == 0x17660000;
+	bool qemu = base == 0x08000000 && reg[0] == 0 && reg[2] == 0xa0000;
+	return !redwood && !qemu;
+}
+
+/* The same description again, for the phone whose own blocks some redwood drivers do belong
+ * to: annibale's GIC distributor is at 0x16000000 and its redistributors at 0x16080000
+ * (span 0x200000) inside a block that starts at 0x00400000, so its reg entry reads
+ * {0x15C00000, 0x10000, 0x15C80000, 0x200000}. Taken from the loader's device tree, as above,
+ * so nothing is read from hardware to answer this. */
+static bool
+platform_is_annibale(void)
+{
+	DTEntry entry;
+	const void *property;
+	unsigned int size;
+
+	if (SecureDTLookupEntry(NULL, "/arm-io/gic", &entry) != kSuccess ||
+	    SecureDTGetProperty(entry, "reg", &property, &size) != kSuccess || size != 4 * sizeof(uint64_t)) {
+		return false;
+	}
+	const uint64_t *reg = property;
+
+	return pe_arm_get_soc_base_phys() == 0x00400000 && reg[1] == 0x10000 && reg[3] == 0x200000 &&
+	    reg[0] == 0x15C00000 && reg[2] == 0x15C80000;
 }
 
 static LCK_GRP_DECLARE(touch_lck_grp, "redwood-touch");
@@ -132,6 +209,7 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_dri
 	}
 	lck_mtx_unlock(&touch_lock);
 	wakeup(&touch_queue);
+	annibale_cpufreq_touch();
 }
 
 void
@@ -210,6 +288,8 @@ redwood_input_init(void)
 {
 	int major = cdevsw_add(-1, &touch_cdevsw);
 
+	(void)redwood_platform_blocks_legacy_drivers();         /* (worked out here, on one thread: see above) */
+	(void)redwood_platform_is_annibale();
 	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-touch") == NULL) {
 		printf("redwood-touch: cannot create the device\n");
 	}
@@ -221,6 +301,7 @@ redwood_input_init(void)
 	redwood_battery_init();
 	redwood_ufs_init();
 	redwood_net_init();
+	redwood_bt_probe_init();
 	redwood_adreno_init();
 	redwood_wifi_init();
 	redwood_adsp_init();

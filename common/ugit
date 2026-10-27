@@ -1,6 +1,19 @@
 #!/bin/bash
 # git for the hackios-xnu-userland repository that shares this working tree (see common/setup.sh):
 #   common/ugit status | common/ugit add userland/src/init.c | common/ugit commit | common/ugit push
+#
+# -f is required on `add`: the shared work tree also reads this checkout's .gitignore, whose first
+# rule ignores everything (/*), so a tracked file gets reported as "paths are ignored" anyway.
+# `common/ugit add -f userland/src/redwoodmetal.m` stages it and its tracked state does not change.
+#
+# Change the driver and shim sources (userland/src/redwoodmetal*.m, *.inc, sb_metal_*.m) and
+# tools/mesa/ here, not with `git -C`: the separate checkout under hackios-xnu-userland/ carries
+# another copy of these files that only the 16.5 line builds from. `common/ugit status` is how to
+# tell whether a file is under version control here.
+#
+# Always name the paths: `common/ugit add` with no path does nothing and says nothing, which reads
+# as success. `common/ugit add -f userland/src/init.c` or `common/ugit add -f tools/mesa/` is the
+# form that stages what you meant.
 ROOT=$(dirname "$(readlink -f "$0")")/..
 [ -d "$ROOT/.userland.git" ] || { echo "ugit: no userland checkout here; run common/setup.sh first" >&2; exit 1; }
 exec git --git-dir="$ROOT/.userland.git" --work-tree="$ROOT" "$@"

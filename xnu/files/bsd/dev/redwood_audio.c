@@ -338,6 +338,7 @@ audio_recording_init(void)
 void
 redwood_audio_init(void)
 {
+	annibale_reboot_probe();
 	int major = cdevsw_add(-1, &audio_cdevsw);
 
 	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-audio") == NULL) {
@@ -349,6 +350,12 @@ redwood_audio_init(void)
 	redwood_virtio_sound_init();
 	redwood_speaker_init();
 	redwood_haptic_init();
+	annibale_haptic_init();
 	redwood_torch_init();
 	redwood_camera_init();
+	annibale_buttons_init();
+	annibale_battery_init();
+	annibale_torch_init();
+	mhi_pcie_init();
+	adreno8_init();                   /* boot-arg adreno8=N: the Adreno 830's stepper, on this phone (bsd/dev/adreno8.c) */
 }

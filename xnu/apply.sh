@@ -1,6 +1,7 @@
 #!/bin/bash
 # Get Apple's XNU sources (the release that iOS 16.5 was built from) and put the redwood
-# work on top of them: redwood.patch changes Apple's files, files/ holds the new ones.
+# work on top of them: patches/ changes Apple's files -- one piece per file, applied in the
+# order patches/series names them -- and files/ holds the new ones.
 # usage: xnu/apply.sh [DIR]              (default: $XNU_SRC, else xnu-src/xnu-8796.121.2 next to this directory)
 # env:   XNU_URL   where to fetch from (default: Apple's repository on GitHub; an existing clone
 #                  that has the tag will do: XNU_URL=file:///path/to/xnu)
@@ -14,7 +15,7 @@ TAG=xnu-8796.121.2
 BASE=c54f35ca767986246321eb901baf8f5ff7923f6a
 
 [ -e "$DIR" ] && { echo "apply.sh: $DIR already exists; not touching it" >&2; exit 1; }
-[ -s "$HERE/redwood.patch" ] && [ -d "$HERE/files" ] || { echo "apply.sh: no redwood.patch and files/ in $HERE" >&2; exit 1; }
+[ -s "$HERE/patches/series" ] && [ -d "$HERE/files" ] || { echo "apply.sh: no patches/series and files/ in $HERE" >&2; exit 1; }
 mkdir -p "$(dirname "$DIR")"
 DIR=$(cd "$(dirname "$DIR")" && pwd)/$(basename "$DIR")
 git init -q "$DIR"
@@ -25,6 +26,8 @@ git fetch -q --depth 1 origin "refs/tags/$TAG:refs/tags/$TAG"      # that one re
 git checkout -q -b redwood "$TAG"
 [ "$(git rev-parse HEAD)" = "$BASE" ] || { echo "apply.sh: $TAG is $(git rev-parse HEAD), expected $BASE" >&2; false; }
 echo 'BUILD/' >> .git/info/exclude
-git apply --whitespace=nowarn "$HERE/redwood.patch"
+while IFS= read -r piece; do
+	git apply --whitespace=nowarn "$HERE/patches/$piece" || { echo "apply.sh: $piece did not apply" >&2; exit 1; }
+done < "$HERE/patches/series"
 cp -a "$HERE/files/." .
-echo "apply.sh: $DIR: $TAG + $(grep -c '^diff --git' "$HERE/redwood.patch") changed and $(find "$HERE/files" -type f | wc -l) new files"
+echo "apply.sh: $DIR: $TAG + $(wc -l < "$HERE/patches/series") pieces and $(find "$HERE/files" -type f | wc -l) new files"
