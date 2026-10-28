@@ -1,12 +1,14 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 60d8aa6148d8..3c5247924e9d 100644
+index 60d8aa6148d8..6d157a86c272 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -108,6 +108,62 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -108,6 +108,64 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c         optional config_cpu_counters
++bsd/dev/redwood_bt_probe.c		standard
 +bsd/dev/redwood_input.c		standard
++bsd/dev/redwood_threads.c	standard
 +bsd/dev/redwood_virtio_input.c	standard
 +bsd/dev/redwood_goodix.c	standard
 +bsd/dev/redwood_buttons.c	standard
@@ -65,7 +67,7 @@ index 60d8aa6148d8..3c5247924e9d 100644
  
  bsd/libkern/crc32.c			standard
  bsd/libkern/random.c			standard
-@@ -155,6 +211,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +213,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -80,7 +82,7 @@ index 60d8aa6148d8..3c5247924e9d 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -380,6 +444,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -380,6 +446,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -88,7 +90,7 @@ index 60d8aa6148d8..3c5247924e9d 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -403,6 +468,7 @@ bsd/kern/kern_debug.c			standard
+@@ -403,6 +470,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard

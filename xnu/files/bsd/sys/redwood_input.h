@@ -9,6 +9,14 @@
  *
  *   write(): one or more records (time is ignored; the kernel stamps them)
  *   read():  blocks until there is at least one record, returns as many whole ones as fit
+ *
+ * The queue holds TOUCH_QUEUE records and, when it is full, the write throws the oldest one away
+ * and succeeds. So write() cannot report "nobody is reading": a producer whose reader has gone
+ * still gets the bytes accepted, and the samples are gone without an error anywhere. Reading
+ * that back from the log means comparing what the producer sent with what `tl: p` shows the
+ * driver posting -- 2026-10-28 two conclusions about lost input were drawn from a silent write()
+ * that had in fact succeeded. A producer that wants to know whether anyone listens has to ask by
+ * another route; nothing in this interface says it.
  */
 #ifndef _SYS_REDWOOD_INPUT_H_
 #define _SYS_REDWOOD_INPUT_H_
@@ -17,6 +25,11 @@
 #include <stdint.h>
 
 #define REDWOOD_TOUCH_DEVICE    "/dev/redwood-touch"
+
+/* Frames put on the panel since boot, kept by the framebuffer and read as kern.redwood.frames.
+ * A control run needs it: when a daemon is frozen to see whether the compositor stalls, "no new
+ * frame" has to be told from "the counter was never moving", and only the number can say which. */
+extern uint32_t redwood_frames_shown;
 
 #define REDWOOD_TOUCH_DOWN      1       /* a finger has landed */
 #define REDWOOD_TOUCH_MOVE      2

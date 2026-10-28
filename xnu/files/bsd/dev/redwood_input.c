@@ -12,6 +12,7 @@
 #include <sys/proc.h>
 #include <sys/redwood_input.h>
 #include <sys/systm.h>
+#include <sys/sysctl.h>
 #include <sys/uio.h>
 #include <pexpert/pexpert.h>
 #include <pexpert/device_tree.h>
@@ -26,6 +27,12 @@
  * tools/latency.py.
  */
 static uint32_t touch_lat = 2;          /* 2: not yet looked up */
+
+uint32_t redwood_frames_shown;          /* (bsd/sys/redwood_input.h: the framebuffer's count) */
+
+SYSCTL_DECL(_kern_redwood);
+SYSCTL_INT(_kern_redwood, OID_AUTO, frames, CTLFLAG_RD, &redwood_frames_shown, 0,
+    "frames put on the panel since boot");
 
 extern void loader_log_line(const char *line);
 
