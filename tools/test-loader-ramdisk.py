@@ -87,6 +87,8 @@ static void print(const char *format, ...) { (void)format; }
 static inline void ui_init(void) {}
 static inline void ui_stage(const char *word) { (void)word; }
 static inline void ui_progress(uint64_t done, uint64_t total) { (void)done; (void)total; }
+/* "oem sh": tools/test-loader-shell.py */
+static void oem_shell(const char *text) { (void)text; }
 static int str_eq(const char *a, const char *b) { return !strcmp(a, b); }
 static uint64_t parse_number(const char *p, int base) { uint64_t n = 0; (void)base; sscanf(p, "%llx", (unsigned long long *)&n); return n; }
 static void fb_reply(const char *status, const char *message)

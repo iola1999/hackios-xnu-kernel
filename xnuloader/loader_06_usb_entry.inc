@@ -501,8 +501,50 @@ starts_with(const char *s, const char *prefix)
 #include "loader_ramdisk.inc"
 
 /*
+ * "oem sh TEXT": hand TEXT to the running kernel's mailbox, where /redwood/bin/rwsh finds it
+ * through kern.redwood.cmd and runs it; its output arrives in the kernel's log. The text goes in
+ * before the sequence number, which is what the kernel's reader checks, and the reply is the new
+ * number so the host can find the output that belongs to it. It goes out twice: fastboot prints an
+ * INFO line as "(bootloader) N" and drops the text of an OKAY to an oem command.
+ */
+static void
+oem_shell(const char *text)
+{
+	struct kernel_live *live = (struct kernel_live *)(uintptr_t)running_live;
+	uint64_t n = 0;
+	uint32_t mark;
+
+	if (live == NULL) {
+		fb_reply("FAIL", "no kernel is running");
+		return;
+	}
+	if (live->magic2 != KERNEL_LIVE_MAGIC2 || live->magic3 != KERNEL_LIVE_MAGIC3) {
+		fb_reply("FAIL", "this kernel has no command mailbox");
+		return;
+	}
+	while (text[n] != 0) {
+		if (n == sizeof(live->cmd) - 1) {
+			fb_reply("FAIL", "command longer than 119 characters");
+			return;
+		}
+		n++;
+	}
+	for (uint64_t i = 0; i <= n; i++) {
+		((volatile char *)live->cmd)[i] = text[i];
+	}
+	__asm__ volatile ("dmb ish" ::: "memory");
+	*(volatile uint64_t *)&live->cmd_seq = live->cmd_seq + 1;
+	mark = log_len;
+	print("%d", live->cmd_seq);
+	log_buf[log_len] = 0;
+	fb_reply("INFO", log_buf + mark);
+	fb_reply("OKAY", log_buf + mark);
+	log_len = mark;
+}
+
+/*
  * One command from the host. While a kernel runs on another core (running_live) only what does
- * not disturb it: questions, the screen, the log so far, and "oem stop". While memory and devices
+ * not disturb it: questions, the screen, the log so far, "oem stop" and "oem sh". While memory and devices
  * are held (kernel_resources_held) the same commands pass and the same ones are refused, with
  * nothing to notify: the transitions live in the LC / LC-ENTER / LC-WATCH / LC-RETURN /
  * LC-WRITE / LC-USB / LC-FB / LC-POLL / LC-EXC
@@ -531,6 +573,8 @@ fb_command(char *cmd)
 				}
 				fb_reply("OKAY", "");
 			}
+		} else if (starts_with(cmd, "oem sh ")) {
+			oem_shell(cmd + 7);
 		} else if (starts_with(cmd, "getvar:")) {
 			const char *var = cmd + 7;
 			if (fb_getvar_identity(var)) {   /* product, version and build-id answer from one block */

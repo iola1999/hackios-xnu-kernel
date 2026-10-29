@@ -167,8 +167,14 @@ redwood_gpu_report(const char *why)
 		return;
 	}
 	/* Both callers report failed execution: a completion timeout or a zero submit fence. */
-	adreno8_say("adreno8: RedwoodGPU %s; last timestamp %u; SMMU fault %u\n",
-	    why, adreno8_context_last(), adreno8_gpu_faulted());
+	adreno8_say("adreno8: RedwoodGPU %s; last timestamp %u, retired %u; SMMU fault %u\n",
+	    why, adreno8_context_last(), adreno8_context_retired(), adreno8_gpu_faulted());
+	/* The GMU's own report of a hang (HFI 150, context bad) can come after the caller's two
+	 * seconds have run out, and once the buffers are stopped nobody reads the queue: up to
+	 * three more seconds of polling, so that its words reach the log. adreno8_hfi_poll returns
+	 * false once a fatal message has been printed or the queue is unusable. */
+	for (unsigned i = 0; i < 30 && adreno8_hfi_poll(); i++)
+		adreno8_sleep_us(100000);
 	adreno8_bo_stop();
 }
 

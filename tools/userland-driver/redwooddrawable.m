@@ -299,14 +299,10 @@ rwd_surface_fits_adreno(const struct rwd_surface *surface, unsigned bytes_per_pi
 			char *why, size_t why_size)
 {
 	/*
-	 * a6xx's minimum pitchalign is 6 -- fd_resource_from_handle sets
-	 * MAX2(fdl_cpp_shift + log2(gmem_align_w), 6) and gmem_align_w is 16 for this
-	 * generation, which gives 2 + 4 = 6 for a four-byte pixel -- so a row has to be a
-	 * multiple of 64 bytes. Named as the number rather than the shift, because the number
-	 * is what the kernel's MINISURF_ROW_ALIGN also is, and the agreement between the two
-	 * trees is the whole reason this is expected to pass.
+	 * A row has to hold whole pixels. What else the GPU needs of it depends on whether
+	 * the texture is sampled or drawn into, which this file does not know; the compiler
+	 * library judges that (air_metal.c, texture_of_shape) and says why when it refuses.
 	 */
-	const unsigned align = 64;
 	uint64_t least;
 
 	if (surface == NULL || bytes_per_pixel == 0) {
@@ -326,11 +322,10 @@ rwd_surface_fits_adreno(const struct rwd_surface *surface, unsigned bytes_per_pi
 		    (unsigned long long)least);
 		return -1;
 	}
-	if (surface->rowBytes % align != 0) {
-		rwd_say(why, why_size, "surface %u has %u bytes a row, which is not a multiple "
-		    "of %u; freedreno refuses such an import (fd_resource_from_handle), and the "
-		    "kernel's own surfaces are aligned to %u (MINISURF_ROW_ALIGN)",
-		    surface->surface, surface->rowBytes, align, align);
+	if (surface->rowBytes % bytes_per_pixel != 0) {
+		rwd_say(why, why_size, "surface %u has %u bytes a row, which is not a whole "
+		    "number of %u-byte pixels", surface->surface, surface->rowBytes,
+		    bytes_per_pixel);
 		return -1;
 	}
 	if (surface->size < (uint64_t)surface->rowBytes * surface->height + surface->offset) {
@@ -362,6 +357,11 @@ rwd_surface_fits_adreno(const struct rwd_surface *surface, unsigned bytes_per_pi
  * authority for what this import can serve is therefore NOT CAMetalLayer's list but what one
  * linear plane can be. Hence the refusals below say what they are refusing.
  *
+ * 30 is 'LA08' by its geometry rather than by a read of QuartzCore: SpringBoard and Spotlight
+ * make 'LA08' surfaces of two bytes a pixel (312x202 at 640 bytes a row), and backboardd asked
+ * for format 30 over one surface 883 times in round lock3cpu4 of 2026-10-30. A surface of
+ * another FourCC is refused below with both names.
+ *
  * Two families are in the table and then refused, each for its own measured reason:
  *
  *   the XR formats (550-555, and 94)   the kernel substitutes 'w30r', 'l10r', 'w30R' and
@@ -382,6 +382,7 @@ struct rwd_format {
 static const struct rwd_format rwd_formats[] = {
 	{  10, 'A008', 1, 0, "MTLPixelFormatR8Unorm" },
 	{  11, 'A008', 1, 0, "MTLPixelFormatR8Unorm_sRGB" },
+	{  30, 'LA08', 2, 0, "MTLPixelFormatRG8Unorm" },
 	{  70, 'RGBA', 4, 0, "MTLPixelFormatRGBA8Unorm" },
 	{  71, 'RGBA', 4, 0, "MTLPixelFormatRGBA8Unorm_sRGB" },
 	{  80, 'BGRA', 4, 0, "MTLPixelFormatBGRA8Unorm" },
@@ -565,10 +566,6 @@ rwd_texture_for_surface(struct rwa_device *mesa_device, void *iosurface, unsigne
 		    "kernel to look up (a surface is given one when it is made shareable)");
 		return NULL;
 	}
-	if (rwd_format_of_metal(want->pixel_format, &fourcc, &bytes_per_pixel, why,
-	    why_size) != 0) {
-		return NULL;
-	}
 	connection = rwd_shared_connection();
 	if (connection == 0) {
 		rwd_say(why, why_size, "no connection to RedwoodGPU: this kernel was booted "
@@ -583,6 +580,19 @@ rwd_texture_for_surface(struct rwa_device *mesa_device, void *iosurface, unsigne
 	 * driver has seen neither of those steps and must not assume they agreed.
 	 */
 	if (rwd_surface_describe(connection, id, &surface, why, why_size) != 0) {
+		return NULL;
+	}
+	/* The format is judged after the surface is described, so that a refusal names the
+	 * surface's own FourCC and geometry: that is what the next table entry is made from. */
+	if (rwd_format_of_metal(want->pixel_format, &fourcc, &bytes_per_pixel, why,
+	    why_size) != 0) {
+		char reason[512];
+
+		snprintf(reason, sizeof(reason), "%s", why != NULL ? why : "");
+		rwd_say(why, why_size, "surface %u ('%c%c%c%c', %ux%u, %u bytes a row): %s", id,
+		    (char)(surface.pixelFormat >> 24), (char)(surface.pixelFormat >> 16),
+		    (char)(surface.pixelFormat >> 8), (char)surface.pixelFormat, surface.width,
+		    surface.height, surface.rowBytes, reason);
 		return NULL;
 	}
 	if (surface.width != want->width || surface.height != want->height) {

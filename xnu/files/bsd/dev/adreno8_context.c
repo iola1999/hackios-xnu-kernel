@@ -268,6 +268,14 @@ adreno8_context_last(void)
 	return context_last;
 }
 
+/* The timestamp the GPU last wrote at end of pipe: the submission after it is the one that did not
+ * retire. Zero before the context exists. */
+uint32_t
+adreno8_context_retired(void)
+{
+	return context_timestamp_view ? adreno8_rd(context_timestamp_view + CONTEXT_EOP) : 0;
+}
+
 bool
 adreno8_context_close(void)
 {

@@ -59,6 +59,7 @@ enum {
 	kSurfaceMethodCreatePort        = 35,
 	kSurfaceMethodDetachModeCode    = 43,
 	kSurfaceMethodSetOwnershipIdentity = 44,
+	kSurfaceMethodQueryTransactionList = 58,
 };
 
 /* IOConnectTrap indices */
@@ -1593,6 +1594,14 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 	case kSurfaceMethodSetIndexedTimestamp:
 	case kSurfaceMethodDetachModeCode:
 	case kSurfaceMethodLog:
+	/*
+	 * iOS 26's IOSurfaceClientQueryTransactionList: in surface, list buffer, entry count and two
+	 * more; out three scalars from which IOSurface builds an IOSurfaceTransactionList. No surface
+	 * here has transactions, so the answer is an empty list. While it was refused, backboardd's
+	 * Metal logged "Failed to allocate MTLTexture from IOSurface" right after each failed query
+	 * (2026-10-30 rounds).
+	 */
+	case kSurfaceMethodQueryTransactionList:
 		/* accounting and diagnostics: nothing depends on them here */
 		if (args->scalarOutputCount != 0) {
 			bzero(args->scalarOutput, args->scalarOutputCount * sizeof(args->scalarOutput[0]));

@@ -3,6 +3,7 @@
 #include <mach/thread_info.h>
 #include <mach/vm_map.h>
 #include <pthread.h>
+#include <ptrauth.h>
 #include <time.h>
 
 /* Where a command buffer's encode time goes, by kind of work. The draws and the copies are
@@ -24,6 +25,8 @@ static struct {
  * this device, so a raw tick count compared to this number is a millisecond, not twenty.
  */
 #define RW_COMMIT_SLOW_US 20000ULL
+#define RW_TRACE_COMMITS 16
+
 /* One flush longer than this is said on its own line; the window average hides it. */
 #define RW_FLUSH_SLOW_US 50000ULL
 /* One draw longer than this is said on its own line: the first draw of a process carries the
@@ -189,60 +192,14 @@ rw_stall_watch(void *ignored)
 			refused = sysctlbyname("kern.redwood.thread_dump", NULL, NULL, &self,
 			    sizeof(self));
 			if (refused != 0) {
-				rw_print("thread dump for pid %d refused (errno %d)\n",
+				rw_print("thread dump for pid %d refused (errno %d); reading this process's threads\n",
 				    (int)self, errno);
+				rw_print_threads();
 			}
 		}
 
 	}
 	return NULL;
-}
-
-/* Where the threads of this process were when a draw had run for a third of a second. The kernel's
- * kern.redwood.thread_dump refuses a write from backboardd, which runs as mobile; a process may read
- * its own threads' registers without that, so the snapshot is taken here instead. One line per
- * thread, and the image name from dladdr says whether the pc is in a library, and the mapped range
- * says whether it is in the kernel at all.
- */
-static void
-rw_print_threads(void)
-{
-	thread_act_array_t threads = NULL;
-	mach_msg_type_number_t count = 0;
-
-	if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) {
-		rw_print("redwood: stall: cannot list the threads of this process\n");
-		return;
-	}
-	for (mach_msg_type_number_t i = 0; i < count; i++) {
-		arm_thread_state64_t state;
-		mach_msg_type_number_t state_count = ARM_THREAD_STATE64_COUNT;
-		thread_identifier_info_data_t ident;
-		mach_msg_type_number_t ident_count = THREAD_IDENTIFIER_INFO_COUNT;
-		uintptr_t pc = 0, lr = 0, fp = 0, sp = 0;
-		const char *image = "?";
-		unsigned long long tid = 0;
-
-		/* arm64e keeps the pointer fields opaque, so they come out through the accessors. */
-		if (thread_get_state(threads[i], ARM_THREAD_STATE64, (thread_state_t)&state,
-		    &state_count) == KERN_SUCCESS) {
-			Dl_info where;
-
-			pc = (uintptr_t)__darwin_arm_thread_state64_get_pc(state);
-			lr = (uintptr_t)__darwin_arm_thread_state64_get_lr(state);
-			fp = (uintptr_t)__darwin_arm_thread_state64_get_fp(state);
-			sp = (uintptr_t)__darwin_arm_thread_state64_get_sp(state);
-			if (pc != 0 && dladdr((void *)pc, &where) != 0 && where.dli_fname != NULL)
-				image = where.dli_fname;
-		}
-		if (thread_info(threads[i], THREAD_IDENTIFIER_INFO, (thread_info_t)&ident, &ident_count) ==
-		    KERN_SUCCESS)
-			tid = (unsigned long long)ident.thread_id;
-		rw_print("redwood: stall pc %p lr %p fp %p sp %p (%s) tid %llu\n", (void *)pc, (void *)lr,
-		    (void *)fp, (void *)sp, image, tid);
-		mach_port_deallocate(mach_task_self(), threads[i]);
-	}
-	vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(thread_t));
 }
 
 static void
@@ -483,12 +440,20 @@ rw_work_time(int kind, uint64_t began)
 
 - (void)enqueue { }
 
+/* One Mesa context serves every command buffer of the process, and it is not thread safe. Each of
+ * the four backboardd crashes on 2026-10-30 (SIGSEGV in fd6_vsc_update_sizes and nearby fd6 code)
+ * came right after "commit N started while commit N-1 was still running"; the first was on a swipe
+ * up out of Settings. Recursive because a completion handler may commit the next buffer from inside
+ * this one. */
+static pthread_mutex_t rw_commit_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
+
 /* Metal's own rule, kept: the recorded dispatches run here and not when they were encoded. */
 - (void)commit
 {
 	char why[512] = { 0 };
 	uint64_t started = mach_absolute_time();
 
+	pthread_mutex_lock(&rw_commit_lock);
 	__atomic_add_fetch(&hb_commit, 1, __ATOMIC_RELAXED);
 
 	if (commit_started != 0) {
@@ -510,8 +475,40 @@ rw_work_time(int kind, uint64_t began)
 	if (mesa.buffer_textures_refresh != NULL) {
 		mesa.buffer_textures_refresh([[_queue device] mesaDevice]);
 	}
+	uint64_t say_after_us = RW_COMMIT_SLOW_US;
+
+	/* The first commits of a process name the pipelines they use. A GPU hang is reported by
+	 * the kernel as a process and its submission number, and this is what matches that
+	 * submission to shaders (the handles are in the "render pipelines" and "compute
+	 * pipeline" lines). */
+	if (commit_count <= RW_TRACE_COMMITS) {
+		void *seen[16];
+		unsigned distinct = 0;
+		char list[16 * 20 + 1] = "";
+		size_t at = 0;
+
+		for (RedwoodMetalWork *work in _work) {
+			void *handle = work->render != nil ? (void *)[work->render render]
+				     : work->pipeline != nil ? (void *)[work->pipeline compute] : NULL;
+			unsigned k = 0;
+
+			while (k < distinct && seen[k] != handle)
+				k++;
+			if (handle == NULL || k < distinct || distinct == 16)
+				continue;
+			seen[distinct++] = handle;
+			at += (size_t)snprintf(list + at, sizeof(list) - at, " %p", handle);
+		}
+		rw_print("trace commit %u: %lu works, pipelines%s\n", commit_count,
+			 (unsigned long)[_work count], list);
+	}
+
+	unsigned work_index = 0;
+
 	for (RedwoodMetalWork *work in _work) {
 		uint64_t work_began = mach_absolute_time();
+
+		work_index++;
 
 		commit_progress_us = rw_now_us();
 
@@ -524,11 +521,15 @@ rw_work_time(int kind, uint64_t began)
 		if (commit_started != 0) {
 			uint64_t spent_us = rw_ticks_us(mach_absolute_time() - commit_started);
 
-			if (spent_us > RW_COMMIT_SLOW_US) {
+			/* Each time the commit's age doubles past the limit, not once per work: a
+			 * 46 ms commit of 121 works wrote 121 lines, and 2489 of them filled a third
+			 * of the log ring in round lock3cpu4. */
+			if (spent_us > say_after_us) {
 				rw_print("commit %u has run for %llu ms and is on work kind %d "
 				         "(%u binds, %s)\n", commit_count,
 				         (unsigned long long)(spent_us / 1000), (int)work->copyKind,
 				         work->count, work->render != nil ? "a draw" : "a dispatch");
+				say_after_us = spent_us * 2;
 			}
 		}
 
@@ -545,6 +546,10 @@ rw_work_time(int kind, uint64_t began)
 				goto done;
 			}
 			rw_work_time(RW_WORK_DRAW, work_began);
+			if (rw_sync_draws() && ![self syncDraw:work index:work_index why:why
+							  size:sizeof(why)]) {
+				goto done;
+			}
 			/* The window line reports draws by the microsecond on average, which is
 			 * the wrong shape for the first draw of a process: that one carries the
 			 * library's own setup and can take seconds. Said on its own line. */
@@ -598,7 +603,12 @@ rw_work_time(int kind, uint64_t began)
 		 * through rwa_dispatch, and then a kernel with a set is refused by name
 		 * there and every offset is read as zero -- which is what an older library
 		 * did with one in any case, out loud. */
-		int rc = mesa.dispatch_buffers != NULL
+		int rc = mesa.dispatch_threadgroup != NULL
+			    ? mesa.dispatch_threadgroup([work->pipeline compute], &bindings,
+						        table, work->count, work->groups,
+						        work->size, work->threadgroupBytes, why,
+						        sizeof(why))
+			    : mesa.dispatch_buffers != NULL
 			    ? mesa.dispatch_buffers([work->pipeline compute], &bindings,
 						    table, work->count, work->groups,
 						    work->size, why, sizeof(why))
@@ -698,11 +708,14 @@ done:
 	 * included: a buffer that errored is as finished as one that drew, and a slot kept
 	 * because of an error would turn one bad draw into a queue that blocks for ever. */
 	[self redwoodReturnSlot];
+	commit_started = 0;
+	commit_in_flight = 0;
+	/* The handlers run outside the lock: one that waits for another thread's commit would
+	 * otherwise wait for ever. */
+	pthread_mutex_unlock(&rw_commit_lock);
 	/* and only then the handlers, so that a handler which makes the next command buffer
 	 * is not waiting for a slot this one still holds */
 	[self redwoodDeliverHandlers];
-	commit_started = 0;
-	commit_in_flight = 0;
 	/* How long the whole commit took, said only when it was long enough to be a missed
 	 * frame. A commit that never returns leaves the "has run for" line above as the last
 	 * thing this process said, which names the work it was inside. */
@@ -720,7 +733,28 @@ done:
 /* A draw, built out of what the encoder recorded. Separate from the dispatch loop because the
  * two have different bindings -- a draw has them per stage -- and folding them together would
  * mean a struct whose fields mean different things depending on a flag. */
-#define RW_COMMIT_SLOW_FOR_IN 50000ULL   /* a commit this old says its draws on entry */
+#define RW_COMMIT_SLOW_FOR_IN 500000ULL  /* a commit this old says its draws on entry */
+
+/* rw_sync_draws: hand this draw to the GPU and wait for it, naming it when it does not finish. */
+- (BOOL)syncDraw:(RedwoodMetalWork *)work index:(unsigned)index why:(char *)why size:(size_t)size
+{
+	struct rwa_device *device = [[_queue device] mesaDevice];
+
+	if (mesa.flush == NULL || mesa.finish == NULL)
+		return YES;
+	rw_describe_draw(work, [work->render render], commit_count, index);
+	mesa.flush(device, why, size);
+	if (mesa.finish(device, why, size) != 0) {
+		rw_print("sync: commit %u work %u did not finish: pipeline %p, %u colour attachments, "
+			 "%u textures, %u buffers: %s\n", commit_count, index,
+			 (void *)[work->render render], work->colorCount, work->textureCount, work->count,
+			 why);
+		rw_dump_kept_air([work->render render]);
+		[self failWith:why];
+		return NO;
+	}
+	return YES;
+}
 
 - (BOOL)runDraw:(RedwoodMetalWork *)work why:(char *)why size:(size_t)size
 {

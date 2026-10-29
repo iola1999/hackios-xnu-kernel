@@ -18,6 +18,10 @@
  * namecache. The name is a basename; the entry bounds printed next to it give the offset when no
  * name is available.
  *
+ * kern.redwood.cmd is the other way in: the last command the host sent through the loader with
+ * "oem sh TEXT" while this kernel runs, read by /redwood/bin/rwsh, which runs it as root and so may
+ * also write thread_dump for a process that cannot do it for itself.
+ *
  * Nothing is enabled unless asked: no boot argument, no timer, no work while idle.
  */
 
@@ -43,6 +47,7 @@ void redwood_thread_dump(task_t task, int pid, uint64_t exec_base, const char *e
 int redwood_task_region_image(task_t task, uint64_t addr, char *name, uint32_t namelen,
     uint64_t *start, uint64_t *end);
 uint64_t redwood_task_exec_image(task_t task, char *name, uint32_t namelen);
+uint64_t loader_live_command(char *text, size_t size);         /* osfmk/arm64/loader_return.c */
 
 /*
  * fill_procregioninfo* hands the vnode over as a bare address because it cannot hold a reference
@@ -176,3 +181,19 @@ redwood_thread_dump_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1
 SYSCTL_PROC(_kern_redwood, OID_AUTO, thread_dump, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
     NULL, 0, redwood_thread_dump_sysctl, "I",
     "write a pid: one line per thread of it (id, state, wait event, priority, user pc)");
+
+/* "SEQ TEXT": SEQ is 0 and TEXT empty until the host has sent a command. */
+static int
+redwood_cmd_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	char text[128], line[160];
+	uint64_t seq = loader_live_command(text, sizeof(text));
+	int n = snprintf(line, sizeof(line), "%llu %s", (unsigned long long)seq, text);
+
+	return SYSCTL_OUT(req, line, (size_t)n + 1);
+}
+
+SYSCTL_PROC(_kern_redwood, OID_AUTO, cmd, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+    NULL, 0, redwood_cmd_sysctl, "A",
+    "the last command the host sent through the loader (oem sh), as SEQ TEXT");

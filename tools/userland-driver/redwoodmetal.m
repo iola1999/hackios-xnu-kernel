@@ -645,12 +645,15 @@ rw_pipeline_dump(void)
  * holds and the host pulls every 20 s. Base64 in 72-character lines, 16 KB a module, four modules
  * a boot: the loader keeps the first 256 KB and the last megabyte, a run writes about 21 KB a
  * second, and a diagnostic that evicts the frames it explains is a worse instrument than a quiet
- * one. tools/mesa/air/airfail-extract.py reads these lines back into .metallib files.
+ * one. tools/mesa/air/airfail-extract.py reads these lines back into .metallib files. The modules
+ * of a draw the GPU did not finish (rw_dump_kept_air, REDWOOD_SYNC_DRAWS) are not counted against
+ * the four and may be up to AIR_HUNG_BYTES: that happens once a boot, as the GPU stops with it.
  */
 #define AIR_DUMP_MAX 4
 #define AIR_DUMP_BYTES (16 * 1024)
+#define AIR_HUNG_BYTES (96 * 1024)
 static void
-air_fail_dump(const void *bytes, NSUInteger length, const char *stage, const char *name)
+air_dump(const void *bytes, NSUInteger length, const char *stage, const char *name, bool counted)
 {
 	static const char b64[] =
 	    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -659,7 +662,7 @@ air_fail_dump(const void *bytes, NSUInteger length, const char *stage, const cha
 	const unsigned char *p = bytes;
 	unsigned hash = 2166136261u;
 
-	if (bytes == NULL || length == 0 || dumped >= AIR_DUMP_MAX) {
+	if (bytes == NULL || length == 0 || (counted && dumped >= AIR_DUMP_MAX)) {
 		return;
 	}
 	for (NSUInteger i = 0; i < length; i++) {
@@ -674,12 +677,12 @@ air_fail_dump(const void *bytes, NSUInteger length, const char *stage, const cha
 			break;
 		}
 	}
-	if (length > AIR_DUMP_BYTES) {
+	if (length > (counted ? AIR_DUMP_BYTES : AIR_HUNG_BYTES)) {
 		rw_print("AIRFAIL over-cap %s %s %lu bytes, the cap is %d\n", stage, name,
-		    (unsigned long)length, AIR_DUMP_BYTES);
+		    (unsigned long)length, counted ? AIR_DUMP_BYTES : AIR_HUNG_BYTES);
 		return;
 	}
-	dumped++;
+	dumped += counted;
 	rw_print("AIRFAIL begin %s %s %lu bytes fnv=%08x\n", stage, name,
 	    (unsigned long)length, hash);
 	for (NSUInteger at = 0; at < length; at += 54) {
@@ -699,6 +702,14 @@ air_fail_dump(const void *bytes, NSUInteger length, const char *stage, const cha
 	}
 	rw_print("AIRFAIL end %s %s\n", stage, name);
 }
+
+static void
+air_fail_dump(const void *bytes, NSUInteger length, const char *stage, const char *name)
+{
+	air_dump(bytes, length, stage, name, true);
+}
+
+#include "redwoodmetal_diag.inc"
 
 /*
  * A BLEND LINE, deduplicated the way a repeated refusal is -- but on the CONTENT and not on
@@ -1204,6 +1215,11 @@ struct gem_close { uint32_t handle, pad; };
 		_mesa = mesa.device_open(why, sizeof(why));
 		rw_print("the compiler library %s\n",
 		         _mesa != NULL ? mesa.device_name(_mesa) : why);
+		/* freedreno reads its debug switch once, when the screen is made, and says
+		 * nothing about it; this line is the only record that a job's FD_MESA_DEBUG
+		 * (package.py JOB_ENV) reached the process. */
+		if (getenv("FD_MESA_DEBUG") != NULL)
+			rw_print("FD_MESA_DEBUG=%s\n", getenv("FD_MESA_DEBUG"));
 	}
 
 	/* The struct Metal reads out of this device by raw pointer, filled here rather than on
@@ -1541,15 +1557,17 @@ struct gem_close { uint32_t handle, pad; };
 
 		mach_timebase_info(&tb);
 		us = (mach_absolute_time() - compile_began) * tb.numer / tb.denom / 1000;
-		if (++built == 1 || us >= 1000) {
+		++built;
+		{
 			/* The entry names are here because a picture that is wrong needs to be
 			 * traced back to the pipeline that drew it, and Apple's own names for the
 			 * compiler library's functions are the only handle this process has on
-			 * them: "air.fragment.blur" says what an address does not.
+			 * them: "air.fragment.blur" says what an address does not. Every pipeline,
+			 * with its handle, which is what the first commits' trace lines name.
 			 */
-			rw_print("render pipelines: %lu built, this one %llu us (%s) vertex %s "
+			rw_print("render pipelines: %lu built, this one %llu us (%s %p) vertex %s "
 			         "fragment %s\n", built, us,
-			         render != NULL ? "ok" : "refused",
+			         render != NULL ? "ok" : "refused", (void *)render,
 			         vertex != nil ? [[vertex name] UTF8String] : "(none)",
 			         [[fragment name] UTF8String]);
 		}
@@ -1576,6 +1594,8 @@ struct gem_close { uint32_t handle, pad; };
 		RW_AGAIN("this render pipeline is refused: %s\n", why);
 		return [self fail:error with:[NSString stringWithUTF8String:why]];
 	}
+	rw_keep_air(render, vertex_air, vertex != nil ? [[vertex name] UTF8String] : NULL, fragment_air,
+		    [[fragment name] UTF8String]);
 	/* and what the library made of it, in GALLIUM's bits: for any mask but All, None,
 	 * green|blue and red|alpha these nibbles must DIFFER from the writeMask printed
 	 * above, because the two enumerations number their channels in opposite directions.
@@ -2182,6 +2202,7 @@ struct gem_close { uint32_t handle, pad; };
 		 * which construct it refused, and an application can act on that. */
 		return [self fail:error with:[NSString stringWithUTF8String:why]];
 	}
+	rw_print("compute pipeline %p is %s\n", (void *)compute, [[function name] UTF8String]);
 	return [[RedwoodMetalComputePipeline alloc] initWithRedwoodDevice:self
 								 compute:compute
 								    info:&info
@@ -2376,7 +2397,7 @@ struct gem_close { uint32_t handle, pad; };
  */
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(void *)s plane:(NSUInteger)p
 {
-	char why[512] = { 0 };
+	char why[768] = { 0 };
 	struct rwd_surface took;
 	struct rwa_texture_shape shape;   /* this file's own declaration; rwd_texture_shape is the
 					   * same layout under the other file's name, and the cast
@@ -2400,7 +2421,14 @@ struct gem_close { uint32_t handle, pad; };
 	texture = rwd_texture_for_surface(_mesa, s, p, (const struct rwd_texture_shape *)&shape,
 					  &took, why, sizeof(why));
 	if (texture == NULL) {
-		RW_AGAIN("no drawable: %s\n", why);
+		static unsigned long refusals;
+		unsigned long n = __sync_add_and_fetch(&refusals, 1);
+
+		/* Every one of the first 64, then powers of two: the refusals of one boot have
+		 * several reasons, and a count shared by all of them hides which one recurs. */
+		if (n <= 64 || (n & (n - 1)) == 0)
+			rw_print("no drawable (%lu): format %u usage %#x: %s\n", n,
+				 shape.pixel_format, shape.usage, why);
 		return nil;
 	}
 	return [[RedwoodMetalTexture alloc] initWithRedwoodDevice:self
@@ -2413,10 +2441,11 @@ struct gem_close { uint32_t handle, pad; };
 		       options:(NSUInteger)options
 		   deallocator:(void (^)(void *, NSUInteger))deallocator
 {
-	/* Only the small buffers for now: roundb's 109 deduplicated copy requests all fell at or under
-	 * this limit, 94 of them at 32 KiB, so a copy of that size says whether the nil return is what
-	 * stops the compositor without paying for a 1 MiB copy on every one of the others. */
-	enum { NOCOPY_LIMIT = 0x10000 };
+	/* The bytes are copied once, here. 64 KiB was the first limit (roundb's 109 requests were at
+	 * or under it); round lock3cpu4 of 2026-10-30 had backboardd ask for 114688 bytes over a
+	 * 640x155 image twice a second, and the image was not drawn. A full-screen BGRA image is
+	 * 11 MB, so 16 MiB covers what the window server composites, at about a millisecond a copy. */
+	enum { NOCOPY_LIMIT = 16 << 20 };
 
 	(void)options;
 	if (bytes == NULL || length == 0 || length > NOCOPY_LIMIT) {
@@ -2649,8 +2678,12 @@ struct gem_close { uint32_t handle, pad; };
 	if (deallocator != NULL) {
 		_callerDeallocator = [deallocator copy];
 	}
-	rw_print("rwa buffer: copied %p of %lu bytes, buffer at %p\n", bytes, (unsigned long)length,
-		 _contents);
+	static unsigned long copies;
+	unsigned long copy_n = __sync_add_and_fetch(&copies, 1);
+
+	if (copy_n <= 32 || copy_n % 256 == 0)
+		rw_print("rwa buffer: copied %p of %lu bytes, buffer at %p (copy %lu)\n", bytes,
+			 (unsigned long)length, _contents, copy_n);
 	return self;
 }
 
@@ -4799,6 +4832,7 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
 	id _textures[RW_MAX_BUFFERS];
 	id _samplers[RW_MAX_BUFFERS];
 	unsigned _highest, _highestTexture, _highestSampler;
+	unsigned _threadgroupBytes;
 	BOOL _complained;
 }
 
@@ -4938,6 +4972,7 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
 	work->size[0] = (unsigned)size.width;
 	work->size[1] = (unsigned)size.height;
 	work->size[2] = (unsigned)size.depth;
+	work->threadgroupBytes = _threadgroupBytes;
 	[_commandBuffer recordWork:work];
 	[work release];
 }
@@ -4972,9 +5007,16 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
 	(void)resources; (void)count; (void)usage;
 }
 - (void)memoryBarrierWithScope:(NSUInteger)scope { (void)scope; }
+/* The compiler library takes one threadgroup buffer, at index 0 (air_to_nir.c refuses a
+ * second), so a length for any other index has nothing to size. */
 - (void)setThreadgroupMemoryLength:(NSUInteger)length atIndex:(NSUInteger)index
 {
-	(void)length; (void)index;   /* only what the shader declares is given, for now */
+	if (index == 0) {
+		_threadgroupBytes = (unsigned)length;
+	} else if (!_complained) {
+		rw_print("a threadgroup memory length for index %lu is not implemented; only "
+		         "index 0 is sized\n", (unsigned long)index);
+	}
 }
 
 /*

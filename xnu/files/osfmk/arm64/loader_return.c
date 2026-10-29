@@ -239,6 +239,9 @@ struct loader_live {
 	volatile uint64_t stop;         /* the loader's to write: the host has asked for the run to end */
 	uint64_t magic2;                /* "XNULIVE2": what follows is there (a loader may meet an older kernel) */
 	const uint64_t *sound;          /* loader_sound: the same for a recording of the sound */
+	uint64_t magic3;                /* "XNULIVE3": the command mailbox follows */
+	volatile uint64_t cmd_seq;      /* the loader's to write, after cmd: a new command is in cmd */
+	volatile char cmd[120];         /* the loader's to write: "oem sh TEXT" from the host, NUL-terminated */
 };
 
 /*
@@ -254,7 +257,37 @@ struct loader_live loader_live = {
 	.log_wrapped = &loader_log_wrapped, .log_head = LOADER_LOG_HEAD, .log_ring = LOADER_LOG_RING,
 	.recording = loader_recording,
 	.magic2 = 0x324556494c554e58ULL, .sound = loader_sound,
+	.magic3 = 0x334556494c554e58ULL,
 };
+
+/*
+ * The last command the host passed through the loader ("oem sh TEXT") and its sequence number, 0
+ * before the first; for kern.redwood.cmd in bsd/dev/redwood_threads.c. The loader writes the text
+ * and then the number from its own core without a lock, so the text is taken only when the number
+ * reads the same before and after the copy.
+ */
+uint64_t
+loader_live_command(char *text, size_t size)
+{
+	uint64_t seq = 0;
+
+	for (int attempt = 0; attempt < 8; attempt++) {
+		size_t n = 0;
+
+		seq = loader_live.cmd_seq;
+		__asm__ volatile ("dmb ish" ::: "memory");
+		while (n + 1 < size && n < sizeof(loader_live.cmd) && loader_live.cmd[n] != 0) {
+			text[n] = loader_live.cmd[n];
+			n++;
+		}
+		text[n] = 0;
+		__asm__ volatile ("dmb ish" ::: "memory");
+		if (loader_live.cmd_seq == seq) {
+			break;
+		}
+	}
+	return seq;
+}
 
 /* Valid from the first instruction of C code: does not depend on gVirtBase/gPhysBase being set up. */
 static inline uint64_t

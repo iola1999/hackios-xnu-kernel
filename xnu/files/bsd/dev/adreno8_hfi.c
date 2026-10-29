@@ -221,6 +221,16 @@ adreno8_hfi_pump(uint32_t request, bool *ack, unsigned *notices)
 			} else if (type == 0 && (received_id == 100 || received_id == 150)) {
 				printf("adreno8: %u: HFI fatal message %u data %#x (%d words)\n",
 				    adreno8_step, received_id, words >= 2 ? resp[1] : 0, words);
+				/* The whole message, eight words a line: for 150 (context bad) KGSL's
+				 * layout puts the context, timestamp and error code after the header,
+				 * and the error's own key/value payload after those. */
+				for (int at = 0; at < words; at += 8) {
+					char line[8 * 9 + 1];
+					unsigned used = 0;
+					for (int i = at; i < words && i < at + 8; i++)
+						used += (unsigned)snprintf(line + used, sizeof(line) - used, " %08x", resp[i]);
+					printf("adreno8: %u: HFI %u word %d:%s\n", adreno8_step, received_id, at, line);
+				}
 				return false;
 			} else if (type == 0 && received_id == 133) {
 				/* EOP memory remains the completion check; this packet is a notification. */

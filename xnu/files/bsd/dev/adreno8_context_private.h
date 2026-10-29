@@ -17,6 +17,7 @@ uint32_t adreno8_context_submit(const uint64_t *addresses, const uint32_t *words
 /* Completion requires EOP memory and healthy transport/device state. */
 bool adreno8_context_done(uint32_t timestamp);
 uint32_t adreno8_context_last(void);
+uint32_t adreno8_context_retired(void);
 uint32_t adreno8_context_depth(void);
 bool adreno8_context_close(void);
 bool adreno8_context_test(void);
