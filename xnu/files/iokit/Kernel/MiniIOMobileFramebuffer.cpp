@@ -835,7 +835,8 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 		char who[24] = "?";
 
 		proc_selfname(who, sizeof(who));
-		redwood_tl("tl: s %u %s at %llu\n", swapWord(swap, SWAP_ID), who, micros(now));
+		redwood_tl("tl: s %u %d %llu %s at %llu\n", swapWord(swap, SWAP_ID),
+		    proc_pid(current_proc()), (unsigned long long)thread_tid(current_thread()), who, micros(now));
 	}
 	IOLockLock(fSwapLock);
 	fStatSwapsLate += fSwapTime != 0 && now - fSwapTime > period && now - fSwapTime < pause;

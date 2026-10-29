@@ -31,6 +31,7 @@
  */
 
 #include <IOKit/IOLib.h>
+#include <kern/thread.h>
 #include <IOKit/IOLocks.h>
 #include <IOKit/IOKitKeys.h>
 #include <IOKit/IOPlatformExpert.h>
@@ -299,7 +300,8 @@ slowWait(const char * kind, uint64_t began)
 	absolutetime_to_nanoseconds(now - began, &ns);
 	if (ns >= NSEC_PER_MSEC) {
 		absolutetime_to_nanoseconds(now, &at);
-		redwood_tl("tl: f %s %llu at %llu\n", kind, ns / 1000, at / 1000);
+		redwood_tl("tl: f %d %llu %s %llu at %llu\n", proc_pid(current_proc()),
+		    (unsigned long long)thread_tid(current_thread()), kind, ns / 1000, at / 1000);
 	}
 }
 
