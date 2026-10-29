@@ -92,6 +92,8 @@ usb_start(void)
 	return 1;
 }
 
+#include "loader_06a_screen_ui.inc"
+
 /*
  * Pump controller events until a transfer on `endpoint` finishes.
  * Returns the byte count, or -1 if the transfer was cancelled or the cable
@@ -352,6 +354,7 @@ usb_wait(uint8_t endpoint, int deliver)
 			last_pet = READ_SYSREG(CNTVCT_EL0);
 			wdt_pet();
 		}
+		ui_tick();
 	}
 }
 
@@ -561,6 +564,7 @@ fb_command(char *cmd)
 		} else if (starts_with(cmd, "download:")) {
 			uint64_t total = parse_number(cmd + 9, 16), got = 0;
 			uint64_t limit = PAYLOAD_CONTAINER_MAX;
+			uint64_t transfer_base, transfer_total;
 			uint8_t *dest = (uint8_t *)PAYLOAD_BASE;
 			int streaming = ramdisk_pending();
 			int to_ramdisk = download_to_ramdisk || streaming;
@@ -590,6 +594,12 @@ fb_command(char *cmd)
 				ph->size = 0;
 				payload_bytes = 0;
 			}
+			/* The bar counts what this image has received in total: a streaming block adds to
+			 * the bytes already in the resident area, a one-shot upload starts at zero. */
+			transfer_base = streaming ? ramdisk_transfer.received : 0;
+			transfer_total = streaming ? ramdisk_transfer.total : total;
+			ui_stage(to_ramdisk ? "RECEIVING RAMDISK" : "RECEIVING PAYLOAD");
+			ui_progress(transfer_base, transfer_total);
 			fb_reply_data(total);
 			while (got < total) {
 				uint64_t want = total - got > USB_CHUNK ? USB_CHUNK : total - got;
@@ -599,6 +609,7 @@ fb_command(char *cmd)
 				}
 				memcpy(dest + got, usb_rx_buf, (size_t)r);
 				got += (uint64_t)r;
+				ui_progress(transfer_base + got, transfer_total);
 			}
 			if (streaming) ramdisk_block_done(total, got);
 			if (got == total) {
@@ -606,6 +617,11 @@ fb_command(char *cmd)
 					resident_rd_size = total;
 				} else if (!to_ramdisk) {
 					payload_bytes = total;   /* a complete container: parse may trust the header now */
+				}
+				if (!to_ramdisk) {
+					ui_stage("PAYLOAD READY");
+				} else if (!ramdisk_pending()) {
+					ui_stage("RAMDISK READY");
 				}
 				fb_reply("OKAY", "");
 			} else {
@@ -618,6 +634,7 @@ fb_command(char *cmd)
 					ph->size = 0;
 					payload_bytes = got;    /* the real received count stays on record */
 				}
+				ui_stage("TRANSFER FAILED");
 				fb_reply("FAIL", "short download");
 			}
 		} else if (starts_with(cmd, "upload")) {
@@ -681,9 +698,13 @@ fb_command(char *cmd)
 			fb_reply("OKAY", "");
 			log_len = 0;
 			print("== XNULOADER run (usb) ==\n");
+			ui_stage("BOOTING KERNEL");
 			if (!run_kernel(have_cp, cp)) {
 				set_result("not-started", 0, 0);
 				compose_logs(NULL, 0);
+				ui_stage("BOOT FAILED");
+			} else {
+				UI.ready = 0;   /* the panel keeps the kernel's last frame for oem screenshot */
 			}
 		} else if (starts_with(cmd, "oem hang")) {
 			fb_reply("OKAY", "watchdog test: not petting any more");
@@ -823,6 +844,7 @@ static void
 usb_command_loop(void)
 {
 	screen_quiet = 1;
+	ui_init();
 	for (;;) {
 		char cmd[128];
 		int64_t n;
@@ -833,6 +855,7 @@ usb_command_loop(void)
 		if (!usb_connected) {
 			/* the link wait ends on a cable event: Connected returns so this loop submits
 			 * the first OUT; a disconnect just keeps waiting for the cable to come up */
+			ui_stage("WAITING FOR HOST");
 			usb_wait(0xff, 0);
 			continue;
 		}

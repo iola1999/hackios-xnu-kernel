@@ -128,6 +128,7 @@ static const char *recording_data;
 static uint64_t recording_len, sound_len;
 static const char *sound_data;
 /* ---- stubs for LC-USB / LC-POLL / LC-EXC ---- */
+static inline void ui_tick(void) {}   /* usb_wait's panel refresh: loader_06a_screen_ui.inc */
 #define USB_EP_OUT 0x01
 #define USB_EP_IN  0x81
 #define USB_CHUNK (1024 * 1024)   /* block-external, mirrored; the driver pins it below and the */

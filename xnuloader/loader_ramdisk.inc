@@ -18,6 +18,7 @@ ramdisk_fail(void)
 	if (ramdisk_pending()) {
 		ramdisk_transfer.failed = 1;
 		resident_rd_size = 0;
+		ui_stage("TRANSFER FAILED");
 	}
 }
 
@@ -81,6 +82,8 @@ ramdisk_begin(const char *arguments)
 	ramdisk_transfer.failed = 0;
 	resident_rd_size = 0;
 	download_to_ramdisk = 0;
+	ui_stage("RECEIVING RAMDISK");
+	ui_progress(0, total);
 	return NULL;
 }
 

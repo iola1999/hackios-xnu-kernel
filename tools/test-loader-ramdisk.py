@@ -83,6 +83,10 @@ static uint64_t rx_left, rx_position;
 static jmp_buf loop_escape;
 static int escape_loop;
 static void print(const char *format, ...) { (void)format; }
+/* the panel status of loader_06a_screen_ui.inc: drawing is not what this test checks */
+static inline void ui_init(void) {}
+static inline void ui_stage(const char *word) { (void)word; }
+static inline void ui_progress(uint64_t done, uint64_t total) { (void)done; (void)total; }
 static int str_eq(const char *a, const char *b) { return !strcmp(a, b); }
 static uint64_t parse_number(const char *p, int base) { uint64_t n = 0; (void)base; sscanf(p, "%llx", (unsigned long long *)&n); return n; }
 static void fb_reply(const char *status, const char *message)
