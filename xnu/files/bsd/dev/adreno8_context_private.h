@@ -7,6 +7,9 @@
 /* OOB and command initialization stay owned by adreno8_gpu.c. */
 bool adreno8_gpu_commands_ready(void);
 bool adreno8_gpu_wait_idle(const char *what);
+/* After a reported hang: the RBBM and CP status, and for each pipe the IB levels the CP is in
+ * with the command words around its position. Reads only; prints nothing when GX is off. */
+void adreno8_gpu_hang_dump(void);
 
 /* Pages and aliases remain allocated until cold reset, including after close.
  * A confirmed close permits registration again; any failure closes this boot. */

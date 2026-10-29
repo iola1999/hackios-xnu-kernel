@@ -13,6 +13,7 @@
 #include "adreno8_hwsched_private.h"
 #include "adreno8_gpu_private.h"
 #include "adreno8_context_private.h"
+#include "adreno8_bo_private.h"
 
 extern void loader_log_line(const char *line);
 extern struct adreno8_block adreno8_smmu;
@@ -483,6 +484,54 @@ gpu_direct_ring_timeout_dump(void)
 			gpu_write(GEN8_CP_SQE_STAT_ADDR_PIPE, index);
 			printf("adreno8: CP_INIT timeout pipe %u SQE_STAT[%u] = %#x\n",
 			    pipe, index, gpu_read(GEN8_CP_SQE_STAT_DATA_PIPE));
+		}
+	}
+	(void)gpu_aperture(0);
+}
+
+/* After HFI 150 the GMU leaves GX up for the host's snapshot, as KGSL takes one before its
+ * recovery. Per pipe, each IB level with a base is printed with the words before and after the
+ * CP's position, base + 4 * (INIT_SIZE - REM_SIZE), so the packet it stopped in can be decoded
+ * against the submission. */
+void
+adreno8_gpu_hang_dump(void)
+{
+	static const uint32_t global[] = { GEN8_RBBM_STATUS, GEN8_RBBM_STATUS1, GEN8_RBBM_GFX_STATUS,
+		GEN8_RBBM_GFX_BR_STATUS, GEN8_RBBM_GFX_BV_STATUS, GEN8_RBBM_MISC_STATUS, GEN8_CP_CP2GMU_STATUS };
+	static const uint32_t piped[] = { GEN8_CP_PIPE_STATUS_PIPE, GEN8_CP_SQE_STATUS_PIPE,
+		GEN8_CP_HW_FAULT_STATUS_PIPE, GEN8_CP_INTERRUPT_STATUS_PIPE };
+	static const struct { const char *name; uint32_t base; } levels[] = {
+		{ "IB1", GEN8_CP_IB1_BASE_PIPE }, { "IB2", GEN8_CP_IB2_BASE_PIPE }, { "IB3", GEN8_CP_IB3_BASE_PIPE },
+		{ "SDS", GEN8_CP_SDS_BASE_PIPE }, { "MRB", GEN8_CP_MRB_BASE_PIPE } };
+
+	if (gpu_state == GPU_FAILED || !GMU_PWR_GX_UP(gpu_gmu_read(GMU_PWR_CLK_STATUS))) {
+		printf("adreno8: hang dump: GX is off, no CP registers\n");
+		return;
+	}
+	for (unsigned i = 0; i < A8_COUNT(global); i++)
+		printf("adreno8: hang reg %#x = %#x\n", global[i], gpu_read(global[i]));
+	for (uint32_t pipe = A8_PIPE_BR; pipe <= A8_PIPE_BV; pipe++) {
+		if (!gpu_aperture(pipe))
+			return;
+		for (unsigned i = 0; i < A8_COUNT(piped); i++)
+			printf("adreno8: hang pipe %u reg %#x = %#x\n", pipe, piped[i], gpu_read(piped[i]));
+		for (uint32_t index = 0; index < 16; index++) {
+			gpu_write(GEN8_CP_SQE_STAT_ADDR_PIPE, index);
+			printf("adreno8: hang pipe %u SQE_STAT[%u] = %#x\n", pipe, index, gpu_read(GEN8_CP_SQE_STAT_DATA_PIPE));
+		}
+		for (unsigned i = 0; i < A8_COUNT(levels); i++) {
+			uint64_t base = gpu_read(levels[i].base) | (uint64_t)gpu_read(levels[i].base + 1) << 32;
+			uint32_t rem = gpu_read(levels[i].base + 2), init = gpu_read(levels[i].base + 3);
+			char what[32];
+
+			printf("adreno8: hang pipe %u %s base %#llx rem %u init %u\n", pipe, levels[i].name, base, rem, init);
+			if (base == 0 || rem > init)
+				continue;
+			uint32_t done = init - rem, before = done < 48 ? done : 48, after = rem < 16 ? rem : 16;
+			uint64_t at = base + 4ull * done;
+
+			snprintf(what, sizeof(what), "pipe %u %s at -%u", pipe, levels[i].name, before);
+			adreno8_bo_dump_words(what, at - 4ull * before, before + after);
 		}
 	}
 	(void)gpu_aperture(0);

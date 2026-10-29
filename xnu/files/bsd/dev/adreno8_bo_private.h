@@ -21,5 +21,8 @@ bool adreno8_bo_commit(void);
  * mapping and backing pages remain owned until cold reset. */
 bool adreno8_bo_unmap(uint64_t address, uint64_t size);
 bool adreno8_bo_release(uint64_t address, uint64_t size);
+/* Print `count` dwords from GPU address `address` through the CB0 page table, for a hang report.
+ * Pages that are not mapped are named, not read. */
+void adreno8_bo_dump_words(const char *what, uint64_t address, uint32_t count);
 
 #endif

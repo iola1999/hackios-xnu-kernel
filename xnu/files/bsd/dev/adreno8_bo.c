@@ -182,6 +182,30 @@ adreno8_bo_unmap(uint64_t address, uint64_t size)
 	return adreno8_space_publish_range(&adreno8_gpu_space, address, size) || bo_fail("unmap TLB synchronization");
 }
 
+extern unsigned int ml_phys_read_word(vm_offset_t paddr);
+
+void
+adreno8_bo_dump_words(const char *what, uint64_t address, uint32_t count)
+{
+	address &= ~3ull;
+	for (uint32_t i = 0; i < count; i += 8) {
+		char line[160];
+		int used = snprintf(line, sizeof(line), "adreno8: %s %#llx:", what, address + 4ull * i);
+
+		for (uint32_t j = i; j < count && j < i + 8 && used < (int)sizeof(line) - 10; j++) {
+			uint64_t at = address + 4ull * j;
+			uint64_t *entry = at < ADRENO8_GPU_IOVA_END ?
+			    adreno8_space_entry(&adreno8_gpu_space, (uint32_t)(at & ~(uint64_t)SMMU_GRANULE_MASK)) : NULL;
+			uint64_t phys = entry && (*entry & 1) ? *entry & PTE_ADDRESS : 0;
+
+			used += phys ? snprintf(line + used, sizeof(line) - used, " %08x",
+			    ml_phys_read_word((vm_offset_t)(phys | (at & SMMU_GRANULE_MASK)))) :
+			    snprintf(line + used, sizeof(line) - used, " unmapped");
+		}
+		printf("%s\n", line);
+	}
+}
+
 bool
 adreno8_bo_release(uint64_t address, uint64_t size)
 {

@@ -175,6 +175,7 @@ redwood_gpu_report(const char *why)
 	 * false once a fatal message has been printed or the queue is unusable. */
 	for (unsigned i = 0; i < 30 && adreno8_hfi_poll(); i++)
 		adreno8_sleep_us(100000);
+	adreno8_gpu_hang_dump();
 	adreno8_bo_stop();
 }
 

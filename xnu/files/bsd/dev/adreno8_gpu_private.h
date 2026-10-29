@@ -64,6 +64,12 @@ struct a8_protect_span { uint32_t reg, start, end, noaccess; };
 #define GEN8_CP_INTERRUPT_STATUS_PIPE 0x8b7
 #define GEN8_CP_PIPE_STATUS_PIPE 0x8b9
 #define GEN8_CP_SQE_STATUS_PIPE 0x8bb
+/* a6xx.xml A8XX variants: BASE (64-bit), REM_SIZE and INIT_SIZE in dwords, per pipe. */
+#define GEN8_CP_IB1_BASE_PIPE 0x900
+#define GEN8_CP_IB2_BASE_PIPE 0x904
+#define GEN8_CP_IB3_BASE_PIPE 0x908
+#define GEN8_CP_SDS_BASE_PIPE 0x90c
+#define GEN8_CP_MRB_BASE_PIPE 0x910
 #define GEN8_CP_SQE_STAT_ADDR_PIPE 0x8f0
 #define GEN8_CP_SQE_STAT_DATA_PIPE 0x8f1
 #define GEN8_GMUAO_CGC_DELAY_CNTL 0x23b0a
