@@ -46,7 +46,13 @@ struct boot_video {
 	uint64_t v_baseAddr, v_display, v_rowBytes, v_width, v_height, v_depth;
 };
 
-#define BOOT_LINE_LENGTH 608
+/*
+ * Same value as pexpert/pexpert/arm64/boot.h. The kernel computes the offsets
+ * of bootFlags and memSizeActual from its own copy of this length; a shorter one
+ * here puts those two fields 416 bytes before where the kernel reads them, so it
+ * picks up whatever the previous boot left at the kernel's offsets.
+ */
+#define BOOT_LINE_LENGTH 1024
 
 struct boot_args {
 	uint16_t revision;
