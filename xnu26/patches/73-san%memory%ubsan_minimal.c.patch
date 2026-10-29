@@ -1,0 +1,61 @@
+diff --git a/san/memory/ubsan_minimal.c b/san/memory/ubsan_minimal.c
+index b9585f2..797e871 100644
+--- a/san/memory/ubsan_minimal.c
++++ b/san/memory/ubsan_minimal.c
+@@ -38,6 +38,7 @@
+ #include <kern/kalloc.h>
+ #include <kern/trap_telemetry.h>
+ #include <machine/machine_routines.h>
++#include <mach/machine/thread_status.h>
+ #include <san/ubsan_minimal.h>
+ 
+ #define UBSAN_M_NONE            (0x0000)
+@@ -72,13 +73,45 @@ ubsan_minimal_trap_to_str(uint16_t trap)
+ 
+ void
+ ubsan_handle_brk_trap(
+-	__unused void     *state,
++	void              *state,
+ 	uint16_t          trap)
+ {
+ 	if (!ubsan_minimal_enabled) {
+ #if DEVELOPMENT
+-		/* We want to know about those sooner than later... */
+-		panic("UBSAN trap taken in early startup code");
++		/*
++		 * We want to know about those sooner than later...
++		 *
++		 * panic() records __builtin_return_address(0) as the caller, and
++		 * inside this file that address is the cold block around this call,
++		 * so it never names the instruction that took the brk. state is the
++		 * arm_saved_state_t the exception vector spilled before any C
++		 * handler ran: pc is ELR_EL1, lr is x30, fp is x29 and esr is
++		 * ESR_EL1, all as the trap took them.
++		 *
++		 * The brk lives in the __ubsan_handle_*_minimal stubs below, so pc
++		 * names the stub and not the check that called it. The call into the
++		 * stub is a plain branch, so lr points past it inside the
++		 * instrumented function, and fp is that function's frame. ESR_EL1
++		 * carries the exception class and the ISS comment, which separates
++		 * the UBSAN checks.
++		 *
++		 * These fields describe the trap being handled right now. They stay
++		 * valid only for the duration of this handler, this early before the
++		 * full UBSAN runtime can report sites.
++		 */
++		arm_saved_state_t *ss = (arm_saved_state_t *)state;
++		uint64_t elr = 0, lr = 0, fp = 0, esr = 0;
++
++		if (is_saved_state64(ss)) {
++			elr = const_saved_state64(ss)->pc;
++			lr = const_saved_state64(ss)->lr;
++			fp = const_saved_state64(ss)->fp;
++			esr = const_saved_state64(ss)->esr;
++		}
++
++		panic("UBSAN trap taken in early startup code: trap=%#x elr=%p lr=%p fp=%p esr=%#llx",
++		    trap, (void *)(uintptr_t)elr, (void *)(uintptr_t)lr,
++		    (void *)(uintptr_t)fp, (unsigned long long)esr);
+ #endif /* DEVELOPMENT */
+ 		return;
+ 	}

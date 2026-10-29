@@ -71,3 +71,4 @@
 70-pexpert%pexpert%arm64%Makefile.patch
 71-pexpert%pexpert%arm64%board_config.h.patch
 72-osfmk%ipc%mach_port.c.patch
+73-san%memory%ubsan_minimal.c.patch

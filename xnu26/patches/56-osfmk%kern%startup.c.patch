@@ -36,3 +36,19 @@ index c977c983be74..cb45dea2f0f2 100644
  
  	kernel_startup_initialize_upto(STARTUP_SUB_LOCKDOWN);
  
+@@ -1132,6 +1138,15 @@ scale_setup(void)
+ 		}
+ 	}
+ 
++	/*
++	 * Early-startup UBSAN reports a signed mul overflow on the line below.
++	 * Scale must be 0..16 and task_max_base starts at CONFIG_TASK_MAX (512),
++	 * so the operands are printed here to tell a bad task_max initial value
++	 * from a bad scale.
++	 */
++	kprintf("scale_setup: task_max=%d base=%d scale=%d max_mem_actual=%llu\n",
++	    task_max, task_max_base, scale, (unsigned long long)max_mem_actual);
++
+ 	task_max = MAX(task_max, task_max_base * scale);
+ 
+ 	if (scale != 0) {
