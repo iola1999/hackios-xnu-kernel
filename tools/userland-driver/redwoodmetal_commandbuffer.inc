@@ -148,8 +148,9 @@ rw_stall_watch(void *ignored)
 		}
 
 		/* A draw that has outlasted RW_DRAW_STALL_US: dump the process's threads while it is
-		 * still inside the call. The kernel prints one line per thread, so the one wanted is
-		 * the render thread's PC, which names the call it is asleep in. */
+		 * still inside the call. rw_print_threads reads them from this process and prints one
+		 * line per thread, so the one wanted is the render thread's PC, which names the call
+		 * it is asleep in. */
 		{
 			uint64_t began = __atomic_load_n(&rw_draw_began_us, __ATOMIC_ACQUIRE);
 			unsigned serial = __atomic_load_n(&rw_draw_serial, __ATOMIC_ACQUIRE);
