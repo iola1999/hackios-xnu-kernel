@@ -1,0 +1,17 @@
+--- a/src/gallium/drivers/freedreno/freedreno_resource.c
++++ b/src/gallium/drivers/freedreno/freedreno_resource.c
+@@ -961,6 +961,14 @@
+                fd_try_shadow_resource(ctx, rsc, level, box, DRM_FORMAT_MOD_LINEAR)) {
+             needs_flush = busy = false;
+             ctx->stats.shadow_uploads++;
++            /* The transfer's stride was copied from the layout this shadowing just replaced:
++             * fd_resource_transfer_map fills ptrans->stride before it calls this function, and
++             * fd_try_shadow_resource swapped rsc->layout before returning. Take it again, so the
++             * offset resource_transfer_map_unsync builds below and the rows the caller walks are
++             * described by one layout instead of two.
++             */
++            trans->b.b.stride = fd_resource_pitch(rsc, level);
++            trans->b.b.layer_stride = fd_resource_layer_stride(rsc, level);
+          } else {
+             struct fd_resource *staging_rsc = NULL;
+ 

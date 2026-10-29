@@ -1,0 +1,114 @@
+Refuse to shadow a resource whose memory belongs to somebody else.
+
+fd_try_shadow_resource swaps the backing bo's (freedreno_resource.c:431) and
+releases the old one once the shadow's batches retire (:442-446). A resource
+imported through fd_resource_from_handle has a client holding a mapping of that
+memory for the resource's whole life: the AIR shim maps once at creation
+(air_metal.c:464-474, "Mapped once, for the buffer's whole life") and never maps
+again, so after a swap the client writes into a bo this driver intends to free.
+
+fd_resource_from_handle sets is_shared on exactly those resources (:1527), and
+no code in freedreno reads the flag: `grep -rn is_shared` over the driver
+directory finds four assignments (:1097, :1391, :1527, :1742) and no condition.
+The one shadow-related guard, :1116, tests the PIPE_BIND_SHARED bind bit, which
+air_metal.c:1186-1188 deliberately leaves out of the import template.
+
+Refusing here is a path the driver already handles. :1116 shadows only when
+!(prsc->bind & PIPE_BIND_SHARED), so a resource carrying that bind bit already
+reaches a failed fd_screen_bo_get_handle with no shadow. The other two callers
+fall back: :906 takes the staging branch at :910, which :892-893 already calls
+the better choice when shadowing would not avoid a flush, and :554
+(fd_resource_uncompress) asserts on failure, so a debug build stops and a release
+build returns without decompressing. That site is reached only for a
+UBWC-compressed resource (a6xx/fd6_image.cc:443, a6xx/fd6_resource.cc:218,225),
+and an imported resource carries a linear modifier.
+
+Measured facts this change rests on. Two rounds (E with fb_hz=120, F with the
+default 60) produced the same fault at the same call site: 28 of 28 link
+registers satisfy (lr - 0x27000c) mod 0x4000 == 0, which is the return address of
+the bl to _memcpy at libredwoodair.dylib + 0x270008, inside _util_copy_rect, the
+row-loop memcpy at u_format.c:94. pc minus the cache slide is 0x2a53619c0 in both
+rounds. The destination is memory a client is using: each faulting x0 sits inside
+a burst of same-pid "rwa buffer: copied ... buffer at <x0>" lines, 2 to 8 lines
+before the fault and 12 to 402 after it, so it is that buffer's _contents, and
+four of the addresses recur across boots. The source argument holds bytes of
+freed memory reused by the process's own allocator: ObjC selector fragments
+("le.siri.", "le.board", "le.Atten", "ion: _ZN", "cklight-") and UUID fragments
+("6-B233-4", "2-2CA8-4"). Copy lengths are 192 (13 times in E, 15 in F), 355
+(once in E) and 38 (once in F); each is one row, ceil(width / blockwidth) *
+blocksize, so 355 pins a single-channel 8-bit format while 192 and 38 do not.
+The row is the mapped box's, not the resource's: u_surface.c:231 takes the box
+from the caller, and both AIR read-backs pass the region the client asked for
+(air_metal.c:1652 and :1745, from redwoodmetal_texture.inc:140-142 and
+:165-168), so the resource can be much wider than any of the three lengths.
+None of the three divides 32768, the buffer size those copies run against, so
+bytesPerRow and the row length are not the same quantity and the buffer size only
+bounds rows * stride. Every faulting x0 is 16K aligned while the loop advances
+dst by dst_stride, which reads as a fault on the first row: the source pointer
+was already invalid when the map returned it, and u_surface.c:330 only rejects
+NULL.
+
+Alternatives kept for the next step, in order. Adding PIPE_BIND_SHARED to the
+import template (and repeating the is_format_supported query with that bit, which
+is why air_metal.c:1186-1188 left it out) fixes the wrong assumption itself but
+covers only the :1116 caller. Setting prsc->bind after the import covers the same
+one caller and depends on :1116's implementation. Replacing the map-once-for-life
+buffer model in air_metal.c:464-474 covers both the bo swap and a staging
+substitution and costs the most.
+
+Why the round that verifies this has to look at the picture and not only at the
+fault count. The caller at :554 is fd_resource_uncompress, whose :556-557 is
+`ASSERTED bool success = ...; assert(success);`. A release build compiles the
+assert out, so this guard would make the function return without decompressing
+and its caller would read compressed data as linear: wrong pixels rather than a
+crash, and nothing in the log. Its three callers are in the a6xx backend
+(a6xx/fd6_image.cc:443, a6xx/fd6_resource.cc:218,225) and are reached for a
+UBWC-compressed resource, while an imported one carries a linear modifier, so
+this is not expected to fire. Expected is not measured, which is why accepting
+this round takes three readings: bad accesses at zero, the desktop still drawn
+correctly, and a frame count comparable with a healthy round.
+
+Verification. mk-mesa.sh:106 stamps PATCHES with the sha256 of cat
+tools/mesa/*.patch, so a new patch file re-extracts and rebuilds the tree
+(:107-118); no list needs updating, and no other patch touches this file. :115
+applies them with `|| [ "$REBASE" = 26 ]`, so under REBASE=26 a patch that fails
+to apply does not stop the build. Confirm the guard is in the built tree with
+`grep -c 'if (rsc->b.is_shared)' <tree>/src/gallium/drivers/freedreno/freedreno_resource.c`,
+0 before and 1 after. Counting every occurrence of the expression instead gives 4
+before and 5 after, because the assignments at :1097, :1391, :1527 and :1742
+already use it. Also confirm the rebuilt libredwoodair.dylib sha256 differs from
+the frozen one. Check this file with `git apply --check` rather than BSD patch:
+macOS patch 2.0-12u11-Apple reports it malformed at the first added line because
+of the prose above, while the container's GNU patch, which is what mk-mesa.sh:115
+runs, applies it.
+
+diff --git a/src/gallium/drivers/freedreno/freedreno_resource.c b/src/gallium/drivers/freedreno/freedreno_resource.c
+--- a/src/gallium/drivers/freedreno/freedreno_resource.c
++++ b/src/gallium/drivers/freedreno/freedreno_resource.c
+@@ -353,8 +353,26 @@
+    struct pipe_resource *prsc = &rsc->b.b;
+    struct fd_screen *screen = fd_screen(pctx->screen);
+    struct fd_batch *batch;
+    bool fallback = false;
+ 
++   /* Shadowing swaps the backing bo's (:431) and releases the old one once the
++    * shadow's batches retire (:442-446). For a resource imported from memory
++    * somebody else allocated, a client holds a mapping of that memory for the
++    * resource's whole life and does not map again, so after a swap it writes
++    * into a bo this driver intends to free. fd_resource_from_handle marks those
++    * resources is_shared (:1527); nothing else in this driver reads the flag.
++    *
++    * The caller at :1116 already leaves a PIPE_BIND_SHARED resource unshadowed
++    * when fd_screen_bo_get_handle fails, :906 falls back to the staging branch
++    * at :910, and :554 asserts. Refusing is the handled path in all three.
++    *
++    * Returning here also skips the flushes this function does at :365 and
++    * :376-378. Those are for the modification shadowing is about to make; the
++    * resource is left untouched, and each caller's fallback does its own.
++    */
++   if (rsc->b.is_shared)
++      return false;
++
+    if (prsc->next)
+       return false;
+ 

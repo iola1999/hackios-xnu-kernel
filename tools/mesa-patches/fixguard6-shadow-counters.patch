@@ -1,0 +1,344 @@
+--- a/src/gallium/drivers/freedreno/freedreno_resource.c
++++ b/src/gallium/drivers/freedreno/freedreno_resource.c
+@@ -336,8 +336,31 @@
+    return pscreen->is_format_supported(
+          pscreen, prsc->format, prsc->target, prsc->nr_samples,
+          prsc->nr_storage_samples, PIPE_BIND_RENDER_TARGET);
++}
++
++/* Round fixguard6 instrumentation (2026-10-29). Two questions: does the is_shared guard run at
++ * all, and does a row copy that faults read a backing store this file swapped away. The counters
++ * print once at exit; the log ring holds about 7,300 lines and wrapped once, so nothing here prints
++ * per call. A process that dies on SIGSEGV never reaches the atexit line, which is why the first
++ * refusal and the first swap print one line each as well. The four counters are non-static only
++ * because u_format.c's row copy prints them next to src/dst.
++ */
++unsigned long long fd_shadow_calls, fd_shadow_shared, fd_shadow_refused, fd_shadow_swapped;
++
++static void
++shadow_report(const char *why)
++{
++   printf("rwa shadow: %s calls=%llu is_shared=%llu refused=%llu swapped=%llu\n", why,
++          fd_shadow_calls, fd_shadow_shared, fd_shadow_refused, fd_shadow_swapped);
++   fflush(stdout);
+ }
+ 
++static void
++shadow_report_atexit(void)
++{
++   shadow_report("teardown");
++}
++
+ /**
+  * @rsc: the resource to shadow
+  * @level: the level to discard (if box != NULL, otherwise ignored)
+@@ -355,6 +378,15 @@
+    struct fd_batch *batch;
+    bool fallback = false;
+ 
++   /* Named, so a grep for the guard condition still counts only the guard itself. */
++   bool shadowed_input = rsc->b.is_shared;
++
++   fd_shadow_calls++;
++   if (shadowed_input)
++      fd_shadow_shared++;
++   if (fd_shadow_calls == 1)
++      atexit(shadow_report_atexit);
++
+    /* Shadowing swaps the backing bo's (:431) and releases the old one once the
+     * shadow's batches retire (:442-446). For a resource imported from memory
+     * somebody else allocated, a client holds a mapping of that memory for the
+@@ -370,8 +402,11 @@
+     * :376-378. Those are for the modification shadowing is about to make; the
+     * resource is left untouched, and each caller's fallback does its own.
+     */
+-   if (rsc->b.is_shared)
++   if (rsc->b.is_shared) {
++      if (++fd_shadow_refused == 1)
++         shadow_report("first-refusal");
+       return false;
++   }
+ 
+    if (prsc->next)
+       return false;
+@@ -447,6 +482,8 @@
+        rsc->track, shadow, shadow->b.b.reference.count, shadow->track);
+ 
+    SWAP(rsc->bo, shadow->bo);
++   if (++fd_shadow_swapped == 1)
++      shadow_report("first-swap");
+    SWAP(rsc->valid, shadow->valid);
+ 
+    /* swap() doesn't work because you can't typeof() the bitfield. */
+@@ -805,9 +842,48 @@
+ 
+    ctx->stats.staging_uploads++;
+ 
+-   return fd_bo_map(staging_rsc->bo);
++   /* A tiled resource is mapped through this staging resource, so the pointer a caller receives
++    * comes from here rather than from the offset arithmetic. Printed only when that pointer cannot
++    * be an address or there is no buffer object to map; the null case returns a failed map instead
++    * of dereferencing it, and the caller already handles a null map.
++    */
++   {
++      void rwa_staging_guard(const void *staging_res, const void *bo, const void *bo_map,
++                             uint64_t bo_size, const void *layout_resource);
++      struct fd_bo *bo = staging_rsc->bo;
++      void *bo_map = bo ? fd_bo_map(bo) : NULL;
++
++      if (!bo || !bo_map || ((uintptr_t)bo_map >> 48))
++         rwa_staging_guard(staging_rsc, bo, bo_map, bo ? bo->size : 0, trans->b.b.resource);
++
++      return bo_map;
++   }
+ }
+ 
++/* The two halves of the address resource_transfer_map_unsync returns, for a copy site that got a
++ * pointer it cannot use. Same arithmetic as that function, on the resource's current bo and layout;
++ * when the layout is tiled the map a caller received came from a staging resource, so the numbers
++ * describe the resource rather than that staging copy.
++ */
++void fd_resource_map_parts(struct pipe_resource *prsc, unsigned level,
++                           const struct pipe_box *box, void **bo_out, void **map_out,
++                           uint64_t *offset_out);
++
++void
++fd_resource_map_parts(struct pipe_resource *prsc, unsigned level, const struct pipe_box *box,
++                      void **bo_out, void **map_out, uint64_t *offset_out)
++{
++   struct fd_resource *rsc = fd_resource(prsc);
++   enum pipe_format format = prsc->format;
++   struct fd_bo *bo = rsc->bo;
++
++   *bo_out = bo;
++   *map_out = bo ? bo->map : NULL;
++   *offset_out = box->y / util_format_get_blockheight(format) * fd_resource_pitch(rsc, level) +
++                 box->x / util_format_get_blockwidth(format) * rsc->layout.cpp +
++                 fd_resource_offset(rsc, level, box->z);
++}
++
+ static void *
+ resource_transfer_map_unsync(struct pipe_context *pctx,
+                              struct pipe_resource *prsc, unsigned level,
+@@ -841,10 +917,40 @@
+    offset = box->y / util_format_get_blockheight(format) * trans->b.b.stride +
+             box->x / util_format_get_blockwidth(format) * rsc->layout.cpp +
+             fd_resource_offset(rsc, level, box->z);
++
++   /* A mapped bo has bo->map set for as long as the bo lives (freedreno_bo.c:642-653 maps once
++    * and :472-487 unmaps at fd_bo_fini_common), so a null map, a null bo, or an offset past the
++    * bo's size are the three ways buf + offset stops being inside a buffer. Printed only then,
++    * with the bo and its map alongside the offset, because those separate a stale struct from an
++    * offset that came out too large.
++    */
++   {
++      void rwa_map_anomaly(const void *res, const void *bo, const void *bo_map, uint64_t offset,
++                           uint64_t bo_size, unsigned level, unsigned box_y);
++      struct fd_bo *bo = rsc->bo;
+ 
++      if (!bo || !bo->map || offset > (uint64_t)bo->size)
++         rwa_map_anomaly(prsc, bo, bo ? bo->map : NULL, offset, bo ? bo->size : 0, level, box->y);
++   }
++
+    if (usage & PIPE_MAP_WRITE)
+       rsc->valid = true;
++
++   /* The address this map is about to hand back, when it cannot be an address. bo_map and offset
++    * are the two halves, bo_src is the layout's surface offset for this level: a backing object
++    * that changed carries a different one, while a stride or box that moved leaves it alone.
++    */
++   {
++      void rwa_map_unsync_guard(const void *res, const void *bo, const void *bo_map, uint64_t offset,
++                                uint64_t bo_size, unsigned level, unsigned box_y, uint64_t bo_src);
++      struct fd_bo *bo = rsc->bo;
++      uintptr_t p = (uintptr_t)buf + offset;
+ 
++      if (p >> 48)
++         rwa_map_unsync_guard(prsc, bo, bo ? bo->map : NULL, offset, bo ? bo->size : 0, level,
++                              box->y, fd_resource_offset(rsc, level, box->z));
++   }
++
+    return buf + offset;
+ }
+ 
+--- a/src/gallium/auxiliary/util/u_transfer.c
++++ b/src/gallium/auxiliary/util/u_transfer.c
+@@ -100,6 +100,55 @@
+    if (!map)
+       return;
+ 
++   /* Round air-d: the address the map call just returned, with the transfer that produced it and
++    * the helper's two fields, so the three candidates can be told apart on one line.
++    */
++   if ((uintptr_t)map >> 48) {
++      void rwa_map_guard(const void *map, const void *transfer, unsigned is_helper,
++                         const void *ptr, const void *staging);
++      int u_transfer_helper_handles(struct pipe_resource *prsc);
++      void u_transfer_helper_parts(struct pipe_transfer *ptrans, const void **ptr,
++                                   const void **staging);
++      const void *ptr = NULL, *staging = NULL;
++      int is_helper = u_transfer_helper_handles(resource);
++
++      if (is_helper)
++         u_transfer_helper_parts(transfer, &ptr, &staging);
++      rwa_map_guard(map, transfer, (unsigned)is_helper, ptr, staging);
++   }
++
++   /* Round air-d: the source of this copy is the caller's own memory, so a value that cannot be an
++    * address entered through the call rather than out of a buffer object. Printed after the map so
++    * the transfer pointer on the line is the one this call created; `src_data` is unchanged since
++    * it was assigned.
++    */
++   if ((uintptr_t)src_data >> 48) {
++      void rwa_subdata_guard(const void *data, const void *transfer, unsigned level,
++                             unsigned stride, unsigned w, unsigned h);
++
++      rwa_subdata_guard(src_data, transfer, level, stride, (unsigned)box->width,
++                        (unsigned)box->height);
++
++      /* The caller's own address, so the call site is `ret - self` when both are in one image. */
++      {
++         void rwa_subdata_caller(const void *data, const void *ret, const void *self,
++                                 const void *transfer);
++
++         rwa_subdata_caller(src_data, (const void *)__builtin_return_address(0),
++                            (const void *)&u_default_texture_subdata, transfer);
++      }
++   }
++
++   /* Round air-d: the resource this copy fills, for the ring libredwoodair prints on SIGSEGV. The
++    * source here is the caller's memory and belongs to no resource, so the texture is what gets
++    * recorded. Row bytes are what util_copy_rect will copy, which is util_format_get_stride's answer
++    * by definition: nblocks times the block size.
++    */
++   void rwa_copy_record(const void *res, const void *buf, const void *src, unsigned level,
++                        unsigned box_y, unsigned rows, unsigned len);
++   rwa_copy_record(resource, map, src_data, level, box->y, box->height,
++                   util_format_get_stride(resource->format, box->width));
++
+    util_copy_box(map,
+                  resource->format,
+                  transfer->stride, /* bytes */
+--- a/src/gallium/auxiliary/util/u_surface.c
++++ b/src/gallium/auxiliary/util/u_surface.c
+@@ -74,6 +74,14 @@
+               unsigned src_x, unsigned src_y, unsigned src_z)
+ {
+    unsigned z;
++
++   {
++      void rwa_copy_box_guard(const void *src, long stride, unsigned x, unsigned y, unsigned w,
++                              unsigned h);
++
++      rwa_copy_box_guard(src, src_stride, src_x, src_y, width, height);
++   }
++
+    dst += dst_z * dst_slice_stride;
+    src += src_z * src_slice_stride;
+    for (z = 0; z < depth; ++z) {
+@@ -331,7 +339,24 @@
+          mesa_loge("util_resource_copy_region: mapping src-texture failed");
+          goto no_src_map;
+       }
++
++         /* Round air-d: the address the map call just returned, with the transfer that produced it
++          * and the helper's two fields, so the three candidates can be told apart on one line.
++          */
++         if ((uintptr_t)src_map >> 48) {
++            void rwa_map_guard(const void *map, const void *transfer, unsigned is_helper,
++                               const void *ptr, const void *staging);
++            int u_transfer_helper_handles(struct pipe_resource *prsc);
++            void u_transfer_helper_parts(struct pipe_transfer *ptrans, const void **ptr,
++                                         const void **staging);
++            const void *ptr = NULL, *staging = NULL;
++            int is_helper = u_transfer_helper_handles(src);
+ 
++            if (is_helper)
++               u_transfer_helper_parts(src_trans, &ptr, &staging);
++            rwa_map_guard(src_map, src_trans, (unsigned)is_helper, ptr, staging);
++         }
++
+       dst_map = pipe->texture_map(pipe,
+                                    dst,
+                                    dst_level,
+@@ -341,6 +366,33 @@
+       if (!dst_map) {
+          mesa_loge("util_resource_copy_region: mapping dst-texture failed");
+          goto no_dst_map;
++      }
++
++      /* Round air-d: the resource this copy reads, for the ring libredwoodair prints on SIGSEGV. */
++      void rwa_copy_record(const void *res, const void *buf, const void *src, unsigned level,
++                           unsigned box_y, unsigned rows, unsigned len);
++      rwa_copy_record(src, dst_map, src_map, src_level, src_box.y, src_box.height,
++                      util_format_get_stride(src_format, src_box.width));
++
++      /* Round air-d: when the pointer the copy is about to read cannot be an address, print the two
++       * halves of it, and the same two for the far side. The map and the offset are separate columns
++       * because only that tells a stale buffer object from an offset that came out wrong.
++       */
++      if ((uintptr_t)src_map >> 48) {
++         void rwa_map_parts(const void *res, const void *bo, const void *bo_map, uint64_t offset,
++                            unsigned rows, unsigned len);
++         void rwa_dst_parts(const void *res, const void *bo, const void *bo_map, uint64_t offset);
++         void fd_resource_map_parts(struct pipe_resource *prsc, unsigned level,
++                                    const struct pipe_box *box, void **bo_out, void **map_out,
++                                    uint64_t *offset_out);
++         void *bo, *map;
++         uint64_t offset;
++
++         fd_resource_map_parts(src, src_level, &src_box, &bo, &map, &offset);
++         rwa_map_parts(src, bo, map, offset, src_box.height,
++                       util_format_get_stride(src_format, src_box.width));
++         fd_resource_map_parts(dst, dst_level, &dst_box, &bo, &map, &offset);
++         rwa_dst_parts(dst, bo, map, offset);
+       }
+ 
+       util_copy_box(dst_map,
+--- a/src/gallium/auxiliary/util/u_transfer_helper.c
++++ b/src/gallium/auxiliary/util/u_transfer_helper.c
+@@ -193,6 +193,28 @@
+ {
+    assert(handle_transfer(ptrans->resource));
+    return (struct u_transfer *)ptrans;
++}
++
++/* Whether a resource's maps go through this helper, and the two addresses its own transfer holds.
++ * The second is only meaningful when the first answers non-zero: a driver transfer has no such
++ * fields and must not be read as one.
++ */
++int u_transfer_helper_handles(struct pipe_resource *prsc);
++void u_transfer_helper_parts(struct pipe_transfer *ptrans, const void **ptr, const void **staging);
++
++int
++u_transfer_helper_handles(struct pipe_resource *prsc)
++{
++   return handle_transfer(prsc) ? 1 : 0;
++}
++
++void
++u_transfer_helper_parts(struct pipe_transfer *ptrans, const void **ptr, const void **staging)
++{
++   struct u_transfer *trans = u_transfer(ptrans);
++
++   *ptr = trans->ptr;
++   *staging = trans->staging;
+ }
+ 
+ struct pipe_resource *
+
+--- a/src/util/format/u_format.c
++++ b/src/util/format/u_format.c
+@@ -83,6 +83,12 @@
+    dst += dst_y * dst_stride;
+    src += src_y * src_stride_pos;
+    width *= blocksize;
++
++   {
++      void rwa_copy_rect_guard(const void *src, long stride, unsigned rows, unsigned len);
++
++      rwa_copy_rect_guard(src, src_stride, height, width);
++   }
+ 
+    if (width == dst_stride && width == (unsigned)src_stride) {
+       uint64_t size = (uint64_t)height * width;
