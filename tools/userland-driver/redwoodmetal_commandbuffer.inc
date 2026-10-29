@@ -1,4 +1,7 @@
 #include <mach/mach.h>
+#include <mach/thread_act.h>
+#include <mach/thread_info.h>
+#include <mach/vm_map.h>
 #include <pthread.h>
 #include <time.h>
 
@@ -16,7 +19,9 @@ static struct {
 /* A commit is the frame, and a commit that never returns is what stops the compositor. These
  * two are set for the length of one commit so the work loop can say it is still inside one.
  * Below the threshold the line is silent: 20 ms is longer than a whole frame at 50 Hz, so a
- * commit that crosses it is already a frame that was missed.
+ * commit that crosses it is already a frame that was missed. Microseconds, and every comparison
+ * against it converts through rw_ticks_us() first -- mach_absolute_time's ticks are 52.08 ns on
+ * this device, so a raw tick count compared to this number is a millisecond, not twenty.
  */
 #define RW_COMMIT_SLOW_US 20000ULL
 /* One flush longer than this is said on its own line; the window average hides it. */
@@ -40,6 +45,15 @@ static volatile uint64_t commit_progress_us;    /* when the work loop last moved
 static volatile unsigned commit_in_flight;      /* the commit running, 0 when none */
 static volatile unsigned commit_phase;          /* 0 in a recorded work, 1 inside mesa.flush */
 static unsigned commit_dumped;                  /* the commit already dumped for */
+
+/* A draw that runs for a third of a second leaves the process asleep somewhere, and a timing line
+ * only says how long: the dump says which call. rw_draw_began_us is 0 between draws, and
+ * rw_draw_dumped names the draw already dumped for, so a run prints one dump per stuck draw. */
+#define RW_DRAW_STALL_US 300000ULL
+static void rw_print_threads(void);
+static volatile uint64_t rw_draw_began_us;
+static volatile unsigned rw_draw_serial;
+static unsigned rw_draw_dumped;
 static pthread_once_t rw_watch_once = PTHREAD_ONCE_INIT;
 
 /* A wait for the GPU is the one stall a check between calls cannot see: the thread is inside
@@ -69,6 +83,19 @@ rw_now_us(void)
 		mach_timebase_info(&tb);
 	}
 	return mach_absolute_time() * tb.numer / tb.denom / 1000;
+}
+
+/* Microseconds of a mach_absolute_time interval. A draw is measured from three of these, so
+ * the arithmetic is in one place rather than repeated at each pair. */
+static uint64_t
+rw_ticks_us(uint64_t ticks)
+{
+	static struct mach_timebase_info tb;
+
+	if (tb.denom == 0) {
+		mach_timebase_info(&tb);
+	}
+	return ticks * tb.numer / tb.denom / 1000;
 }
 
 static void *
@@ -120,6 +147,21 @@ rw_stall_watch(void *ignored)
 			}
 		}
 
+		/* A draw that has outlasted RW_DRAW_STALL_US: dump the process's threads while it is
+		 * still inside the call. The kernel prints one line per thread, so the one wanted is
+		 * the render thread's PC, which names the call it is asleep in. */
+		{
+			uint64_t began = __atomic_load_n(&rw_draw_began_us, __ATOMIC_ACQUIRE);
+			unsigned serial = __atomic_load_n(&rw_draw_serial, __ATOMIC_ACQUIRE);
+
+			if (began != 0 && serial != rw_draw_dumped && rw_now_us() - began >= RW_DRAW_STALL_US) {
+				rw_draw_dumped = serial;
+				rw_print("draw %u has run for %llu ms; reading this process's threads\n", serial,
+				    (unsigned long long)((rw_now_us() - began) / 1000));
+				rw_print_threads();
+			}
+		}
+
 		struct timespec nap = { 0, (long)(RW_WATCH_NAP_US * 1000) };
 		unsigned watched = commit_in_flight;
 		uint64_t moved = commit_progress_us;
@@ -153,6 +195,53 @@ rw_stall_watch(void *ignored)
 
 	}
 	return NULL;
+}
+
+/* Where the threads of this process were when a draw had run for a third of a second. The kernel's
+ * kern.redwood.thread_dump refuses a write from backboardd, which runs as mobile; a process may read
+ * its own threads' registers without that, so the snapshot is taken here instead. One line per
+ * thread, and the image name from dladdr says whether the pc is in a library, and the mapped range
+ * says whether it is in the kernel at all.
+ */
+static void
+rw_print_threads(void)
+{
+	thread_act_array_t threads = NULL;
+	mach_msg_type_number_t count = 0;
+
+	if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) {
+		rw_print("redwood: stall: cannot list the threads of this process\n");
+		return;
+	}
+	for (mach_msg_type_number_t i = 0; i < count; i++) {
+		arm_thread_state64_t state;
+		mach_msg_type_number_t state_count = ARM_THREAD_STATE64_COUNT;
+		thread_identifier_info_data_t ident;
+		mach_msg_type_number_t ident_count = THREAD_IDENTIFIER_INFO_COUNT;
+		uintptr_t pc = 0, lr = 0, fp = 0, sp = 0;
+		const char *image = "?";
+		unsigned long long tid = 0;
+
+		/* arm64e keeps the pointer fields opaque, so they come out through the accessors. */
+		if (thread_get_state(threads[i], ARM_THREAD_STATE64, (thread_state_t)&state,
+		    &state_count) == KERN_SUCCESS) {
+			Dl_info where;
+
+			pc = (uintptr_t)__darwin_arm_thread_state64_get_pc(state);
+			lr = (uintptr_t)__darwin_arm_thread_state64_get_lr(state);
+			fp = (uintptr_t)__darwin_arm_thread_state64_get_fp(state);
+			sp = (uintptr_t)__darwin_arm_thread_state64_get_sp(state);
+			if (pc != 0 && dladdr((void *)pc, &where) != 0 && where.dli_fname != NULL)
+				image = where.dli_fname;
+		}
+		if (thread_info(threads[i], THREAD_IDENTIFIER_INFO, (thread_info_t)&ident, &ident_count) ==
+		    KERN_SUCCESS)
+			tid = (unsigned long long)ident.thread_id;
+		rw_print("redwood: stall pc %p lr %p fp %p sp %p (%s) tid %llu\n", (void *)pc, (void *)lr,
+		    (void *)fp, (void *)sp, image, tid);
+		mach_port_deallocate(mach_task_self(), threads[i]);
+	}
+	vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(thread_t));
 }
 
 static void
@@ -432,12 +521,12 @@ rw_work_time(int kind, uint64_t began)
 		 * that blocked.
 		 */
 		if (commit_started != 0) {
-			uint64_t spent = mach_absolute_time() - commit_started;
+			uint64_t spent_us = rw_ticks_us(mach_absolute_time() - commit_started);
 
-			if (spent > RW_COMMIT_SLOW_US) {
+			if (spent_us > RW_COMMIT_SLOW_US) {
 				rw_print("commit %u has run for %llu ms and is on work kind %d "
 				         "(%u binds, %s)\n", commit_count,
-				         (unsigned long long)(spent / 1000), (int)work->copyKind,
+				         (unsigned long long)(spent_us / 1000), (int)work->copyKind,
 				         work->count, work->render != nil ? "a draw" : "a dispatch");
 			}
 		}
@@ -617,11 +706,8 @@ done:
 	 * frame. A commit that never returns leaves the "has run for" line above as the last
 	 * thing this process said, which names the work it was inside. */
 	{
-		struct mach_timebase_info tb;
-		uint64_t us;
+		uint64_t us = rw_ticks_us(mach_absolute_time() - started);
 
-		mach_timebase_info(&tb);
-		us = (mach_absolute_time() - started) * tb.numer / tb.denom / 1000;
 		if (us > RW_COMMIT_SLOW_US) {
 			rw_print("commit %u took %llu ms over %lu recorded works\n", commit_count,
 			         (unsigned long long)(us / 1000),
@@ -633,8 +719,11 @@ done:
 /* A draw, built out of what the encoder recorded. Separate from the dispatch loop because the
  * two have different bindings -- a draw has them per stage -- and folding them together would
  * mean a struct whose fields mean different things depending on a flag. */
+#define RW_COMMIT_SLOW_FOR_IN 50000ULL   /* a commit this old says its draws on entry */
+
 - (BOOL)runDraw:(RedwoodMetalWork *)work why:(char *)why size:(size_t)size
 {
+	uint64_t rd_t0 = mach_absolute_time();
 	struct rwa_texture *color[8] = { NULL };
 	struct rwa_texture *resolve[8] = { NULL };
 	struct rwa_buffer *vertex_buffers[RW_MAX_BUFFERS] = { NULL };
@@ -648,6 +737,18 @@ done:
 	 * which block of a buffer argument -- because Metal has one call behind both. */
 	struct rwa_buffer_bind vertex_table[RW_MAX_BUFFERS] = { { NULL, 0 } };
 	struct rwa_buffer_bind fragment_table[RW_MAX_BUFFERS] = { { NULL, 0 } };
+
+	/* Pairs with the `rd out` line below: a draw that entered and did not come back is the
+	 * one worth reading, so entering is recorded here and its own exit always says so. The
+	 * condition is on the commit, not on this draw, so the line appears only where the frame
+	 * is already slow. */
+	bool rd_said_in = false;
+
+	if (rw_ticks_us(mach_absolute_time() - commit_started) > RW_COMMIT_SLOW_FOR_IN) {
+		rd_said_in = true;
+		rw_print("rd in %u %u %u %p\n", commit_count, work->count, work->textureCount,
+		    (void *)[work->render render]);
+	}
 
 	if (mesa.render_draw == NULL) {
 		snprintf(why, size, "this compiler library can compute but not yet draw");
@@ -797,7 +898,34 @@ done:
 		return NO;
 	}
 
-	if (mesa.render_draw([work->render render], &draw, why, size) != 0) {
+	/* The call the watch thread watches: a draw that stops moving is inside this one, and the
+	 * dump it asks for names the kernel call that thread is asleep in. One dump per draw comes
+	 * from the serial, which is bumped here and compared there. */
+	__atomic_store_n(&rw_draw_serial, __atomic_add_fetch(&rw_draw_serial, 1, __ATOMIC_RELAXED),
+	    __ATOMIC_RELEASE);
+	__atomic_store_n(&rw_draw_began_us, rw_now_us(), __ATOMIC_RELEASE);
+	uint64_t rd_t1 = mach_absolute_time();
+	int rd_rc = mesa.render_draw([work->render render], &draw, why, size);
+	uint64_t rd_t2 = mach_absolute_time();
+	__atomic_store_n(&rw_draw_began_us, 0, __ATOMIC_RELEASE);
+
+	/* Said when this draw announced itself above, and also when it was slow without doing so:
+	 * the pair is what makes a missing `rd out` mean a draw that did not return. `binds` is the
+	 * time spent filling the bindings before the call, `draw` is the call itself, `total` is both
+	 * plus this method's own entry, and `slow` repeats the 50 ms test so the line says why it is
+	 * here without the reader comparing two thresholds. */
+	uint64_t rd_draw_us = rw_ticks_us(rd_t2 - rd_t1);
+
+	if (rd_said_in || rd_draw_us > RW_DRAW_SLOW_US) {
+		rw_print("rd out %u %u %u %u %u %p binds=%llu draw=%llu total=%llu slow=%u\n",
+		    commit_count, work->count, work->textureCount, work->vertexBufferCount,
+		    work->colorCount, (void *)[work->render render],
+		    (unsigned long long)rw_ticks_us(rd_t1 - rd_t0),
+		    (unsigned long long)rd_draw_us, (unsigned long long)rw_ticks_us(rd_t2 - rd_t0),
+		    rd_draw_us > RW_DRAW_SLOW_US ? 1u : 0u);
+	}
+
+	if (rd_rc != 0) {
 		rw_print("the draw failed: %s\n", why);
 		[self failWith:why];
 		return NO;
