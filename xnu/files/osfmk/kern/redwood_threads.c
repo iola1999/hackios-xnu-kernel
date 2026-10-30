@@ -49,7 +49,13 @@ redwood_td_copy(void *map, void *dst, user_addr_t src, size_t size)
 	return vm_map_read_user((vm_map_t)map, src, dst, size) == KERN_SUCCESS ? 0 : EFAULT;
 }
 
-/* One "bt" line per thread: up to REDWOOD_TD_FRAMES return addresses, innermost first. */
+/*
+ * One "bt" line per thread with up to REDWOOD_TD_LINE_FRAMES return addresses, innermost first, and
+ * "bt+" lines after it with the rest, up to REDWOOD_TD_FRAMES: redwood_tl() keeps 191 characters
+ * of a line, and a single line used to end after 16 or 17 frames.
+ */
+#define REDWOOD_TD_LINE_FRAMES  12
+
 static void
 redwood_td_backtrace(int pid, vm_map_t map, thread_t thread)
 {
@@ -61,13 +67,18 @@ redwood_td_backtrace(int pid, vm_map_t map, thread_t thread)
 	};
 	struct backtrace_user_info info = BTUINFO_INIT;
 	unsigned int count = backtrace_user(frames, REDWOOD_TD_FRAMES, &ctl, &info);
-	char line[REDWOOD_TD_FRAMES * 12 + 64];
-	int n = snprintf(line, sizeof(line), "tl: td %d tid %llu bt", pid, (unsigned long long)thread_tid(thread));
+	unsigned int at = 0;
 
-	for (unsigned int i = 0; i < count && n > 0 && (size_t)n < sizeof(line); i++) {
-		n += snprintf(line + n, sizeof(line) - (size_t)n, " %lx", (unsigned long)frames[i]);
-	}
-	redwood_tl("%s%s\n", line, (info.btui_info & BTI_TRUNCATED) ? " +" : "");
+	do {
+		char line[REDWOOD_TD_LINE_FRAMES * 12 + 64];
+		int n = snprintf(line, sizeof(line), "tl: td %d tid %llu bt%s", pid,
+		    (unsigned long long)thread_tid(thread), at == 0 ? "" : "+");
+
+		for (unsigned int i = 0; i < REDWOOD_TD_LINE_FRAMES && at < count && n > 0 && (size_t)n < sizeof(line); i++, at++) {
+			n += snprintf(line + n, sizeof(line) - (size_t)n, " %lx", (unsigned long)frames[at]);
+		}
+		redwood_tl("%s%s\n", line, at >= count && (info.btui_info & BTI_TRUNCATED) ? " +" : "");
+	} while (at < count);
 }
 
 void

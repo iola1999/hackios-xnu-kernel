@@ -595,6 +595,52 @@ rw_surface_through_copy(RedwoodMetalDevice *device, MTLTextureDescriptor *d, voi
 
 @implementation RedwoodMetalDevice (Surface)
 
+/* fdl6_layout_image requires max(64 bytes, 16 pixels) for explicit linear
+ * rows. Keep superclass validation and any stronger alignment it returns.
+ */
+- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format
+{
+	NSUInteger alignment = [super minimumLinearTextureAlignmentForPixelFormat:format];
+
+	switch (format) {
+	case MTLPixelFormatRG32Uint: case MTLPixelFormatRG32Sint: case MTLPixelFormatRG32Float:
+	case MTLPixelFormatRGBA16Unorm: case MTLPixelFormatRGBA16Snorm:
+	case MTLPixelFormatRGBA16Uint: case MTLPixelFormatRGBA16Sint: case MTLPixelFormatRGBA16Float:
+		return MAX(alignment, 128);
+	case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGBA32Sint: case MTLPixelFormatRGBA32Float:
+		return MAX(alignment, 256);
+	default:
+		return alignment;
+	}
+}
+
+/* The linear answer, as on Apple's GPUs: iconservicesagent writes icon rows at it (832 bytes for
+ * 194 RGB10A2 texels), and while this answered 16 the icons showed text from other memory. */
+- (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(NSUInteger)format
+{
+	return [self minimumLinearTextureAlignmentForPixelFormat:format];
+}
+
+/*
+ * The row and base alignment CoreAnimation gives the images it shares with the window server.
+ * QuartzCore starts from 32 bytes (CADeviceInfo init_alignment), raises it to this answer when its
+ * Metal renderer starts, and hands the raised value to every process that connects afterwards
+ * (CARenderServerGetNeededAlignment). _MTLDevice answers 4 for this device's feature profile, so
+ * rows stayed at 32 bytes: SpringBoard's 50x83 BGRA images came as 224 bytes a row, which the
+ * A830 cannot sample in place, and rw_surface_through_copy copied them before every submission.
+ * A process that connected before the renderer started keeps the old value; those surfaces still
+ * go through the copy.
+ */
+- (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes
+{
+	return MAX([super iosurfaceReadOnlyTextureAlignmentBytes], 64);
+}
+
+- (NSUInteger)deviceLinearReadOnlyTextureAlignmentBytes
+{
+	return MAX([super deviceLinearReadOnlyTextureAlignmentBytes], 64);
+}
+
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(void *)s plane:(NSUInteger)p
 {
 	char why[768] = { 0 };

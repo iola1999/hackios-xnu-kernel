@@ -38,6 +38,10 @@
 #include <kern/kalloc.h>
 #include <mach/mach_time.h>
 #include <kern/clock.h>
+#include <kern/locks.h>
+#include <vm/vm_kern.h>
+#include <pexpert/pexpert.h>
+#include <sys/redwood_audio.h>
 
 SYSCTL_DECL(_kern_redwood);
 
@@ -221,6 +225,112 @@ redwood_inbox_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __un
 SYSCTL_PROC(_kern_redwood, OID_AUTO, inbox, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED,
     NULL, 0, redwood_inbox_sysctl, "S",
     "the last file the host pushed through the loader (oem push): an 8-byte sequence number, then the file");
+
+/*
+ * kern.redwood.outbox: a file for the host, handed over the way a screen recording is. Each write is
+ * a header { total bytes, offset } and then that piece of the file. The piece at offset 0 takes a
+ * buffer of the total size in one physical piece, and the piece that completes the file publishes
+ * it in loader_recording: after "oem stop" the loader stages it ("oem recording") and the host
+ * reads it with "fastboot get_staged" (tools/k90auto/run-auto.py). This replaces a screen
+ * recording of the same run. Reading answers { total bytes, bytes written so far }.
+ *
+ * The loaded file system has no other way off the phone faster than the log (rwsh "cat", 48 bytes a
+ * line). The buffer is allocated on the first write, which finds no 328 MB in one piece once iOS
+ * runs (kernel-12377-cmd29-seed2); boot-arg outbox_mb=N takes N MB at boot instead, while memory
+ * is still in large pieces (redwood_outbox_init, called with the other drivers' inits).
+ */
+extern uint64_t loader_recording[3];    /* osfmk/arm64/loader_return.c */
+extern uint64_t kvtophys(vm_offset_t va);
+static LCK_GRP_DECLARE(redwood_outbox_grp, "redwood-outbox");
+static LCK_MTX_DECLARE(redwood_outbox_lock, &redwood_outbox_grp);
+static vm_offset_t redwood_outbox;
+static uint64_t redwood_outbox_size, redwood_outbox_total, redwood_outbox_filled;
+
+#define REDWOOD_OUTBOX_MAX (1ULL << 30)  /* what the loader takes as a recording */
+
+void
+redwood_outbox_init(void)
+{
+	uint32_t mb = 0;
+
+	if (!PE_parse_boot_argn("outbox_mb", &mb, sizeof(mb)) || mb == 0) {
+		return;
+	}
+	redwood_outbox_size = (uint64_t)MIN(mb, (uint32_t)(REDWOOD_OUTBOX_MAX >> 20)) << 20;
+	if (kmem_alloc_contig(kernel_map, &redwood_outbox, redwood_outbox_size, PAGE_MASK, 0, 0,
+	    KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		redwood_outbox = 0;
+		redwood_outbox_size = 0;
+	}
+	printf("outbox: %llu MB in one piece taken at boot%s\n", (uint64_t)mb,
+	    redwood_outbox != 0 ? "" : ": none to be had");
+}
+
+static int
+redwood_outbox_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	uint64_t head[2], piece;
+	int error = 0;
+
+	lck_mtx_lock(&redwood_outbox_lock);
+	if (req->newptr == USER_ADDR_NULL) {
+		head[0] = redwood_outbox_total;
+		head[1] = redwood_outbox_filled;
+		goto out;
+	}
+	if (req->newlen < sizeof(head) || (error = SYSCTL_IN(req, head, sizeof(head))) != 0) {
+		error = error != 0 ? error : EINVAL;
+		goto out;
+	}
+	piece = req->newlen - sizeof(head);
+	if (head[0] == 0 || head[0] > REDWOOD_OUTBOX_MAX || head[1] > head[0] || piece > head[0] - head[1]) {
+		error = EINVAL;
+		goto out;
+	}
+	if (head[1] == 0) {
+		loader_recording[0] = loader_recording[1] = loader_recording[2] = 0;
+		if (redwood_outbox != 0 && redwood_outbox_size < round_page(head[0])) {
+			kmem_free(kernel_map, redwood_outbox, redwood_outbox_size);
+			redwood_outbox = 0;
+		}
+		if (redwood_outbox == 0 && kmem_alloc_contig(kernel_map, &redwood_outbox, round_page(head[0]), PAGE_MASK,
+		    0, 0, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+			printf("outbox: no memory in one piece for %llu MB\n", head[0] >> 20);
+			redwood_outbox = 0;
+			error = ENOMEM;
+			goto out;
+		}
+		redwood_outbox_size = MAX(redwood_outbox_size, round_page(head[0]));
+		redwood_outbox_total = head[0];
+		redwood_outbox_filled = 0;
+	}
+	/* pieces come in order: one out of order means the writer lost track, and the file has a hole */
+	if (redwood_outbox == 0 || head[0] != redwood_outbox_total || head[1] != redwood_outbox_filled) {
+		error = ESPIPE;
+		goto out;
+	}
+	if (piece != 0 && (error = SYSCTL_IN(req, (void *)(redwood_outbox + head[1]), (size_t)piece)) != 0) {
+		goto out;
+	}
+	redwood_outbox_filled += piece;
+	if (redwood_outbox_filled == redwood_outbox_total) {
+		loader_recording[0] = kvtophys(redwood_outbox);
+		loader_recording[1] = redwood_outbox_total;
+		loader_recording[2] = (uint64_t)redwood_outbox;
+		printf("outbox: %llu bytes for the host at %#llx (oem recording after the run)\n",
+		    redwood_outbox_total, loader_recording[0]);
+	}
+	head[0] = redwood_outbox_total;
+	head[1] = redwood_outbox_filled;
+out:
+	lck_mtx_unlock(&redwood_outbox_lock);
+	return error != 0 ? error : SYSCTL_OUT(req, head, sizeof(head));
+}
+
+SYSCTL_PROC(_kern_redwood, OID_AUTO, outbox, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED,
+    NULL, 0, redwood_outbox_sysctl, "S",
+    "a file for the host, staged by the loader after the run: write { total, offset } and a piece");
 
 /*
  * kern.redwood.env: settings for the processes that load libredwoodmetal, written by rwsh

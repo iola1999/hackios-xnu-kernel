@@ -825,6 +825,9 @@ rw_blend_result(unsigned enabled_mask, unsigned write_masks)
  * which is precisely the invitation this file accepts. */
 @interface _MTLDevice : NSObject
 - (instancetype)init;
+- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format;
+- (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes;
+- (NSUInteger)deviceLinearReadOnlyTextureAlignmentBytes;
 @end
 
 /* The private bases this driver stands on. Only what is used of each is declared, and
@@ -2384,34 +2387,6 @@ struct gem_close { uint32_t handle, pad; };
 - (uint64_t)singleFPConfig { return 0; }
 - (uint64_t)halfFPConfig   { return 0; }
 - (uint64_t)doubleFPConfig { return 0; }
-
-/* fdl6_layout_image requires max(64 bytes, 16 pixels) for explicit linear
- * rows. Keep superclass validation and any stronger alignment it returns.
- */
-- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format
-{
-	static unsigned calls;
-	NSUInteger alignment = [super minimumLinearTextureAlignmentForPixelFormat:format];
-	switch (format) {
-	case MTLPixelFormatRG32Uint: case MTLPixelFormatRG32Sint: case MTLPixelFormatRG32Float:
-	case MTLPixelFormatRGBA16Unorm: case MTLPixelFormatRGBA16Snorm:
-	case MTLPixelFormatRGBA16Uint: case MTLPixelFormatRGBA16Sint: case MTLPixelFormatRGBA16Float:
-		alignment = MAX(alignment, 128); break;
-	case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGBA32Sint: case MTLPixelFormatRGBA32Float:
-		alignment = MAX(alignment, 256); break;
-	default: break;
-	}
-	if (__sync_fetch_and_add(&calls, 1) < 64)
-		rw_print("linear alignment query: format=%lu alignment=%lu\n", (unsigned long)format, (unsigned long)alignment);
-	return alignment;
-}
-
-/* The linear answer, as on Apple's GPUs: iconservicesagent writes icon rows at it (832 bytes for
- * 194 RGB10A2 texels), and while this answered 16 the icons showed text from other memory. */
-- (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(NSUInteger)format
-{
-	return [self minimumLinearTextureAlignmentForPixelFormat:format];
-}
 
 /* Everything else the two protocols require and this driver has not built. Each returns the
  * API's own failure value, so a caller finds out by the rule Metal already has, rather than

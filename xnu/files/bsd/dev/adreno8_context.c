@@ -127,14 +127,32 @@ context_queue_indices(uint32_t *read, uint32_t *write)
 	return true;
 }
 
+/*
+ * Every wait asks here every 100 us, and so does every program that polls a fence. The health
+ * checks behind an answer read the SMMU fault registers of three contexts, the GMU's interrupt
+ * state, the HFI queues and the context queue; on kernel-12377-cmd24-hash1 they were most of
+ * SpringBoard's processor time while it swiped pages (adreno8_space_faulted, adreno8_hfi_pump,
+ * adreno8_rd). They run at most once per CONTEXT_CHECK_NS, as adreno8_bo_ready's do, so a fault
+ * is still noticed by the next check at most that much later; the timestamp is read every time.
+ */
+#define CONTEXT_CHECK_NS 1000000ull              /* 1 ms */
+static uint64_t context_checked;
+
 bool
 adreno8_context_done(uint32_t timestamp)
 {
+	uint64_t now = mach_absolute_time(), since;
 	uint32_t read, write;
+
 	if (!timestamp || !context_last || (int32_t)(context_last - timestamp) < 0 ||
-	    !context_health()) return false;
-	if (!adreno8_hfi_poll()) return context_fail("completion transport");
-	if (!context_queue_indices(&read, &write)) return false;
+	    context_state == CONTEXT_FAILED) return false;
+	absolutetime_to_nanoseconds(now - context_checked, &since);
+	if (context_checked == 0 || since >= CONTEXT_CHECK_NS) {
+		if (!context_health()) return false;
+		if (!adreno8_hfi_poll()) return context_fail("completion transport");
+		if (!context_queue_indices(&read, &write)) return false;
+		context_checked = now;
+	}
 	adreno8_settle();
 	uint32_t eop = adreno8_rd(context_timestamp_view + CONTEXT_EOP);
 	if ((int32_t)(context_last - eop) < 0) return context_fail("EOP exceeds submitted timestamp");

@@ -363,6 +363,8 @@ gic_prof_sample(int cpu)
 		pid = task_pid(current_task());
 	} else {
 		pc = VM_KERNEL_UNSLIDE(get_saved_state_pc(state));
+		/* the caller of a leaf (ml_get_timebase, adreno8_rd) is what tells two spins apart */
+		lr = VM_KERNEL_UNSLIDE(get_saved_state_lr(state));
 		pid = current_thread() == current_processor()->idle_thread ? GIC_PROF_IDLE : task_pid(current_task());
 	}
 	if (gic_prof_only > 0 && pid != gic_prof_only) {

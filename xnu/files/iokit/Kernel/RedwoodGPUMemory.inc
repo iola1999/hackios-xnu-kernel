@@ -130,6 +130,30 @@ RedwoodGPUUserClient::buffer(uint32_t handle)
 }
 
 /*
+ * The submission a processor access to buffer `handle` has to wait for: the last one that named
+ * the buffer here, or, for a surface's pixels, the last one in any program that named the surface
+ * (MiniIOSurface::drawn). Waiting for redwood_gpu_last() instead, as CPU_PREP did, made a program
+ * that writes one buffer wait for all the work every other program had given the GPU. A handle
+ * that is not there waits for everything, as before. With the lock held.
+ */
+uint32_t
+RedwoodGPUUserClient::lastUse(uint32_t handle)
+{
+	struct gpu_buffer * b = buffer(handle);
+	uint32_t fence;
+
+	if (b == NULL) {
+		return redwood_gpu_last();
+	}
+	fence = b->fence;
+	if (b->surface != NULL && b->surface->drawn != 0 &&
+	    (fence == 0 || (int32_t) (b->surface->drawn - fence) > 0)) {
+		fence = b->surface->drawn;
+	}
+	return fence;
+}
+
+/*
  * A handle and addresses of the GPU's for `size` bytes of a memory descriptor, from byte `from`
  * of it on (wired memory; both in whole pages). With the lock held; NULL: allocation or mapping failed.
  */

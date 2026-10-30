@@ -1,5 +1,5 @@
 /*
- * Bring-up aid: with boot-arg systrace set, describe every fatal-looking
+ * Bring-up aid: with boot-arg systrace or usertrap set, describe every fatal-looking
  * exception a user thread takes, before it is delivered. There is no crash
  * reporter in this system, so this is the only place a crash is recorded.
  *
@@ -34,6 +34,9 @@ extern char *proc_name_address(struct proc *p);
 void user_exception_trace(exception_type_t exception, mach_exception_data_t code, mach_msg_type_number_t count, thread_t thread);
 
 static TUNABLE(uint32_t, user_exception_trace_enabled, "systrace", 0);
+/* usertrap=1: these lines without systrace's line per system call, which overruns the console
+ * ring within seconds and loses the lines a round waits for (kernel-12377-cmd27-style1). */
+static TUNABLE(uint32_t, user_exception_trace_only, "usertrap", 0);
 
 static bool
 plausible_user_address(uint64_t address)
@@ -52,7 +55,7 @@ user_exception_trace(exception_type_t exception, mach_exception_data_t code, mac
 	task_t task;
 	struct proc *proc;
 
-	if (!user_exception_trace_enabled || thread != current_thread()) {
+	if ((!user_exception_trace_enabled && !user_exception_trace_only) || thread != current_thread()) {
 		return;
 	}
 	if (exception != EXC_BAD_ACCESS && exception != EXC_BAD_INSTRUCTION && exception != EXC_ARITHMETIC &&

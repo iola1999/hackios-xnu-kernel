@@ -107,6 +107,12 @@ mesa_available(void)
 	*(void **)&mesa.fence_wait = dlsym(mesa.handle, "rwa_fence_wait");
 	*(void **)&mesa.fence_release = dlsym(mesa.handle, "rwa_fence_release");
 	*(void **)&mesa.device_open = dlsym(mesa.handle, "rwa_device_open");
+	/* Neither library is in the shared cache, so a profile names their addresses only with
+	 * where this process loaded them (tools/k90auto/prof.py reads this line). */
+	Dl_info driver_image, air_image;
+	if (dladdr((const void *)mesa_available, &driver_image) && mesa.device_open != NULL &&
+	    dladdr((const void *)mesa.device_open, &air_image))
+		printf("images: driver %p air %p\n", driver_image.dli_fbase, air_image.dli_fbase);
 	*(void **)&mesa.device_close = dlsym(mesa.handle, "rwa_device_close");
 	*(void **)&mesa.device_name = dlsym(mesa.handle, "rwa_device_name");
 	*(void **)&mesa.buffer_create = dlsym(mesa.handle, "rwa_buffer_create");

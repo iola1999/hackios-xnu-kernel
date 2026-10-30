@@ -487,6 +487,7 @@ class RedwoodGPUUserClient : public IOUserClient
 	uint64_t                fKeptBytes;
 
 	struct gpu_buffer * buffer(uint32_t handle);
+	uint32_t lastUse(uint32_t handle);
 	struct gpu_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle);
 	void freeBuffer(struct gpu_buffer * b);
 	bool keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags);
@@ -650,6 +651,7 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 	struct gpu_buffer * b;
 	IOReturn ret = kIOReturnSuccess;
 	uint64_t zero = 0, patience, waitBegan;
+	uint32_t fence;
 
 	if (args->structureInput == NULL || size > sizeof(r) || fBuffers == NULL) {
 		return kIOReturnBadArgument;
@@ -688,14 +690,15 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 	case kMsmGemInfo:
 		ret = gemInfo(&r.gemInfo);
 		break;
-	case kMsmGemCpuPrep:                            /* is the GPU done with a buffer: with all it has been given, here */
+	case kMsmGemCpuPrep:                            /* is the GPU done with a buffer */
 		waitBegan = mach_absolute_time();
 		IOLockLock(gGPULock);
 		patience = (r.cpuPrep.op & MSM_PREP_NOSYNC) ? 0 : millisecondsUntil(&r.cpuPrep.timeout);
-		if (!gpuWait(redwood_gpu_last(), patience)) {
+		fence = lastUse(r.cpuPrep.handle);
+		if (fence != 0 && !gpuWait(fence, patience)) {
 			ret = kIOReturnBusy;
 			if (patience == 0 && !(r.cpuPrep.op & MSM_PREP_NOSYNC)) {
-				waitOver(&r.cpuPrep.timeout, redwood_gpu_last());
+				waitOver(&r.cpuPrep.timeout, fence);
 			}
 		}
 		IOLockUnlock(gGPULock);

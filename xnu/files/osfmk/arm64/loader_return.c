@@ -251,8 +251,11 @@ struct loader_live {
 
 /* The inbox: a file from the host while the kernel runs, for rwsh "pull" (kern.redwood.inbox), so a
  * library can be replaced without a new image. In the kernel image so its memory is contiguous and
- * the loader reaches it the way it reaches the log. */
-#define LOADER_INBOX_SIZE (32ULL << 20)
+ * the loader reaches it the way it reaches the log. 16 MB holds the AIR library (about 15 MB); the
+ * kernel's static span and the root image after it have to end below the resident system image at
+ * 128 MB (xnuloader RESIDENT_RD_OFFSET), and 32 MB here left the root image 24 MB, too little for
+ * a /private/var seed with the icon cache (tools/k90auto/make-payload.py checks the room). */
+#define LOADER_INBOX_SIZE (16ULL << 20)
 static char loader_inbox[LOADER_INBOX_SIZE] __attribute__((aligned(16384)));
 
 /*

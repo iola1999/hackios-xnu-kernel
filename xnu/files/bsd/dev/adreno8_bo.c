@@ -84,7 +84,14 @@ bo_range(uint64_t address, uint64_t size)
 	    size <= ADRENO8_GPU_IOVA_END - address;
 }
 
-/* Every page below this address was in use when last looked at: a search for room starts here. */
+/*
+ * Where the search for room starts: just past the last reservation, wrapping to the start of the
+ * range when the rest has no room. The search used to start at the lowest free page, and every
+ * small buffer given back moved that down, so a larger reservation then stepped page by page
+ * through every page in use above it: adreno8_space_find_range was about a fifth of SpringBoard's
+ * processor time while it swiped pages (kernel-12377-cmd26-wait1). With 3.25 GB of addresses and
+ * a few hundred MB in use, the room past the last buffer is free nearly every time.
+ */
 static uint32_t bo_free_from = ADRENO8_GPU_IOVA_START;
 
 /*
@@ -204,11 +211,7 @@ adreno8_bo_reserve(uint64_t size)
 	if (address + size < bo_mapped_low) bo_mapped_low = address + size;
 	if (address + span > bo_mapped_high) bo_mapped_high = address + span;
 	bo_note_reserve(address, size);
-	/* (the pages it passes over stay in use until a release brings it back below them) */
-	for (uint64_t *entry; bo_free_from < ADRENO8_GPU_IOVA_END &&
-	    (entry = adreno8_space_entry(&adreno8_gpu_space, bo_free_from)) != NULL && *entry != 0;
-	    bo_free_from += SMMU_GRANULE) {
-	}
+	bo_free_from = address + span < ADRENO8_GPU_IOVA_END ? (uint32_t)(address + span) : ADRENO8_GPU_IOVA_START;
 	return address;
 }
 
@@ -443,6 +446,5 @@ adreno8_bo_release(uint64_t address, uint64_t size)
 	for (uint64_t at = 0; at < size; at += SMMU_GRANULE)
 		*adreno8_space_entry(&adreno8_gpu_space, (uint32_t)(address + at)) = 0;
 	bo_note_release(address, size);
-	if (address < bo_free_from) bo_free_from = (uint32_t)address;
 	return true;
 }

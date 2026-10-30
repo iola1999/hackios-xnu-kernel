@@ -209,6 +209,31 @@ GenericARMPE::probe(IOService * provider, SInt32 * score)
 	return this;
 }
 
+/*
+ * MobileGestalt's WifiAddress answer (libMobileGestalt, MGIOKitSupport.c) reads /chosen
+ * mac-address-wifi0, then local-mac-address of a node named sdio, wlan or marconi-wifi, and
+ * failing all of them waits up to 5 seconds for an IONetworkController to be registered. This
+ * device tree has none of them and nothing here is an IONetworkController, so every process
+ * that asked waited the 5 seconds. The address published here is a locally administered one;
+ * RedwoodWLAN still gives the radio's own address to its controller when there is a radio.
+ */
+static void
+publishWifiAddress(void)
+{
+	static const uint8_t address[6] = { 0x02, 0x72, 0x77, 0x00, 0x00, 0x01 };
+	IORegistryEntry * chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
+
+	if (chosen != NULL && chosen->getProperty("mac-address-wifi0") == NULL) {
+		OSData * data = OSData::withBytes(address, sizeof(address));
+
+		if (data != NULL) {
+			chosen->setProperty("mac-address-wifi0", data);
+			data->release();
+		}
+	}
+	OSSafeReleaseNULL(chosen);
+}
+
 bool
 GenericARMPE::start(IOService * provider)
 {
@@ -294,6 +319,7 @@ GenericARMPE::start(IOService * provider)
 		}
 	}
 
+	publishWifiAddress();
 	/* BSD looks the platform expert up by class (IOSecureBSDRoot). */
 	registerService();
 
