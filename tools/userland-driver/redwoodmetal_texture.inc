@@ -255,25 +255,33 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 }
 
 /* A view of a texture is another texture over the same resource (rwa_texture_view), read
- * and rendered in its own format. It keeps the texture it came from, which -parentTexture
- * answers. */
-- (id)newTextureViewWithPixelFormat:(NSUInteger)format
+ * and rendered in its own format, over a run of the texture's levels. It keeps the texture it
+ * came from, which -parentTexture answers. */
+- (id)redwoodViewWithPixelFormat:(NSUInteger)format levels:(NSRange)levels
 {
 	char why[256] = { 0 };
 	struct rwa_texture_shape shape = _shape;
 	struct rwa_texture *view;
 	RedwoodMetalTexture *texture;
+	unsigned first = (unsigned)levels.location;
 
 	if (mesa.texture_view == NULL) {
 		RW_ONCE("this compiler library has no rwa_texture_view; a texture view is nil\n");
 		return nil;
 	}
-	view = mesa.texture_view(_texture, (unsigned)format, why, sizeof(why));
+	view = mesa.texture_view(_texture, (unsigned)format, first, (unsigned)levels.length, why,
+				 sizeof(why));
 	if (view == NULL) {
 		rw_print("texture view: %s\n", why);
 		return nil;
 	}
 	shape.pixel_format = (unsigned)format;
+	shape.width = MAX(shape.width >> first, 1u);
+	if (shape.height)
+		shape.height = MAX(shape.height >> first, 1u);
+	if (shape.depth)
+		shape.depth = MAX(shape.depth >> first, 1u);
+	shape.mip_levels = (unsigned)levels.length;
 	texture = [[RedwoodMetalTexture alloc] initWithRedwoodDevice:_owner texture:view
 							       shape:&shape iosurface:NULL plane:0];
 	if (texture != nil) {
@@ -282,13 +290,19 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 	return texture;
 }
 
+- (id)newTextureViewWithPixelFormat:(NSUInteger)format
+{
+	return [self redwoodViewWithPixelFormat:format
+					 levels:NSMakeRange(0, MAX(_shape.mip_levels, 1))];
+}
+
 /*
  * THE REST OF WHAT <MTLTexture>, <MTLTextureSPI>, <MTLResource> AND <MTLResourceSPI>
  * REQUIRE: 27 methods with no answer anywhere in this chain before this section. The same
  * three kinds as everywhere else -- served, true by construction, or refused out loud.
  *
- * A view of part of a texture, or as another type, is refused out loud: rwa_texture_view
- * makes a view of every level and slice, and a view over less would read the wrong ones.
+ * A view over part of the slices, or as another type, is refused out loud: rwa_texture_view
+ * covers every slice, and a view over fewer would read the wrong ones.
  */
 - (id)newTextureViewWithPixelFormat:(NSUInteger)format
 			textureType:(NSUInteger)type
@@ -298,13 +312,12 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 	NSUInteger layers = _shape.type == 3 || _shape.type == 4 ? 6 * MAX(_shape.array_length, 1)
 								  : MAX(_shape.array_length, 1);
 
-	if (type == _shape.type && levels.location == 0 &&
-	    levels.length == MAX(_shape.mip_levels, 1) && slices.location == 0 &&
-	    slices.length == layers) {
-		return [self newTextureViewWithPixelFormat:format];
+	if (type == _shape.type && slices.location == 0 && slices.length == layers) {
+		return [self redwoodViewWithPixelFormat:format levels:levels];
 	}
 	rw_print("texture view: type %lu levels %lu+%lu slices %lu+%lu of a type %u texture "
-		 "of %u levels and %lu slices; only a view of the whole texture is made\n",
+		 "of %u levels and %lu slices; only a view of every slice, of the same type, "
+		 "is made\n",
 		 (unsigned long)type, (unsigned long)levels.location,
 		 (unsigned long)levels.length, (unsigned long)slices.location,
 		 (unsigned long)slices.length, _shape.type, _shape.mip_levels,

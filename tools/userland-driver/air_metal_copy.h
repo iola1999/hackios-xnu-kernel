@@ -71,6 +71,7 @@ struct rwa_linked_function {
 /* A second texture over the same resource, read and rendered as mtl_format: Metal's
  * -newTextureViewWithPixelFormat:. Every level and slice; texels of the same size. */
 struct rwa_texture *rwa_texture_view(struct rwa_texture *texture, unsigned mtl_format,
+                                     unsigned first_level, unsigned num_levels,
                                      char *why, size_t why_size);
 
 #ifdef __cplusplus
