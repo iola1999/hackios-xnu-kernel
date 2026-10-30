@@ -2401,12 +2401,11 @@ struct gem_close { uint32_t handle, pad; };
 	return alignment;
 }
 
+/* The linear answer, as on Apple's GPUs: iconservicesagent writes icon rows at it (832 bytes for
+ * 194 RGB10A2 texels), and while this answered 16 the icons showed text from other memory. */
 - (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(NSUInteger)format
 {
-	static unsigned calls;
-	if (__sync_fetch_and_add(&calls, 1) < 64)
-		rw_print("texture-buffer alignment query: format=%lu alignment=16 (buffer textures unsupported)\n", (unsigned long)format);
-	return 16;
+	return [self minimumLinearTextureAlignmentForPixelFormat:format];
 }
 
 /* Heaps are suballocation of one big allocation, and nothing here suballocates yet. Metal's

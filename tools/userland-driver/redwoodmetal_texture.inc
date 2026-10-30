@@ -464,6 +464,11 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 	shape.mip_levels = (unsigned)[descriptor mipmapLevelCount];
 	shape.sample_count = (unsigned)[descriptor sampleCount];
 	shape.usage = (unsigned)[descriptor usage];
+	static unsigned said;
+	if (said < 48)
+		rw_print("texture over buffer %u: format %u %ux%u, %lu bytes a row at offset %lu\n",
+			 said++, shape.pixel_format, shape.width, shape.height,
+			 (unsigned long)bytesPerRow, (unsigned long)offset);
 	texture = mesa.texture_from_buffer([_owner mesaDevice], &shape, _mesa, offset,
 					   (unsigned)bytesPerRow, why, sizeof(why));
 	if (texture == NULL) {
