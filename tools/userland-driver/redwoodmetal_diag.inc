@@ -9,6 +9,46 @@
 #include "redwoodmetal_work_private.h"
 
 /*
+ * kern.redwood.env (bsd/dev/redwood_threads.c, written by rwsh "setenv"/"addenv"): the words
+ * PROCESS:NAME=VALUE and PROCESS:-NAME for this process go into its environment before the first
+ * device is made, so a process restarted with rwsh "restart" runs with the new settings without a
+ * new image. Its launchd plist's EnvironmentVariables are already set by then and are overridden by
+ * these. The +load methods run before this; only the REDWOOD_DIAG address line there reads one.
+ */
+__attribute__((constructor)) static void
+rw_runtime_env(void)
+{
+	char value[1024], *rest;
+	size_t size = sizeof(value) - 1;
+	const char *self = getprogname();
+	size_t self_length = strlen(self);
+
+	if (sysctlbyname("kern.redwood.env", value, &size, NULL, 0) != 0) {
+		if (errno != ENOENT)   /* a sandbox may refuse the read; an older kernel has no such name */
+			rw_print("kern.redwood.env: %s\n", strerror(errno));
+		return;
+	}
+	if (size == 0)
+		return;
+	value[size] = '\0';
+	for (char *word = strtok_r(value, " ", &rest); word != NULL; word = strtok_r(NULL, " ", &rest)) {
+		char *setting, *equals;
+
+		if (strncmp(word, self, self_length) != 0 || word[self_length] != ':')
+			continue;
+		setting = word + self_length + 1;
+		rw_print("kern.redwood.env: %s\n", word);
+		equals = strchr(setting, '=');
+		if (setting[0] == '-')
+			unsetenv(setting + 1);
+		else if (equals != NULL) {
+			*equals = '\0';
+			setenv(setting, equals + 1, 1);
+		}
+	}
+}
+
+/*
  * REDWOOD_SYNC_DRAWS=1 (package.py SYNC_JOBS): every draw is flushed and waited for before the
  * next one is recorded. A GPU hang closes submissions for the rest of the boot and the kernel names
  * only the process and its submission, which holds dozens of draws; waiting after each one names

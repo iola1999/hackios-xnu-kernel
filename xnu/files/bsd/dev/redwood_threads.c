@@ -197,3 +197,13 @@ redwood_cmd_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unus
 SYSCTL_PROC(_kern_redwood, OID_AUTO, cmd, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
     NULL, 0, redwood_cmd_sysctl, "A",
     "the last command the host sent through the loader (oem sh), as SEQ TEXT");
+
+/*
+ * kern.redwood.env: settings for the processes that load libredwoodmetal, written by rwsh
+ * ("setenv", "addenv") while iOS runs. The words are PROCESS:NAME=VALUE or PROCESS:-NAME; the
+ * driver applies its process's words when the process loads it, so a probe can be changed and the
+ * process restarted ("restart NAME") without a new image. Empty until written; writing needs root.
+ */
+static char redwood_env[1024];
+SYSCTL_STRING(_kern_redwood, OID_AUTO, env, CTLFLAG_RW | CTLFLAG_LOCKED, redwood_env,
+    sizeof(redwood_env), "settings for libredwoodmetal, as PROCESS:NAME=VALUE words");
