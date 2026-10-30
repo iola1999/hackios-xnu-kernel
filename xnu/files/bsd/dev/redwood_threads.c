@@ -35,6 +35,9 @@
 #include <mach/vm_prot.h>
 #include <kern/task.h>
 #include <sys/bsdtask_info.h>
+#include <kern/kalloc.h>
+#include <mach/mach_time.h>
+#include <kern/clock.h>
 
 SYSCTL_DECL(_kern_redwood);
 
@@ -48,6 +51,10 @@ int redwood_task_region_image(task_t task, uint64_t addr, char *name, uint32_t n
     uint64_t *start, uint64_t *end);
 uint64_t redwood_task_exec_image(task_t task, char *name, uint32_t namelen);
 uint64_t loader_live_command(char *text, size_t size);         /* osfmk/arm64/loader_return.c */
+uint64_t loader_live_inbox(const char **data, uint64_t *len);  /* the same */
+int psci_smp_report(char *buf, size_t size);                  /* osfmk/arm64/psci_smp.c */
+int psci_smp_prof_report(char *buf, size_t size);             /* the same */
+void gic_v3_prof_control(bool on, int only_pid);              /* osfmk/arm64/gic_v3_irq.c */
 
 /*
  * fill_procregioninfo* hands the vnode over as a bare address because it cannot hold a reference
@@ -198,6 +205,23 @@ SYSCTL_PROC(_kern_redwood, OID_AUTO, cmd, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_
     NULL, 0, redwood_cmd_sysctl, "A",
     "the last command the host sent through the loader (oem sh), as SEQ TEXT");
 
+/* kern.redwood.inbox: the last file the host pushed through the loader ("oem push"), preceded by
+ * its sequence number (8 bytes, 0 before the first push); rwsh "pull" writes it to a file. */
+static int
+redwood_inbox_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	const char *data;
+	uint64_t len, seq = loader_live_inbox(&data, &len);
+	int error = SYSCTL_OUT(req, &seq, sizeof(seq));
+
+	return error != 0 ? error : SYSCTL_OUT(req, data, (size_t)len);
+}
+
+SYSCTL_PROC(_kern_redwood, OID_AUTO, inbox, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED,
+    NULL, 0, redwood_inbox_sysctl, "S",
+    "the last file the host pushed through the loader (oem push): an 8-byte sequence number, then the file");
+
 /*
  * kern.redwood.env: settings for the processes that load libredwoodmetal, written by rwsh
  * ("setenv", "addenv") while iOS runs. The words are PROCESS:NAME=VALUE or PROCESS:-NAME; the
@@ -207,3 +231,118 @@ SYSCTL_PROC(_kern_redwood, OID_AUTO, cmd, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_
 static char redwood_env[1024];
 SYSCTL_STRING(_kern_redwood, OID_AUTO, env, CTLFLAG_RW | CTLFLAG_LOCKED, redwood_env,
     sizeof(redwood_env), "settings for libredwoodmetal, as PROCESS:NAME=VALUE words");
+
+/* kern.redwood.cpus: psci_smp_report(), one line per processor. */
+static int
+redwood_cpus_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	char text[2048];
+	int n = psci_smp_report(text, sizeof(text));
+
+	return SYSCTL_OUT(req, text, (size_t)n + 1 <= sizeof(text) ? (size_t)n + 1 : sizeof(text));
+}
+
+SYSCTL_PROC(_kern_redwood, OID_AUTO, cpus, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+    NULL, 0, redwood_cpus_sysctl, "A", "per processor: signal word, interrupt, IPI, timer and WFE counts");
+
+/*
+ * kern.redwood.prof_on: 1 clears the interrupt-sampled profile and starts it, 0 stops it; a pid
+ * written to kern.redwood.prof_pid first keeps that process's samples only (0: every process).
+ * kern.redwood.prof: the profile so far (psci_smp_prof_report): samples per pid, then the most
+ * frequent (pid, pc, lr). Two reads a few seconds apart after a 1 say where the processors were.
+ */
+static int redwood_prof_on, redwood_prof_pid;
+
+SYSCTL_INT(_kern_redwood, OID_AUTO, prof_pid, CTLFLAG_RW | CTLFLAG_LOCKED, &redwood_prof_pid, 0,
+    "the process kern.redwood.prof_on samples, 0 for all");
+
+static int
+redwood_prof_on_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	int value = redwood_prof_on, changed = 0;
+	int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
+
+	if (error == 0 && changed) {
+		redwood_prof_on = value != 0;
+		gic_v3_prof_control(redwood_prof_on, redwood_prof_pid);
+	}
+	return error;
+}
+
+SYSCTL_PROC(_kern_redwood, OID_AUTO, prof_on, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    NULL, 0, redwood_prof_on_sysctl, "I", "1: clear the interrupt-sampled profile and start it, 0: stop");
+
+static int
+redwood_prof_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	const size_t size = 8192;
+	char *text = kalloc_data(size, Z_WAITOK);
+	int n, error;
+
+	if (text == NULL) {
+		return ENOMEM;
+	}
+	n = psci_smp_prof_report(text, size);
+	error = SYSCTL_OUT(req, text, (size_t)n + 1 <= size ? (size_t)n + 1 : size);
+	kfree_data(text, size);
+	return error;
+}
+
+SYSCTL_PROC(_kern_redwood, OID_AUTO, prof, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+    NULL, 0, redwood_prof_sysctl, "A", "interrupt-sampled profile: samples per pid, then count pid u|k pc lr");
+
+/*
+ * kern.redwood.say: a line any process writes here goes into the kernel log as
+ * "say PID NAME: TEXT". It is for libraries inserted into processes whose standard error goes
+ * nowhere (an XPC service under xpcproxy, a sandboxed extension), which is where the loops that
+ * keep the processors busy run. At most REDWOOD_SAY_PER_SECOND lines a second are printed and the
+ * rest counted, so a library that says too much costs the log one line a second.
+ */
+#define REDWOOD_SAY_PER_SECOND  200
+
+extern void redwood_tl(const char *format, ...) __printflike(1, 2);
+
+static int
+redwood_say_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	static uint64_t window;
+	static uint32_t said, dropped;
+	char text[256], name[32];
+	size_t length = req->newlen < sizeof(text) - 1 ? req->newlen : sizeof(text) - 1;
+	uint64_t now = mach_absolute_time(), second;
+	int error;
+
+	if (req->newptr == USER_ADDR_NULL) {
+		return 0;
+	}
+	error = SYSCTL_IN(req, text, length);
+	if (error != 0) {
+		return error;
+	}
+	text[length] = '\0';
+	while (length > 0 && (text[length - 1] == '\n' || text[length - 1] == '\0')) {
+		text[--length] = '\0';
+	}
+	nanoseconds_to_absolutetime(NSEC_PER_SEC, &second);
+	if (now - window >= second) {
+		if (dropped != 0) {
+			redwood_tl("say: %u lines over %u a second not printed\n", dropped, REDWOOD_SAY_PER_SECOND);
+		}
+		window = now;
+		said = dropped = 0;
+	}
+	if (++said > REDWOOD_SAY_PER_SECOND) {
+		dropped++;
+		return 0;
+	}
+	proc_selfname(name, sizeof(name));
+	redwood_tl("say %d %s: %s\n", proc_selfpid(), name, text);
+	return 0;
+}
+
+SYSCTL_PROC(_kern_redwood, OID_AUTO, say, CTLTYPE_STRING | CTLFLAG_WR | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+    NULL, 0, redwood_say_sysctl, "A", "a line for the kernel log, from any process");

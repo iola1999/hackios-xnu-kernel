@@ -217,6 +217,7 @@ struct redwood_worked {
 static IOLock * gGPULock;                       /* around everything that is the GPU's (redwood_gpu_...) */
 static bool gGPUReported;
 static bool gGPUCached;                         /* boot-arg gpu_cached=1 */
+static bool gGPUCoherent;                       /* boot-arg gpu_coherent=1: the GPU snoops the caches (adreno8.c) */
 static bool gGPUSaidSetIova;                    /* MSM_INFO_SET_IOVA has been refused out loud once */
 
 /* What the last seconds' submissions were and cost here, for the log. */
@@ -381,6 +382,9 @@ RedwoodGPUStart(void)
 		return false;
 	}
 	gGPUCached = PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached)) && cached != 0;
+	cached = 0;
+	gGPUCoherent = PE_parse_boot_argn("gpu_coherent", &cached, sizeof(cached)) && cached == 1;
+	gGPUCached = gGPUCached || gGPUCoherent;
 	gpu = OSTypeAlloc(RedwoodGPU);
 	if (gpu == NULL || !gpu->init() || !gpu->attach(provider)) {
 		OSSafeReleaseNULL(gpu);

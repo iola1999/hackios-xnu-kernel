@@ -737,8 +737,8 @@ done:
 	 * otherwise wait for ever. */
 	pthread_mutex_unlock(&rw_commit_lock);
 	/* and only then the handlers, so that a handler which makes the next command buffer
-	 * is not waiting for a slot this one still holds */
-	[self redwoodDeliverHandlers];
+	 * is not waiting for a slot this one still holds (redwoodmetal_completion.inc) */
+	[self redwoodCompleteLater];
 	/* How long the whole commit took, said only when it was long enough to be a missed
 	 * frame. A commit that never returns leaves the "has run for" line above as the last
 	 * thing this process said, which names the work it was inside. */
@@ -1039,7 +1039,7 @@ done:
 {
 	char why[512] = { 0 };
 
-	if (_status == RW_CB_ERROR) {
+	if (_status == RW_CB_ERROR || [self redwoodAwaitCompletion]) {
 		return;
 	}
 
@@ -1086,13 +1086,11 @@ done:
  * says WHERE its completion handlers may run precisely because it must not have them on its
  * own thread.
  *
- * So handlers are kept and delivered where the work happens: -commit. A scheduled handler
- * is delivered as soon as the recorded work has been submitted, a completed handler after
- * the GPU fence has been paid for -- the fence is only taken when somebody is actually
- * waiting on one, because this driver's -commit is otherwise asynchronous and a fence
- * nobody asked for would cost every frame. A handler added after the fact is delivered at
- * once rather than dropped: Metal calls that undefined, and losing it would be the kind of
- * silence this driver is trying to stop having.
+ * So handlers are kept until the work they are about: scheduled ones go out at -commit, completed
+ * ones from the completion thread once the GPU has done the buffer (redwoodmetal_completion.inc).
+ * A scheduled handler added after -commit is delivered here at once rather than dropped: Metal
+ * calls that undefined, and losing it would be the kind of silence this driver is trying to stop
+ * having.
  */
 - (void)redwoodDeliver:(void (^)(id))handler
 {
@@ -1126,42 +1124,9 @@ done:
 
 - (void)addCompletedHandler:(void (^)(id))handler
 {
-	if (handler == NULL) {
-		return;
+	if (handler != NULL) {
+		[self redwoodAddCompleted:handler];
 	}
-	if (_status >= RW_CB_SCHEDULED) {
-		[self redwoodDeliver:handler];
-		return;
-	}
-	if (_completed == nil) {
-		_completed = [[NSMutableArray alloc] init];
-	}
-	[_completed addObject:[[handler copy] autorelease]];
-}
-
-/* Called from the one place the work is done. The order is Metal's: scheduled first, then
- * the fence, then completed. */
-- (void)redwoodDeliverHandlers
-{
-	NSArray *scheduled = _scheduled;
-	NSArray *completed = _completed;
-
-	_scheduled = nil;
-	_completed = nil;
-	for (id handler in scheduled) {
-		[self redwoodDeliver:(void (^)(id))handler];
-	}
-	if ([completed count] > 0 && _status != RW_CB_ERROR) {
-		/* A completed handler is a promise about the GPU, so it is made true before it
-		 * is kept: -waitUntilCompleted is this driver's fence and sets the status the
-		 * handler will read. */
-		[self waitUntilCompleted];
-	}
-	for (id handler in completed) {
-		[self redwoodDeliver:(void (^)(id))handler];
-	}
-	[scheduled release];
-	[completed release];
 }
 
 /* -commitWithDeadline: is an abstract entry of _MTLCommandBuffer, so inheriting it aborts

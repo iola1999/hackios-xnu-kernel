@@ -4,7 +4,7 @@
  * The compositor stops making frames for seconds at a time, and the display side can see that it
  * stopped but not which thread held the others. This prints one line per thread of the task: the
  * thread id, its state, the event it waits on, its scheduled priority, and the user pc its saved
- * state holds.
+ * state holds; then, per thread, the return addresses of its user stack ("bt" lines).
  *
  * The user side calls this from a watcher thread of its own (see redwoodmetal_commandbuffer.inc)
  * while a commit is inside one long call, so the dump is taken during the stall. That is also why
@@ -18,6 +18,11 @@
  * the BSD half finds the process by pid, reads the image base the pcs below are offsets from, and
  * calls here, so neither side includes the other's headers.
  *
+ * The user stacks are walked after the task lock is let go of, through the task's map
+ * (vm_map_read_user), because the reads may fault pages in. A thread can move between the
+ * collection of its registers and the walk; for a thread waiting in the kernel, which is the case
+ * this is for (a main thread asleep in mach_msg inside some run loop), the frames do not change.
+ *
  * Nothing is enabled unless asked: no boot argument, no timer, no work while idle.
  */
 
@@ -27,16 +32,50 @@
 #include <kern/thread.h>
 #include <kern/queue.h>
 #include <mach/arm/thread_status.h>
+#include <kern/backtrace.h>
+#include <vm/vm_map_xnu.h>
+#include <sys/errno.h>
+
+#define REDWOOD_TD_THREADS      48
+#define REDWOOD_TD_FRAMES       32
 
 extern void redwood_tl(const char *format, ...) __printflike(1, 2);
 
 void redwood_thread_dump(task_t task, int pid, uint64_t exec_base, const char *exec_image);
 
+static errno_t
+redwood_td_copy(void *map, void *dst, user_addr_t src, size_t size)
+{
+	return vm_map_read_user((vm_map_t)map, src, dst, size) == KERN_SUCCESS ? 0 : EFAULT;
+}
+
+/* One "bt" line per thread: up to REDWOOD_TD_FRAMES return addresses, innermost first. */
+static void
+redwood_td_backtrace(int pid, vm_map_t map, thread_t thread)
+{
+	uintptr_t frames[REDWOOD_TD_FRAMES];
+	struct backtrace_control ctl = {
+		.btc_user_thread = thread,
+		.btc_user_copy = redwood_td_copy,
+		.btc_user_copy_context = map,
+	};
+	struct backtrace_user_info info = BTUINFO_INIT;
+	unsigned int count = backtrace_user(frames, REDWOOD_TD_FRAMES, &ctl, &info);
+	char line[REDWOOD_TD_FRAMES * 12 + 64];
+	int n = snprintf(line, sizeof(line), "tl: td %d tid %llu bt", pid, (unsigned long long)thread_tid(thread));
+
+	for (unsigned int i = 0; i < count && n > 0 && (size_t)n < sizeof(line); i++) {
+		n += snprintf(line + n, sizeof(line) - (size_t)n, " %lx", (unsigned long)frames[i]);
+	}
+	redwood_tl("%s%s\n", line, (info.btui_info & BTI_TRUNCATED) ? " +" : "");
+}
+
 void
 redwood_thread_dump(task_t task, int pid, uint64_t exec_base, const char *exec_image)
 {
-	thread_t thread;
-	unsigned printed = 0;
+	thread_t thread, held[REDWOOD_TD_THREADS];
+	unsigned printed = 0, kept = 0;
+	vm_map_t map;
 
 	task_lock(task);
 	redwood_tl("tl: td pid %d threads %d\n", pid, task->thread_count);
@@ -61,8 +100,20 @@ redwood_thread_dump(task_t task, int pid, uint64_t exec_base, const char *exec_i
 		    (unsigned long long)thread_tid(thread), thread->state,
 		    (void *)(uintptr_t)thread->wait_event, (int)thread->sched_pri, pc);
 		printed++;
+		if (kept < REDWOOD_TD_THREADS && thread->machine.upcb != NULL) {
+			thread_reference(thread);
+			held[kept++] = thread;
+		}
 	}
+	map = task->map;
+	vm_map_reference(map);
 	task_unlock(task);
+
+	for (unsigned i = 0; i < kept; i++) {
+		redwood_td_backtrace(pid, map, held[i]);
+		thread_deallocate(held[i]);
+	}
+	vm_map_deallocate(map);
 
 	redwood_tl("tl: td pid %d printed %u\n", pid, printed);
 }

@@ -384,4 +384,122 @@ psci_smp_stop_here(void)
 	}
 }
 
+
+/*
+ * For kern.redwood.cpus: whether processors may idle, and per processor the signal word (bit 31,
+ * SIGPdisabled, keeps cpu_idle() from waiting in WFI: the core then spins in its idle loop) and the
+ * interrupt, IPI, timer and WFE counts, which two readings a few seconds apart turn into rates.
+ */
+int
+psci_smp_report(char *buf, size_t size)
+{
+	extern boolean_t idle_enable;
+	size_t n = (size_t)snprintf(buf, size, "idle_enable %d\n", idle_enable);
+
+	for (unsigned int cpu = 0; cpu <= (unsigned int)ml_get_max_cpu_number() && n < size; cpu++) {
+		cpu_data_t *cdp = cpu_datap(cpu);
+
+		if (cdp == NULL) {
+			continue;
+		}
+		uint32_t kinds[GIC_SIGNAL_KINDS];
+
+		gic_v3_signal_kinds((int)cpu, kinds);
+		n += (size_t)snprintf(buf + n, size - n, "cpu %u phys %#llx signal %#x flags %#x irq %llu ipi %llu "
+		    "timer %llu wfe %llu; ipi kinds nop %u maint %u xcall %u ast %u debug %u kppet %u imm %u "
+		    "tlocal %u deferred %u\n", cpu, (unsigned long long)cdp->cpu_phys_id, (unsigned)cdp->cpu_signal,
+		    (unsigned)os_atomic_load(&cdp->cpu_flags, relaxed), cdp->cpu_stat.irq_ex_cnt,
+		    cdp->cpu_stat.ipi_cnt, cdp->cpu_stat.timer_cnt, cdp->wfe_count, kinds[GIC_SIGNAL_KINDS - 1],
+		    kinds[0], kinds[2], kinds[3], kinds[4], kinds[8], kinds[9], kinds[10], kinds[11]);
+	}
+	return (int)(n < size ? n : size);
+}
+/*
+ * kern.redwood.prof, read: the interrupt samples of all processors (gic_v3_irq.c) merged by
+ * (pid, pc, lr). First the samples per pid, user and kernel apart (pid -2 is the idle threads,
+ * 0 the kernel's own), then the PROF_TOP most frequent places: "count pid u|k pc lr".
+ */
+#define PROF_TOP        64
+#define PROF_PIDS       48
+
+int
+psci_smp_prof_report(char *buf, size_t size)
+{
+	unsigned int cpus = (unsigned int)ml_get_max_cpu_number() + 1;
+	size_t capacity = (size_t)cpus * GIC_PROF_TABLE * 2;     /* open addressing, at most half full */
+	struct gic_prof_slot *merged = kalloc_data(capacity * sizeof(*merged), Z_WAITOK | Z_ZERO);
+	struct gic_prof_slot *table = kalloc_data(GIC_PROF_TABLE * sizeof(*table), Z_WAITOK);
+	struct { int32_t pid; uint32_t user, kernel; } pids[PROF_PIDS];
+	unsigned int distinct = 0, npids = 0;
+	uint64_t total = 0, lost = 0;
+	size_t n = 0;
+
+	if (merged == NULL || table == NULL) {
+		n = (size_t)snprintf(buf, size, "no memory for the report\n");
+		goto out;
+	}
+	bzero(pids, sizeof(pids));
+	for (unsigned int cpu = 0; cpu < cpus; cpu++) {
+		uint32_t cpu_lost;
+
+		gic_v3_prof_table((int)cpu, table, &cpu_lost);
+		lost += cpu_lost;
+		for (unsigned int i = 0; i < GIC_PROF_TABLE; i++) {
+			struct gic_prof_slot *slot = &table[i];
+			unsigned int j, k;
+
+			if (slot->count == 0) {
+				continue;
+			}
+			total += slot->count;
+			for (k = 0; k < npids && pids[k].pid != slot->pid; k++) {
+			}
+			if (k == npids && npids < PROF_PIDS) {
+				pids[npids++].pid = slot->pid;
+			}
+			if (k < npids) {
+				*(slot->user ? &pids[k].user : &pids[k].kernel) += slot->count;
+			}
+			j = (unsigned int)(((slot->pc >> 2) ^ ((slot->lr >> 2) * 0x9e3779b1u) ^ (uint32_t)slot->pid) % capacity);
+			while (merged[j].count != 0 &&
+			    (merged[j].pid != slot->pid || merged[j].pc != slot->pc || merged[j].lr != slot->lr)) {
+				j = (unsigned int)((j + 1) % capacity);
+			}
+			if (merged[j].count == 0) {
+				merged[j] = *slot;
+				distinct++;
+			} else {
+				merged[j].count += slot->count;
+			}
+		}
+	}
+	n = (size_t)snprintf(buf, size, "samples %llu lost %llu distinct %u\n", total, lost, distinct);
+	for (unsigned int k = 0; k < npids && n < size; k++) {
+		n += (size_t)snprintf(buf + n, size - n, "pid %d user %u kernel %u\n", pids[k].pid, pids[k].user,
+		    pids[k].kernel);
+	}
+	for (unsigned int top = 0; top < PROF_TOP && n < size; top++) {
+		size_t best = capacity;
+
+		for (size_t j = 0; j < capacity; j++) {
+			if (merged[j].count != 0 && (best == capacity || merged[j].count > merged[best].count)) {
+				best = j;
+			}
+		}
+		if (best == capacity) {
+			break;
+		}
+		n += (size_t)snprintf(buf + n, size - n, "%u %d %c %llx %llx\n", merged[best].count, merged[best].pid,
+		    merged[best].user ? 'u' : 'k', merged[best].pc, merged[best].lr);
+		merged[best].count = 0;
+	}
+out:
+	if (merged != NULL) {
+		kfree_data(merged, capacity * sizeof(*merged));
+	}
+	if (table != NULL) {
+		kfree_data(table, GIC_PROF_TABLE * sizeof(*table));
+	}
+	return (int)(n < size ? n : size);
+}
 #endif /* defined(GENERIC_PSCI_SMP) */

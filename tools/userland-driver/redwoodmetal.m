@@ -80,8 +80,8 @@
  * `device` one the GPU cannot fetch from is refused by name, because the shader may write
  * it and a copy would lose the writes.
  *
- * Heaps, events, multisample resolve and viewport rectangles remain unimplemented
- * (docs/metal.md 10.8). Blit currently supports buffer and matching-format 2D copies.
+ * Heaps make separate allocations (redwoodmetal_heap.inc); events, multisample resolve and
+ * viewport rectangles remain unimplemented (docs/metal.md 10.8). Blit currently supports buffer and matching-format 2D copies.
  *
  * Every line this file writes carries the PROCESS it was written by
  * (`redwoodmetal[progname pid]:`, see rw_print): a driver is a library, four or five
@@ -475,20 +475,25 @@ static void rw_print(const char *fmt, ...) __attribute__((format(printf, 1, 2)))
  * is a measurement and is written where it is done (the end of this file) */
 static void ensure_function_encoder(void);
 
+#include "redwoodmetal_console.inc"
+
 static void
 rw_print(const char *fmt, ...)
 {
 	static char who[96];
+	FILE *out = rw_console != NULL ? rw_console : stdout;
 	va_list ap;
 
 	if (who[0] == '\0') {
 		snprintf(who, sizeof(who), "redwoodmetal[%s %d]", getprogname(), getpid());
 	}
-	printf("%s: ", who);
+	flockfile(out);
+	fprintf(out, "%s: ", who);
 	va_start(ap, fmt);
-	vprintf(fmt, ap);
+	vfprintf(out, fmt, ap);
 	va_end(ap);
-	fflush(stdout);
+	fflush(out);
+	funlockfile(out);
 }
 
 /*
@@ -2408,20 +2413,6 @@ struct gem_close { uint32_t handle, pad; };
 	return [self minimumLinearTextureAlignmentForPixelFormat:format];
 }
 
-/* Heaps are suballocation of one big allocation, and nothing here suballocates yet. Metal's
- * contract allows nil and a zero size-and-align, so these decline rather than lie. */
-- (id)newHeapWithDescriptor:(id)descriptor { (void)descriptor; return nil; }
-- (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)length options:(NSUInteger)options
-{
-	(void)length; (void)options;
-	return (MTLSizeAndAlign){ 0, 0 };
-}
-- (MTLSizeAndAlign)heapTextureSizeAndAlignWithDescriptor:(id)descriptor
-{
-	(void)descriptor;
-	return (MTLSizeAndAlign){ 0, 0 };
-}
-
 /* Everything else the two protocols require and this driver has not built. Each returns the
  * API's own failure value, so a caller finds out by the rule Metal already has, rather than
  * by a selector that does not exist. */
@@ -2570,6 +2561,8 @@ struct gem_close { uint32_t handle, pad; };
 }
 
 @end
+
+#include "redwoodmetal_heap.inc"   /* -newHeapWithDescriptor: and the two size answers */
 
 @implementation RedwoodMetalBuffer
 
@@ -2760,8 +2753,8 @@ struct gem_close { uint32_t handle, pad; };
  * a path that then believes the resource was purged: see -addPurgedResource: on the command
  * buffer.) */
 - (NSUInteger)setPurgeableState:(NSUInteger)state { (void)state; return 2; }
-- (id)heap                      { return nil; }
-- (NSUInteger)heapOffset        { return 0; }
+- (id)heap                      { return rw_resource_heap(self); }
+- (NSUInteger)heapOffset        { return rw_resource_heap_offset(self); }
 - (BOOL)isAliasable             { return NO; }
 - (void)makeAliasable           { }
 
@@ -2772,7 +2765,7 @@ struct gem_close { uint32_t handle, pad; };
  * protocol demands instead of what our own tests happen to send.
  *
  * Aliasing: nothing here aliases anything. Every buffer is its own GEM allocation (or its
- * own Mesa allocation), there are no heaps and -makeAliasable does nothing, so "does this
+ * own Mesa allocation), a heap's too, and -makeAliasable does nothing, so "does this
  * overlap that" is NO for every pair, for certain.
  *
  * Completion: this driver's -commit runs the recorded work and -waitUntilCompleted fences
@@ -3299,6 +3292,7 @@ enum {
 };
 
 #include "redwoodmetal_commandbuffer.inc"
+#include "redwoodmetal_completion.inc"   /* where command buffers complete */
 
 @implementation RedwoodMetalRenderEncoder {
 	RedwoodMetalCommandBuffer *_commandBuffer;   /* not retained: it owns the encoder */
@@ -4047,7 +4041,7 @@ enum {
 {
 	(void)heap;
 	RW_ONCE("-useHeap: is a no-op here, for -useResource:'s reason, and "
-		"this driver has no heaps to make resident in any case\n");
+		"a heap's resources are separate allocations, resident like any other\n");
 }
 - (void)useHeap:(id)heap stages:(NSUInteger)stages             { (void)heap; (void)stages; }
 - (void)useHeaps:(const id *)heaps count:(NSUInteger)count     { (void)heaps; (void)count; }

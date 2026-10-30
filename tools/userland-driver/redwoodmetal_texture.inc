@@ -174,8 +174,8 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
  * the compiler library's is held until it is destroyed, so there is no volatile state to
  * report and zero was not a state at all. */
 - (NSUInteger)setPurgeableState:(NSUInteger)state { (void)state; return 2; }
-- (id)heap                         { return nil; }
-- (NSUInteger)heapOffset           { return 0; }
+- (id)heap                         { return rw_resource_heap(self); }
+- (NSUInteger)heapOffset           { return rw_resource_heap_offset(self); }
 - (BOOL)isAliasable                { return NO; }
 - (void)makeAliasable              { }
 
@@ -379,8 +379,8 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 /*
  * True by construction, and each is a sentence about this driver rather than a shrug:
  *
- *   - nothing aliases: each texture is its own allocation of the compiler library's, there
- *     are no heaps, and -makeAliasable does nothing, so "does this overlap that" is NO for
+ *   - nothing aliases: each texture is its own allocation of the compiler library's, a
+ *     heap's too, and -makeAliasable does nothing, so "does this overlap that" is NO for
  *     every pair, for certain;
  *   - nothing is compressed: the library allocates surfaces with no lossless-compression
  *     metadata, so there is no compression and nothing to feed back;

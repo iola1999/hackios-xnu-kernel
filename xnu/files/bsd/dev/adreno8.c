@@ -53,6 +53,9 @@
  * adreno8_cbscan=1    diagnostic only: after the step-8 SMMU read, print context-bank 0-5 and
  *                  20 registers (SCTLR, TTBR0, TCR, FSR) and read context 3's SCTLR twice;
  *                  read-only, the values enter no decision, off unless asked
+ * gpu_coherent=1     map user buffers and surfaces into the GPU as cacheable, inner-shareable memory
+ *                  (MAIR index 1), so the GPU snoops the processors' caches (vendor dt: kgsl_smmu is
+ *                  dma-coherent) and RedwoodGPU stops cleaning caches before each submission
  * adreno8_gpu_stall=1  diagnostic only: stall faults in GPU contexts 0 and 3; poll fault
  *                  registers with context fault interrupts disabled; GMU context 2 is unchanged
  * adreno8_arc_read=1  stage-1 diagnostic: Apps DRV2 cx.lvl then mx.lvl reads; requires explicit
@@ -96,6 +99,7 @@ uint32_t adreno8_gmu_from_pll;                 /* adreno8_gmuclk */
 
 bool adreno8_direct_ring;                      /* cold-boot ordinary HFI/CP_INIT diagnostic */
 bool adreno8_gpu_stall;                        /* adreno8_gpu_stall=1 */
+bool adreno8_gpu_coherent;                     /* gpu_coherent=1 */
 
 uint32_t adreno8_step;                         /* the one being performed */
 
@@ -398,6 +402,8 @@ adreno8_init(void)
 	adreno8_fine = PE_parse_boot_argn("adreno8_fine", &one, sizeof(one)) && one != 0;
 	one = 0;
 	adreno8_gpu_stall = PE_parse_boot_argn("adreno8_gpu_stall", &one, sizeof(one)) && one == 1;
+	one = 0;
+	adreno8_gpu_coherent = PE_parse_boot_argn("gpu_coherent", &one, sizeof(one)) && one == 1;
 	PE_parse_boot_argn("adreno8_skip", &adreno8_skip_steps, sizeof(adreno8_skip_steps));
 	PE_parse_boot_argn("adreno8_empty_powerup", &empty_powerup, sizeof(empty_powerup));
 	PE_parse_boot_argn("adreno8_raw_nop", &raw_nop, sizeof(raw_nop));

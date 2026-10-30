@@ -82,11 +82,12 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
 	 * a frame and not once a submission: not everybody who draws into a surface says so (an
 	 * application drawing a picture that is on the screen meanwhile). A surface this program
 	 * has mapped, every time. The buffers made here need none of that, unless they are
-	 * ordinary memory (gpu_cached=1).
+	 * ordinary memory (gpu_cached=1). With gpu_coherent=1 none of it is done: the GPU maps
+	 * those pages cacheable and inner-shareable and snoops the caches itself (adreno8_bo_attributes).
 	 */
 	began = mach_absolute_time();
 	nanoseconds_to_absolutetime(GPU_PUSH_AGAIN_MS * NSEC_PER_MSEC, &again);
-	for (uint32_t i = 0; i < request->nr_bos; i++) {
+	for (uint32_t i = 0; i < request->nr_bos && !gGPUCoherent; i++) {
 		struct gpu_buffer * b = buffer(bos[i].handle);
 
 		if (b == NULL) {

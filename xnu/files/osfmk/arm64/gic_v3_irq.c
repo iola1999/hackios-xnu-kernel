@@ -38,6 +38,9 @@
 #include <pexpert/pexpert.h>
 #include <pexpert/device_tree.h>
 #include <pexpert/arm64/board_config.h>
+#include <kern/processor.h>
+#include <kern/task.h>
+#include <string.h>
 
 #if defined(GENERIC_GIC_V3_IRQ)
 
@@ -297,10 +300,122 @@ gic_v3_spi_count(uint32_t intid)
 	return 0;
 }
 
+/*
+ * What the processor-signal interrupts asked for, per receiving processor: one count per SIGP bit
+ * (0..11) set in its cpu_signal word when the interrupt was taken, and in GIC_SIGNAL_KINDS - 1 the
+ * ones that found no bit set (SIGPnop: a wake from WFI and nothing else). For kern.redwood.cpus.
+ */
+static uint32_t gic_signal_kinds[MAX_CPUS][GIC_SIGNAL_KINDS];
+
+void
+gic_v3_signal_kinds(int cpu, uint32_t kinds[GIC_SIGNAL_KINDS])
+{
+	for (unsigned i = 0; i < GIC_SIGNAL_KINDS; i++) {
+		kinds[i] = cpu >= 0 && cpu < MAX_CPUS ? gic_signal_kinds[cpu][i] : 0;
+	}
+}
+
+static void
+gic_count_signal(int cpu)
+{
+	uint32_t bits = getCpuDatap()->cpu_signal & ((1u << (GIC_SIGNAL_KINDS - 1)) - 1);
+
+	if (bits == 0) {
+		gic_signal_kinds[cpu][GIC_SIGNAL_KINDS - 1]++;
+	}
+	for (; bits != 0; bits &= bits - 1) {
+		gic_signal_kinds[cpu][__builtin_ctz(bits)]++;
+	}
+}
+
+/*
+ * kern.redwood.prof: where the processors are, sampled at every interrupt. Each interrupt
+ * records the interrupted context in a per-processor table keyed by (pid, pc, lr): the user pc and
+ * lr when it came from user space, the unslid kernel pc when from the kernel (pid 0 for kernel
+ * threads, and GIC_PROF_IDLE for a processor's idle thread). Interrupts arrive at about 10,000 a
+ * second per processor here, mostly the scheduler's IPIs, so a few seconds give a profile of
+ * everything that runs, user and system time apart. Off until kern.redwood.prof is written.
+ */
+#define GIC_PROF_SLOTS          GIC_PROF_TABLE
+#define GIC_PROF_PROBES         8
+#define GIC_PROF_IDLE           (-2)
+
+static volatile bool gic_prof_on;
+static volatile int32_t gic_prof_only;          /* > 0: only this pid's samples are kept */
+static struct gic_prof_slot gic_prof[MAX_CPUS][GIC_PROF_SLOTS];
+static uint32_t gic_prof_lost[MAX_CPUS];
+
+static void
+gic_prof_sample(int cpu)
+{
+	arm_saved_state_t *state = getCpuDatap()->cpu_int_state;
+	uint64_t pc, lr = 0;
+	int32_t pid;
+	bool user;
+
+	if (!gic_prof_on || state == NULL || cpu < 0 || cpu >= MAX_CPUS) {
+		return;
+	}
+	user = PSR64_IS_USER(get_saved_state_cpsr(state));
+	if (user) {
+		pc = get_saved_state_pc(state) & GIC_PROF_USER_MASK;
+		lr = get_saved_state_lr(state) & GIC_PROF_USER_MASK;
+		pid = task_pid(current_task());
+	} else {
+		pc = VM_KERNEL_UNSLIDE(get_saved_state_pc(state));
+		pid = current_thread() == current_processor()->idle_thread ? GIC_PROF_IDLE : task_pid(current_task());
+	}
+	if (gic_prof_only > 0 && pid != gic_prof_only) {
+		return;
+	}
+	uint32_t h = (uint32_t)((pc >> 2) ^ ((lr >> 2) * 0x9e3779b1u) ^ (uint32_t)pid) % GIC_PROF_SLOTS;
+	for (unsigned i = 0; i < GIC_PROF_PROBES; i++) {
+		struct gic_prof_slot *slot = &gic_prof[cpu][(h + i) % GIC_PROF_SLOTS];
+
+		if (slot->count == 0) {
+			*slot = (struct gic_prof_slot){ .pc = pc, .lr = lr, .pid = pid, .user = user, .count = 1 };
+			return;
+		}
+		if (slot->pc == pc && slot->lr == lr && slot->pid == pid) {
+			slot->count++;
+			return;
+		}
+	}
+	gic_prof_lost[cpu]++;
+}
+
+/* Clear the tables and start (on) or stop sampling; only_pid > 0 keeps that process's samples only. */
+void
+gic_v3_prof_control(bool on, int only_pid)
+{
+	gic_prof_on = false;
+	gic_prof_only = only_pid;
+	__builtin_arm_dmb(DMB_ISH);
+	bzero(gic_prof, sizeof(gic_prof));
+	bzero(gic_prof_lost, sizeof(gic_prof_lost));
+	__builtin_arm_dmb(DMB_ISH);
+	gic_prof_on = on;
+}
+
+/* A copy of one processor's table, for the report; the samples taken meanwhile may be torn. */
+void
+gic_v3_prof_table(int cpu, struct gic_prof_slot *out, uint32_t *lost)
+{
+	if (cpu < 0 || cpu >= MAX_CPUS) {
+		bzero(out, sizeof(gic_prof[0]));
+		*lost = 0;
+		return;
+	}
+	memcpy(out, gic_prof[cpu], sizeof(gic_prof[0]));
+	*lost = gic_prof_lost[cpu];
+}
+
 static void
 gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub, __unused int source)
 {
 	int cpu = cpu_number();
+
+	gic_prof_sample(cpu);
 
 	for (;;) {
 		uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
@@ -316,6 +431,7 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
 			getCpuDatap()->cpu_decrementer = -1; /* Large */
 			rtclock_intr(TRUE);
 		} else if (intid == GIC_SGI_SIGNAL) {
+			gic_count_signal(cpu);
 			cpu_signal_handler();
 		} else if (intid == GIC_SGI_STOP) {
 			/* comes back only if nobody has in fact asked for that */

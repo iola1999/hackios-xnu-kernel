@@ -543,6 +543,56 @@ oem_shell(const char *text)
 }
 
 /*
+ * "oem push" and the download after it: a file into the running kernel's inbox, where rwsh "pull"
+ * finds it (kern.redwood.inbox), so a library can be replaced while iOS runs. The download goes
+ * straight into the kernel's buffer, which is the kernel's memory and none of the loader's or the
+ * payload's; the length and then the sequence number follow it, the order the kernel reads them in.
+ */
+static int download_to_inbox;
+
+static struct kernel_live *
+inbox_live(void)
+{
+	struct kernel_live *live = (struct kernel_live *)(uintptr_t)running_live;
+
+	return live != NULL && live->magic2 == KERNEL_LIVE_MAGIC2 && live->magic3 == KERNEL_LIVE_MAGIC3 &&
+	    live->magic4 == KERNEL_LIVE_MAGIC4 ? live : NULL;
+}
+
+static void
+inbox_download(const char *size)
+{
+	struct kernel_live *live = inbox_live();
+	uint64_t total = parse_number(size, 16), got = 0;
+	uint8_t *dest;
+
+	download_to_inbox = 0;
+	if (live == NULL || total == 0 || total > live->inbox_size) {
+		fb_reply("FAIL", live == NULL ? "this kernel has no inbox" : "bad size");
+		return;
+	}
+	dest = (uint8_t *)(uintptr_t)(live->inbox + running_slide);
+	fb_reply_data(total);
+	while (got < total) {
+		uint64_t want = total - got > USB_CHUNK ? USB_CHUNK : total - got;
+		int64_t r = usb_rx(usb_rx_buf, want, 0);
+		if (r <= 0) {
+			break;
+		}
+		memcpy(dest + got, usb_rx_buf, (size_t)r);
+		got += (uint64_t)r;
+	}
+	if (got != total) {
+		fb_reply("FAIL", "short transfer");
+		return;
+	}
+	*(volatile uint64_t *)&live->inbox_len = total;
+	__asm__ volatile ("dmb ish" ::: "memory");
+	*(volatile uint64_t *)&live->inbox_seq = live->inbox_seq + 1;
+	fb_reply("OKAY", "");
+}
+
+/*
  * One command from the host. While a kernel runs on another core (running_live) only what does
  * not disturb it: questions, the screen, the log so far, "oem stop" and "oem sh". While memory and devices
  * are held (kernel_resources_held) the same commands pass and the same ones are refused, with
@@ -556,7 +606,12 @@ fb_command(char *cmd)
 	int live = running_live != NULL;
 
 	{
-		if (lc_cmd_denied(kernel_resources_held, firmware_fault, live, cmd)) {
+		if (live && download_to_inbox && starts_with(cmd, "download:")) {
+			inbox_download(cmd + 9);
+		} else if (starts_with(cmd, "oem push")) {
+			download_to_inbox = inbox_live() != NULL;
+			fb_reply(download_to_inbox ? "OKAY" : "FAIL", download_to_inbox ? "" : "no kernel with an inbox is running");
+		} else if (lc_cmd_denied(kernel_resources_held, firmware_fault, live, cmd)) {
 			fb_reply("FAIL", live ? "a kernel is running (oem stop ends it)"
 			    : "a kernel may still hold memory or devices: reboot to start over");
 		} else if (ramdisk_command(cmd)) {

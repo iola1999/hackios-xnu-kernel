@@ -28,6 +28,8 @@
 #include <libkern/libkern.h>
 #include <mach/vm_param.h>
 #include <sys/attr.h>
+#include <sys/content_protection.h>
+#include <sys/ioccom.h>
 #include <sys/dirent.h>
 #include <sys/errno.h>
 #include <sys/fcntl.h>
@@ -895,6 +897,7 @@ ramfs_getattr(struct vnop_getattr_args *ap)
 	VATTR_RETURN(vap, va_fsid, vfs_statfs(vnode_mount(vp))->f_fsid.val[0]);
 	VATTR_RETURN(vap, va_filerev, 0);
 	VATTR_RETURN(vap, va_gen, 0);
+	VATTR_RETURN(vap, va_dataprotect_class, PROTECTION_CLASS_D);   /* "none", which PosterBoard checks */
 	if (node->rn_type == VDIR && node->rn_parent != NULL) {
 		VATTR_RETURN(vap, va_parentid, node->rn_parent->rn_ino);
 		/*
@@ -1203,11 +1206,7 @@ ramfs_readlink(struct vnop_readlink_args *ap)
 	return uiomove(node->rn_target, (int)node->rn_size, ap->a_uio);
 }
 
-static int
-ramfs_ioctl(__unused struct vnop_ioctl_args *ap)
-{
-	return ENOTTY;
-}
+#include "ramfs_fsctl.inc"
 
 /* Last reference gone: a node without a name has no reason to linger in the vnode cache. */
 static int

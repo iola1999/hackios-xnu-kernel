@@ -19,7 +19,7 @@ extern uint32_t adreno8_smmu_page, adreno8_smmu_pages;
 #define SMMU_TCR2_TBI            (1u << 5 | 1u << 6)
 #define SMMU_PTE_XN              (3ULL << 53)
 #define SMMU_PTE_REQUIRED        (3ULL | 1ULL << 10 | 1ULL << 11)
-#define SMMU_PTE_VARIABLE        (3ULL << 6 | 3ULL << 8 | SMMU_PTE_XN)
+#define SMMU_PTE_VARIABLE        (7ULL << 2 | 3ULL << 6 | 3ULL << 8 | SMMU_PTE_XN)
 
 /* io-pgtable-arm.c at d50b305 uses bit 55 as ARM_LPAE_PTE_SW_SYNC.
  * Hardware ignores this software bit. In CB0 it records external ownership;
@@ -39,6 +39,17 @@ adreno8_space_attributes(uint32_t prot)
 	if (!(prot & ADRENO8_MEM_WRITE)) attributes |= 1ULL << 7;
 	if (!(prot & ADRENO8_MEM_PRIV)) attributes |= 1ULL << 6;
 	if (!(prot & ADRENO8_MEM_EXEC)) attributes |= SMMU_PTE_XN;
+	return attributes;
+}
+
+/* A user buffer's or surface's page: with gpu_coherent=1 cacheable (MAIR0_NORMAL index 1, write-back)
+ * and inner-shareable, as Linux maps IOMMU_CACHE memory, so the GPU's reads and writes are coherent
+ * with the processors' caches. Kernel-owned GPU memory keeps adreno8_space_attributes(). */
+static inline uint64_t
+adreno8_bo_attributes(uint32_t prot)
+{
+	uint64_t attributes = adreno8_space_attributes(prot);
+	if (attributes != 0 && adreno8_gpu_coherent) attributes |= 1ULL << 2 | 3ULL << 8;
 	return attributes;
 }
 

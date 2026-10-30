@@ -243,6 +243,7 @@ extern uint32_t adreno8_speed_asked;
 extern uint32_t adreno8_inflight;
 extern uint32_t adreno8_gmu_from_pll;
 extern bool adreno8_gpu_stall;
+extern bool adreno8_gpu_coherent;
 extern uint32_t adreno8_step;
 extern uint32_t adreno8_newest_step;
 extern char adreno8_last_write[96];

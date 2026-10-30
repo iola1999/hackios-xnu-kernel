@@ -223,7 +223,7 @@ adreno8_bo_map(uint64_t address, uint64_t phys, bool read_only)
 	    (phys & SMMU_GRANULE_MASK) || phys >= SMMU_PHYS_LIMIT)
 		return bo_fail("physical page");
 	uint32_t prot = ADRENO8_MEM_READ | ADRENO8_MEM_EXEC | (read_only ? 0 : ADRENO8_MEM_WRITE);
-	*entry = phys | adreno8_space_attributes(prot) | ADRENO8_PTE_EXTERNAL;
+	*entry = phys | adreno8_bo_attributes(prot) | ADRENO8_PTE_EXTERNAL;
 	if (address < bo_mapped_low) bo_mapped_low = address;
 	if (address + SMMU_GRANULE > bo_mapped_high) bo_mapped_high = address + SMMU_GRANULE;
 	return true;
@@ -248,8 +248,8 @@ bo_owned(uint64_t pte)
 	uint64_t attributes = pte & ~(PTE_ADDRESS | ADRENO8_PTE_EXTERNAL);
 	uint32_t prot = ADRENO8_MEM_READ | ADRENO8_MEM_EXEC;
 	return (pte & ADRENO8_PTE_EXTERNAL) && phys && phys < SMMU_PHYS_LIMIT &&
-	    (attributes == adreno8_space_attributes(prot) ||
-	    attributes == adreno8_space_attributes(prot | ADRENO8_MEM_WRITE));
+	    (attributes == adreno8_bo_attributes(prot) ||
+	    attributes == adreno8_bo_attributes(prot | ADRENO8_MEM_WRITE));
 }
 
 /* Each unmap waits for the GPU to be idle: how often, and how long, every 5 s while it goes on. */

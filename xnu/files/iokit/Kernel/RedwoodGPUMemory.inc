@@ -316,7 +316,7 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
 		    fBufferBytes >> 20);
 		return kIOReturnNoMemory;
 	}
-	if (gGPUCached) {
+	if (gGPUCached && !gGPUCoherent) {
 		redwood_gpu_to_memory(memory->getBytesNoCopy(), size);
 	}
 	uint64_t allocated = mach_absolute_time();

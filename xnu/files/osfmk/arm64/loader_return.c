@@ -242,7 +242,18 @@ struct loader_live {
 	uint64_t magic3;                /* "XNULIVE3": the command mailbox follows */
 	volatile uint64_t cmd_seq;      /* the loader's to write, after cmd: a new command is in cmd */
 	volatile char cmd[120];         /* the loader's to write: "oem sh TEXT" from the host, NUL-terminated */
+	uint64_t magic4;                /* "XNULIVE4": the inbox follows */
+	char *inbox;                    /* where the loader puts a file the host pushes ("oem push") */
+	uint64_t inbox_size;            /* how many bytes it holds */
+	volatile uint64_t inbox_len;    /* the loader's to write: the length of the last file */
+	volatile uint64_t inbox_seq;    /* the loader's to write, after the file and inbox_len */
 };
+
+/* The inbox: a file from the host while the kernel runs, for rwsh "pull" (kern.redwood.inbox), so a
+ * library can be replaced without a new image. In the kernel image so its memory is contiguous and
+ * the loader reaches it the way it reaches the log. */
+#define LOADER_INBOX_SIZE (32ULL << 20)
+static char loader_inbox[LOADER_INBOX_SIZE] __attribute__((aligned(16384)));
 
 /*
  * A screen recording (the display driver makes one with boot-arg rec_secs): where it is, for the
@@ -258,7 +269,20 @@ struct loader_live loader_live = {
 	.recording = loader_recording,
 	.magic2 = 0x324556494c554e58ULL, .sound = loader_sound,
 	.magic3 = 0x334556494c554e58ULL,
+	.magic4 = 0x344556494c554e58ULL, .inbox = loader_inbox, .inbox_size = LOADER_INBOX_SIZE,
 };
+
+/* The last file the host pushed and its sequence number, 0 before the first. */
+uint64_t
+loader_live_inbox(const char **data, uint64_t *len)
+{
+	uint64_t seq = loader_live.inbox_seq;
+
+	__asm__ volatile ("dmb ish" ::: "memory");
+	*len = seq != 0 && loader_live.inbox_len <= LOADER_INBOX_SIZE ? loader_live.inbox_len : 0;
+	*data = loader_inbox;
+	return seq;
+}
 
 /*
  * The last command the host passed through the loader ("oem sh TEXT") and its sequence number, 0

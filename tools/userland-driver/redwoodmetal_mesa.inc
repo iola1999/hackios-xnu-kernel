@@ -1,5 +1,7 @@
 #include "air_metal_copy.h"
 
+struct rwa_fence;
+
 static struct {
 	void *handle;
 	__typeof__(&rwa_buffer_copy) buffer_copy;
@@ -11,6 +13,9 @@ static struct {
 	__typeof__(&rwa_texture_view) texture_view;
 	__typeof__(&rwa_texture_thumbnail) texture_thumbnail;
 	__typeof__(&rwa_buffer_set_mirror) buffer_set_mirror;
+	struct rwa_fence *(*fence_take)(struct rwa_device *);
+	int (*fence_wait)(struct rwa_device *, struct rwa_fence *);
+	void (*fence_release)(struct rwa_device *, struct rwa_fence *);
 	struct rwa_device *(*device_open)(char *, size_t);
 	void (*device_close)(struct rwa_device *);
 	const char *(*device_name)(struct rwa_device *);
@@ -98,6 +103,9 @@ mesa_available(void)
 	*(void **)&mesa.texture_view = dlsym(mesa.handle, "rwa_texture_view");
 	*(void **)&mesa.texture_thumbnail = dlsym(mesa.handle, "rwa_texture_thumbnail");
 	*(void **)&mesa.buffer_set_mirror = dlsym(mesa.handle, "rwa_buffer_set_mirror");
+	*(void **)&mesa.fence_take = dlsym(mesa.handle, "rwa_fence_take");
+	*(void **)&mesa.fence_wait = dlsym(mesa.handle, "rwa_fence_wait");
+	*(void **)&mesa.fence_release = dlsym(mesa.handle, "rwa_fence_release");
 	*(void **)&mesa.device_open = dlsym(mesa.handle, "rwa_device_open");
 	*(void **)&mesa.device_close = dlsym(mesa.handle, "rwa_device_close");
 	*(void **)&mesa.device_name = dlsym(mesa.handle, "rwa_device_name");

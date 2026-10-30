@@ -341,6 +341,11 @@ struct kernel_live {
 	uint64_t magic3;                /* "XNULIVE3": the command mailbox follows */
 	uint64_t cmd_seq;               /* ours to write, after cmd: bumped for every command ("oem sh") */
 	char cmd[120];                  /* ours to write: the command text, NUL-terminated */
+	uint64_t magic4;                /* "XNULIVE4": the inbox follows */
+	uint64_t inbox;                 /* (a virtual address too) where a pushed file goes ("oem push") */
+	uint64_t inbox_size;            /* how many bytes it holds */
+	uint64_t inbox_len;             /* ours to write: the length of the last file */
+	uint64_t inbox_seq;             /* ours to write, after the file and inbox_len */
 };
 
 /*
@@ -409,6 +414,7 @@ static const char *sound_data;
 static uint64_t sound_len;
 #define KERNEL_LIVE_MAGIC2      0x324556494c554e58ULL
 #define KERNEL_LIVE_MAGIC3      0x334556494c554e58ULL
+#define KERNEL_LIVE_MAGIC4      0x344556494c554e58ULL
 #define KERNEL_LIVE_MAGIC       0x214556494c554e58ULL
 #define START_SECONDS           5
 #define SILENCE_SECONDS         50
