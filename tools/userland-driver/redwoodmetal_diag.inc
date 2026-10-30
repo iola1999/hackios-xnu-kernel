@@ -40,16 +40,27 @@ static void
 rw_keep_air(const void *render, NSData *vertex, const char *vertex_name, NSData *fragment,
 	    const char *fragment_name)
 {
-	if (!rw_sync_draws() || render == NULL || rw_kept_count >= RW_KEPT_PIPELINES)
+	unsigned i = 0;
+
+	if (!rw_sync_draws() || render == NULL)
 		return;
-	rw_kept[rw_kept_count].render = render;
-	rw_kept[rw_kept_count].vertex = [vertex copy];
-	rw_kept[rw_kept_count].fragment = [fragment copy];
-	snprintf(rw_kept[rw_kept_count].vertex_name, sizeof(rw_kept[0].vertex_name), "%s",
+	/* A later pipeline can get the address of one that was freed; its entry replaces the old
+	 * one, which otherwise answered for it (render81 sampled the wrong draws that way). */
+	while (i < rw_kept_count && rw_kept[i].render != render)
+		i++;
+	if (i >= RW_KEPT_PIPELINES)
+		return;
+	[rw_kept[i].vertex release];
+	[rw_kept[i].fragment release];
+	rw_kept[i].render = render;
+	rw_kept[i].vertex = [vertex copy];
+	rw_kept[i].fragment = [fragment copy];
+	snprintf(rw_kept[i].vertex_name, sizeof(rw_kept[0].vertex_name), "%s",
 		 vertex_name ? vertex_name : "(none)");
-	snprintf(rw_kept[rw_kept_count].fragment_name, sizeof(rw_kept[0].fragment_name), "%s",
+	snprintf(rw_kept[i].fragment_name, sizeof(rw_kept[0].fragment_name), "%s",
 		 fragment_name ? fragment_name : "(none)");
-	rw_kept_count++;
+	if (i == rw_kept_count)
+		rw_kept_count++;
 }
 
 /*
@@ -165,12 +176,29 @@ rw_thumb_commit(NSArray *works, unsigned commit)
 		}
 }
 
+/* REDWOOD_THUMB_TEXTURE=WxH[,WxH...] further limits the sampled draws to those that bind a
+ * fragment texture of one of those sizes, such as SpringBoard's reads of an icon layer (194x194). */
 static bool
-rw_thumb_work_wanted(const void *render, unsigned commit)
+rw_thumb_work_wanted(RedwoodMetalWork *work, unsigned commit)
 {
+	const char *size = getenv("REDWOOD_THUMB_TEXTURE");
+	bool bound = size == NULL;
+
+	for (unsigned i = 0; !bound && i < work->textureCount; i++) {
+		char text[32];
+
+		snprintf(text, sizeof(text), ",%lux%lu,",
+		    (unsigned long)[(id<MTLTexture>)work->textures[i] width],
+		    (unsigned long)[(id<MTLTexture>)work->textures[i] height]);
+		bound = work->textures[i] != nil &&
+		    [[NSString stringWithFormat:@",%s,", size] containsString:@(text)];
+	}
+	if (!bound)
+		return false;
 	if (rw_thumb_whole_commit != 0)
 		return rw_thumb_whole_commit == commit;
-	return rw_thumb_match(render);
+	return rw_thumb_match(((void *(*)(id, SEL))objc_msgSend)(work->render,
+	    sel_registerName("render")));
 }
 
 static void

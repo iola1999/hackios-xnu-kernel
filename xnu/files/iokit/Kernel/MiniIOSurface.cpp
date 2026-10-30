@@ -576,6 +576,14 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 	if (bpr == 0) {
 		bpr = planeCount ? s->planes[0].bytesPerRow
 		    : alignUp((uint64_t) ((width + ew - 1) / ew) * bpe, MINISURF_ROW_ALIGN);
+	} else if (planeCount == 0 && wrapped == NULL) {
+		/*
+		 * The A830 reads a linear texture at a pitch of whole 64-byte units: SpringBoard's
+		 * 50x83 glyph at the 224 bytes a row it asked for was sampled at 256 and came out
+		 * sheared (render84). The memory is ours here, so the rows are padded; a client
+		 * learns the pitch from IOSurfaceGetBytesPerRow. Client memory keeps its own.
+		 */
+		bpr = alignUp(bpr, MINISURF_ROW_ALIGN);
 	}
 	if (planeCount == 0) {
 		needed = (uint64_t) bpr * ((height + eh - 1) / eh);

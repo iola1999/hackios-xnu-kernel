@@ -642,6 +642,15 @@ rwd_texture_for_surface(struct rwa_device *mesa_device, void *iosurface, unsigne
 	if (texture == NULL) {
 		return NULL;    /* the library wrote the sentence; it names the GPU's own reason */
 	}
+	static unsigned said;
+	if (said < 48) {
+		printf("redwooddrawable: %s import %u: surface %u '%c%c%c%c' %ux%u, %u bytes a row "
+		    "from %u, texture %ux%u of format %u\n", getprogname(), said++, id,
+		    (char)(surface.pixelFormat >> 24), (char)(surface.pixelFormat >> 16),
+		    (char)(surface.pixelFormat >> 8), (char)surface.pixelFormat, surface.width,
+		    surface.height, surface.rowBytes, surface.offset, want->width, want->height,
+		    want->pixel_format);
+	}
 	if (took != NULL) {
 		*took = surface;    /* what the surface turned out to be, for whoever logs it */
 	}

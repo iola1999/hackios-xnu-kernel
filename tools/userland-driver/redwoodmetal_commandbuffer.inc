@@ -789,7 +789,7 @@ done:
 - (void)thumbWork:(RedwoodMetalWork *)work index:(unsigned)index after:(BOOL)after
 {
 	if (!rw_thumbs_wanted(commit_count) || !rw_thumb_draws ||
-	    !rw_thumb_work_wanted([work->render render], commit_count))
+	    !rw_thumb_work_wanted(work, commit_count))
 		return;
 	for (unsigned i = 0; i < work->colorCount; i++)
 		rw_thumb([work->color[i] mesaTexture], work->color[i], commit_count, index,
