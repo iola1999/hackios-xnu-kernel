@@ -1115,6 +1115,7 @@ struct gem_close { uint32_t handle, pad; };
 @interface RedwoodMetalDepthStencilState : _MTLDepthStencilState {
 	struct rwa_depth_stencil *_state;
 	BOOL _readsDepth, _writesDepth, _readsStencil, _writesStencil;
+	unsigned _depthCompare;   /* MTLCompareFunction, for the sync log */
 }
 @property (readonly) struct rwa_depth_stencil *mesaDepthStencil;
 - (instancetype)initWithRedwoodDevice:(RedwoodMetalDevice *)device

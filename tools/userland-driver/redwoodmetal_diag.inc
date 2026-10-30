@@ -60,7 +60,8 @@ rw_keep_air(const void *render, NSData *vertex, const char *vertex_name, NSData 
  * limits that to pipelines whose vertex or fragment function name contains TEXT.
  * Each sample is a header line and 32 lines of 32 texels, four characters a texel: R, G, B and A
  * in their top six bits, as digits of rw_thumb_digits. tools/k90auto/thumbs.py turns them back
- * into images.
+ * into images. Each line waits a millisecond after it is printed: the log ring holds about 1.3 MB
+ * between two pulls, and a commit's samples printed at once overran it.
  */
 #define RW_THUMB 32
 static const char rw_thumb_digits[] =
@@ -84,6 +85,41 @@ rw_thumbs_wanted(unsigned commit)
 	return rw_sync_draws() && rw_thumbs_left > 0 && commit >= rw_thumb_from;
 }
 
+/* The first words of a buffer a sampled draw binds, in hex, 24 a line: RenderBox's uniforms hold
+ * half4 colours, which a print of floats does not show. REDWOOD_THUMB_WORDS=N prints N words
+ * (default 24, at most 4096); each line names its own offset. */
+static void
+rw_thumb_words(const char *stage, unsigned slot, id buffer, size_t offset, unsigned commit,
+	       unsigned work)
+{
+	static int words = -1;
+	const uint8_t *base = buffer != nil ? (const uint8_t *)[(id<MTLBuffer>)buffer contents] : NULL;
+	size_t length = buffer != nil ? [(id<MTLBuffer>)buffer length] : 0;
+
+	if (words < 0) {
+		const char *env = getenv("REDWOOD_THUMB_WORDS");
+
+		words = env != NULL ? atoi(env) : 24;
+		words = words < 1 ? 24 : words > 4096 ? 4096 : words;
+	}
+	if (base == NULL || offset >= length)
+		return;
+	for (size_t line = 0; line < (size_t)words && offset + 4 * line < length; line += 24) {
+		char text[24 * 9 + 1] = "";
+		size_t at = 0, from = offset + 4 * line;
+
+		for (size_t k = 0; k < 24 && line + k < (size_t)words && from + 4 * k + 4 <= length; k++) {
+			uint32_t word;
+
+			memcpy(&word, base + from + 4 * k, sizeof(word));
+			at += (size_t)snprintf(text + at, sizeof(text) - at, " %08x", word);
+		}
+		rw_print("thumb %s buffer %u of commit %u work %u at %zu:%s\n", stage, slot, commit,
+		    work, from, text);
+		usleep(1000);
+	}
+}
+
 /* Whether a draw of this pipeline is sampled under REDWOOD_THUMB_MATCH; the names are the ones
  * rw_keep_air kept, so a pipeline that was not kept does not match. */
 static bool
@@ -96,6 +132,36 @@ rw_thumb_match(const void *render)
 			return strstr(rw_kept[i].vertex_name, rw_thumb_text) != NULL ||
 			    strstr(rw_kept[i].fragment_name, rw_thumb_text) != NULL;
 	return false;
+}
+
+/* REDWOOD_THUMB_WHOLE=1 widens REDWOOD_THUMB_MATCH from a draw to its commit: every draw of a
+ * commit that has a matching draw is sampled, so what consumes a path's winding is seen too.
+ * Asked once per commit, before its first draw runs. */
+static unsigned rw_thumb_whole_commit;
+
+static void
+rw_thumb_commit(NSArray *works, unsigned commit)
+{
+	static int whole = -1;
+
+	if (whole < 0)
+		whole = getenv("REDWOOD_THUMB_WHOLE") != NULL;
+	if (!whole || !rw_thumbs_wanted(commit))
+		return;
+	for (RedwoodMetalWork *work in works)
+		if (work->render != nil && rw_thumb_match(((void *(*)(id, SEL))objc_msgSend)(
+		    work->render, sel_registerName("render")))) {
+			rw_thumb_whole_commit = commit;
+			return;
+		}
+}
+
+static bool
+rw_thumb_work_wanted(const void *render, unsigned commit)
+{
+	if (rw_thumb_whole_commit != 0)
+		return rw_thumb_whole_commit == commit;
+	return rw_thumb_match(render);
 }
 
 static void
@@ -121,6 +187,7 @@ rw_thumb(struct rwa_texture *texture, id object, unsigned commit, unsigned work,
 			row[x] = rw_thumb_digits[rgba[y * RW_THUMB * 4 + x] >> 2];
 		row[RW_THUMB * 4] = '\0';
 		rw_print("thumb %u %02u: %s\n", seq, y, row);
+		usleep(1000);
 	}
 	seq++;
 }
@@ -141,10 +208,25 @@ rw_describe_attachment(id texture, BOOL clears, char *out, size_t size)
 	    clears ? " clear" : "");
 }
 
-/* What a draw was, said before it is handed to the GPU in sync mode, so that the draw that does
- * not finish can be set beside the ones of the same pass that did. */
+/* What a draw was, in sync mode: kept for the draw that does not finish, and said before it is
+ * handed to the GPU when `say` -- with REDWOOD_SYNC_LOG, or for a commit REDWOOD_THUMBS samples.
+ * Saying it for every draw was 35838 lines and 10 MB of iconservicesagent's log in render62, more
+ * than the 1.3 MB ring holds between two pulls, and the start of the icon work was lost. */
+static char rw_last_draw[768];
+
+static bool
+rw_sync_log_wanted(unsigned commit)
+{
+	static int wanted = -1;
+
+	if (wanted < 0)
+		wanted = getenv("REDWOOD_SYNC_LOG") != NULL;
+	return wanted || rw_thumbs_wanted(commit);
+}
+
 static void
-rw_describe_draw(RedwoodMetalWork *work, const void *render, unsigned commit, unsigned index)
+rw_describe_draw(RedwoodMetalWork *work, const void *render, unsigned commit, unsigned index,
+		 bool say)
 {
 	char text[768];
 	size_t at = (size_t)snprintf(text, sizeof(text),
@@ -158,6 +240,11 @@ rw_describe_draw(RedwoodMetalWork *work, const void *render, unsigned commit, un
 	}
 	if (at < sizeof(text))
 		at += rw_describe_attachment(work->depth, work->clearsDepth, text + at, sizeof(text) - at);
+	if (at < sizeof(text) && work->clears)
+		at += (size_t)snprintf(text + at, sizeof(text) - at, ", clear colour %g %g %g %g",
+		    work->clearColor[0], work->clearColor[1], work->clearColor[2], work->clearColor[3]);
+	if (at < sizeof(text) && work->clearsDepth)
+		at += (size_t)snprintf(text + at, sizeof(text) - at, ", clear depth %g", work->clearDepth);
 	if (at < sizeof(text) && work->depthStencilState != nil) {
 		/* the four answers of <MTLDepthStencilStateSPI>, sent by name because the class is
 		 * declared after this file */
@@ -168,6 +255,10 @@ rw_describe_draw(RedwoodMetalWork *work, const void *render, unsigned commit, un
 		    ask(state, sel_registerName("writesDepth")) ? "w" : "-",
 		    ask(state, sel_registerName("readsStencil")) ? "r" : "-",
 		    ask(state, sel_registerName("writesStencil")) ? "w" : "-");
+		if ([state respondsToSelector:sel_registerName("redwoodDepthCompare")])
+			at += (size_t)snprintf(text + at, sizeof(text) - at, " cmp %u",
+			    ((unsigned (*)(id, SEL))objc_msgSend)(state,
+			    sel_registerName("redwoodDepthCompare")));
 	}
 	if (at < sizeof(text) && work->hasViewportRect)
 		at += (size_t)snprintf(text + at, sizeof(text) - at, ", viewport %.0f,%.0f %.0fx%.0f",
@@ -190,7 +281,12 @@ rw_describe_draw(RedwoodMetalWork *work, const void *render, unsigned commit, un
 			at += (size_t)snprintf(text + at, sizeof(text) - at, " %u", v);
 		}
 	}
-	rw_print("%s, %u textures, %u buffers\n", text, work->textureCount, work->count);
+	if (at < sizeof(text))
+		snprintf(text + at, sizeof(text) - at, ", %u textures, %u buffers", work->textureCount,
+		    work->count);
+	strlcpy(rw_last_draw, text, sizeof(rw_last_draw));
+	if (say)
+		rw_print("%s\n", text);
 }
 
 /* `why` names the dump: "hung" for the draw the GPU did not finish, "refused" for a draw the

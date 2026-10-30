@@ -505,6 +505,7 @@ static pthread_mutex_t rw_commit_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 
 	unsigned work_index = 0;
 
+	rw_thumb_commit(_work, commit_count);
 	for (RedwoodMetalWork *work in _work) {
 		uint64_t work_began = mach_absolute_time();
 
@@ -764,9 +765,13 @@ done:
 
 	if (mesa.flush == NULL || mesa.finish == NULL)
 		return YES;
-	rw_describe_draw(work, [work->render render], commit_count, index);
+	bool said = rw_sync_log_wanted(commit_count);
+
+	rw_describe_draw(work, [work->render render], commit_count, index, said);
 	mesa.flush(device, why, size);
 	if (mesa.finish(device, why, size) != 0) {
+		if (!said)
+			rw_print("%s\n", rw_last_draw);
 		rw_print("sync: commit %u work %u did not finish: pipeline %p, %u colour attachments, "
 			 "%u textures, %u buffers: %s\n", commit_count, index,
 			 (void *)[work->render render], work->colorCount, work->textureCount, work->count,
@@ -783,23 +788,22 @@ done:
  * and the textures after it. */
 - (void)thumbWork:(RedwoodMetalWork *)work index:(unsigned)index after:(BOOL)after
 {
-	if (!rw_thumbs_wanted(commit_count) || !rw_thumb_draws || !rw_thumb_match([work->render render]))
+	if (!rw_thumbs_wanted(commit_count) || !rw_thumb_draws ||
+	    !rw_thumb_work_wanted([work->render render], commit_count))
 		return;
 	for (unsigned i = 0; i < work->colorCount; i++)
 		rw_thumb([work->color[i] mesaTexture], work->color[i], commit_count, index,
 			 after ? "out" : "pre", i);
+	if (work->depth != nil)   /* slot 8: depth values, rwa_texture_thumbnail */
+		rw_thumb([work->depth mesaTexture], work->depth, commit_count, index, after ? "out" : "pre", 8);
 	for (unsigned i = 0; after && i < work->textureCount; i++)
 		rw_thumb([work->textures[i] mesaTexture], work->textures[i], commit_count, index, "in", i);
-	for (unsigned i = 0; !after && i < work->vertexBufferCount; i++) {
-		const float *f = (const float *)((const char *)[work->vertexBuffers[i] contents] +
-		    work->vertexBufferOffsets[i]);
-		if ([work->vertexBuffers[i] contents] != NULL && [work->vertexBuffers[i] length] >=
-		    work->vertexBufferOffsets[i] + 64)
-			rw_print("thumb vertex buffer %u of commit %u work %u at %lu: %g %g %g %g %g %g "
-				 "%g %g %g %g %g %g %g %g %g %g\n", i, commit_count, index,
-				 (unsigned long)work->vertexBufferOffsets[i], f[0], f[1], f[2], f[3],
-				 f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
-	}
+	for (unsigned i = 0; !after && i < work->vertexBufferCount; i++)
+		rw_thumb_words("vertex", i, work->vertexBuffers[i], work->vertexBufferOffsets[i],
+			       commit_count, index);
+	for (unsigned i = 0; !after && i < work->count; i++)
+		rw_thumb_words("fragment", i, work->buffers[i], work->bufferOffsets[i], commit_count,
+			       index);
 }
 
 - (BOOL)runDraw:(RedwoodMetalWork *)work why:(char *)why size:(size_t)size

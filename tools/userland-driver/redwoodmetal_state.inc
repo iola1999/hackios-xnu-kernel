@@ -65,6 +65,7 @@
 
 	_writesDepth = [descriptor isDepthWriteEnabled];
 	_readsDepth = [descriptor depthCompareFunction] != MTLCompareFunctionAlways;
+	_depthCompare = (unsigned)[descriptor depthCompareFunction];
 	for (unsigned i = 0; i < 2; i++) {
 		MTLStencilDescriptor *f = faces[i];
 		BOOL keeps;
@@ -95,6 +96,7 @@
 
 - (struct rwa_depth_stencil *)mesaDepthStencil { return _state; }
 
+- (unsigned)redwoodDepthCompare { return _depthCompare; }
 - (BOOL)readsDepth    { return _readsDepth; }
 - (BOOL)writesDepth   { return _writesDepth; }
 - (BOOL)readsStencil  { return _readsStencil; }
