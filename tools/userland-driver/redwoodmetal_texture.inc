@@ -122,6 +122,16 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 	_bufferBytesPerRow = bytesPerRow;
 }
 
+/* The surface a texture read through a copy stands for (rw_surface_through_copy), so that
+ * -iosurface answers it. */
+- (void)redwoodSetSurface:(CFTypeRef)surface plane:(NSUInteger)plane
+{
+	if (_iosurface != NULL)
+		CFRelease(_iosurface);
+	_iosurface = surface ? CFRetain(surface) : NULL;
+	_iosurfacePlane = plane;
+}
+
 - (struct rwa_texture *)mesaTexture { return _texture; }
 
 - (id)device                       { return _owner; }
@@ -489,6 +499,111 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 {
 	(void)bytesPerImage;
 	return [self newTextureWithDescriptor:descriptor offset:offset bytesPerRow:bytesPerRow];
+}
+
+@end
+
+/*
+ * An IOSurface as a texture. A surface whose rows lie a whole number of 64 bytes apart is imported
+ * where it lies (rwd_texture_for_surface). One whose rows do not cannot be sampled there: the A830
+ * reads a linear texture at a pitch of whole 64-byte units, and SpringBoard writes its glyph
+ * surfaces at the 224 or 416 bytes a row it asked for, whatever pitch the surface reports (render84
+ * sampled them sheared; render88, with the kernel padding the pitch, read the rows sheared on the
+ * processor side as well). Such a surface is read the way a caller's own memory is: through a
+ * no-copy buffer over the surface's memory and a texture over that buffer, whose bytes are copied
+ * in before each commit and written back once the GPU has written them (rwa_texture_from_buffer,
+ * rwa_buffer_set_mirror). nil leaves the surface to the import in place.
+ */
+static id
+rw_surface_through_copy(RedwoodMetalDevice *device, MTLTextureDescriptor *d, void *surface,
+			NSUInteger plane)
+{
+	static size_t (*row_bytes)(void *), (*alloc_size)(void *), (*plane_count)(void *);
+	static void *(*base_address)(void *);
+	static unsigned said;
+	RedwoodMetalTexture *texture;
+	id buffer;
+	size_t row;
+
+	if (row_bytes == NULL) {
+		*(void **)&alloc_size = dlsym(RTLD_DEFAULT, "IOSurfaceGetAllocSize");
+		*(void **)&plane_count = dlsym(RTLD_DEFAULT, "IOSurfaceGetPlaneCount");
+		*(void **)&base_address = dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddress");
+		*(void **)&row_bytes = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRow");
+	}
+	if (surface == NULL || row_bytes == NULL || alloc_size == NULL || plane_count == NULL ||
+	    base_address == NULL || plane != 0 || plane_count(surface) > 1 ||
+	    [d textureType] != MTLTextureType2D || [d mipmapLevelCount] > 1 || [d sampleCount] > 1)
+		return nil;
+	row = row_bytes(surface);
+	if (row == 0 || row % 64 == 0)
+		return nil;
+	/* the buffer reads and writes the surface's memory for as long as it lives */
+	CFRetain(surface);
+	buffer = [device newBufferWithBytesNoCopy:base_address(surface) length:alloc_size(surface)
+					  options:0 deallocator:^(void *bytes, NSUInteger length) {
+		(void)bytes; (void)length;
+		CFRelease(surface);
+	}];
+	if (buffer == nil) {
+		CFRelease(surface);
+		return nil;
+	}
+	texture = [buffer newTextureWithDescriptor:d offset:0 bytesPerRow:row];
+	[buffer release];   /* the texture holds it (redwoodSetBuffer) */
+	if (texture == nil)
+		return nil;
+	[texture redwoodSetSurface:surface plane:plane];
+	if (said < 16)
+		rw_print("surface %p of %lux%lu at %zu bytes a row is sampled through a copy (%u)\n",
+			 surface, (unsigned long)[d width], (unsigned long)[d height], row, said++);
+	return texture;
+}
+
+@implementation RedwoodMetalDevice (Surface)
+
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(void *)s plane:(NSUInteger)p
+{
+	char why[768] = { 0 };
+	struct rwd_surface took;
+	struct rwa_texture_shape shape;   /* this file's own declaration; rwd_texture_shape is the
+					   * same layout under the other file's name, and the cast
+					   * below is the one place the two meet */
+	struct rwa_texture *texture;
+	id copy;
+
+	if (_mesa == NULL) {
+		rw_print("a drawable's texture needs the compiler library\n");
+		return nil;
+	}
+	if ((copy = rw_surface_through_copy(self, d, s, p)) != nil)
+		return copy;
+	memset(&shape, 0, sizeof(shape));
+	shape.pixel_format = (unsigned)[d pixelFormat];
+	shape.type = (unsigned)[d textureType];
+	shape.width = (unsigned)[d width];
+	shape.height = (unsigned)[d height];
+	shape.depth = (unsigned)[d depth];
+	shape.array_length = (unsigned)[d arrayLength];
+	shape.mip_levels = (unsigned)[d mipmapLevelCount];
+	shape.sample_count = (unsigned)[d sampleCount];
+	shape.usage = (unsigned)[d usage];
+	texture = rwd_texture_for_surface(_mesa, s, p, (const struct rwd_texture_shape *)&shape,
+					  &took, why, sizeof(why));
+	if (texture == NULL) {
+		static unsigned long refusals;
+		unsigned long n = __sync_add_and_fetch(&refusals, 1);
+
+		/* Every one of the first 64, then powers of two: the refusals of one boot have
+		 * several reasons, and a count shared by all of them hides which one recurs. */
+		if (n <= 64 || (n & (n - 1)) == 0)
+			rw_print("no drawable (%lu): format %u usage %#x: %s\n", n,
+				 shape.pixel_format, shape.usage, why);
+		return nil;
+	}
+	return [[RedwoodMetalTexture alloc] initWithRedwoodDevice:self
+							 texture:texture
+							   shape:&shape iosurface:s plane:p];
 }
 
 @end

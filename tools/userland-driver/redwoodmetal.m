@@ -2437,46 +2437,6 @@ struct gem_close { uint32_t handle, pad; };
  * CoreAnimation does not test what it gets back, so a bare nil becomes a CAMetalDrawable
  * whose -texture is nil, and the application finds out later and somewhere else.
  */
-- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(void *)s plane:(NSUInteger)p
-{
-	char why[768] = { 0 };
-	struct rwd_surface took;
-	struct rwa_texture_shape shape;   /* this file's own declaration; rwd_texture_shape is the
-					   * same layout under the other file's name, and the cast
-					   * below is the one place the two meet */
-	struct rwa_texture *texture;
-
-	if (_mesa == NULL) {
-		rw_print("a drawable's texture needs the compiler library\n");
-		return nil;
-	}
-	memset(&shape, 0, sizeof(shape));
-	shape.pixel_format = (unsigned)[d pixelFormat];
-	shape.type = (unsigned)[d textureType];
-	shape.width = (unsigned)[d width];
-	shape.height = (unsigned)[d height];
-	shape.depth = (unsigned)[d depth];
-	shape.array_length = (unsigned)[d arrayLength];
-	shape.mip_levels = (unsigned)[d mipmapLevelCount];
-	shape.sample_count = (unsigned)[d sampleCount];
-	shape.usage = (unsigned)[d usage];
-	texture = rwd_texture_for_surface(_mesa, s, p, (const struct rwd_texture_shape *)&shape,
-					  &took, why, sizeof(why));
-	if (texture == NULL) {
-		static unsigned long refusals;
-		unsigned long n = __sync_add_and_fetch(&refusals, 1);
-
-		/* Every one of the first 64, then powers of two: the refusals of one boot have
-		 * several reasons, and a count shared by all of them hides which one recurs. */
-		if (n <= 64 || (n & (n - 1)) == 0)
-			rw_print("no drawable (%lu): format %u usage %#x: %s\n", n,
-				 shape.pixel_format, shape.usage, why);
-		return nil;
-	}
-	return [[RedwoodMetalTexture alloc] initWithRedwoodDevice:self
-							 texture:texture
-							   shape:&shape iosurface:s plane:p];
-}
 - (id)newBufferWithIOSurface:(void *)surface        { (void)surface; return nil; }
 - (id)newBufferWithBytesNoCopy:(void *)bytes
 			length:(NSUInteger)length
