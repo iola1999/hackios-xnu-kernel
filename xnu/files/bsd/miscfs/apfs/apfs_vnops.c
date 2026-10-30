@@ -12,6 +12,7 @@
 #include <sys/attr.h>
 #include <sys/dirent.h>
 #include <sys/errno.h>
+#include <sys/ioccom.h>
 #include <sys/namei.h>
 #include <sys/stat.h>
 #include <sys/systm.h>
@@ -1186,15 +1187,23 @@ apfs_vnop_reclaim(struct vnop_reclaim_args *ap)
 	return 0;
 }
 
+/* APFSIOC_MARK_PURGEABLE in APFS's own numbering: 'J' 68 with a uint64_t of flags. */
+#define APFS_IOC_MARK_PURGEABLE _IOWR('J', 68, uint64_t)
+
 /*
- * No ioctl or fsctl means anything here.  ENOTTY is what callers take for "this filesystem
- * does not have that"; the default, ENOTSUP, is not -- the iOS dyld, probing the root
- * volume for APFS features, gives up on it.
+ * One fsctl is accepted: marking a file or directory purgeable. iOS 26's PosterBoard marks its
+ * data store directories purgeable and gives up creating a poster store when the mark fails
+ * (render15, errno -1). This volume is a RAM disk and nothing here purges, so the mark is
+ * answered with success and kept nowhere.
+ *
+ * Everything else is ENOTTY, which callers take for "this filesystem does not have that"; the
+ * default, ENOTSUP, is not -- the iOS dyld, probing the root volume for APFS features, gives up
+ * on it.
  */
 static int
-apfs_vnop_ioctl(__unused struct vnop_ioctl_args *ap)
+apfs_vnop_ioctl(struct vnop_ioctl_args *ap)
 {
-	return ENOTTY;
+	return ap->a_command == APFS_IOC_MARK_PURGEABLE ? 0 : ENOTTY;
 }
 
 static int
