@@ -513,6 +513,12 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
  * no-copy buffer over the surface's memory and a texture over that buffer, whose bytes are copied
  * in before each commit and written back once the GPU has written them (rwa_texture_from_buffer,
  * rwa_buffer_set_mirror). nil leaves the surface to the import in place.
+ *
+ * Textures over one surface share its memory in Metal, and copies made per texture would each hold
+ * bytes of their own: a draw into one would not reach a draw that samples another (backboardd made
+ * three textures over one 240x240 surface in render89). So one texture of a pixel format and size
+ * serves every request for that surface, kept in a table that holds it until nobody else does; a
+ * request for a usage it was not made with replaces it with one made for both.
  */
 static id
 rw_surface_through_copy(RedwoodMetalDevice *device, MTLTextureDescriptor *d, void *surface,
@@ -520,8 +526,12 @@ rw_surface_through_copy(RedwoodMetalDevice *device, MTLTextureDescriptor *d, voi
 {
 	static size_t (*row_bytes)(void *), (*alloc_size)(void *), (*plane_count)(void *);
 	static void *(*base_address)(void *);
+	static NSMutableDictionary *shared;   /* "surface format WxH" -> the texture, held here */
+	static pthread_mutex_t shared_lock = PTHREAD_MUTEX_INITIALIZER;
 	static unsigned said;
-	RedwoodMetalTexture *texture;
+	RedwoodMetalTexture *texture, *before;
+	NSUInteger usage = [d usage];
+	NSString *key;
 	id buffer;
 	size_t row;
 
@@ -538,6 +548,24 @@ rw_surface_through_copy(RedwoodMetalDevice *device, MTLTextureDescriptor *d, voi
 	row = row_bytes(surface);
 	if (row == 0 || row % 64 == 0)
 		return nil;
+	key = [NSString stringWithFormat:@"%p %lu %lux%lu", surface, (unsigned long)[d pixelFormat],
+	       (unsigned long)[d width], (unsigned long)[d height]];
+	pthread_mutex_lock(&shared_lock);
+	if (shared == nil)
+		shared = [[NSMutableDictionary alloc] init];
+	for (NSString *gone in [shared allKeys])
+		if ([[shared objectForKey:gone] retainCount] == 1)
+			[shared removeObjectForKey:gone];
+	before = [shared objectForKey:key];
+	if (before != nil && ([before usage] & usage) == usage) {
+		[before retain];
+		pthread_mutex_unlock(&shared_lock);
+		return before;
+	}
+	if (before != nil) {
+		d = [[d copy] autorelease];
+		[d setUsage:usage | [before usage]];
+	}
 	/* the buffer reads and writes the surface's memory for as long as it lives */
 	CFRetain(surface);
 	buffer = [device newBufferWithBytesNoCopy:base_address(surface) length:alloc_size(surface)
@@ -547,16 +575,21 @@ rw_surface_through_copy(RedwoodMetalDevice *device, MTLTextureDescriptor *d, voi
 	}];
 	if (buffer == nil) {
 		CFRelease(surface);
+		pthread_mutex_unlock(&shared_lock);
 		return nil;
 	}
 	texture = [buffer newTextureWithDescriptor:d offset:0 bytesPerRow:row];
 	[buffer release];   /* the texture holds it (redwoodSetBuffer) */
-	if (texture == nil)
-		return nil;
-	[texture redwoodSetSurface:surface plane:plane];
-	if (said < 16)
-		rw_print("surface %p of %lux%lu at %zu bytes a row is sampled through a copy (%u)\n",
-			 surface, (unsigned long)[d width], (unsigned long)[d height], row, said++);
+	if (texture != nil) {
+		[texture redwoodSetSurface:surface plane:plane];
+		[shared setObject:texture forKey:key];
+	}
+	pthread_mutex_unlock(&shared_lock);
+	if (texture != nil && said < 64)
+		rw_print("surface %p of %lux%lu format %lu usage %#lx at %zu bytes a row is sampled "
+			 "through a copy%s (%u)\n", surface, (unsigned long)[d width],
+			 (unsigned long)[d height], (unsigned long)[d pixelFormat], (unsigned long)usage,
+			 row, before != nil ? ", replacing one of a narrower usage" : "", said++);
 	return texture;
 }
 
