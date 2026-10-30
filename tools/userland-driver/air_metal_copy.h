@@ -1,6 +1,7 @@
 #ifndef AIR_METAL_COPY_H
 #define AIR_METAL_COPY_H
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -43,12 +44,22 @@ int rwa_texture_generate_mipmaps(struct rwa_texture *texture, char *why, size_t 
 
 /* A texture laid over a buffer the caller holds, as -newTextureWithDescriptor:offset:
  * bytesPerRow: asks for: the bytes are copied out of the buffer at this call and again at
- * every rwa_buffer_textures_refresh, and never copied back. */
+ * every rwa_buffer_textures_refresh; once the texture has been written they are copied back
+ * into the buffer, at the next refresh or at rwa_buffer_textures_writeback. */
 struct rwa_texture *rwa_texture_from_buffer(struct rwa_device *device,
                                             const struct rwa_texture_shape *shape,
                                             struct rwa_buffer *source, size_t offset,
                                             unsigned row_bytes, char *why, size_t why_size);
 void rwa_buffer_textures_refresh(struct rwa_device *device);
+void rwa_buffer_textures_writeback(struct rwa_device *device);
+
+/* A w x h nearest-texel sample of the first level as 8-bit RGBA, clamped; -1 for a depth,
+ * stencil, multisample or compressed texture. Waits for the work that writes the texture. */
+int rwa_texture_thumbnail(struct rwa_texture *texture, unsigned w, unsigned h, uint8_t *rgba);
+
+/* The caller's memory of a no-copy buffer: textures over the buffer read their bytes from it and
+ * write their results back into it as well as into the buffer. NULL turns it off. */
+void rwa_buffer_set_mirror(struct rwa_buffer *buffer, void *mirror);
 
 /* A function linked into the fragment stage (MTLLinkedFunctions), node by node: the same
  * layout as air_metal.h's, see rwa_render_create_linked there. */

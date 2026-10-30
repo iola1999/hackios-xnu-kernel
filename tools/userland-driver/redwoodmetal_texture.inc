@@ -1,4 +1,5 @@
-/* Texture ownership, IOSurface properties and Metal texture operations. */
+/* Texture ownership, IOSurface properties and Metal texture operations, and the textures a buffer
+ * makes over its own memory. */
 /* `-replaceRegion:` receives `MTLRegion` by value and reads six NSUInteger fields out of it. The
  * region is printed as six machine words before anything reads a field, because whether those six
  * words hold `origin.{x,y,z}` then `size.{width,height,depth}` is the question: a caller compiled
@@ -109,7 +110,16 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 		CFRelease(_iosurface);
 	}
 	[_parentTexture release];
+	[_buffer release];   /* after the texture, whose copy-back reads the buffer */
 	[super dealloc];
+}
+
+- (void)redwoodSetBuffer:(id)buffer offset:(NSUInteger)offset bytesPerRow:(NSUInteger)bytesPerRow
+{
+	[_buffer release];
+	_buffer = [buffer retain];
+	_bufferOffset = offset;
+	_bufferBytesPerRow = bytesPerRow;
 }
 
 - (struct rwa_texture *)mesaTexture { return _texture; }
@@ -129,9 +139,9 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 - (id)parentTexture                { return _parentTexture; }
 - (NSUInteger)parentRelativeLevel  { return 0; }
 - (NSUInteger)parentRelativeSlice  { return 0; }
-- (id)buffer                       { return nil; }
-- (NSUInteger)bufferOffset         { return 0; }
-- (NSUInteger)bufferBytesPerRow    { return 0; }
+- (id)buffer                       { return _buffer; }
+- (NSUInteger)bufferOffset         { return _bufferOffset; }
+- (NSUInteger)bufferBytesPerRow    { return _bufferBytesPerRow; }
 - (IOSurfaceRef)iosurface          { return (IOSurfaceRef)_iosurface; }
 - (NSUInteger)iosurfacePlane       { return _iosurfacePlane; }
 /* MTLStorageModeShared, except for a multisample texture, which Metal does not allow to be
@@ -418,5 +428,62 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 	return _responsibleProcess != 0 ? _responsibleProcess : getpid();
 }
 - (void)setResponsibleProcess:(int)pid { _responsibleProcess = pid; }
+
+@end
+
+@implementation RedwoodMetalBuffer (Texture)
+
+/*
+ * A texture laid over this buffer's memory, which CoreAnimation asks for: 120x120 RGBA8 at
+ * 512 bytes a row, once per process.
+ *
+ * The bytes are copied into a texture of its own rather than shared, because Gallium cannot
+ * lay one resource over another's memory. The copies happen when the texture is made and
+ * again at every -commit (rwa_buffer_textures_refresh), since the processor may have written
+ * the buffer in between and nothing tells this driver when. What the GPU writes into the
+ * texture goes back into the buffer at -waitUntilCompleted (rwa_buffer_textures_writeback).
+ */
+- (id)newTextureWithDescriptor:(id)descriptor offset:(NSUInteger)offset
+		   bytesPerRow:(NSUInteger)bytesPerRow
+{
+	char why[512] = { 0 };
+	struct rwa_texture_shape shape;
+	struct rwa_texture *texture;
+
+	if (_mesa == NULL || mesa.texture_from_buffer == NULL) {
+		rw_print("a texture over a buffer needs a buffer the compiler library made\n");
+		return nil;
+	}
+	memset(&shape, 0, sizeof(shape));
+	shape.pixel_format = (unsigned)[descriptor pixelFormat];
+	shape.type = (unsigned)[descriptor textureType];
+	shape.width = (unsigned)[descriptor width];
+	shape.height = (unsigned)[descriptor height];
+	shape.depth = (unsigned)[descriptor depth];
+	shape.array_length = (unsigned)[descriptor arrayLength];
+	shape.mip_levels = (unsigned)[descriptor mipmapLevelCount];
+	shape.sample_count = (unsigned)[descriptor sampleCount];
+	shape.usage = (unsigned)[descriptor usage];
+	texture = mesa.texture_from_buffer([_owner mesaDevice], &shape, _mesa, offset,
+					   (unsigned)bytesPerRow, why, sizeof(why));
+	if (texture == NULL) {
+		rw_print("%s\n", why);
+		return nil;
+	}
+	RedwoodMetalTexture *made = [[RedwoodMetalTexture alloc] initWithRedwoodDevice:_owner
+										  texture:texture
+										    shape:&shape
+										iosurface:NULL plane:0];
+	[made redwoodSetBuffer:self offset:offset bytesPerRow:bytesPerRow];
+	return made;
+}
+
+- (id)newLinearTextureWithDescriptor:(id)descriptor offset:(NSUInteger)offset
+			 bytesPerRow:(NSUInteger)bytesPerRow
+		       bytesPerImage:(NSUInteger)bytesPerImage
+{
+	(void)bytesPerImage;
+	return [self newTextureWithDescriptor:descriptor offset:offset bytesPerRow:bytesPerRow];
+}
 
 @end

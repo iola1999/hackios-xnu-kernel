@@ -3,6 +3,7 @@
  * The ladder, the boot-args and what is not settled: see adreno8.c; the shared world: adreno8_private.h.
  */
 #include "adreno8_smmu_private.h"
+#include "adreno8_bo_private.h"
 
 #define printf adreno8_say
 
@@ -1085,5 +1086,7 @@ adreno8_space_faulted(struct adreno8_gpu_space *space)
 	    adreno8_rd(adreno8_smmu.base + cb + SMMU_CB_SCTLR),
 	    leaf != NULL ? ((uint64_t *)leaf->table)[address >> 12 & 0x1ff] : 0,
 	    adreno8_rd(adreno8_smmu.base + SMMU_SGFSR));
+	if (space == &adreno8_gpu_space)
+		adreno8_bo_describe_fault(address);
 	return true;
 }

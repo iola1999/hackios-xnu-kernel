@@ -28,5 +28,8 @@ void adreno8_bo_dump_words(const char *what, uint64_t address, uint32_t count);
  * three levels down; then the fragment stage's bindless descriptors in Mesa's fb-read slots. Once
  * per boot, for a hang report. */
 void adreno8_bo_dump_tree(uint64_t base, uint32_t count);
+/* After an SMMU fault in the GPU space, once per boot: the BOs that held the faulting address
+ * in the last reservations, live or released, and the nearest live ones below and above it. */
+void adreno8_bo_describe_fault(uint32_t fault);
 
 #endif

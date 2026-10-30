@@ -3,10 +3,20 @@
 #include "adreno8_smmu_private.h"
 #include "adreno8_hwsched_private.h"
 #include "adreno8_context_private.h"
+#include <sys/proc.h>
 
 #define printf adreno8_say
 
 static enum { BO_COLD, BO_ENABLED, BO_FAILED } bo_state;
+
+/*
+ * A zeroed read-only page mapped after every BO, as KGSL maps its guard page: the GPU reads a
+ * little past the end of a buffer (render48: the first byte after SpringBoard's newest BO, which
+ * was the last one in the space), and with nothing mapped there the read is an SMMU fault, which
+ * closes submissions until a cold reset. The guard is part of the reservation and goes with it.
+ */
+static vm_offset_t bo_guard;
+static uint64_t bo_guard_pte;
 
 void
 adreno8_bo_stop(void)
@@ -55,6 +65,13 @@ adreno8_bo_enable(void)
 	if (bo_state == BO_ENABLED) return adreno8_bo_ready();
 	if (!adreno8_context_wait_idle("external BO enable")) return false;
 	if (!adreno8_gpu_memory_verify() || !adreno8_hfi_poll()) return false;
+	if (bo_guard == 0) {
+		if (kmem_alloc(kernel_map, &bo_guard, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS)
+			return bo_fail("guard page");
+		adreno8_to_memory(bo_guard, PAGE_SIZE);
+		bo_guard_pte = kvtophys(bo_guard) | adreno8_space_attributes(ADRENO8_MEM_READ) | ADRENO8_PTE_EXTERNAL;
+	}
 	bo_state = BO_ENABLED;
 	return adreno8_bo_ready();
 }
@@ -70,21 +87,111 @@ bo_range(uint64_t address, uint64_t size)
 /* Every page below this address was in use when last looked at: a search for room starts here. */
 static uint32_t bo_free_from = ADRENO8_GPU_IOVA_START;
 
+/*
+ * The last BO_HISTORY reservations, with the process that asked and when each was given back, for
+ * an SMMU fault report. Buffers are packed one after another, so a read that runs past the end of
+ * one lands in the next and does not fault; a fault lands in a hole, which is either a buffer
+ * that has been released or the room after the last one. The report names which.
+ */
+#define BO_HISTORY 4096
+static struct bo_record {
+	uint32_t address, size;
+	int pid;
+	uint64_t reserved, released;    /* mach_absolute_time; released is 0 while the BO is live */
+} bo_history[BO_HISTORY];
+static uint32_t bo_history_next;
+
+static void
+bo_note_reserve(uint32_t address, uint64_t size)
+{
+	bo_history[bo_history_next++ % BO_HISTORY] = (struct bo_record){
+		.address = address, .size = (uint32_t)size, .pid = proc_selfpid(),
+		.reserved = mach_absolute_time(),
+	};
+}
+
+static void
+bo_note_release(uint64_t address, uint64_t size)
+{
+	for (uint32_t i = 1; i <= BO_HISTORY; i++) {
+		struct bo_record *r = &bo_history[(bo_history_next - i) % BO_HISTORY];
+
+		if (r->reserved != 0 && r->released == 0 && r->address == address && r->size == size) {
+			r->released = mach_absolute_time();
+			return;
+		}
+	}
+}
+
+static void
+bo_say_record(uint32_t fault, const char *what, const struct bo_record *r, uint64_t now)
+{
+	uint64_t reserved, released = 0;
+
+	absolutetime_to_nanoseconds(now - r->reserved, &reserved);
+	if (r->released != 0)
+		absolutetime_to_nanoseconds(now - r->released, &released);
+	printf("adreno8: fault %#x: %s BO %#x+%#x (fault at offset %lld), pid %d, reserved %llu ms ago, "
+	    "released %lld ms ago (-1: live)\n", fault, what, r->address, r->size,
+	    (long long)fault - (long long)r->address, r->pid, reserved / NSEC_PER_MSEC,
+	    r->released != 0 ? (long long)(released / NSEC_PER_MSEC) : -1ll);
+}
+
+void
+adreno8_bo_describe_fault(uint32_t fault)
+{
+	static bool described;
+	const struct bo_record *below = NULL, *above = NULL;
+	uint64_t now = mach_absolute_time();
+	unsigned holders = 0;
+
+	if (described)
+		return;
+	described = true;
+	for (uint32_t i = 1; i <= BO_HISTORY; i++) {
+		const struct bo_record *r = &bo_history[(bo_history_next - i) % BO_HISTORY];
+
+		if (r->reserved == 0)
+			continue;
+		if (fault >= r->address && fault - r->address < r->size && holders < 4) {
+			bo_say_record(fault, "held by", r, now);
+			holders++;
+		}
+		if (r->released != 0)
+			continue;
+		if (r->address + r->size <= fault && (!below || r->address > below->address))
+			below = r;
+		if (r->address > fault && (!above || r->address < above->address))
+			above = r;
+	}
+	if (holders == 0)
+		printf("adreno8: fault %#x: no BO in the last %u reservations held this address\n", fault,
+		    BO_HISTORY);
+	if (below)
+		bo_say_record(fault, "nearest live below:", below, now);
+	if (above)
+		bo_say_record(fault, "nearest live above:", above, now);
+}
+
+/* The pages entered since the last commit, which cleans just their entries out of the cache. */
+static uint64_t bo_mapped_low = UINT64_MAX, bo_mapped_high;
+
 uint64_t
 adreno8_bo_reserve(uint64_t size)
 {
 	uint32_t address, from = bo_free_from;
+	uint64_t span = size + SMMU_GRANULE;   /* the BO and its guard page */
 	if (!adreno8_bo_ready()) return 0;
-	if (!bo_range(ADRENO8_GPU_IOVA_START, size) ||
-	    (!adreno8_space_find_range(&adreno8_gpu_space, from, ADRENO8_GPU_IOVA_END, (uint32_t)size, SMMU_GRANULE, &address) &&
+	if (!bo_range(ADRENO8_GPU_IOVA_START, span) ||
+	    (!adreno8_space_find_range(&adreno8_gpu_space, from, ADRENO8_GPU_IOVA_END, (uint32_t)span, SMMU_GRANULE, &address) &&
 	    (from == ADRENO8_GPU_IOVA_START || !adreno8_space_find_range(&adreno8_gpu_space, ADRENO8_GPU_IOVA_START,
-	    ADRENO8_GPU_IOVA_END, (uint32_t)size, SMMU_GRANULE, &address)))) {
+	    ADRENO8_GPU_IOVA_END, (uint32_t)span, SMMU_GRANULE, &address)))) {
 		bo_fail("IOVA reservation");
 		return 0;
 	}
 	/* Populate tables before marking any leaf. A partial table allocation is
 	 * retained on failure and no physical BO page has been exposed yet. */
-	for (uint64_t at = 0; at < size; at += SMMU_GRANULE) {
+	for (uint64_t at = 0; at < span; at += SMMU_GRANULE) {
 		if (!adreno8_space_prepare_page(&adreno8_gpu_space, address + at)) {
 			bo_fail("reservation tables");
 			return 0;
@@ -92,6 +199,11 @@ adreno8_bo_reserve(uint64_t size)
 	}
 	for (uint64_t at = 0; at < size; at += SMMU_GRANULE)
 		*adreno8_space_entry(&adreno8_gpu_space, address + at) = ADRENO8_PTE_EXTERNAL;
+	/* published with the BO's own pages at the next commit */
+	*adreno8_space_entry(&adreno8_gpu_space, address + size) = bo_guard_pte;
+	if (address + size < bo_mapped_low) bo_mapped_low = address + size;
+	if (address + span > bo_mapped_high) bo_mapped_high = address + span;
+	bo_note_reserve(address, size);
 	/* (the pages it passes over stay in use until a release brings it back below them) */
 	for (uint64_t *entry; bo_free_from < ADRENO8_GPU_IOVA_END &&
 	    (entry = adreno8_space_entry(&adreno8_gpu_space, bo_free_from)) != NULL && *entry != 0;
@@ -99,9 +211,6 @@ adreno8_bo_reserve(uint64_t size)
 	}
 	return address;
 }
-
-/* The pages entered since the last commit, which cleans just their entries out of the cache. */
-static uint64_t bo_mapped_low = UINT64_MAX, bo_mapped_high;
 
 /* One page of a buffer: the GPU's health is checked at its reservation and at its commit. */
 bool
@@ -326,8 +435,14 @@ adreno8_bo_release(uint64_t address, uint64_t size)
 		uint64_t *entry = adreno8_space_entry(&adreno8_gpu_space, (uint32_t)(address + at));
 		if (!entry || *entry != ADRENO8_PTE_EXTERNAL) return bo_fail("release ownership");
 	}
+	uint64_t *guard = adreno8_space_entry(&adreno8_gpu_space, (uint32_t)(address + size));
+	if (!guard || *guard != bo_guard_pte) return bo_fail("release guard page");
+	/* The guard's TLB entry may outlive this: it names the zero page, read-only, and the next
+	 * BO placed here is published before the GPU is given it. */
+	*guard = 0;
 	for (uint64_t at = 0; at < size; at += SMMU_GRANULE)
 		*adreno8_space_entry(&adreno8_gpu_space, (uint32_t)(address + at)) = 0;
+	bo_note_release(address, size);
 	if (address < bo_free_from) bo_free_from = (uint32_t)address;
 	return true;
 }

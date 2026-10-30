@@ -7,7 +7,10 @@ static struct {
 	__typeof__(&rwa_texture_generate_mipmaps) texture_generate_mipmaps;
 	__typeof__(&rwa_texture_from_buffer) texture_from_buffer;
 	__typeof__(&rwa_buffer_textures_refresh) buffer_textures_refresh;
+	__typeof__(&rwa_buffer_textures_writeback) buffer_textures_writeback;
 	__typeof__(&rwa_texture_view) texture_view;
+	__typeof__(&rwa_texture_thumbnail) texture_thumbnail;
+	__typeof__(&rwa_buffer_set_mirror) buffer_set_mirror;
 	struct rwa_device *(*device_open)(char *, size_t);
 	void (*device_close)(struct rwa_device *);
 	const char *(*device_name)(struct rwa_device *);
@@ -90,7 +93,11 @@ mesa_available(void)
 	*(void **)&mesa.texture_generate_mipmaps = dlsym(mesa.handle, "rwa_texture_generate_mipmaps");
 	*(void **)&mesa.texture_from_buffer = dlsym(mesa.handle, "rwa_texture_from_buffer");
 	*(void **)&mesa.buffer_textures_refresh = dlsym(mesa.handle, "rwa_buffer_textures_refresh");
+	*(void **)&mesa.buffer_textures_writeback = dlsym(mesa.handle,
+							  "rwa_buffer_textures_writeback");
 	*(void **)&mesa.texture_view = dlsym(mesa.handle, "rwa_texture_view");
+	*(void **)&mesa.texture_thumbnail = dlsym(mesa.handle, "rwa_texture_thumbnail");
+	*(void **)&mesa.buffer_set_mirror = dlsym(mesa.handle, "rwa_buffer_set_mirror");
 	*(void **)&mesa.device_open = dlsym(mesa.handle, "rwa_device_open");
 	*(void **)&mesa.device_close = dlsym(mesa.handle, "rwa_device_close");
 	*(void **)&mesa.device_name = dlsym(mesa.handle, "rwa_device_name");

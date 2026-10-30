@@ -595,9 +595,11 @@ rwd_texture_for_surface(struct rwa_device *mesa_device, void *iosurface, unsigne
 		    surface.height, surface.rowBytes, reason);
 		return NULL;
 	}
-	if (surface.width != want->width || surface.height != want->height) {
-		rwd_say(why, why_size, "surface %u is %ux%u and the descriptor asks for %ux%u",
-		    id, surface.width, surface.height, want->width, want->height);
+	/* A texture may cover the top-left part of a larger surface, rows at the surface's own
+	 * pitch: iconservicesagent asks for 130x62 of a 192x64 surface and 64x70 of a 64x128 one. */
+	if (surface.width < want->width || surface.height < want->height) {
+		rwd_say(why, why_size, "surface %u is %ux%u, smaller than the %ux%u the descriptor "
+		    "asks for", id, surface.width, surface.height, want->width, want->height);
 		return NULL;
 	}
 	if (surface.pixelFormat != fourcc) {

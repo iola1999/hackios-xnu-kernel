@@ -1087,11 +1087,16 @@ struct gem_close { uint32_t handle, pad; };
 	NSUInteger _iosurfacePlane;
 	int _responsibleProcess;   /* as on the buffer: accounting, not behaviour */
 	id _parentTexture;         /* the texture this one is a view of, retained */
+	id _buffer;                /* the buffer this texture was laid over, retained */
+	NSUInteger _bufferOffset, _bufferBytesPerRow;
 }
 - (instancetype)initWithRedwoodDevice:(RedwoodMetalDevice *)device
 	texture:(struct rwa_texture *)texture shape:(const struct rwa_texture_shape *)shape
 	iosurface:(CFTypeRef)surface plane:(NSUInteger)plane;
 @property (readonly) struct rwa_texture *mesaTexture;
+/* The buffer a texture made by -[MTLBuffer newTextureWithDescriptor:offset:bytesPerRow:]
+ * lies over: kept alive by the texture and answered by -buffer, as Metal does. */
+- (void)redwoodSetBuffer:(id)buffer offset:(NSUInteger)offset bytesPerRow:(NSUInteger)bytesPerRow;
 /* Not part of MTLTexture: the depth or stencil aspect of this texture, one float and one
  * byte per texel. Metal's own -getBytes: has no aspect to name and the compiler library
  * refuses a depth texture through it by name, so a caller that wants to know what a depth
@@ -1371,8 +1376,8 @@ struct gem_close { uint32_t handle, pad; };
 	if ([fragment respondsToSelector:@selector(redwoodUnspecializedFunction)]) {
 		fragment = [fragment redwoodUnspecializedFunction];
 	}
-
 	rw_stitch_dump_linked(descriptor);
+	rw_dump_pipeline_air(descriptor);
 	/* No fragment function is a depth/stencil-only pipeline (RenderBox's path_edges); the
 	 * library gives it an empty fragment stage and writes no colour. */
 	if (fragment == nil && vertex == nil) {
@@ -2694,10 +2699,9 @@ struct gem_close { uint32_t handle, pad; };
 	return _mesa;
 }
 
-/* Memory the caller owns, copied once: our buffer has to outlive the call and the caller's pages
- * cannot be mapped into the GPU's address space yet. The cost is the copy; the behaviour that
- * differs from Metal is that writing through -contents no longer lands in the caller's memory, so
- * this is a way to get the drawing done, not a finished no-copy buffer. */
+/* Memory the caller owns, held as a copy: the caller's pages cannot be mapped into the GPU's address
+ * space yet. Textures over the buffer read the caller's memory and write their results back into
+ * it (rwa_buffer_set_mirror); writing through -contents still does not reach the caller. */
 - (instancetype)initWithDevice:(RedwoodMetalDevice *)device
 			   gpu:(io_connect_t)gpu
 			 bytes:(const void *)bytes
@@ -2711,6 +2715,7 @@ struct gem_close { uint32_t handle, pad; };
 	if (bytes != NULL && _contents != NULL) {
 		memcpy(_contents, bytes, length);
 	}
+	if (_mesa != NULL && mesa.buffer_set_mirror != NULL) mesa.buffer_set_mirror(_mesa, (void *)bytes);
 	_callerBytes = (void *)bytes;
 	if (deallocator != NULL) {
 		_callerDeallocator = [deallocator copy];
@@ -2726,10 +2731,9 @@ struct gem_close { uint32_t handle, pad; };
 
 - (void)dealloc
 {
-	/* The caller handed us its own memory and an expectation to be told when we are done with it.
-	 * That moment is now: the buffer is going away, so the deallocator runs once, before the
-	 * memory it describes is released. _callerBytes is what the block was given, not _contents,
-	 * which is our copy. */
+	/* The caller handed us its own memory and an expectation to be told when we are done with it:
+	 * the deallocator runs once, here, after the library has stopped mirroring that memory.
+	 * _callerBytes is what the block was given, not _contents, which is our copy. */
 	uint64_t dealloc_n = rw_dealloc_count + 1;
 	bool dealloc_print = rw_dealloc_print();
 	if (dealloc_print) {
@@ -2737,6 +2741,7 @@ struct gem_close { uint32_t handle, pad; };
 			 (unsigned long long)dealloc_n, getpid(), self, _mesa, (void *)self->_contents,
 			 _callerBytes, (unsigned long)self->_length);
 	}
+	if (_mesa != NULL && mesa.buffer_set_mirror != NULL) mesa.buffer_set_mirror(_mesa, NULL);
 	if (_callerDeallocator != NULL) {
 		void (^block)(void *, NSUInteger) = _callerDeallocator;
 
@@ -2843,54 +2848,6 @@ struct gem_close { uint32_t handle, pad; };
 	return _responsibleProcess != 0 ? _responsibleProcess : getpid();
 }
 - (void)setResponsibleProcess:(int)pid { _responsibleProcess = pid; }
-/*
- * A texture laid over this buffer's memory, which CoreAnimation asks for: 120x120 RGBA8 at
- * 512 bytes a row, once per process.
- *
- * The bytes are copied into a texture of its own rather than shared, because Gallium cannot
- * lay one resource over another's memory. The copies happen when the texture is made and
- * again at every -commit (rwa_buffer_textures_refresh), since the processor may have written
- * the buffer in between and nothing tells this driver when.
- */
-- (id)newTextureWithDescriptor:(id)descriptor offset:(NSUInteger)offset
-		   bytesPerRow:(NSUInteger)bytesPerRow
-{
-	char why[512] = { 0 };
-	struct rwa_texture_shape shape;
-	struct rwa_texture *texture;
-
-	if (_mesa == NULL || mesa.texture_from_buffer == NULL) {
-		rw_print("a texture over a buffer needs a buffer the compiler library made\n");
-		return nil;
-	}
-	memset(&shape, 0, sizeof(shape));
-	shape.pixel_format = (unsigned)[descriptor pixelFormat];
-	shape.type = (unsigned)[descriptor textureType];
-	shape.width = (unsigned)[descriptor width];
-	shape.height = (unsigned)[descriptor height];
-	shape.depth = (unsigned)[descriptor depth];
-	shape.array_length = (unsigned)[descriptor arrayLength];
-	shape.mip_levels = (unsigned)[descriptor mipmapLevelCount];
-	shape.sample_count = (unsigned)[descriptor sampleCount];
-	shape.usage = (unsigned)[descriptor usage];
-	texture = mesa.texture_from_buffer([_owner mesaDevice], &shape, _mesa, offset,
-					   (unsigned)bytesPerRow, why, sizeof(why));
-	if (texture == NULL) {
-		rw_print("%s\n", why);
-		return nil;
-	}
-	return [[RedwoodMetalTexture alloc] initWithRedwoodDevice:_owner
-							 texture:texture
-							   shape:&shape iosurface:NULL plane:0];
-}
-
-- (id)newLinearTextureWithDescriptor:(id)descriptor offset:(NSUInteger)offset
-			 bytesPerRow:(NSUInteger)bytesPerRow
-		       bytesPerImage:(NSUInteger)bytesPerImage
-{
-	(void)bytesPerImage;
-	return [self newTextureWithDescriptor:descriptor offset:offset bytesPerRow:bytesPerRow];
-}
 - (void)addDebugMarker:(NSString *)marker range:(NSRange)range { (void)marker; (void)range; }
 - (void)removeAllDebugMarkers { }
 

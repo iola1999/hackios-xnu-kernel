@@ -542,6 +542,7 @@ static pthread_mutex_t rw_commit_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 			continue;
 		}
 		if (work->render != nil) {
+			[self thumbWork:work index:work_index after:NO];
 			if (![self runDraw:work why:why size:sizeof(why)]) {
 				goto done;
 			}
@@ -631,6 +632,22 @@ static pthread_mutex_t rw_commit_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 		}
 	}
 	_status = RW_CB_SCHEDULED;   /* submitted; the fence below is what makes it completed */
+	if (rw_thumbs_wanted(commit_count) && !rw_thumb_draws) {
+		NSMutableSet *seen = [NSMutableSet set];
+
+		for (RedwoodMetalWork *work in _work) {
+			for (unsigned i = 0; i < work->colorCount + work->textureCount; i++) {
+				bool out = i < work->colorCount;
+				id texture = out ? work->color[i] : work->textures[i - work->colorCount];
+
+				if (texture == nil || [seen containsObject:texture])
+					continue;
+				[seen addObject:texture];
+				rw_thumb([texture mesaTexture], texture, commit_count, 0, out ? "out" : "in",
+					 out ? i : i - work->colorCount);
+			}
+		}
+	}
 done:
 	/* The draws this buffer recorded are all in the library's batch by now -- a draw no
 	 * longer waits for the GPU (rwa_render_draw) -- and this hands them over.
@@ -758,7 +775,31 @@ done:
 		[self failWith:why];
 		return NO;
 	}
+	[self thumbWork:work index:index after:YES];
 	return YES;
+}
+
+/* REDWOOD_THUMB_DRAWS (redwoodmetal_diag.inc): the attachments before a draw, or the attachments
+ * and the textures after it. */
+- (void)thumbWork:(RedwoodMetalWork *)work index:(unsigned)index after:(BOOL)after
+{
+	if (!rw_thumbs_wanted(commit_count) || !rw_thumb_draws || !rw_thumb_match([work->render render]))
+		return;
+	for (unsigned i = 0; i < work->colorCount; i++)
+		rw_thumb([work->color[i] mesaTexture], work->color[i], commit_count, index,
+			 after ? "out" : "pre", i);
+	for (unsigned i = 0; after && i < work->textureCount; i++)
+		rw_thumb([work->textures[i] mesaTexture], work->textures[i], commit_count, index, "in", i);
+	for (unsigned i = 0; !after && i < work->vertexBufferCount; i++) {
+		const float *f = (const float *)((const char *)[work->vertexBuffers[i] contents] +
+		    work->vertexBufferOffsets[i]);
+		if ([work->vertexBuffers[i] contents] != NULL && [work->vertexBuffers[i] length] >=
+		    work->vertexBufferOffsets[i] + 64)
+			rw_print("thumb vertex buffer %u of commit %u work %u at %lu: %g %g %g %g %g %g "
+				 "%g %g %g %g %g %g %g %g %g %g\n", i, commit_count, index,
+				 (unsigned long)work->vertexBufferOffsets[i], f[0], f[1], f[2], f[3],
+				 f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
+	}
 }
 
 - (BOOL)runDraw:(RedwoodMetalWork *)work why:(char *)why size:(size_t)size
@@ -1021,6 +1062,11 @@ done:
 		return;
 	}
 	__atomic_store_n(&fence_wait, 0, __ATOMIC_RELEASE);
+	/* A texture over a buffer is a copy (rwa_texture_from_buffer); what the work wrote into
+	 * one goes back into its buffer before a caller reads the buffer as the result. */
+	if (mesa.buffer_textures_writeback != NULL) {
+		mesa.buffer_textures_writeback([[_queue device] mesaDevice]);
+	}
 	_status = RW_CB_COMPLETED;   /* the fence has been paid, and only now */
 }
 

@@ -52,6 +52,79 @@ rw_keep_air(const void *render, NSData *vertex, const char *vertex_name, NSData 
 	rw_kept_count++;
 }
 
+/*
+ * REDWOOD_THUMBS=N, with REDWOOD_SYNC_DRAWS: from commit REDWOOD_THUMB_FROM on (default 1), a
+ * 32x32 sample of every texture a commit drew into or sampled, once each when the commit ends
+ * (reported as work 0), N samples in all. REDWOOD_THUMB_DRAWS=1 samples each draw instead: its
+ * attachments before it ("pre"), its attachments and textures after it; REDWOOD_THUMB_MATCH=TEXT
+ * limits that to pipelines whose vertex or fragment function name contains TEXT.
+ * Each sample is a header line and 32 lines of 32 texels, four characters a texel: R, G, B and A
+ * in their top six bits, as digits of rw_thumb_digits. tools/k90auto/thumbs.py turns them back
+ * into images.
+ */
+#define RW_THUMB 32
+static const char rw_thumb_digits[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static int rw_thumbs_left = -1;
+static unsigned rw_thumb_from;
+static bool rw_thumb_draws;
+static const char *rw_thumb_text;
+
+static bool
+rw_thumbs_wanted(unsigned commit)
+{
+	if (rw_thumbs_left < 0) {
+		const char *count = getenv("REDWOOD_THUMBS"), *from = getenv("REDWOOD_THUMB_FROM");
+
+		rw_thumbs_left = count != NULL ? atoi(count) : 0;
+		rw_thumb_from = from != NULL ? (unsigned)atoi(from) : 1;
+		rw_thumb_draws = getenv("REDWOOD_THUMB_DRAWS") != NULL;
+		rw_thumb_text = getenv("REDWOOD_THUMB_MATCH");
+	}
+	return rw_sync_draws() && rw_thumbs_left > 0 && commit >= rw_thumb_from;
+}
+
+/* Whether a draw of this pipeline is sampled under REDWOOD_THUMB_MATCH; the names are the ones
+ * rw_keep_air kept, so a pipeline that was not kept does not match. */
+static bool
+rw_thumb_match(const void *render)
+{
+	if (rw_thumb_text == NULL)
+		return true;
+	for (unsigned i = 0; i < rw_kept_count; i++)
+		if (rw_kept[i].render == render)
+			return strstr(rw_kept[i].vertex_name, rw_thumb_text) != NULL ||
+			    strstr(rw_kept[i].fragment_name, rw_thumb_text) != NULL;
+	return false;
+}
+
+static void
+rw_thumb(struct rwa_texture *texture, id object, unsigned commit, unsigned work, const char *role,
+	 unsigned slot)
+{
+	static unsigned seq;
+	uint8_t rgba[RW_THUMB * RW_THUMB * 4];
+	char row[RW_THUMB * 4 + 1];
+
+	if (texture == NULL || rw_thumbs_left <= 0 || mesa.texture_thumbnail == NULL ||
+	    mesa.texture_thumbnail(texture, RW_THUMB, RW_THUMB, rgba) != 0)
+		return;
+	rw_thumbs_left--;
+	rw_print("thumb %u: commit %u work %u %s %u: format %lu %lux%lu %p%s\n", seq, commit, work,
+	    role, slot, (unsigned long)[(id<MTLTexture>)object pixelFormat],
+	    (unsigned long)[(id<MTLTexture>)object width],
+	    (unsigned long)[(id<MTLTexture>)object height], (void *)texture,
+	    [(id<MTLTexture>)object buffer] != nil ? " buffer" :
+	    [(id<MTLTexture>)object iosurface] != NULL ? " surface" : "");
+	for (unsigned y = 0; y < RW_THUMB; y++) {
+		for (unsigned x = 0; x < RW_THUMB * 4; x++)
+			row[x] = rw_thumb_digits[rgba[y * RW_THUMB * 4 + x] >> 2];
+		row[RW_THUMB * 4] = '\0';
+		rw_print("thumb %u %02u: %s\n", seq, y, row);
+	}
+	seq++;
+}
+
 /* One attachment: Metal pixel format, size, sample count, whether it is over an IOSurface (linear)
  * or the driver's own memory, and whether the pass clears it. */
 static size_t
@@ -248,4 +321,56 @@ rw_print_threads(void)
 		mach_port_deallocate(mach_task_self(), threads[i]);
 	}
 	vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(thread_t));
+}
+
+/*
+ * REDWOOD_DUMP_AIR=TEXT: the bitcode -[_MTLFunction bitcodeData] gives this driver for the
+ * functions of a render pipeline whose name contains TEXT, once per name and at most 16 of them,
+ * base64 in lines of 96 characters: `air dump NAME: N bytes`, then `air dump NAME K: ...`. A
+ * specialized function's bitcode is what _MTLLibrary made in process, which no file on disk holds;
+ * tools/k90auto/airdump.py writes the modules back out for llvm-dis. The lines are paced at one
+ * per 2 ms: dumping 48 modules at once in render59 lost the first 38 pipelines' log lines.
+ */
+static void
+rw_dump_air(id function)
+{
+	static NSMutableSet *seen;
+	static unsigned left = 16;
+	enum { LINE = 96 };
+	const char *text_wanted = getenv("REDWOOD_DUMP_AIR");
+	SEL bitcode = sel_getUid("bitcodeData");
+
+	if (function == nil || ![function respondsToSelector:bitcode])
+		return;
+	@synchronized ([NSData class]) {
+		NSString *name = [function name];
+		NSData *air = ((NSData *(*)(id, SEL))objc_msgSend)(function, bitcode);
+
+		if (left == 0 || name == nil || air == nil || text_wanted == NULL ||
+		    strstr([name UTF8String], text_wanted) == NULL || [seen containsObject:name])
+			return;
+		if (seen == nil)
+			seen = [[NSMutableSet alloc] init];
+		[seen addObject:name];
+		left--;
+
+		const char *text = [[air base64EncodedStringWithOptions:0] UTF8String];
+		size_t length = strlen(text);
+
+		rw_print("air dump %s: %lu bytes\n", [name UTF8String], (unsigned long)[air length]);
+		for (size_t at = 0; at < length; at += LINE) {
+			rw_print("air dump %s %zu: %.*s\n", [name UTF8String], at / LINE,
+			    (int)MIN((size_t)LINE, length - at), text + at);
+			usleep(2000);
+		}
+	}
+}
+
+static void
+rw_dump_pipeline_air(MTLRenderPipelineDescriptor *descriptor)
+{
+	if (getenv("REDWOOD_DUMP_AIR") == NULL)
+		return;
+	rw_dump_air([descriptor vertexFunction]);
+	rw_dump_air([descriptor fragmentFunction]);
 }
