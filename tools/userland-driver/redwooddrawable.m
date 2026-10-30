@@ -642,6 +642,15 @@ rwd_texture_for_surface(struct rwa_device *mesa_device, void *iosurface, unsigne
 	if (texture == NULL) {
 		return NULL;    /* the library wrote the sentence; it names the GPU's own reason */
 	}
+	/* The A830 samples a linear texture at a pitch of whole 64-byte units (render84: a glyph of
+	 * 224 bytes a row read at 256, sheared). MiniIOSurface pads the rows it allocates; a surface
+	 * over client memory keeps its own pitch, and this names one that will come out sheared. */
+	static unsigned sheared;
+	if (surface.rowBytes % 64 != 0 && sheared++ < 16) {
+		printf("redwooddrawable: %s surface %u: %u bytes a row is not a multiple of 64, and the "
+		    "GPU reads its rows %u bytes apart\n", getprogname(), id, surface.rowBytes,
+		    (surface.rowBytes + 63) & ~63u);
+	}
 	static unsigned said;
 	if (said < 48) {
 		printf("redwooddrawable: %s import %u: surface %u '%c%c%c%c' %ux%u, %u bytes a row "
