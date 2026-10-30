@@ -14,8 +14,10 @@
  *   - a touch keeps it at BOOST_MHZ or faster for BOOST_MS;
  *   - never faster than cpufreq_mhz=N (default CEILING_MHZ) or the sustained frequency the firmware
  *     gives (its sustained level index names another level: 4320 MHz for 4089.6);
- *   - at HOT_TENTHS on any sensor of its cluster it goes to its slowest level until under
- *     COOL_TENTHS, and without a valid reading it stays there. A sensor whose valid bit is clear
+ *   - a thermal limit caps the level, moved a step at a time the way Linux's step_wise thermal
+ *     governor moves a cooling device: one level down each tick that any sensor of the cluster reads
+ *     HOT_TENTHS or more, one level up every RISE_TICKS ticks under RELEASE_TENTHS, held in between;
+ *     at CUT_TENTHS, or without a valid reading, the limit is the slowest level at once. A sensor whose valid bit is clear
  *     stands by its last reading for TSENS_STALE_MS before it leaves the maximum, because that bit
  *     follows the sensor's own measurement cycle and not its health. These are far under the stock
  *     trips (95 C for cpu-1-*): the phone is not to get near those.
@@ -82,7 +84,9 @@ extern bool ml_cpu_idle_time(int cpu_id, uint64_t *idle);
 #define TSENS_STALE_MS          200     /* a reading older than this no longer stands in for a missing one */
 #define TSENS_SENSORS           15      /* sensors are numbered from 1 and the widest group ends at 14 */
 #define HOT_TENTHS              700
-#define COOL_TENTHS             600
+#define RELEASE_TENTHS          650
+#define CUT_TENTHS              750
+#define RISE_TICKS              4       /* 200 ms a level on the way back up */
 #define STEP_TENTHS             50      /* a tick-to-tick move of the group maximum this large is counted */
 #define SWING_TENTHS            100     /* a sensor whose own spread over a window reaches this is counted */
 #define NO_READING              (-10000)
@@ -108,7 +112,8 @@ static bool governing;
 static struct {
 	bool ours, known, refused, hot;
 	uint32_t count, key[MAX_LEVELS], khz[MAX_LEVELS];       /* key: what LEVEL_SET takes (index or value) */
-	uint32_t boot, ceiling, boost, now;                     /* indices into key[] and khz[] */
+	uint32_t boot, ceiling, boost, now, limit;              /* indices into key[] and khz[]; limit: the thermal one */
+	uint32_t cool_ticks;                                    /* ticks under RELEASE_TENTHS since the limit last moved */
 	uint64_t low_since;                                     /* since when a slower level would do; 0: not */
 	uint64_t at[MAX_LEVELS], asking;                        /* time at each level and in LEVEL_SET, since the last report */
 	uint32_t changes, hot_entries;                          /* (hot_entries: times it reached HOT_TENTHS) */
@@ -399,6 +404,7 @@ perf_describe(uint32_t d, uint32_t version)
 		pd->boost = pd->khz[i] <= BOOST_MHZ * 1000 ? i : pd->boost;
 	}
 	pd->now = pd->boot;
+	pd->limit = pd->ceiling;
 	tell("cpufreq: SCMI domain %u: %u levels (MHz/%s):%s\n", d, pd->count, indexing ? "index" : "value", list);
 	if (pd->count == 0 || status != 0 || words < 1) {
 		tell("cpufreq: SCMI domain %u: level unknown (status %d)\n", d, status);
@@ -443,15 +449,28 @@ perf_want(uint32_t d, uint32_t busy, uint64_t now, uint64_t boost_abs, bool vali
 	uint64_t touched = os_atomic_load(&touch_at, relaxed);
 	bool was_hot = pd->hot;
 
-	pd->hot = !valid || t >= HOT_TENTHS || (pd->hot && t >= COOL_TENTHS);
+	pd->hot = !valid || t >= HOT_TENTHS;
 	pd->hot_entries += pd->hot && !was_hot;
 	pd->hot_by_temp += pd->hot && !was_hot && valid;
 	pd->hot_by_no_reading += pd->hot && !was_hot && !valid;
-	if (pd->hot) {
-		return 0;
+	/*
+	 * Until 12377-cmd33 a hot tick sent the domain to its slowest level until every sensor was under
+	 * 60 C. On kernel-12377-cmd32-bo3 cluster 1 read 70 C on 2 ticks in 30 s and then spent 63-75%
+	 * of the window at 1017 MHz cooling that far; page swipes ran at 23 frames a second in those
+	 * stretches and at 54 outside them.
+	 */
+	if (!valid || t >= CUT_TENTHS) {
+		pd->limit = 0;
+		pd->cool_ticks = 0;
+	} else if (t >= HOT_TENTHS) {
+		pd->limit -= pd->limit > 0;
+		pd->cool_ticks = 0;
+	} else if (t < RELEASE_TENTHS && pd->limit < pd->ceiling && ++pd->cool_ticks >= RISE_TICKS) {
+		pd->limit++;
+		pd->cool_ticks = 0;
 	}
 	if (mode == 3) {
-		return pd->ceiling;
+		return pd->limit;
 	}
 	while (want < pd->ceiling && pd->khz[want] < khz) {
 		want++;
@@ -459,7 +478,7 @@ perf_want(uint32_t d, uint32_t busy, uint64_t now, uint64_t boost_abs, bool vali
 	if (touched != 0 && now - touched < boost_abs && want < pd->boost) {
 		want = pd->boost;
 	}
-	return want;
+	return MIN(want, pd->limit);
 }
 
 /*
@@ -702,7 +721,7 @@ governor_thread(void *arg __unused, wait_result_t wr __unused)
 				continue;
 			}
 			want = perf_want(d, busy[d], now, boost_abs, valid, t);
-			if (want > pd->now || pd->hot) {
+			if (want > pd->now || pd->limit < pd->now) {
 				pd->low_since = 0;
 				perf_go(d, want, now, &level_since[d]);
 			} else if (want < pd->now) {

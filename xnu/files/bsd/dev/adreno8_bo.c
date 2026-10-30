@@ -89,9 +89,17 @@ bo_range(uint64_t address, uint64_t size)
  * range when the rest has no room. The search used to start at the lowest free page, and every
  * small buffer given back moved that down, so a larger reservation then stepped page by page
  * through every page in use above it: adreno8_space_find_range was about a fifth of SpringBoard's
- * processor time while it swiped pages (kernel-12377-cmd26-wait1). With 3.25 GB of addresses and
- * a few hundred MB in use, the room past the last buffer is free nearly every time.
+ * processor time while it swiped pages (kernel-12377-cmd26-wait1). With a few hundred MB in use,
+ * the room past the last buffer is free nearly every time.
+ *
+ * The cursor goes back to the start once it passes BO_WINDOW, so the addresses in use, and the
+ * level-2 tables they need, stay near what is live. Walking all 3.25 GB needs about 1670 tables
+ * (one per 2 MB); the space holds 1024, and the reservation that found none closed submissions and
+ * took backboardd and SpringBoard down after a few minutes of swiping (kernel-12377-cmd31-warm5,
+ * "external BO reservation tables failed"; kernel-12377-cmd27-bo1's backboardd SIGSEGV). A live
+ * set larger than the window still finds room past it: the search runs to the end of the range.
  */
+#define BO_WINDOW       (512u << 20)
 static uint32_t bo_free_from = ADRENO8_GPU_IOVA_START;
 
 /*
@@ -193,14 +201,16 @@ adreno8_bo_reserve(uint64_t size)
 	    (!adreno8_space_find_range(&adreno8_gpu_space, from, ADRENO8_GPU_IOVA_END, (uint32_t)span, SMMU_GRANULE, &address) &&
 	    (from == ADRENO8_GPU_IOVA_START || !adreno8_space_find_range(&adreno8_gpu_space, ADRENO8_GPU_IOVA_START,
 	    ADRENO8_GPU_IOVA_END, (uint32_t)span, SMMU_GRANULE, &address)))) {
-		bo_fail("IOVA reservation");
+		printf("adreno8: no GPU addresses for a buffer of %llu KB: this one buffer is refused\n", size >> 10);
 		return 0;
 	}
-	/* Populate tables before marking any leaf. A partial table allocation is
-	 * retained on failure and no physical BO page has been exposed yet. */
+	/* Populate tables before marking any leaf. A partial table allocation is retained on failure
+	 * and no physical BO page has been exposed yet, so only this buffer is refused: closing all
+	 * submissions here turned one missing table into a dead compositor (kernel-12377-cmd31-warm5). */
 	for (uint64_t at = 0; at < span; at += SMMU_GRANULE) {
 		if (!adreno8_space_prepare_page(&adreno8_gpu_space, address + at)) {
-			bo_fail("reservation tables");
+			printf("adreno8: no page table for GPU address %#llx: a buffer of %llu KB is refused\n",
+			    address + at, size >> 10);
 			return 0;
 		}
 	}
@@ -211,7 +221,7 @@ adreno8_bo_reserve(uint64_t size)
 	if (address + size < bo_mapped_low) bo_mapped_low = address + size;
 	if (address + span > bo_mapped_high) bo_mapped_high = address + span;
 	bo_note_reserve(address, size);
-	bo_free_from = address + span < ADRENO8_GPU_IOVA_END ? (uint32_t)(address + span) : ADRENO8_GPU_IOVA_START;
+	bo_free_from = address + span < ADRENO8_GPU_IOVA_START + BO_WINDOW ? (uint32_t)(address + span) : ADRENO8_GPU_IOVA_START;
 	return address;
 }
 
