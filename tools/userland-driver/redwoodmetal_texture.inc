@@ -108,6 +108,7 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 	if (_iosurface != NULL) {
 		CFRelease(_iosurface);
 	}
+	[_parentTexture release];
 	[super dealloc];
 }
 
@@ -125,7 +126,7 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 - (NSUInteger)usage                { return _shape.usage; }
 - (BOOL)isFramebufferOnly          { return NO; }
 - (BOOL)allowGPUOptimizedContents  { return NO; }
-- (id)parentTexture                { return nil; }
+- (id)parentTexture                { return _parentTexture; }
 - (NSUInteger)parentRelativeLevel  { return 0; }
 - (NSUInteger)parentRelativeSlice  { return 0; }
 - (id)buffer                       { return nil; }
@@ -253,28 +254,61 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 	return YES;
 }
 
-/* A view of a texture is another texture over the same memory, and the compiler library has
- * no call for that yet; nil is the honest answer, and it is better than a view that aliases
- * nothing. */
-- (id)newTextureViewWithPixelFormat:(NSUInteger)format { (void)format; return nil; }
+/* A view of a texture is another texture over the same resource (rwa_texture_view), read
+ * and rendered in its own format. It keeps the texture it came from, which -parentTexture
+ * answers. */
+- (id)newTextureViewWithPixelFormat:(NSUInteger)format
+{
+	char why[256] = { 0 };
+	struct rwa_texture_shape shape = _shape;
+	struct rwa_texture *view;
+	RedwoodMetalTexture *texture;
+
+	if (mesa.texture_view == NULL) {
+		RW_ONCE("this compiler library has no rwa_texture_view; a texture view is nil\n");
+		return nil;
+	}
+	view = mesa.texture_view(_texture, (unsigned)format, why, sizeof(why));
+	if (view == NULL) {
+		rw_print("texture view: %s\n", why);
+		return nil;
+	}
+	shape.pixel_format = (unsigned)format;
+	texture = [[RedwoodMetalTexture alloc] initWithRedwoodDevice:_owner texture:view
+							       shape:&shape iosurface:NULL plane:0];
+	if (texture != nil) {
+		texture->_parentTexture = [self retain];
+	}
+	return texture;
+}
 
 /*
  * THE REST OF WHAT <MTLTexture>, <MTLTextureSPI>, <MTLResource> AND <MTLResourceSPI>
  * REQUIRE: 27 methods with no answer anywhere in this chain before this section. The same
  * three kinds as everywhere else -- served, true by construction, or refused out loud.
  *
- * The two view calls are the only ones here that hand nothing back, and they say so: a view
- * is a second texture over the first one's memory, and rwa has no call that makes one. A
- * view that aliased nothing would be found much later, by a picture that did not change.
+ * A view of part of a texture, or as another type, is refused out loud: rwa_texture_view
+ * makes a view of every level and slice, and a view over less would read the wrong ones.
  */
 - (id)newTextureViewWithPixelFormat:(NSUInteger)format
 			textureType:(NSUInteger)type
 			     levels:(NSRange)levels
 			     slices:(NSRange)slices
 {
-	(void)format; (void)type; (void)levels; (void)slices;
-	RW_ONCE("a texture view is not implemented (the compiler library has no "
-		"call that makes a second texture over the same memory); nil\n");
+	NSUInteger layers = _shape.type == 3 || _shape.type == 4 ? 6 * MAX(_shape.array_length, 1)
+								  : MAX(_shape.array_length, 1);
+
+	if (type == _shape.type && levels.location == 0 &&
+	    levels.length == MAX(_shape.mip_levels, 1) && slices.location == 0 &&
+	    slices.length == layers) {
+		return [self newTextureViewWithPixelFormat:format];
+	}
+	rw_print("texture view: type %lu levels %lu+%lu slices %lu+%lu of a type %u texture "
+		 "of %u levels and %lu slices; only a view of the whole texture is made\n",
+		 (unsigned long)type, (unsigned long)levels.location,
+		 (unsigned long)levels.length, (unsigned long)slices.location,
+		 (unsigned long)slices.length, _shape.type, _shape.mip_levels,
+		 (unsigned long)layers);
 	return nil;
 }
 - (id)newTextureViewWithPixelFormat:(NSUInteger)format

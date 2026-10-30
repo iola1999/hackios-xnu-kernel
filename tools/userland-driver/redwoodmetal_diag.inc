@@ -120,19 +120,45 @@ rw_describe_draw(RedwoodMetalWork *work, const void *render, unsigned commit, un
 	rw_print("%s, %u textures, %u buffers\n", text, work->textureCount, work->count);
 }
 
+/* `why` names the dump: "hung" for the draw the GPU did not finish, "refused" for a draw the
+ * library would not run (stage names "hung-fragment", "refused-fragment" and so on). */
 static void
-rw_dump_kept_air(const void *render)
+rw_dump_kept_air(const void *render, const char *why)
 {
 	for (unsigned i = 0; i < rw_kept_count; i++) {
 		if (rw_kept[i].render != render)
 			continue;
-		air_dump([rw_kept[i].vertex bytes], [rw_kept[i].vertex length], "hung-vertex",
-			 rw_kept[i].vertex_name, false);
-		air_dump([rw_kept[i].fragment bytes], [rw_kept[i].fragment length], "hung-fragment",
+		char fragment[32], vertex[32];
+		snprintf(fragment, sizeof(fragment), "%s-fragment", why);
+		snprintf(vertex, sizeof(vertex), "%s-vertex", why);
+		/* Fragment first: the process can be killed before the dump ends, and the hangs
+		 * so far came down to the fragment shader. */
+		air_dump([rw_kept[i].fragment bytes], [rw_kept[i].fragment length], fragment,
 			 rw_kept[i].fragment_name, false);
+		air_dump([rw_kept[i].vertex bytes], [rw_kept[i].vertex length], vertex,
+			 rw_kept[i].vertex_name, false);
 		return;
 	}
 	rw_print("sync: pipeline %p was not kept, so its shaders cannot be printed\n", render);
+}
+
+/* The shaders of a pipeline whose draw the library refused, once per pipeline: the refusal names
+ * a binding, and only the module says how the shader declares it. */
+static void
+rw_dump_refused_air(const void *render)
+{
+	static const void *dumped[16];
+	static unsigned count;
+
+	if (!rw_sync_draws())
+		return;
+	for (unsigned i = 0; i < count; i++)
+		if (dumped[i] == render)
+			return;
+	if (count == sizeof(dumped) / sizeof(dumped[0]))
+		return;
+	dumped[count++] = render;
+	rw_dump_kept_air(render, "refused");
 }
 
 /* "image+0xoffset" for an address inside a loaded image, the bare address otherwise. The offset is

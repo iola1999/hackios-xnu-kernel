@@ -492,7 +492,8 @@ gpu_direct_ring_timeout_dump(void)
 /* After HFI 150 the GMU leaves GX up for the host's snapshot, as KGSL takes one before its
  * recovery. Per pipe, each IB level with a base is printed with the words before and after the
  * CP's position, base + 4 * (INIT_SIZE - REM_SIZE), so the packet it stopped in can be decoded
- * against the submission. */
+ * against the submission. BR's IB1 is also printed whole, with the buffers it names
+ * (adreno8_bo_dump_tree), so the hung draw's register state can be rebuilt. */
 void
 adreno8_gpu_hang_dump(void)
 {
@@ -503,6 +504,12 @@ adreno8_gpu_hang_dump(void)
 	static const struct { const char *name; uint32_t base; } levels[] = {
 		{ "IB1", GEN8_CP_IB1_BASE_PIPE }, { "IB2", GEN8_CP_IB2_BASE_PIPE }, { "IB3", GEN8_CP_IB3_BASE_PIPE },
 		{ "SDS", GEN8_CP_SDS_BASE_PIPE }, { "MRB", GEN8_CP_MRB_BASE_PIPE } };
+	static bool dumped;
+
+	/* Both the HFI 150 handler and the timeout report ask; the first one reads. */
+	if (dumped)
+		return;
+	dumped = true;
 
 	if (gpu_state == GPU_FAILED || !GMU_PWR_GX_UP(gpu_gmu_read(GMU_PWR_CLK_STATUS))) {
 		printf("adreno8: hang dump: GX is off, no CP registers\n");
@@ -532,6 +539,8 @@ adreno8_gpu_hang_dump(void)
 
 			snprintf(what, sizeof(what), "pipe %u %s at -%u", pipe, levels[i].name, before);
 			adreno8_bo_dump_words(what, at - 4ull * before, before + after);
+			if (pipe == A8_PIPE_BR && levels[i].base == GEN8_CP_IB1_BASE_PIPE)
+				adreno8_bo_dump_tree(base, init);
 		}
 	}
 	(void)gpu_aperture(0);

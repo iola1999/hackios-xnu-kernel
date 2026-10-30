@@ -50,6 +50,29 @@ struct rwa_texture *rwa_texture_from_buffer(struct rwa_device *device,
                                             unsigned row_bytes, char *why, size_t why_size);
 void rwa_buffer_textures_refresh(struct rwa_device *device);
 
+/* A function linked into the fragment stage (MTLLinkedFunctions), node by node: the same
+ * layout as air_metal.h's, see rwa_render_create_linked there. */
+struct rwa_stitch_node {
+	const void *bitcode;
+	size_t size;
+	const char *function;
+	unsigned num_args;
+	const int *args;
+	unsigned num_after;
+	const unsigned *after;
+};
+struct rwa_linked_function {
+	const char *name;
+	unsigned num_nodes;
+	const struct rwa_stitch_node *nodes;
+	unsigned output;
+};
+
+/* A second texture over the same resource, read and rendered as mtl_format: Metal's
+ * -newTextureViewWithPixelFormat:. Every level and slice; texels of the same size. */
+struct rwa_texture *rwa_texture_view(struct rwa_texture *texture, unsigned mtl_format,
+                                     char *why, size_t why_size);
+
 #ifdef __cplusplus
 }
 #endif

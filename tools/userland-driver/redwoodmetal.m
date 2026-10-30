@@ -1086,6 +1086,7 @@ struct gem_close { uint32_t handle, pad; };
 	CFTypeRef _iosurface;
 	NSUInteger _iosurfacePlane;
 	int _responsibleProcess;   /* as on the buffer: accounting, not behaviour */
+	id _parentTexture;         /* the texture this one is a view of, retained */
 }
 - (instancetype)initWithRedwoodDevice:(RedwoodMetalDevice *)device
 	texture:(struct rwa_texture *)texture shape:(const struct rwa_texture_shape *)shape
@@ -1157,6 +1158,8 @@ struct gem_close { uint32_t handle, pad; };
 		   deallocator:(void (^)(void *, NSUInteger))deallocator;
 @end
 
+#include "redwoodmetal_stitch.inc"
+
 @implementation RedwoodMetalDevice
 
 + (void)load
@@ -1181,6 +1184,7 @@ struct gem_close { uint32_t handle, pad; };
 - (instancetype)initWithAcceleratorPort:(io_service_t)port
 {
 	ensure_spi([self class]);
+	rw_stitch_install_hooks();
 
 	self = [super init];
 	if (self == nil) {
@@ -1215,11 +1219,13 @@ struct gem_close { uint32_t handle, pad; };
 		_mesa = mesa.device_open(why, sizeof(why));
 		rw_print("the compiler library %s\n",
 		         _mesa != NULL ? mesa.device_name(_mesa) : why);
-		/* freedreno reads its debug switch once, when the screen is made, and says
-		 * nothing about it; this line is the only record that a job's FD_MESA_DEBUG
-		 * (package.py JOB_ENV) reached the process. */
-		if (getenv("FD_MESA_DEBUG") != NULL)
-			rw_print("FD_MESA_DEBUG=%s\n", getenv("FD_MESA_DEBUG"));
+		/* freedreno reads its debug switches without saying so; these lines are the only
+		 * record that a job's FD_MESA_DEBUG or IR3_SHADER_DEBUG (package.py JOB_ENV) reached
+		 * the process. */
+		static const char *const switches[] = { "FD_MESA_DEBUG", "IR3_SHADER_DEBUG" };
+		for (unsigned i = 0; i < sizeof(switches) / sizeof(switches[0]); i++)
+			if (getenv(switches[i]) != NULL)
+				rw_print("%s=%s\n", switches[i], getenv(switches[i]));
 	}
 
 	/* The struct Metal reads out of this device by raw pointer, filled here rather than on
@@ -1357,20 +1363,34 @@ struct gem_close { uint32_t handle, pad; };
 	id vertex = [descriptor vertexFunction];
 	id fragment = [descriptor fragmentFunction];
 
-	if (fragment == nil) {
-		return [self fail:error with:@"the descriptor has no fragment function, and this "
-					     @"driver has nothing to draw without one"];
+	/* a specialization proxy (redwoodmetal_stitch.inc) answers to the specialized name; the
+	 * module's entry point is the function underneath */
+	if ([vertex respondsToSelector:@selector(redwoodUnspecializedFunction)]) {
+		vertex = [vertex redwoodUnspecializedFunction];
 	}
-	if (![fragment respondsToSelector:bitcode] ||
+	if ([fragment respondsToSelector:@selector(redwoodUnspecializedFunction)]) {
+		fragment = [fragment redwoodUnspecializedFunction];
+	}
+
+	rw_stitch_dump_linked(descriptor);
+	/* No fragment function is a depth/stencil-only pipeline (RenderBox's path_edges); the
+	 * library gives it an empty fragment stage and writes no colour. */
+	if (fragment == nil && vertex == nil) {
+		return [self fail:error with:@"the descriptor has neither a vertex nor a fragment "
+					     @"function"];
+	}
+	if ((fragment != nil && ![fragment respondsToSelector:bitcode]) ||
 	    (vertex != nil && ![vertex respondsToSelector:bitcode])) {
 		return [self fail:error with:@"a function in this descriptor does not answer "
 					     @"bitcodeData, so its AIR cannot be read"];
 	}
-	NSData *fragment_air = ((NSData *(*)(id, SEL))objc_msgSend)(fragment, bitcode);
+	NSData *fragment_air = fragment != nil ?
+	    ((NSData *(*)(id, SEL))objc_msgSend)(fragment, bitcode) : nil;
 	NSData *vertex_air = vertex != nil ?
 	    ((NSData *(*)(id, SEL))objc_msgSend)(vertex, bitcode) : nil;
+	const char *fragment_name = fragment != nil ? [[fragment name] UTF8String] : "(none)";
 
-	if (fragment_air == nil || [fragment_air length] == 0) {
+	if (fragment != nil && (fragment_air == nil || [fragment_air length] == 0)) {
 		return [self fail:error with:@"the fragment function has no bitcode"];
 	}
 
@@ -1544,12 +1564,27 @@ struct gem_close { uint32_t handle, pad; };
 	 * while it animates -- ten a second in one Control Center pull -- and if that is where
 	 * a frame's time goes, the answer is a pipeline it can reuse rather than a faster one. */
 	uint64_t compile_began = mach_absolute_time();
-	struct rwa_render *render = mesa.render_create(_mesa,
-	    vertex_air != nil ? [vertex_air bytes] : NULL,
-	    vertex_air != nil ? [vertex_air length] : 0,
-	    vertex != nil ? [[vertex name] UTF8String] : NULL,
-	    [fragment_air bytes], [fragment_air length], [[fragment name] UTF8String],
-	    &shape, &info, why, sizeof(why));
+	struct rwa_linked_function linked[RW_LINKED_MAX];
+	NSMutableData *linked_scratch = [NSMutableData data];
+	unsigned num_linked = mesa.render_create_linked != NULL
+	    ? rw_linked_fragment_functions(descriptor, linked, RW_LINKED_MAX, linked_scratch) : 0;
+	struct rwa_render *render = mesa.render_create_linked != NULL
+	    ? mesa.render_create_linked(_mesa,
+		  vertex_air != nil ? [vertex_air bytes] : NULL,
+		  vertex_air != nil ? [vertex_air length] : 0,
+		  vertex != nil ? [[vertex name] UTF8String] : NULL,
+		  fragment_air != nil ? [fragment_air bytes] : NULL,
+		  fragment_air != nil ? [fragment_air length] : 0,
+		  fragment != nil ? fragment_name : NULL, linked, num_linked, &shape, &info, why,
+		  sizeof(why))
+	    : mesa.render_create(_mesa,
+		  vertex_air != nil ? [vertex_air bytes] : NULL,
+		  vertex_air != nil ? [vertex_air length] : 0,
+		  vertex != nil ? [[vertex name] UTF8String] : NULL,
+		  fragment_air != nil ? [fragment_air bytes] : NULL,
+		  fragment_air != nil ? [fragment_air length] : 0,
+		  fragment != nil ? fragment_name : NULL, &shape, &info, why, sizeof(why));
+	rw_linked_free(linked_scratch);
 	{
 		static unsigned long built;
 		struct mach_timebase_info tb;
@@ -1569,7 +1604,7 @@ struct gem_close { uint32_t handle, pad; };
 			         "fragment %s\n", built, us,
 			         render != NULL ? "ok" : "refused", (void *)render,
 			         vertex != nil ? [[vertex name] UTF8String] : "(none)",
-			         [[fragment name] UTF8String]);
+			         fragment_name);
 		}
 	}
 
@@ -1577,8 +1612,10 @@ struct gem_close { uint32_t handle, pad; };
 		/* Both modules go out, whichever of them the sentence names: the driver cannot
 		 * tell from here which stage the frontend gave up on, and a dump of the wrong
 		 * one is a boot spent learning nothing. */
-		air_fail_dump([fragment_air bytes], [fragment_air length], "fragment",
-		    [[fragment name] UTF8String]);
+		if (fragment_air != nil) {
+			air_fail_dump([fragment_air bytes], [fragment_air length], "fragment",
+			    fragment_name);
+		}
 		if (vertex_air != nil) {
 			air_fail_dump([vertex_air bytes], [vertex_air length], "vertex",
 			    [[vertex name] UTF8String]);
@@ -1595,7 +1632,7 @@ struct gem_close { uint32_t handle, pad; };
 		return [self fail:error with:[NSString stringWithUTF8String:why]];
 	}
 	rw_keep_air(render, vertex_air, vertex != nil ? [[vertex name] UTF8String] : NULL, fragment_air,
-		    [[fragment name] UTF8String]);
+		    fragment_name);
 	/* and what the library made of it, in GALLIUM's bits: for any mask but All, None,
 	 * green|blue and red|alpha these nibbles must DIFFER from the writeMask printed
 	 * above, because the two enumerations number their channels in opposite directions.
@@ -2861,105 +2898,7 @@ struct gem_close { uint32_t handle, pad; };
 
 #include "redwoodmetal_texture.inc"
 
-@implementation RedwoodMetalSampler
-
-- (instancetype)initWithRedwoodDevice:(RedwoodMetalDevice *)device
-			      sampler:(struct rwa_sampler *)sampler
-			   descriptor:(id)descriptor
-{
-	/* the initialiser AGXA11FamilySampler sends to super; the descriptor is passed on
-	 * because the base keeps it and the pipeline-state assertions taught us not to send
-	 * nil to one of these */
-	self = [super initWithDevice:device samplerDescriptor:descriptor];
-	if (self == nil) {
-		mesa.sampler_destroy(sampler);
-		return nil;
-	}
-	_sampler = sampler;
-	return self;
-}
-
-- (void)dealloc
-{
-	if (_sampler != NULL) {
-		mesa.sampler_destroy(_sampler);
-	}
-	[super dealloc];
-}
-
-- (struct rwa_sampler *)mesaSampler { return _sampler; }
-
-@end
-
-@implementation RedwoodMetalDepthStencilState
-
-- (instancetype)initWithRedwoodDevice:(RedwoodMetalDevice *)device
-				state:(struct rwa_depth_stencil *)state
-			   descriptor:(MTLDepthStencilDescriptor *)descriptor
-{
-	/* The base class's own designated initialiser, which validates the descriptor,
-	 * sends `init` to super and fills _device and _label (0x181a29b38). The descriptor
-	 * is handed on for the same reason the sampler's is: the base reads it, and a nil
-	 * there is reported by Apple's own validation. */
-	self = [super initWithDevice:device depthStencilDescriptor:descriptor];
-	if (self == nil) {
-		mesa.depth_stencil_destroy(state);
-		return nil;
-	}
-	_state = state;
-
-	/*
-	 * The four answers <MTLDepthStencilStateSPI> requires and the base class gives as
-	 * NO (nil-stubs at 0x181b1b5e0 and its neighbours). They are the only methods of
-	 * this object that are a statement about what it will do, so they are derived from
-	 * the descriptor rather than left at a default that would be false for every state
-	 * that writes anything.
-	 *
-	 * "Reads" means the test consults the buffer: MTLCompareFunctionAlways consults
-	 * nothing, anything else does. For the stencil an operation other than Keep also
-	 * reads it, because incrementing or inverting a value means fetching it first.
-	 */
-	MTLStencilDescriptor *faces[2] = { [descriptor frontFaceStencil],
-					   [descriptor backFaceStencil] };
-
-	_writesDepth = [descriptor isDepthWriteEnabled];
-	_readsDepth = [descriptor depthCompareFunction] != MTLCompareFunctionAlways;
-	for (unsigned i = 0; i < 2; i++) {
-		MTLStencilDescriptor *f = faces[i];
-		BOOL keeps;
-
-		if (f == nil) {
-			continue;   /* null_resettable, so this is Metal's default: no stencil */
-		}
-		keeps = [f stencilFailureOperation] == MTLStencilOperationKeep &&
-			[f depthFailureOperation] == MTLStencilOperationKeep &&
-			[f depthStencilPassOperation] == MTLStencilOperationKeep;
-		if ([f stencilCompareFunction] != MTLCompareFunctionAlways || !keeps) {
-			_readsStencil = YES;
-		}
-		if (!keeps && [f writeMask] != 0) {
-			_writesStencil = YES;
-		}
-	}
-	return self;
-}
-
-- (void)dealloc
-{
-	if (_state != NULL) {
-		mesa.depth_stencil_destroy(_state);
-	}
-	[super dealloc];
-}
-
-- (struct rwa_depth_stencil *)mesaDepthStencil { return _state; }
-
-- (BOOL)readsDepth    { return _readsDepth; }
-- (BOOL)writesDepth   { return _writesDepth; }
-- (BOOL)readsStencil  { return _readsStencil; }
-- (BOOL)writesStencil { return _writesStencil; }
-
-@end
+#include "redwoodmetal_state.inc"
 
 @implementation RedwoodMetalComputePipeline
 

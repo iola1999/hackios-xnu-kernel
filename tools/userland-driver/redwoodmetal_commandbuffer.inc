@@ -588,6 +588,11 @@ static pthread_mutex_t rw_commit_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 		}
 		for (unsigned i = 0; i < work->textureCount; i++) {
 			textures[i] = [work->textures[i] mesaTexture];
+			if (textures[i] == NULL && work->textures[i] != nil) {
+				rw_print("texture %u of this dispatch is a %s with no texture in the "
+				         "compiler library, so it cannot be bound\n", i,
+				         object_getClassName(work->textures[i]));
+			}
 		}
 		for (unsigned i = 0; i < work->samplerCount; i++) {
 			samplers[i] = [work->samplers[i] mesaSampler];
@@ -749,7 +754,7 @@ done:
 			 "%u textures, %u buffers: %s\n", commit_count, index,
 			 (void *)[work->render render], work->colorCount, work->textureCount, work->count,
 			 why);
-		rw_dump_kept_air([work->render render]);
+		rw_dump_kept_air([work->render render], "hung");
 		[self failWith:why];
 		return NO;
 	}
@@ -863,6 +868,11 @@ done:
 	}
 	for (unsigned i = 0; i < work->textureCount; i++) {
 		fragment_textures[i] = [work->textures[i] mesaTexture];
+		if (fragment_textures[i] == NULL && work->textures[i] != nil) {
+			rw_print("texture %u of this draw is a %s with no texture in the compiler "
+			         "library, so it cannot be bound\n", i,
+			         object_getClassName(work->textures[i]));
+		}
 	}
 	for (unsigned i = 0; i < work->samplerCount; i++) {
 		fragment_samplers[i] = [work->samplers[i] mesaSampler];
@@ -962,6 +972,7 @@ done:
 
 	if (rd_rc != 0) {
 		rw_print("the draw failed: %s\n", why);
+		rw_dump_refused_air([work->render render]);
 		[self failWith:why];
 		return NO;
 	}

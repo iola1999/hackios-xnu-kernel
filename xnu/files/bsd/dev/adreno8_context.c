@@ -19,7 +19,10 @@
 /* NO_GMEM_ALLOC, PREAMBLE, PER_CONTEXT_TS, NOTIFY, priority 1 (RB0), GL. */
 #define CONTEXT_FLAGS 0x00101072u
 #define CONTEXT_NOTIFY (1u << 5)
-#define CONTEXT_WAIT_NS 200000000ULL
+/* Every wait for a timestamp, including an external buffer's unmap. The GMU's own hang report
+ * (HFI 150, with the timestamps and a CP dump) has arrived on device both before and after two
+ * seconds; a wait that gives up sooner closes submissions with neither. */
+#define CONTEXT_WAIT_NS 2000000000ULL
 #define CONTEXT_INFLIGHT_MAX 8u
 #define CONTEXT_CONSUME_NS 20000000ULL
 
@@ -145,7 +148,12 @@ context_wait(uint32_t timestamp)
 	while (!adreno8_context_done(timestamp)) {
 		if (context_state == CONTEXT_FAILED) return false;
 		absolutetime_to_nanoseconds(mach_absolute_time() - start, &elapsed);
-		if (elapsed >= CONTEXT_WAIT_NS) return context_fail("EOP timeout");
+		if (elapsed >= CONTEXT_WAIT_NS) {
+			printf("adreno8: EOP timeout waiting for %u: last %u, EOP %u\n", timestamp, context_last,
+			    adreno8_rd(context_timestamp_view + CONTEXT_EOP));
+			adreno8_gpu_hang_dump();
+			return context_fail("EOP timeout");
+		}
 		adreno8_sleep_us(100);
 	}
 	return true;

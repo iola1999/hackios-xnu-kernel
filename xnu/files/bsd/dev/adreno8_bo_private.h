@@ -24,5 +24,9 @@ bool adreno8_bo_release(uint64_t address, uint64_t size);
 /* Print `count` dwords from GPU address `address` through the CB0 page table, for a hang report.
  * Pages that are not mapped are named, not read. */
 void adreno8_bo_dump_words(const char *what, uint64_t address, uint32_t count);
+/* Print the command buffer at `base`, `count` dwords, and the IBs and draw-state groups it names,
+ * three levels down; then the fragment stage's bindless descriptors in Mesa's fb-read slots. Once
+ * per boot, for a hang report. */
+void adreno8_bo_dump_tree(uint64_t base, uint32_t count);
 
 #endif

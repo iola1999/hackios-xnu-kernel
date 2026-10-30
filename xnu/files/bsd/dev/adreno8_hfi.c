@@ -3,6 +3,7 @@
 #include "adreno8_hwsched_private.h"
 #include "adreno8_memory_private.h"
 #include "adreno8_clock_private.h"
+#include "adreno8_context_private.h"
 #include <sys/redwood_input.h>
 
 #define printf adreno8_say
@@ -231,6 +232,10 @@ adreno8_hfi_pump(uint32_t request, bool *ack, unsigned *notices)
 						used += (unsigned)snprintf(line + used, sizeof(line) - used, " %08x", resp[i]);
 					printf("adreno8: %u: HFI %u word %d:%s\n", adreno8_step, received_id, at, line);
 				}
+				/* The GMU reports the hang here, often before any wait times out and while
+				 * GX is still up, so the CP state is read now. */
+				if (received_id == 150)
+					adreno8_gpu_hang_dump();
 				return false;
 			} else if (type == 0 && received_id == 133) {
 				/* EOP memory remains the completion check; this packet is a notification. */

@@ -184,6 +184,19 @@ adreno8_bo_unmap(uint64_t address, uint64_t size)
 
 extern unsigned int ml_phys_read_word(vm_offset_t paddr);
 
+/* The dword at GPU address `at`, read through the CB0 page table; false for an unmapped page. */
+static bool
+bo_word(uint64_t at, uint32_t *word)
+{
+	uint64_t *entry = at < ADRENO8_GPU_IOVA_END ?
+	    adreno8_space_entry(&adreno8_gpu_space, (uint32_t)(at & ~(uint64_t)SMMU_GRANULE_MASK)) : NULL;
+
+	if (!entry || !(*entry & 1))
+		return false;
+	*word = ml_phys_read_word((vm_offset_t)((*entry & PTE_ADDRESS) | (at & SMMU_GRANULE_MASK)));
+	return true;
+}
+
 void
 adreno8_bo_dump_words(const char *what, uint64_t address, uint32_t count)
 {
@@ -193,16 +206,114 @@ adreno8_bo_dump_words(const char *what, uint64_t address, uint32_t count)
 		int used = snprintf(line, sizeof(line), "adreno8: %s %#llx:", what, address + 4ull * i);
 
 		for (uint32_t j = i; j < count && j < i + 8 && used < (int)sizeof(line) - 10; j++) {
-			uint64_t at = address + 4ull * j;
-			uint64_t *entry = at < ADRENO8_GPU_IOVA_END ?
-			    adreno8_space_entry(&adreno8_gpu_space, (uint32_t)(at & ~(uint64_t)SMMU_GRANULE_MASK)) : NULL;
-			uint64_t phys = entry && (*entry & 1) ? *entry & PTE_ADDRESS : 0;
+			uint32_t word;
 
-			used += phys ? snprintf(line + used, sizeof(line) - used, " %08x",
-			    ml_phys_read_word((vm_offset_t)(phys | (at & SMMU_GRANULE_MASK)))) :
+			used += bo_word(address + 4ull * j, &word) ?
+			    snprintf(line + used, sizeof(line) - used, " %08x", word) :
 			    snprintf(line + used, sizeof(line) - used, " unmapped");
 		}
 		printf("%s\n", line);
+	}
+}
+
+/* Packet opcodes and registers the walk follows (Mesa adreno_pm4.xml and a6xx.xml, A8XX). */
+#define PM4_INDIRECT_BUFFER 0x3f
+#define PM4_INDIRECT_BUFFER_CHAIN 0x57
+#define PM4_SET_DRAW_STATE 0x43
+#define PM4_CONTEXT_REG_BUNCH 0x5c
+#define DRAW_STATE_DISABLE (1u << 17)
+/* SP_GFX_BINDLESS_BASE[4].DESCRIPTOR, the fragment stage's set; bits 0-1 are the descriptor size. */
+#define BINDLESS_BASE_FS 0xab12
+/* Mesa's fb-read descriptors: IR3_BINDLESS_DESC_COUNT - 1 - A6XX_MAX_RENDER_TARGETS, 16 dwords each. */
+#define FB_READ_FIRST_SLOT 55
+#define FB_READ_SLOTS 4
+#define TREE_BUFFERS 96
+#define TREE_WORDS 12288
+#define TREE_DEPTH 3
+
+struct bo_tree {
+	uint64_t seen[TREE_BUFFERS];
+	unsigned buffers;
+	uint32_t words;
+	uint64_t bindless_fs;
+};
+
+static void
+bo_tree_reg(struct bo_tree *tree, uint32_t reg, uint32_t value)
+{
+	if (reg == BINDLESS_BASE_FS)
+		tree->bindless_fs = (tree->bindless_fs & ~0xffffffffull) | (value & ~3u);
+	else if (reg == BINDLESS_BASE_FS + 1)
+		tree->bindless_fs = (tree->bindless_fs & 0xffffffffull) | (uint64_t)value << 32;
+}
+
+static void
+bo_tree_walk(struct bo_tree *tree, uint64_t base, uint32_t count, unsigned depth)
+{
+	for (unsigned i = 0; i < tree->buffers; i++)
+		if (tree->seen[i] == base)
+			return;
+	if (tree->buffers == TREE_BUFFERS || tree->words + count > TREE_WORDS) {
+		printf("adreno8: tree %#llx (%u words) not printed: over the dump's size\n", base, count);
+		return;
+	}
+	tree->seen[tree->buffers++] = base;
+	tree->words += count;
+
+	char what[32];
+	snprintf(what, sizeof(what), "tree %u of %u", depth, count);
+	adreno8_bo_dump_words(what, base, count);
+
+	for (uint32_t at = 0; at < count;) {
+		uint32_t header, size, a, b, c;
+
+		if (!bo_word(base + 4ull * at, &header))
+			return;
+		if (header >> 28 == 7)
+			size = header & 0x7fff;
+		else if (header >> 28 == 4)
+			size = header & 0x7f;
+		else
+			return;
+
+		uint32_t opcode = (header >> 16) & 0x7f;
+		uint64_t body = base + 4ull * (at + 1);
+		if (header >> 28 == 4) {
+			for (uint32_t i = 0; i < size && bo_word(body + 4ull * i, &a); i++)
+				bo_tree_reg(tree, ((header >> 8) & 0x3ffff) + i, a);
+		} else if (opcode == PM4_CONTEXT_REG_BUNCH) {
+			for (uint32_t i = 0; i + 1 < size && bo_word(body + 4ull * i, &a) &&
+			     bo_word(body + 4ull * (i + 1), &b); i += 2)
+				bo_tree_reg(tree, a, b);
+		} else if ((opcode == PM4_INDIRECT_BUFFER || opcode == PM4_INDIRECT_BUFFER_CHAIN) &&
+		    size >= 3 && depth < TREE_DEPTH && bo_word(body, &a) && bo_word(body + 4, &b) &&
+		    bo_word(body + 8, &c)) {
+			bo_tree_walk(tree, a | (uint64_t)b << 32, c & 0xfffff, depth + 1);
+		} else if (opcode == PM4_SET_DRAW_STATE && depth < TREE_DEPTH) {
+			for (uint32_t i = 0; i + 3 <= size && bo_word(body + 4ull * i, &a) &&
+			     bo_word(body + 4ull * (i + 1), &b) && bo_word(body + 4ull * (i + 2), &c); i += 3)
+				if ((a & 0xffff) && !(a & DRAW_STATE_DISABLE))
+					bo_tree_walk(tree, b | (uint64_t)c << 32, a & 0xffff, depth + 1);
+		}
+		at += size + 1;
+	}
+}
+
+void
+adreno8_bo_dump_tree(uint64_t base, uint32_t count)
+{
+	static struct bo_tree tree;
+
+	bo_tree_walk(&tree, base, count, 0);
+	if (!tree.bindless_fs) {
+		printf("adreno8: tree: no write to SP_GFX_BINDLESS_BASE[4]\n");
+		return;
+	}
+	for (unsigned slot = FB_READ_FIRST_SLOT; slot < FB_READ_FIRST_SLOT + FB_READ_SLOTS; slot++) {
+		char what[48];
+
+		snprintf(what, sizeof(what), "fs bindless slot %u", slot);
+		adreno8_bo_dump_words(what, tree.bindless_fs + 64ull * slot, 16);
 	}
 }
 

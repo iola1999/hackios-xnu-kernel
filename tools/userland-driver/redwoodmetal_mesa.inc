@@ -7,6 +7,7 @@ static struct {
 	__typeof__(&rwa_texture_generate_mipmaps) texture_generate_mipmaps;
 	__typeof__(&rwa_texture_from_buffer) texture_from_buffer;
 	__typeof__(&rwa_buffer_textures_refresh) buffer_textures_refresh;
+	__typeof__(&rwa_texture_view) texture_view;
 	struct rwa_device *(*device_open)(char *, size_t);
 	void (*device_close)(struct rwa_device *);
 	const char *(*device_name)(struct rwa_device *);
@@ -48,6 +49,11 @@ static struct {
 	int (*argbuf_encode_sampler)(struct rwa_buffer *, size_t, unsigned,
 				     struct rwa_sampler *, char *, size_t);
 	unsigned (*argbuf_encoded_members)(const struct rwa_buffer *, size_t);
+	struct rwa_render *(*render_create_linked)(struct rwa_device *, const void *, size_t,
+						   const char *, const void *, size_t, const char *,
+						   const struct rwa_linked_function *, unsigned,
+						   const struct rwa_render_shape *,
+						   struct rwa_render_info *, char *, size_t);
 	struct rwa_render *(*render_create)(struct rwa_device *, const void *, size_t,
 					    const char *, const void *, size_t, const char *,
 					    const struct rwa_render_shape *,
@@ -84,6 +90,7 @@ mesa_available(void)
 	*(void **)&mesa.texture_generate_mipmaps = dlsym(mesa.handle, "rwa_texture_generate_mipmaps");
 	*(void **)&mesa.texture_from_buffer = dlsym(mesa.handle, "rwa_texture_from_buffer");
 	*(void **)&mesa.buffer_textures_refresh = dlsym(mesa.handle, "rwa_buffer_textures_refresh");
+	*(void **)&mesa.texture_view = dlsym(mesa.handle, "rwa_texture_view");
 	*(void **)&mesa.device_open = dlsym(mesa.handle, "rwa_device_open");
 	*(void **)&mesa.device_close = dlsym(mesa.handle, "rwa_device_close");
 	*(void **)&mesa.device_name = dlsym(mesa.handle, "rwa_device_name");
@@ -118,6 +125,7 @@ mesa_available(void)
 	 * yet draw is a real state of this work, and the driver says so when asked to draw
 	 * rather than refusing to exist. */
 	*(void **)&mesa.render_create = dlsym(mesa.handle, "rwa_render_create");
+	*(void **)&mesa.render_create_linked = dlsym(mesa.handle, "rwa_render_create_linked");
 	*(void **)&mesa.render_destroy = dlsym(mesa.handle, "rwa_render_destroy");
 	*(void **)&mesa.render_draw = dlsym(mesa.handle, "rwa_render_draw");
 	/* Depth likewise: a library that can draw and not test depth is a real state of
