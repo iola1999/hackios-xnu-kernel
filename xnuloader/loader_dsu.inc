@@ -15,7 +15,8 @@
  *                              of a WINDOW-byte memory window, as "oem ramdisk begin TOTAL WINDOW"
  *                              and its blocks would have left it; getvar ramdisk-state then says ready
  * "oem dsu crc OFFSET LENGTH"  CRC-32 (zlib's) of that part of the resident image, for the host to
- *                              compare with its own copy before it boots a kernel on it
+ *                              compare with its own copy before it boots a kernel on it; the host
+ *                              reads it with "getvar dsu-crc" (fastboot shows no text of an oem OKAY)
  * Nothing here writes to the storage. Ported from hakios-arm64e-dada's loader (APSL 2.0).
  */
 #define LP_GEOMETRY_MAGIC  0x616c4467u
@@ -200,13 +201,16 @@ dsu_load(efi_block_io *data, const char *arguments)
 	fb_reply("OKAY", "");
 }
 
-/* the reply of "oem dsu crc": its CRC as eight hex digits */
+/* "oem dsu crc": the CRC as eight hex digits, kept for "getvar dsu-crc" ("none" until there is one) */
+static char dsu_crc_text[16] = "none";
+
 static void
 dsu_crc_reply(const char *arguments)
 {
 	uint64_t offset, length;
-	char reply[16], *p = reply;
+	char *p = dsu_crc_text;
 
+	memcpy(dsu_crc_text, "none", 5);
 	if (!ramdisk_hex(&arguments, &offset) || *arguments++ != ' ' || !ramdisk_hex(&arguments, &length) ||
 	    *arguments || resident_rd_size == 0 || offset > resident_rd_size || length > resident_rd_size - offset) {
 		fb_reply("FAIL", "expected OFFSET LENGTH inside the resident image");
@@ -217,7 +221,7 @@ dsu_crc_reply(const char *arguments)
 		*p++ = "0123456789abcdef"[(crc >> shift) & 15];
 	}
 	*p = 0;
-	fb_reply("OKAY", reply);
+	fb_reply("OKAY", dsu_crc_text);
 }
 
 /* Called after the shared held/fault/live command check, which refuses all of "oem dsu" while busy. */
@@ -228,6 +232,10 @@ dsu_command(const char *cmd)
 
 	if (starts_with(cmd, "oem dsu crc ")) {
 		dsu_crc_reply(cmd + 12);
+		return 1;
+	}
+	if (str_eq(cmd, "getvar:dsu-crc")) {
+		fb_reply("OKAY", dsu_crc_text);
 		return 1;
 	}
 	if (!str_eq(cmd, "oem dsu") && !starts_with(cmd, "oem dsu load ")) {
