@@ -610,7 +610,16 @@ static pthread_mutex_t rw_commit_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 		 * through rwa_dispatch, and then a kernel with a set is refused by name
 		 * there and every offset is read as zero -- which is what an older library
 		 * did with one in any case, out loud. */
-		int rc = mesa.dispatch_threadgroup != NULL
+		/* Without the wait: the dispatch goes with this buffer's flush below, and the buffer
+		 * completes on that fence (redwoodmetal_completion.inc). In the Today view of
+		 * kernel-12377-cmd43-bo19 the waiting dispatch took 1.4 to 3.2 ms each, 16 to 52 of
+		 * them per 64 command buffers. REDWOOD_SYNC_DRAWS keeps the wait, which names the
+		 * dispatch the GPU did not finish. */
+		int rc = mesa.dispatch_nowait != NULL && !rw_sync_draws()
+			    ? mesa.dispatch_nowait([work->pipeline compute], &bindings, table,
+						   work->count, work->groups, work->size,
+						   work->threadgroupBytes, why, sizeof(why))
+			    : mesa.dispatch_threadgroup != NULL
 			    ? mesa.dispatch_threadgroup([work->pipeline compute], &bindings,
 						        table, work->count, work->groups,
 						        work->size, work->threadgroupBytes, why,

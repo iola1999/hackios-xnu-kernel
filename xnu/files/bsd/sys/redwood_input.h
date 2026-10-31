@@ -98,6 +98,7 @@ bool annibale_gpu_temperature(int32_t *tenths); /* the hottest GPU sensor; false
 uint64_t annibale_cpufreq_touched(void);        /* mach_absolute_time() of the last touch, 0 for none */
 void redwood_freeze_check(uint64_t touched);    /* bsd/dev/redwood_threads.c: thread dumps when a touched screen gets no frame */
 uint32_t redwood_touch_unread(void);              /* bsd/dev/redwood_input.c: touch samples the input service has not read */
+uint64_t redwood_touch_last(void);                /* ... mach_absolute_time() of the last finger sample (no buttons), 0 for none */
 void redwood_adreno_init(void);         /* boot-arg adreno=N: the first N steps of waking the phone's GPU */
 void redwood_adreno_quiesce(void);      /* on the way back to the loader: the GPU block stopped, out of our memory */
 void redwood_adreno_stop(void);         /* before that, where the ending is no panic's: the GPU given back in order */

@@ -144,6 +144,7 @@ static LCK_GRP_DECLARE(touch_lck_grp, "redwood-touch");
 static LCK_MTX_DECLARE(touch_lock, &touch_lck_grp);
 static struct redwood_touch touch_queue[TOUCH_QUEUE];
 static uint32_t touch_head, touch_tail;        /* read from head, add at tail */
+static uint64_t screen_touched;                 /* mach_absolute_time() of the last finger sample, buttons not counted */
 
 /*
  * The way out when nothing else is at hand: five fingers held on the screen for a second and a
@@ -201,6 +202,9 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_dri
 	}
 	t = &touch_queue[touch_tail++ % TOUCH_QUEUE];
 	t->time = mach_absolute_time();
+	if (type <= REDWOOD_TOUCH_UP) {
+		__atomic_store_n(&screen_touched, t->time, __ATOMIC_RELAXED);
+	}
 	if (latency_lines()) {
 		uint64_t ns;
 
@@ -230,6 +234,12 @@ uint32_t
 redwood_touch_unread(void)
 {
 	return __atomic_load_n(&touch_tail, __ATOMIC_RELAXED) - __atomic_load_n(&touch_head, __ATOMIC_RELAXED);
+}
+
+uint64_t
+redwood_touch_last(void)
+{
+	return __atomic_load_n(&screen_touched, __ATOMIC_RELAXED);
 }
 
 static int

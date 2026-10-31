@@ -206,15 +206,20 @@ redwood_thread_dump_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1
  *     submitted anything after those until the next gesture, about four seconds later;
  *   - an animation that stops while the screen is being touched: the panel's frame count had been
  *     moving since the gesture began (two changes at most STALL_FLOWING_MS apart, the last after the
- *     gesture's first touch), has not moved for STALL_MS since, and the last touch is under a second
- *     old.
- * Each case dumps once per gesture or stall, and at most STALL_DUMPS times a boot.
+ *     gesture's first touch), has not moved for STALL_MS since, and the last finger sample is under
+ *     STALL_TOUCH_MS old, so the finger is still on the glass.
+ * Each case dumps once per gesture or stall, and at most STALL_DUMPS times a boot. Only finger
+ * samples count as touches (redwood_touch_last). In kernel-12377-cmd43-bo20, with button presses
+ * counted and a stall allowed up to a second after the last touch, the six home presses on the
+ * first page, which draw nothing, used most of the first case's dumps, and all eight of the second
+ * case's came 445 to 954 ms after the finger had lifted, once a page swipe had settled.
  */
 #define GESTURE_GAP_MS          300
 #define QUIET_MS                400
 #define QUIET_FRAMES            8
 #define STALL_MS                300
 #define STALL_FLOWING_MS        100
+#define STALL_TOUCH_MS          100
 #define STALL_DUMPS             8
 
 static void
@@ -285,7 +290,8 @@ redwood_freeze_check(uint64_t touched)
 	absolutetime_to_nanoseconds(now - touched, &touch_ns);
 	absolutetime_to_nanoseconds(now - moved, &still_ns);
 	absolutetime_to_nanoseconds(moved - moved_before, &flowing_ns);
-	if (touch_ns > NSEC_PER_SEC || still_ns < STALL_MS * NSEC_PER_MSEC || flowing_ns > STALL_FLOWING_MS * NSEC_PER_MSEC) {
+	if (touch_ns > STALL_TOUCH_MS * NSEC_PER_MSEC || still_ns < STALL_MS * NSEC_PER_MSEC ||
+	    flowing_ns > STALL_FLOWING_MS * NSEC_PER_MSEC) {
 		return;
 	}
 	dumped = true;
