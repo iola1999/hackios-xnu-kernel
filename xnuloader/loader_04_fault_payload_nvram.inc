@@ -3,6 +3,15 @@
 /* used by Linux drivers/virt/haven/hh_virt_wdt.c). Armed for the whole stay */
 /* in the loader and the kernel: any hang ends in a reset without a human.   */
 
+/*
+ * The loader feeds it only while the host has sent a command within HOST_SILENCE_SECONDS: a loader
+ * the host can no longer reach (its USB wedged, or the loader stuck) lets the watchdog reset the
+ * phone, which comes back as the loader again (slot A) or, once slot A's retries are spent, as
+ * Android. A running kernel feeds it on its own (hv_wdt_pet), whatever the host does.
+ */
+#define HOST_SILENCE_SECONDS 180
+static uint64_t host_last_cmd;
+
 #define VIRT_WDT_CONTROL   0x86000005u
 #define VIRT_WDT_STATUS    0x86000006u
 #define VIRT_WDT_PET       0x86000007u
@@ -36,7 +45,7 @@ smc_call(uint64_t id, uint64_t a1, uint64_t a2, uint64_t *r1, uint64_t *r2)
 static void
 wdt_pet(void)
 {
-	if (wdt_armed) {
+	if (wdt_armed && READ_SYSREG(CNTVCT_EL0) - host_last_cmd < HOST_SILENCE_SECONDS * READ_SYSREG(CNTFRQ_EL0)) {
 		smc_call(VIRT_WDT_PET, 0, 0, NULL, NULL);
 	}
 }
@@ -59,7 +68,7 @@ wdt_arm(void)
 {
 	uint64_t ctl = 0, since = 0;
 
-	if (PLAT != &platform_redwood) {
+	if (PLAT != &platform_redwood && PLAT != &platform_annibale) {
 		return; /* SMC is not routed anywhere useful on QEMU virt */
 	}
 	uint64_t st = smc_call(VIRT_WDT_STATUS, 0, 0, &ctl, &since);
@@ -69,6 +78,7 @@ wdt_arm(void)
 	print("watchdog: status ret=%x ctl=%x since_pet=%x; set_time=%x enable=%x pet=%x\n", st, ctl, since, r_time,
 	    r_ctl, r_pet);
 	wdt_armed = (r_pet == 0);
+	host_last_cmd = READ_SYSREG(CNTVCT_EL0);
 }
 
 /* ------------------------------------------------------------------------ */

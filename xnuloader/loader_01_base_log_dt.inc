@@ -418,8 +418,8 @@ static inline int
 lc_blocked_cmd(const char *cmd)
 {
 	static const char *const blocked[] = { "oem ramdisk", "download:", "oem run", "oem selftest",
-		"oem hang", "oem recording", "oem sound", "oem clearscreen", "oem memmap", "oem probe",
-		"oem logwrite" };
+		"oem recording", "oem sound", "oem clearscreen", "oem memmap", "oem probe",
+		"oem logwrite", "oem dsu" };
 
 	for (unsigned i = 0; i < sizeof(blocked) / sizeof(blocked[0]); i++) {
 		if (lc_starts(cmd, blocked[i])) {

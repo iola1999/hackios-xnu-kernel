@@ -859,8 +859,10 @@ lc_watch_round(const struct kernel_live *live, uint64_t slide, uint64_t started,
 			return 1;   /* held at once: no block, USB or charger service past the decision */
 		}
 	}
-	/* Feed this core's watchdog through the requested budget and a 60-second return margin. */
-	if (wdt_armed && seconds_since(*last_pet) >= 5 && seconds_since(started) < budget + 60) {
+	/* Feed this core's watchdog through the requested budget and a 60-second return margin, or for
+	 * the whole run when there is none (k90auto ends a run with "oem stop"): whether the kernel's
+	 * own feeding counts from another core is not known. Host silence still stops it (wdt_pet). */
+	if (wdt_armed && seconds_since(*last_pet) >= 5 && (budget == 0 || seconds_since(started) < budget + 60)) {
 		wdt_pet();
 		*last_pet = READ_SYSREG(CNTVCT_EL0);
 	}

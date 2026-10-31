@@ -499,6 +499,7 @@ starts_with(const char *s, const char *prefix)
 }
 
 #include "loader_ramdisk.inc"
+#include "loader_dsu.inc"
 
 /*
  * "oem sh TEXT": hand TEXT to the running kernel's mailbox, where /redwood/bin/rwsh finds it
@@ -605,6 +606,7 @@ fb_command(char *cmd)
 {
 	int live = running_live != NULL;
 
+	host_last_cmd = READ_SYSREG(CNTVCT_EL0);
 	{
 		if (live && download_to_inbox && starts_with(cmd, "download:")) {
 			inbox_download(cmd + 9);
@@ -616,6 +618,7 @@ fb_command(char *cmd)
 			    : "a kernel may still hold memory or devices: reboot to start over");
 		} else if (ramdisk_command(cmd)) {
 			/* The RAM protocol uses the same command protection as legacy downloads. */
+		} else if (dsu_command(cmd)) {
 		} else if (starts_with(cmd, "oem stop")) {
 			/* the kernel looks at this once a second and comes back as it does when its time is up */
 			int act = lc_stop_action(kernel_resources_held, live);
@@ -637,6 +640,8 @@ fb_command(char *cmd)
 				fb_reply("OKAY", (download_to_ramdisk || ramdisk_pending()) ? "0xffffffff" : "0x03700000");
 			} else if (str_eq(var, "result")) {
 				fb_reply("OKAY", last_result);
+			} else if (str_eq(var, "watchdog")) {
+				fb_reply("OKAY", wdt_armed ? "armed" : "off");
 			} else if (str_eq(var, "screen") && SCREEN.base != 0) {
 				/* width height bytes-per-row */
 				uint32_t mark = log_len;
@@ -806,6 +811,12 @@ fb_command(char *cmd)
 				UI.ready = 0;   /* the panel keeps the kernel's last frame for oem screenshot */
 			}
 		} else if (starts_with(cmd, "oem hang")) {
+			/* the watchdog's reset, from here: with memory and devices held too (a host cold reset),
+			 * but not while a kernel runs, which feeds the watchdog itself */
+			if (live || !wdt_armed) {
+				fb_reply("FAIL", live ? "a kernel is running (oem stop ends it)" : "the watchdog is not armed");
+				return;
+			}
 			fb_reply("OKAY", "watchdog test: not petting any more");
 			for (;;) {
 			}

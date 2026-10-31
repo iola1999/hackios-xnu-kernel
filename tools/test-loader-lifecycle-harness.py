@@ -242,7 +242,7 @@ static struct h_st h_st = { &h_rt };
 """
 
 SCENARIOS = r"""/* ---- scenarios ---- */
-static const char *const blocked_cmds[] = { "oem ramdisk x", "download:1f000", "oem run", "oem selftest", "oem hang", "oem recording", "oem sound", "oem clearscreen", "oem memmap", "oem probe", "oem logwrite" };
+static const char *const blocked_cmds[] = { "oem ramdisk x", "download:1f000", "oem run", "oem selftest", "oem recording", "oem sound", "oem clearscreen", "oem memmap", "oem probe", "oem logwrite", "oem dsu" };
 static const char *const open_cmds[] = { "getvar:product", "getvar:result", "upload", "oem log", "oem screenshot", "reboot", "oem stop", "" };
 static void sc_psci_spec(void)
 {
