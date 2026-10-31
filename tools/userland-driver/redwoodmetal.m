@@ -1175,6 +1175,7 @@ struct gem_close { uint32_t handle, pad; };
 @end
 
 #include "redwoodmetal_stitch.inc"
+#include "redwoodmetal_pipecache.inc"
 
 @implementation RedwoodMetalDevice
 
@@ -1274,6 +1275,7 @@ struct gem_close { uint32_t handle, pad; };
 - (void)dealloc
 {
 	if (_mesa != NULL) {
+		rw_pipe_forget(_mesa);
 		mesa.device_close(_mesa);
 	}
 	if (_gpu != IO_OBJECT_NULL) {
@@ -1568,13 +1570,7 @@ struct gem_close { uint32_t handle, pad; };
 
 	char why[512] = { 0 };
 	struct rwa_render_info info = { 0 };
-	/* A cache keyed by the descriptor -- both modules, both names, the whole
-	 * rwa_render_shape -- was tried here because CoreAnimation asks for ten pipelines a
-	 * second while the Control Center animates. It never hit once in a 360-second run:
-	 * the descriptors that repeat a blend configuration do not repeat it exactly, so
-	 * each one is a compile. Removed rather than left as code that runs on every
-	 * pipeline and never answers.
-	 */
+	unsigned char key[CC_SHA256_DIGEST_LENGTH];
 
 	/* How long a compile takes, and how many there have been: CoreAnimation builds these
 	 * while it animates -- ten a second in one Control Center pull -- and if that is where
@@ -1584,44 +1580,48 @@ struct gem_close { uint32_t handle, pad; };
 	NSMutableData *linked_scratch = [NSMutableData data];
 	unsigned num_linked = mesa.render_create_linked != NULL
 	    ? rw_linked_fragment_functions(descriptor, linked, RW_LINKED_MAX, linked_scratch) : 0;
-	struct rwa_render *render = mesa.render_create_linked != NULL
-	    ? mesa.render_create_linked(_mesa,
-		  vertex_air != nil ? [vertex_air bytes] : NULL,
-		  vertex_air != nil ? [vertex_air length] : 0,
-		  vertex != nil ? [[vertex name] UTF8String] : NULL,
-		  fragment_air != nil ? [fragment_air bytes] : NULL,
-		  fragment_air != nil ? [fragment_air length] : 0,
-		  fragment != nil ? fragment_name : NULL, linked, num_linked, &shape, &info, why,
-		  sizeof(why))
-	    : mesa.render_create(_mesa,
-		  vertex_air != nil ? [vertex_air bytes] : NULL,
-		  vertex_air != nil ? [vertex_air length] : 0,
-		  vertex != nil ? [[vertex name] UTF8String] : NULL,
-		  fragment_air != nil ? [fragment_air bytes] : NULL,
-		  fragment_air != nil ? [fragment_air length] : 0,
-		  fragment != nil ? fragment_name : NULL, &shape, &info, why, sizeof(why));
+	const char *vertex_name = vertex != nil ? [[vertex name] UTF8String] : NULL;
+	struct rwa_render *render = NULL;
+	if (num_linked == 0) {
+		rw_pipe_key(key, vertex_air, vertex_name, fragment_air, fragment != nil ? fragment_name : NULL,
+			    &shape);
+		render = rw_pipe_find(_mesa, key, &info);
+	}
+	bool reused = render != NULL;
+	if (!reused) {
+		render = mesa.render_create_linked != NULL
+		    ? mesa.render_create_linked(_mesa, [vertex_air bytes], [vertex_air length], vertex_name,
+			  [fragment_air bytes], [fragment_air length], fragment != nil ? fragment_name : NULL,
+			  linked, num_linked, &shape, &info, why, sizeof(why))
+		    : mesa.render_create(_mesa, [vertex_air bytes], [vertex_air length], vertex_name,
+			  [fragment_air bytes], [fragment_air length], fragment != nil ? fragment_name : NULL,
+			  &shape, &info, why, sizeof(why));
+		if (render != NULL && num_linked == 0) {
+			rw_pipe_keep(_mesa, key, render, &info);
+		}
+	}
 	rw_linked_free(linked_scratch);
 	{
-		static unsigned long built;
+		static unsigned long built, reuses;
 		struct mach_timebase_info tb;
 		uint64_t us;
 
 		mach_timebase_info(&tb);
 		us = (mach_absolute_time() - compile_began) * tb.numer / tb.denom / 1000;
-		++built;
-		{
-			/* The entry names are here because a picture that is wrong needs to be
-			 * traced back to the pipeline that drew it, and Apple's own names for the
-			 * compiler library's functions are the only handle this process has on
-			 * them: "air.fragment.blur" says what an address does not. Every pipeline,
-			 * with its handle, which is what the first commits' trace lines name.
-			 */
-			rw_print("render pipelines: %lu built, this one %llu us (%s %p) vertex %s "
-			         "fragment %s\n", built, us,
-			         render != NULL ? "ok" : "refused", (void *)render,
-			         vertex != nil ? [[vertex name] UTF8String] : "(none)",
-			         fragment_name);
+		if (reused) {
+			++reuses;
+		} else {
+			++built;
 		}
+		/* The entry names are here because a picture that is wrong needs to be traced back to
+		 * the pipeline that drew it, and Apple's own names for the compiler library's
+		 * functions are the only handle this process has on them: "air.fragment.blur" says
+		 * what an address does not. Every pipeline, with its handle, which is what the first
+		 * commits' trace lines name. */
+		rw_print("render pipelines: %lu built, this one %llu us (%s %p) vertex %s "
+		         "fragment %s; %lu reused\n", built, us,
+		         reused ? "reused" : render != NULL ? "ok" : "refused", (void *)render,
+		         vertex_name != NULL ? vertex_name : "(none)", fragment_name, reuses);
 	}
 
 	if (render == NULL) {
@@ -2802,7 +2802,7 @@ struct gem_close { uint32_t handle, pad; };
 	 * descriptor, for the reason the compute one learned at its own line 1504 */
 	self = [super initWithDevice:device pipelineStateDescriptor:descriptor];
 	if (self == nil) {
-		mesa.render_destroy(render);
+		rw_pipe_release(render);
 		return nil;
 	}
 	_owner = device;
@@ -2830,7 +2830,7 @@ struct gem_close { uint32_t handle, pad; };
 - (void)dealloc
 {
 	if (_render != NULL) {
-		mesa.render_destroy(_render);
+		rw_pipe_release(_render);
 	}
 	[super dealloc];
 }
