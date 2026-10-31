@@ -41,6 +41,7 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 #include "MiniIOSurface.h"
 #include "MiniFramebufferScale.h"
 #include "MiniFramebufferSwap.h"
+#include "MiniFramebufferFlip.inc"
 
 extern "C" void redwood_tl(const char * format, ...) __printflike(1, 2);
 extern "C" uint32_t redwood_frames_shown;        /* (bsd/sys/redwood_input.h) */
@@ -152,7 +153,7 @@ static TUNABLE(uint32_t, gOnTheBeat, "fb_beat", 1);
 static TUNABLE(uint32_t, gThreads, "fb_threads", 3);
 static TUNABLE(uint32_t, gRows, "fb_rows", 1);           /* draw only the rows that changed: see dirtyBand() */
 #define SWAP_QUEUE              2                       /* frames that may wait for the panel at most (fb_queue) */
-static TUNABLE(uint32_t, gQueue, "fb_queue", 2);
+static TUNABLE(uint32_t, gQueue, "fb_queue", 1);
 static inline unsigned
 swapQueue(void)
 {
@@ -219,7 +220,7 @@ class IOMobileFramebuffer : public IOService
 
 public:
 	IOLock *        fLock;
-	uint8_t *       fBase;                  /* the boot framebuffer: the panel */
+	uint8_t *       fBase;                  /* where frames are drawn: the boot framebuffer, or the buffer off screen (fb_flip) */
 	uint32_t        fPanelWidth, fPanelHeight, fRowBytes;
 	uint32_t        fWidth, fHeight;        /* the display as user space sees it */
 	MiniIOSurface * fDefaultSurface;
@@ -229,13 +230,12 @@ public:
 	bool            fGraphics;              /* the text console has been told to stop */
 	/*
 	 * A frame goes to the panel when the GPU is done with it: a thread of ours waits for that
-	 * and copies it there, and whoever made the frame is back at the next one meanwhile. One
-	 * frame waits at a time: the swap after it is held, in SwapEnd, until this one is being
-	 * copied to the panel. Whoever draws is so at most two frames ahead of the panel, and
-	 * needs a third surface to be that: CoreAnimation makes itself a new one for every frame.
-	 * By default two frames may wait (boot-arg fb_queue=1: one, as before): CoreAnimation draws on a
-	 * clock of its own, and a SwapEnd held past its next tick makes that tick late, the clock going
-	 * on from there (rc.jobs.fps: 28% of the frames over 16.7 ms with two, 33% with one).
+	 * and copies it there, and whoever made the frame is back at the next one meanwhile. A swap
+	 * keeps its place in the queue until its pixels are copied, and the swap after it is held in
+	 * SwapEnd while the queue is full. iOS 26's CoreAnimation draws into two surfaces in turn
+	 * (the swap log's surfaces 1 and 2): with two swaps queued (fb_queue=2) it can be drawing into
+	 * a surface whose frame the panel has not had yet; with one, the default, SwapEnd for the
+	 * next frame returns only once this frame is copied.
 	 */
 	IOLock *        fSwapLock;              /* around the next five */
 	uint8_t         fSwap[SWAP_QUEUE][SWAP_SIZE];   /* the swaps on their way to the panel (fb_queue), from fSwapFirst on */
@@ -422,6 +422,7 @@ IOMobileFramebuffer::start(IOService * provider)
 	fPanelWidth = vinfo.v_width;
 	fPanelHeight = vinfo.v_height;
 	fRowBytes = vinfo.v_rowbytes;
+	flip_start(vinfo.v_physaddr, fBase, fRowBytes * fPanelHeight, fPanelHeight);
 	fWidth = gFBWidth ? gFBWidth : fPanelWidth;
 	fHeight = gFBHeight ? gFBHeight : fPanelHeight;
 	if (gFBScale != 0 && gFBScale != kFBDefaultScale) {
@@ -654,6 +655,7 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 		fStatUnchanged++;
 		return;
 	}
+	flip_band(&job.by0, &job.by1, job.py0, job.py1);
 	fStatBandRows += (uint64_t) (job.by1 - job.by0);
 	if (fThreads <= 1 || fDiff || fHelpersStarted + 1 < fThreads) {
 		drawRows(&job, job.by0, job.by1, fBlendRow);
@@ -829,12 +831,6 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 	}
 	shown = began;
-	/* its turn has come: the swap after it may be handed over */
-	IOLockLock(fSwapLock);
-	fSwapFirst = (fSwapFirst + 1) % SWAP_QUEUE;
-	fSwapsWaiting--;
-	IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
-	IOLockUnlock(fSwapLock);
 	IOLockLock(fLock);
 	if (fLastFrame != 0) {
 		absolutetime_to_nanoseconds(began - fLastFrame, &nanos);
@@ -860,6 +856,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		    swapWord(swap, SWAP_ID), fSwapsShown, swapWord(swap, SWAP_SURFACE(0)), swapWord(swap, SWAP_SURFACE(1)),
 		    swapWord(swap, SWAP_SURFACE(2)), swapWord(swap, SWAP_SURFACE(3)), set, swapWord(swap, SWAP_LAYERS_CLEARED));
 	}
+	fBase = flip_target(fBase);
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
 		int32_t src[4], dst[4];
@@ -879,6 +876,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				for (uint32_t y = 0; y < fPanelHeight; y++) {
 					bzero(fBase + (size_t) y * fRowBytes, (size_t) fPanelWidth * 4);
 				}
+				flip_whole();
 			}
 			continue;
 		}
@@ -908,10 +906,17 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			}
 		}
 	}
+	flip_present();
 	drawn = mach_absolute_time();
 	if (recorded != NULL) {
 		record(recorded);
 	}
+	/* its pixels copied (and recorded): the swap after it may be handed over */
+	IOLockLock(fSwapLock);
+	fSwapFirst = (fSwapFirst + 1) % SWAP_QUEUE;
+	fSwapsWaiting--;
+	IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
+	IOLockUnlock(fSwapLock);
 	fSwapsShown++;
 	redwood_frames_shown = fSwapsShown;      /* (kern.redwood.frames: what a control run watches) */
 	if (gTouchLat) {
@@ -1484,25 +1489,6 @@ publishAccelerator(IOService * provider)
 		}
 	}
 	OSSafeReleaseNULL(accelerator);
-}
-
-/*
- * A picture from inside the kernel (the GPU driver's first ones): rows of 32-bit pixels, put at
- * the top left corner of the panel as they are and cut to its size.
- */
-extern "C" void
-MiniIOMobileFramebufferShow(const uint8_t * pixels, uint32_t width, uint32_t height, uint32_t rowBytes)
-{
-	uint32_t columns = width < vinfo.v_width ? width : (uint32_t) vinfo.v_width;
-	uint32_t rows = height < vinfo.v_height ? height : (uint32_t) vinfo.v_height;
-
-	if (vinfo.v_baseaddr == 0 || vinfo.v_depth != 32) {
-		return;
-	}
-	for (uint32_t y = 0; y < rows; y++) {
-		memcpy((void *) (vinfo.v_baseaddr + (size_t) y * vinfo.v_rowbytes), pixels + (size_t) y * rowBytes,
-		    (size_t) columns * 4);
-	}
 }
 
 void

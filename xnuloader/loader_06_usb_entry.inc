@@ -766,6 +766,20 @@ fb_command(char *cmd)
 			staged_data = (const char *)(uintptr_t)SCREEN.base;
 			staged_len = (uint64_t)SCREEN.stride * SCREEN.height;
 			fb_reply("OKAY", "");
+		} else if (starts_with(cmd, "oem stage ")) {
+			/* stage LENGTH bytes at ADDRESS (both hex) of the kernel's memory window, also while it
+			 * runs: what it keeps there for the host, a screen recording (rec_secs) among them */
+			const char *p = cmd + 10;
+			uint64_t at, len;
+
+			if (!ramdisk_hex(&p, &at) || *p++ != ' ' || !ramdisk_hex(&p, &len) || *p || len == 0 || win_size == 0 ||
+			    at < win_base || at - win_base >= win_size || len > win_size - (at - win_base)) {
+				fb_reply("FAIL", "expected ADDRESS LENGTH inside the kernel's memory window");
+				return;
+			}
+			staged_data = (const char *)(uintptr_t)at;
+			staged_len = len;
+			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "oem recording")) {
 			/* stage what the kernel's display driver recorded (boot-arg rec_secs) */
 			if (recording_data == NULL) {

@@ -66,6 +66,7 @@ extern void redwood_torch_quiesce(void);
 extern void annibale_torch_quiesce(void);
 extern void redwood_camera_quiesce(void);
 extern void redwood_mic_quiesce(void);
+extern void MiniIOMobileFramebufferQuiesce(void);   /* iokit/Kernel/MiniFramebufferFlip.inc */
 extern void redwood_ufs_quiesce(void);
 extern void redwood_var_save_on_return(void);   /* bsd/dev/redwood_ufs.c: the data volume into the flash */
 void loader_checkpoint(uint64_t n);
@@ -483,6 +484,7 @@ loader_return(void)
 	annibale_torch_quiesce();       /* or the other phone's, lit on its PMIC's flash module */
 	redwood_camera_quiesce();       /* the camera powered down, if it was powered up */
 	redwood_mic_quiesce();          /* (what the microphones' path did, said again: it happens in the log's middle) */
+	MiniIOMobileFramebufferQuiesce();       /* the display back on the boot framebuffer, the last frame in it (fb_flip) */
 	/*
 	 * A panic's text is first collected in the panic buffer and only later
 	 * flushed to the console; if the console itself is what failed, that
