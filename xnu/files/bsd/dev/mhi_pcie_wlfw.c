@@ -8,8 +8,9 @@
  *   - the PHY capability (number of radios, board id), the indications wanted, the host capability;
  *   - the memory the firmware asks for (REQUEST_MEM): the region types ath12k serves, from the memory below 4 GB;
  *   - once it says FW_MEM_READY: the target capability (chip, board id, firmware build), the regulatory database
- *     (fw/regdb.bin), the board data (fw/bdwlan.eNN, NN the board id in hex: Android's name for it) and the M3
- *     image (fw/phy_ucode20.elf, Android's phy_ucode for hardware 2.0) placed in that memory;
+ *     (fw/regdb.bin), the board data (fw/bdwlan.eNN, NN the board id in hex, or fw/bdwlan.elf when the firmware
+ *     gives none: Android's cnss2 names them so) and the M3 image (fw/phy_ucode20.elf, Android's phy_ucode for
+ *     hardware 2.0) placed in that memory;
  *   - FW_READY awaited. With pcie_mission=1 also what ath12k_qmi_firmware_start() sends then: the logging, the
  *     configuration (copy engines and services, without the shadow registers, which ath12k works out from its
  *     rings) and the mode "mission".
@@ -308,7 +309,11 @@ load_board(void)
 	if (!send_file("regulatory database", "regdb.bin", ATH12K_QMI_BDF_TYPE_REGDB, board_id)) {
 		return false;
 	}
-	snprintf(name, sizeof(name), "bdwlan.e%02x", board_id & 0xff);
+	/* cnss2's names: bdwlan.elf when the firmware gives no board id (0xff), else bdwlan.eNN; pcie_bdf=NAME picks one */
+	if (!PE_parse_boot_argn("pcie_bdf", name, sizeof(name))) {
+		snprintf(name, sizeof(name), board_id == ATH12K_BOARD_ID_DEFAULT ? "bdwlan.elf" : "bdwlan.e%02x",
+		    board_id & 0xff);
+	}
 	if (!send_file("board data", name, ATH12K_QMI_BDF_TYPE_ELF, board_id)) {
 		return false;
 	}
