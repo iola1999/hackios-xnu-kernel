@@ -1745,19 +1745,6 @@ struct gem_close { uint32_t handle, pad; };
 	}
 }
 
-/* QuartzCore's texture-layout object requires initialization, copy and finalization.
- * Return nil until those operations are implemented along with size/alignment.
- */
-- (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)descriptor
-			isHeapOrBufferBacked:(BOOL)backed
-{
-	(void)descriptor;
-	(void)backed;
-	RW_ONCE("redwoodmetal: texture-layout initialization/copy/finalization unsupported; "
-		"newTextureLayoutWithDescriptor returns nil\n");
-	return nil;
-}
-
 /*
  * A resource group names resources whose cache lines the GPU may drop at the end of a pass -- an
  * AGX cache-management optimisation this port has no control over. nil here is not a guess: the
@@ -1782,34 +1769,6 @@ struct gem_close { uint32_t handle, pad; };
 - (id)newSharedTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
 {
 	(void)descriptor;
-	return nil;
-}
-
-/*
- * A texture over memory the CALLER allocated, which CoreAnimation's update_texture stores and
- * uses (docs/metal.md 10.48, selector 5 of the class-declared list). It is answered by name
- * rather than left unrecognized, because an unrecognized selector is terminate() and a named nil
- * is a line in the log -- mediaserverd died 43 times on the one above this before it was
- * answered at all.
- *
- * nil and not a texture, because the contract has no call for it. rwa_texture_from_surface takes
- * an IOSurface, which the kernel hands over as a buffer (kRedwoodSurface); a bare pointer into
- * the caller's address space is a different import, and a texture made by copying instead would
- * be wrong in a way nothing would report: the caller writes to its own pages and expects the
- * texture to change.
- */
-- (id)newTextureWithBytesNoCopy:(void *)bytes length:(NSUInteger)length
-		     descriptor:(MTLTextureDescriptor *)descriptor
-		    deallocator:(void (^)(void *, NSUInteger))deallocator
-{
-	(void)bytes;
-	(void)length;
-	(void)descriptor;
-	(void)deallocator;
-	RW_ONCE("redwoodmetal: a texture over the caller's own memory was asked for, and the "
-		"contract has no import for a bare pointer -- only for an IOSurface. Copying "
-		"instead would be worse than nil: the caller writes to its pages and expects the "
-		"texture to follow\n");
 	return nil;
 }
 
@@ -2916,6 +2875,7 @@ struct gem_close { uint32_t handle, pad; };
 
 #include "redwoodmetal_work.inc"
 #include "redwoodmetal_blit.inc"
+#include "redwoodmetal_texture_layout.inc"   /* ATX/KTX images: texture layouts and textures over their memory */
 
 /*
  * THE SLOT EVERY COMMAND BUFFER TAKES FROM THE QUEUE, AND WHY IT HAS TO BE GIVEN BACK.

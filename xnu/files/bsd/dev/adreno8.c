@@ -380,6 +380,8 @@ adreno8_init(void)
 	PE_parse_boot_argn("adreno8_pause", &adreno8_pause_ms, sizeof(adreno8_pause_ms));
 	PE_parse_boot_argn("adreno8_watch", &adreno8_watch_seconds, sizeof(adreno8_watch_seconds));
 	PE_parse_boot_argn("adreno8_speed", &adreno8_speed_asked, sizeof(adreno8_speed_asked));
+	PE_parse_boot_argn("adreno8_floor", &adreno8_speed_floor, sizeof(adreno8_speed_floor));
+	PE_parse_boot_argn("adreno8_touch_ms", &adreno8_touch_ms, sizeof(adreno8_touch_ms));
 	PE_parse_boot_argn("adreno8_inflight", &adreno8_inflight, sizeof(adreno8_inflight));
 	PE_parse_boot_argn("adreno8_gmuclk", &adreno8_gmu_from_pll, sizeof(adreno8_gmu_from_pll));
 	adreno8_gpu8_keep = PE_parse_boot_argn("adreno8_keep", &one, sizeof(one)) && one != 0;

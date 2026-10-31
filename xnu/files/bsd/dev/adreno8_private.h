@@ -240,6 +240,7 @@ struct adreno8_gpu_space {
 extern uint32_t adreno8_skip_steps;
 extern uint32_t adreno8_pause_ms;
 extern uint32_t adreno8_speed_asked;
+extern uint32_t adreno8_speed_floor, adreno8_touch_ms;  /* adreno8_speed_tick's floor and touch hold */
 extern uint32_t adreno8_inflight;
 extern uint32_t adreno8_gmu_from_pll;
 extern bool adreno8_gpu_stall;
