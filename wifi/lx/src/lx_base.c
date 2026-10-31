@@ -450,6 +450,12 @@ _sx_xunlock(struct sx *sx, const char *file, int line)
 	word_unlock(&sx->sx_lock);
 }
 
+/* What FreeBSD's start would call for a lock defined with DEFINE_MUTEX(): never here, and a lock of all zeros is free. */
+void
+sx_sysinit(const void *argument)
+{
+}
+
 void
 _mtx_init(volatile uintptr_t *c, const char *name, const char *type, int opts)
 {
@@ -755,8 +761,12 @@ iounmap(void *address)
  * or the other way round. The first part of it is handed out for good, a stretch at a time
  * (rings); the rest is slots of one size, taken and given back (buffers).
  */
-#define POOL_SIZE	(44u << 20)
-#define POOL_RINGS	(12u << 20)		/* (the data path's rings and link descriptors come to about 6 MB) */
+#ifndef LX_POOL_MB				/* (the build may say otherwise: ath12k's firmware takes 16 MB of rings' memory) */
+#define LX_POOL_MB	44u
+#define LX_RINGS_MB	12u			/* (ath11k's data path's rings and link descriptors come to about 6 MB) */
+#endif
+#define POOL_SIZE	(LX_POOL_MB << 20)
+#define POOL_RINGS	(LX_RINGS_MB << 20)
 #define POOL_SLOT	4096u
 #define POOL_SLOTS	((POOL_SIZE - POOL_RINGS) / POOL_SLOT)
 
@@ -798,13 +808,14 @@ linux_dma_alloc_coherent(struct device *dev, size_t size, dma_addr_t *dma_handle
 
 	size = roundup2(size, 64);
 	lx_os_lock();
-	at = pool.rings_used;
+	/* (a page or more starts on a page, as Linux gives it) */
+	at = size >= PAGE_SIZE ? roundup2(pool.rings_used, PAGE_SIZE) : pool.rings_used;
 	if (pool.memory == NULL || at + size > POOL_RINGS) {
 		lx_os_unlock();
 		printf("lx: no room for %zu more bytes of rings\n", size);
 		return (NULL);
 	}
-	pool.rings_used += size;
+	pool.rings_used = at + size;
 	lx_os_unlock();
 	bzero(pool.memory + at, size);
 	*dma_handle = pool.address + at;
@@ -917,6 +928,19 @@ linuxkpi_kfree_skb(struct sk_buff *skb)
 		lx_os_unlock();
 	}
 	lkpi_kfree(skb->m);
+}
+
+/* A copy of a buffer: its data and its control block, in a slot of its own. */
+struct sk_buff *
+linuxkpi_skb_copy(const struct sk_buff *skb, gfp_t gfp)
+{
+	struct sk_buff *copy = linuxkpi_dev_alloc_skb(skb->len, gfp);
+
+	if (copy != NULL) {
+		memcpy(skb_put(copy, skb->len), skb->data, skb->len);
+		memcpy(copy->cb, skb->cb, sizeof(copy->cb));
+	}
+	return (copy);
 }
 
 /* ---- firmware files ---------------------------------------------------------------------------- */

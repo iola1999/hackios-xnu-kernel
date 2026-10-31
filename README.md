@@ -165,7 +165,7 @@ The iOS programs, frameworks and dyld shared cache are not changed by a single b
 | `uefi/`, `mkxnuimg.py` | the UEFI port and packing the boot image for `fastboot boot` |
 | `wifi/lx/` | the layer on which Linux's Wi-Fi driver builds for our kernel |
 | `qemu/` | QEMU runs, touch input, screenshots, stack symbolication |
-| `tools/` | recording (`recording.py`, `sound.py`), UFS/flash tools, `mk-ath11k.sh`, `new-workspace.sh`, host tests |
+| `tools/` | recording (`recording.py`, `sound.py`), UFS/flash tools, `mk-ath11k.sh`, `mk-ath12k.sh`, `new-workspace.sh`, host tests |
 | `prebuilt/` | built kernel, loader and UEFI pieces (`NOTICES.md` for the third-party code in the kernel) |
 | `docs/` | screenshots, [checks.md](docs/checks.md), [PORTING.md](docs/PORTING.md) |
 
@@ -189,7 +189,7 @@ From the phone's screen, one session (`GL=1 REST=1`, `gpu=1`):
 - `xnu/` is a derivative work of XNU and is distributed under APSL 2.0, like XNU itself; `prebuilt/mach.*` is the kernel built from it. It also contains ath11k (BSD-3-Clause-Clear) and FreeBSD LinuxKPI code (BSD-2-Clause): see [prebuilt/NOTICES.md](prebuilt/NOTICES.md).
 - `xnu/files/bsd/miscfs/apfs/libzbitmap/` and `xnu-deps/build/lzbitmap/` — libzbitmap (Corellium LLC, MIT here); `xnu/files/bsd/miscfs/apfs/libdeflate/` — libdeflate 1.24 (Eric Biggers, MIT, `COPYING` there).
 - `xnu/files/bsd/dev/mhi_boot.c` and `mhi_boot.h` — UniXNU's MhiBoot, unchanged, BSD-2-Clause-Patent, taken from hakios-arm64e-dada (`bsd/dev/hakios_mhi_boot.c`); `xnu/files/bsd/dev/mhi_pcie_fw.c` follows that project's `bsd/dev/hakios_dada_wifi.c` (HakiOS, APSL 2.0).
-- ath11k, Linux and FreeBSD sources are not in the repository: `tools/mk-ath11k.sh` fetches pinned releases. `wifi/lx/patches/*.patch` are our changes to FreeBSD headers; the rest of `wifi/lx/` is ours.
+- ath11k, ath12k, Linux and FreeBSD sources are not in the repository: `tools/mk-ath11k.sh` and `tools/mk-ath12k.sh` fetch pinned releases. `wifi/lx/patches/*.patch` are our changes to FreeBSD headers; the rest of `wifi/lx/` is ours. A 12377 kernel built while `xnu-deps/build/ath12k/out/ath12k.o` exists links ath12k (BSD-3-Clause-Clear) and FreeBSD LinuxKPI code (BSD-2-Clause) in.
 - `uefi/files/Binaries/redwood` and `prebuilt/uefi/SILICIUM_UEFI.fd` contain UEFI drivers from the phone's Xiaomi firmware, distributed the way Project Silicium distributes them for other devices; `prebuilt/uefi/mkbootimg.py` — AOSP, Apache-2.0.
 - This repository is licensed under the [Apple Public Source License 2.0](LICENSE): our changes to XNU are a derivative of XNU and must be, and our other code here (loader, scripts) is released under the same license. Third-party code keeps its own license, as listed above.
 

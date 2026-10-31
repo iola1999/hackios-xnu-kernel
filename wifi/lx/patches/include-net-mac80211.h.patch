@@ -1,11 +1,37 @@
 --- a/sys/compat/linuxkpi/common/include/net/mac80211.h
 +++ b/sys/compat/linuxkpi/common/include/net/mac80211.h
-@@ -282,6 +282,8 @@
+@@ -282,6 +282,10 @@
  struct ieee80211_bss_conf {
  	/* TODO FIXME */
  	struct ieee80211_vif			*vif;
 +	struct ieee80211_bss_conf		*tx_bss_conf;	/* of a multiple-BSSID set: the one that transmits */
++	bool					eht_80mhz_full_bw_ul_mumimo;
++	bool					eht_disable_mcs15;	/* the access point does not receive EHT-MCS 15 */
 +	uint8_t					pwr_reduction;	/* the access point's power constraint, dB */
  	struct cfg80211_bss			*bss;
  	const uint8_t				*bssid;
  	uint8_t					addr[ETH_ALEN];
+@@ -473,6 +477,7 @@
+ 	IEEE80211_HW_NO_VIRTUAL_MONITOR,
+ 
+ 	/* Keep last. */
++	IEEE80211_HW_MLO_MCAST_MULTI_LINK_TX,
+ 	NUM_IEEE80211_HW_FLAGS
+ };
+ 
+@@ -755,6 +760,7 @@
+ 	uint8_t					max_sp;
+ 	uint8_t					uapsd_queues;
+ 	uint16_t				valid_links;
++	uint16_t				eml_cap;	/* of its multi-link element */
+ 
+ 	struct ieee80211_link_sta		deflink;
+ 	struct ieee80211_link_sta		*link[IEEE80211_MLD_MAX_NUM_LINKS];	/* rcu? */
+@@ -1004,6 +1010,7 @@
+ 	int  (*sta_remove)(struct ieee80211_hw *, struct ieee80211_vif *, struct ieee80211_sta *);
+ 	int  (*sta_set_txpwr)(struct ieee80211_hw *, struct ieee80211_vif *, struct ieee80211_sta *);
+ 	void (*sta_statistics)(struct ieee80211_hw *, struct ieee80211_vif *, struct ieee80211_sta *, struct station_info *);
++	void (*link_sta_statistics)(struct ieee80211_hw *, struct ieee80211_vif *, struct ieee80211_link_sta *, struct link_station_info *);
+ 	void (*sta_pre_rcu_remove)(struct ieee80211_hw *, struct ieee80211_vif *, struct ieee80211_sta *);
+ 	int  (*sta_state)(struct ieee80211_hw *, struct ieee80211_vif *, struct ieee80211_sta *, enum ieee80211_sta_state, enum ieee80211_sta_state);
+ 	void (*sta_notify)(struct ieee80211_hw *, struct ieee80211_vif *, enum sta_notify_cmd, struct ieee80211_sta *);

@@ -30,7 +30,16 @@ export KERNEL_BUILD_OBJROOT=${KERNEL_BUILD_OBJROOT:-xnu12377[xnu-12377.121.6-1-g
 # stable, and any other value would make the same sources produce a different hash.
 export KERNEL_UUID=${KERNEL_UUID:-c71f02b3-2965-3ecc-9398-8915830464c4}
 
-${MAKE:-gmake} XCRUN="$XNU26_ROOT/xnu26/xcrun" SDKROOT="$XNU26_SDK" \
+# The Wi-Fi driver's object (tools/mk-ath12k.sh) is linked into the kernel when it is there; make does not see it
+# change, so the linked kernel is thrown away when it has (as xnu-build.sh does for ath11k's).
+LX=$XNU26_ROOT/xnu-deps/build/ath12k/out/ath12k.o
+if [ -f "$LX" ]; then now="$LX $(stat -f %m "$LX")"; else LX= now=; fi
+if [ -d BUILD/obj ] && [ "$(cat BUILD/obj/redwood-objects 2>/dev/null)" != "$now" ]; then
+  rm -f BUILD/obj/*/mach.*.unstripped
+  echo "$now" > BUILD/obj/redwood-objects
+fi
+
+${MAKE:-gmake} XCRUN="$XNU26_ROOT/xnu26/xcrun" SDKROOT="$XNU26_SDK" REDWOOD_OBJECTS="$LX" \
   ARCH_CONFIGS=ARM64 MACHINE_CONFIGS=${MACHINE:-BCM2837} KERNEL_CONFIGS=${KERNEL_CONFIG:-DEVELOPMENT} \
   ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64 BUILD_WERROR=0 BUILD_LTO=0 DO_CTFMERGE=0 LOGCOLORS=n \
   KEXT_CREATE_SYMBOL_SET=/usr/bin/true "$@" || exit $?

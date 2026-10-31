@@ -466,8 +466,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		torch_requested |= starts_with(c, "torch=") && (c == pi.cmdline || c[-1] == ' ') && c[6] >= '1' && c[6] <= '9';
 		camera_requested |= starts_with(c, "cam=5") && (c == pi.cmdline || c[-1] == ' ') && (c[5] == 0 || c[5] == ' ');
 		gamut_p3 |= starts_with(c, "gamut=p3") && (c == pi.cmdline || c[-1] == ' ');
-		low_dma_requested |= starts_with(c, "pcie=") && (c == pi.cmdline || c[-1] == ' ') && c[5] >= '7' &&
-		    c[5] <= '9' && (c[6] == 0 || c[6] == ' ');
+		low_dma_requested |= starts_with(c, "pcie=") && (c == pi.cmdline || c[-1] == ' ') &&
+		    ((c[5] >= '7' && c[5] <= '9' && (c[6] == 0 || c[6] == ' ')) ||
+		    (c[5] == '1' && c[6] == '0' && (c[7] == 0 || c[7] == ' ')));
 		if (starts_with(c, "ufs=") && (c == pi.cmdline || c[-1] == ' ') && c[4] >= '1' && c[4] <= '2' &&
 		    (c[5] == 0 || c[5] == ' ')) {
 			ufs_requested = c[4] - '0';

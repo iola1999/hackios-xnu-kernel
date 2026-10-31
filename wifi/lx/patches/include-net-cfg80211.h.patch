@@ -8,7 +8,34 @@
  	uint32_t				center_freq;
  	uint16_t				hw_value;
  	enum ieee80211_channel_flags		flags;
-@@ -716,6 +717,7 @@
+@@ -193,6 +194,7 @@
+ 	uint8_t					he_gi;
+ 	uint8_t					he_ru_alloc;
+ 	uint8_t					eht_gi;
++	uint8_t					eht_ru_alloc;		/* enum nl80211_eht_ru_alloc */
+ };
+ 
+ struct ieee80211_rate {
+@@ -684,6 +686,18 @@
+ 	struct nl80211_sta_flag_update		sta_flags;
+ };
+ 
++/* What a station has done on one of its links (multi-link operation, 802.11be) */
++struct link_station_info {
++	uint64_t				filled;		/* enum nl80211_sta_info */
++	uint64_t				rx_duration;
++	uint64_t				tx_duration;
++	uint32_t				tx_failed;
++	uint32_t				tx_retries;
++	int8_t					signal;
++	int8_t					signal_avg;
++	struct rate_info			txrate;
++};
++
+ struct station_parameters {
+ 	/* XXX TODO */
+ 	int     sta_flags_mask, sta_flags_set;
+@@ -716,6 +730,7 @@
  struct ieee80211_reg_rule {
  	/* TODO FIXME */
  	uint32_t	flags;
@@ -16,7 +43,7 @@
  	int	dfs_cac_ms;
  	struct freq_range {
  		int	start_freq_khz;
-@@ -1714,18 +1716,8 @@
+@@ -1714,18 +1729,8 @@
      struct linuxkpi_ieee80211_regdomain *regd)
  {
  

@@ -26,6 +26,8 @@ void	 lx_os_free(void *memory, unsigned long size);
  */
 void	*lx_os_radio_memory(unsigned long size, unsigned long long *address);
 void	*lx_os_map_registers(unsigned long long physical, unsigned long size);	/* never unmapped */
+/* where a radio on PCIe has its registers (BAR0): 0, or an errno (ENXIO: there is none) */
+int	 lx_os_radio_registers(unsigned long long *physical, unsigned long *size);
 
 /* ---- saying things ---- */
 void	 lx_os_print(const char *text);				/* for whoever looks for a fault: may be kept back */

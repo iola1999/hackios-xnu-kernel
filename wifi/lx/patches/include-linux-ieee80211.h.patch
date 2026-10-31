@@ -1,0 +1,19 @@
+--- a/sys/compat/linuxkpi/common/include/linux/ieee80211.h
++++ b/sys/compat/linuxkpi/common/include/linux/ieee80211.h
+@@ -607,6 +607,16 @@
+ 					/* Optional follows... */
+ 					uint8_t variable[0];
+ 				} __packed addba_req;
++				/* 802.11-2024, 9.6.4.3 ADDBA Response frame format */
++				struct {
++					uint8_t action_code;
++					uint8_t dialog_token;
++					uint16_t status;
++					uint16_t capab;
++					uint16_t timeout;
++					/* Optional follows... */
++					uint8_t variable[0];
++				} __packed addba_resp;
+ 				/* 802.11-2024, 9.6.13.3 Event Report frame format */
+ 				struct {
+ 					uint8_t wnm_action;

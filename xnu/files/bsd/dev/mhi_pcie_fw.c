@@ -137,15 +137,35 @@ static struct {
 	uint64_t pa, size, used;
 } dma;
 
-/* aligned to its own size rounded up to a power of two, as the boot loader wants its image (UniXNU arenaAlloc) */
-static void *
-dma_alloc(uint64_t bytes, uint64_t *pa)
+/* the loader's memory, mapped once */
+static bool
+dma_open(void)
 {
-	uint64_t align, at;
+	uint64_t low = 0, mb = 0;
 
-	bytes = (bytes + 4095) & ~4095ull;
-	for (align = 4096; align < bytes; align <<= 1) {
+	if (dma.va != 0) {
+		return true;
 	}
+	if (!PE_parse_boot_argn("lowdma", &low, sizeof(low)) || !PE_parse_boot_argn("lowdma_mb", &mb, sizeof(mb)) ||
+	    mb < 32 || low == 0 || low + (mb << 20) > 0x100000000ULL) {
+		printf("pcie: no memory below 4 GB from the loader (lowdma=, lowdma_mb=): loader v14 or later\n");
+		return false;
+	}
+	dma.pa = low;
+	dma.size = mb << 20;
+	dma.va = ml_io_map_wcomb((vm_offset_t)dma.pa, (vm_size_t)dma.size);
+	return dma.va != 0;
+}
+
+static void *
+dma_alloc_aligned(uint64_t bytes, uint64_t align, uint64_t *pa)
+{
+	uint64_t at;
+
+	if (!dma_open()) {
+		return NULL;
+	}
+	bytes = (bytes + 4095) & ~4095ull;
 	at = ((dma.pa + dma.used + align - 1) & ~(align - 1)) - dma.pa;
 	if (at + bytes > dma.size) {
 		return NULL;
@@ -156,11 +176,29 @@ dma_alloc(uint64_t bytes, uint64_t *pa)
 	return (void *)(dma.va + at);
 }
 
+/* aligned to its own size rounded up to a power of two, as the boot loader wants its image (UniXNU arenaAlloc) */
+static void *
+dma_alloc(uint64_t bytes, uint64_t *pa)
+{
+	uint64_t align;
+
+	for (align = 4096; align < bytes; align <<= 1) {
+	}
+	return dma_alloc_aligned(bytes, align, pa);
+}
+
 /* for step 9 (mhi_pcie_wlfw.c): what the firmware asks for, and the M3 image */
 void *
 mhi_pcie_dma_alloc(uint64_t bytes, uint64_t *pa)
 {
 	return dma_alloc(bytes, pa);
+}
+
+/* for the driver (redwood_lx.c): its memory for the card, in pages; the card sees it at its physical address */
+void *
+mhi_pcie_radio_memory(uint64_t bytes, uint64_t *pa)
+{
+	return dma_alloc_aligned(bytes, 4096, pa);
 }
 
 /* ---- streams: the controller's table, then the SMMU ---------------------------------------------------------- */
@@ -449,20 +487,12 @@ static const char *const phases[] = { "idle", "resetting", "loading the boot loa
 static bool
 stage_image(uint64_t *seg_pa, uint32_t *size, uint32_t *segments)
 {
-	uint64_t low = 0, mb = 0, soc_version, disk_size = 0;
+	uint64_t soc_version, disk_size = 0;
 	uint32_t which = 0;
 	const uint8_t *image;
 	int disk = 0;
 
-	if (!PE_parse_boot_argn("lowdma", &low, sizeof(low)) || !PE_parse_boot_argn("lowdma_mb", &mb, sizeof(mb)) ||
-	    mb < 32 || low == 0 || low + (mb << 20) > 0x100000000ULL) {
-		printf("pcie: step 7: no memory below 4 GB from the loader (lowdma=, lowdma_mb=): loader v14 or later\n");
-		return false;
-	}
-	dma.pa = low;
-	dma.size = mb << 20;
-	dma.va = ml_io_map_wcomb((vm_offset_t)dma.pa, (vm_size_t)dma.size);
-	if (dma.va == 0) {
+	if (!dma_open()) {
 		return false;
 	}
 	soc_version = card_rd(TCSR_SOC_HW_VERSION);
@@ -502,7 +532,8 @@ mhi_pcie_firmware(const struct mhi_pcie_card *card)
 	MhiIo io = { mhi_read, mhi_write, NULL, BAR_MAP };
 
 	conf = card->conf;
-	bar = card->bar0 != 0 ? ml_io_map(card->bar0, BAR_MAP) : 0;
+	bar = bar != 0 ? bar : card->bar0 != 0 ? ml_io_map(card->bar0, BAR_MAP) : 0;
+	window = UINT32_MAX;                            /* (the driver moves it too, pcie=10) */
 	if (bar == 0) {
 		printf("pcie: step 7: no BAR0 to map\n");
 		return false;
@@ -762,6 +793,18 @@ channel(struct ring *r, uint32_t number, uint32_t type)
 	printf("pcie: step 8: channel %u: %s, context state %#x\n", number, commands_done != before ? "started" : "no answer",
 	    rd((vm_offset_t)c) & 0xff);
 	return commands_done != before;
+}
+
+/*
+ * The host's vote that keeps the card awake (Linux drivers/bus/mhi: the doorbell of channel 127, MHI_DEV_WAKE_DB):
+ * ath12k holds it around every access to the card's registers past the first 4 KiB, and here it is held from mission
+ * mode on, for the driver (pcie=10), which touches those registers without asking.
+ */
+void
+mhi_pcie_wake(void)
+{
+	doorbell(MHI_CHDB(127), 1);
+	printf("pcie: the card is asked to stay awake (the wake doorbell)\n");
 }
 
 /* the link's thread: both event rings, every 5 ms, for as long as the phone runs */

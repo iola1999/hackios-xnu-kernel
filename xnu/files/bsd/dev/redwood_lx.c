@@ -8,7 +8,8 @@
  * and asks for the calls of sys/redwood_lx.h, which are here: memory, time, threads, one lock
  * to sleep under, the kernel's options. What it asks of the radio itself -- its firmware's
  * files, its view of memory, the processor its firmware runs on -- is redwood_wifi.c's to
- * answer, which knows the phone.
+ * answer, which knows the phone; on the K90 (ath12k, tools/mk-ath12k.sh, started by pcie=10)
+ * it is mhi_pcie.c's, which knows the card on PCIe.
  *
  * A kernel built without the object has the lx_start() at the end of this file, which says so.
  */
@@ -30,6 +31,7 @@
 #include <sys/systm.h>
 #include <vm/memory_types.h>
 #include <vm/vm_kern.h>
+#include "mhi_pcie_private.h"
 
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
@@ -66,6 +68,12 @@ lx_os_radio_memory(unsigned long size, unsigned long long *address)
 	vm_offset_t cached = 0, uncached;
 	uint64_t physical;
 
+	if (mhi_pcie_radio()) {
+		void *memory = mhi_pcie_radio_memory(size, &physical);
+
+		*address = physical;
+		return memory;
+	}
 	size = round_page(size);
 	if (kmem_alloc_contig(kernel_map, &cached, size, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
 	    KERN_SUCCESS) {
@@ -92,6 +100,19 @@ lx_os_map_registers(unsigned long long physical, unsigned long size)
 	vm_offset_t mapped = ml_io_map_unmappable(page, round_page(physical + size) - page, VM_WIMG_IO);
 
 	return mapped == 0 ? NULL : (void *)(mapped + (physical - page));
+}
+
+int
+lx_os_radio_registers(unsigned long long *physical, unsigned long *size)
+{
+	uint64_t pa, length;
+
+	if (!mhi_pcie_radio_registers(&pa, &length)) {
+		return ENXIO;
+	}
+	*physical = pa;
+	*size = (unsigned long)length;
+	return 0;
 }
 
 /* ---- saying things ----------------------------------------------------------------------------------- */
@@ -215,7 +236,7 @@ int
 lx_os_firmware(const char *name, const void **data, unsigned long *size)
 {
 	uint64_t length = 0;
-	const uint8_t *file = redwood_wifi_driver_file(name, &length);
+	const uint8_t *file = mhi_pcie_radio() ? mhi_pcie_radio_file(name, &length) : redwood_wifi_driver_file(name, &length);
 
 	if (file == NULL) {
 		return ENOENT;
@@ -228,6 +249,9 @@ lx_os_firmware(const char *name, const void **data, unsigned long *size)
 int
 lx_os_rproc_boot(void)
 {
+	if (mhi_pcie_radio()) {
+		return mhi_pcie_radio_boot();
+	}
 	return redwood_wifi_dsp_is_up() ? 0 : ENXIO;
 }
 

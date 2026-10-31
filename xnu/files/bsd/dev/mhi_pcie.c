@@ -34,7 +34,7 @@
  * sizing test, written all-ones and restored, every write read back. Nothing happens at all
  * unless a boot-arg asks:
  *
- *   pcie=N   run steps 1 through N, clamped to 9.
+ *   pcie=N   run steps 1 through N, clamped to 10.
  *
  *   step 1  read-only, the clock controller and the pin controller only: the two PCIe power
  *           domains, the root complex's clocks, and the six pins the device tree wires to the
@@ -63,6 +63,8 @@
  *           goes back to the card's config space for it and stays there.
  *   step 8  once step 7 reached mission mode: QRTR's MHI channels, the router on them (mhi_pcie_fw.c).
  *   step 9  the exchange with the firmware's WLFW service up to FW_READY (mhi_pcie_wlfw.c).
+ *   step 10 in place of steps 7 to 9: the Wi-Fi driver (ath12k, tools/mk-ath12k.sh, through redwood_lx.c), which
+ *           has steps 7 and 8 run when it powers the card up, and talks to the WLFW service itself.
  *
  * Without pcie_power=1 nothing persists -- everything written is restored -- so there is no quiesce on the
  * way out. pcie_power=1 with pcie=2 or more powers root complex 0 and the card up between steps 1
@@ -79,11 +81,14 @@
 #include <mach/mach_types.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
+#include <sys/redwood_input.h>
+#include <sys/redwood_qrtr.h>
 #include <sys/systm.h>
 
 #include "mhi_pcie_private.h"
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern const uint8_t *redwood_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 extern kern_return_t thread_terminate(thread_t thread);
 extern void loader_log_putc(char c);
 
@@ -860,6 +865,61 @@ mhi_pcie_pause(const char *what)
 	thread_block(THREAD_CONTINUE_NULL);
 }
 
+/* ---- step 10: the card, for the driver (redwood_lx.c) ------------------------------------------------- */
+
+static struct mhi_pcie_card radio_card;         /* set when the driver is started on it */
+
+bool
+mhi_pcie_radio(void)
+{
+	return radio_card.bar0 != 0;
+}
+
+/* the driver's power-up: the firmware to mission mode (step 7), QRTR on the IPCR channels (step 8), the card kept awake */
+int
+mhi_pcie_radio_boot(void)
+{
+	if (!mhi_pcie_radio() || !mhi_pcie_firmware(&radio_card) || !mhi_pcie_ipcr()) {
+		return EIO;
+	}
+	mhi_pcie_wake();
+	return 0;
+}
+
+bool
+mhi_pcie_radio_registers(uint64_t *pa, uint64_t *size)
+{
+	*pa = radio_card.bar0;
+	*size = BAR0_SIZE;
+	return mhi_pcie_radio();
+}
+
+/*
+ * The files ath12k asks for, by the names of Linux's firmware tree ("ath12k/WCN7850/hw2.0/board.bin"), from what
+ * Android's driver loads (fw/ of the RAM disk, package.py WIFI_FW=1): the board's data as cnss2 picks it when the
+ * firmware gives no board id (pcie_bdf=NAME picks another), the regulatory database, and the M3 image. Those that
+ * ath12k can do without (board-2.bin, firmware-2.bin, calibration) are not there.
+ */
+const uint8_t *
+mhi_pcie_radio_file(const char *name, uint64_t *size)
+{
+	static char board[32] = "bdwlan.elf";
+	const char *last = strrchr(name, '/'), *file = NULL;
+	int disk = 0;
+
+	last = last == NULL ? name : last + 1;
+	if (strcmp(last, "board.bin") == 0) {
+		(void)PE_parse_boot_argn("pcie_bdf", board, sizeof(board));
+		file = board;
+	} else if (strcmp(last, "regdb.bin") == 0) {
+		file = "regdb.bin";
+	} else if (strcmp(last, "m3.bin") == 0) {
+		file = "phy_ucode20.elf";
+	}
+	printf("pcie: the driver asks for %s: %s\n", last, file == NULL ? "not there" : file);
+	return file == NULL ? NULL : redwood_image_file("fw", file, size, &disk);
+}
+
 static void
 pcie_thread(void *parameter, __unused wait_result_t result)
 {
@@ -923,7 +983,12 @@ pcie_thread(void *parameter, __unused wait_result_t result)
 		struct mhi_pcie_card card = { parf, dm_core, conf, ep_bar0 & ~0xfu };
 
 		config_window();
-		if (mhi_pcie_firmware(&card) && steps >= 8 && mhi_pcie_ipcr() && steps >= 9) {
+		if (steps >= 10) {
+			/* (the driver asks for the WLFW service before it powers the card up and the router has a link) */
+			radio_card = card;
+			redwood_qmi_set_transport(&redwood_qrtr);
+			printf("pcie: step 10: the driver starts (redwood_lx.c): %d\n", redwood_lx_start());
+		} else if (mhi_pcie_firmware(&card) && steps >= 8 && mhi_pcie_ipcr() && steps >= 9) {
 			mhi_pcie_wlfw();
 		}
 	}
@@ -947,8 +1012,8 @@ mhi_pcie_init(void)
 	}
 	PE_parse_boot_argn("pcie_pause", &pause_s, sizeof(pause_s));
 	PE_parse_boot_argn("pcie_power", &power, sizeof(power));
-	if (steps > 9) {
-		steps = 9;
+	if (steps > 10) {
+		steps = 10;
 	}
 	if (kernel_thread_start(pcie_thread, (void *)(uintptr_t)steps, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
