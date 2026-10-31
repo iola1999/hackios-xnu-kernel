@@ -34,7 +34,7 @@
  * sizing test, written all-ones and restored, every write read back. Nothing happens at all
  * unless a boot-arg asks:
  *
- *   pcie=N   run steps 1 through N, clamped to 8.
+ *   pcie=N   run steps 1 through N, clamped to 9.
  *
  *   step 1  read-only, the clock controller and the pin controller only: the two PCIe power
  *           domains, the root complex's clocks, and the six pins the device tree wires to the
@@ -61,8 +61,8 @@
  *           a later step after this access succeeds on the device.
  *   step 7  the card's firmware, PBL to mission mode (mhi_pcie_fw.c). Only with pcie_power=1; region 0
  *           goes back to the card's config space for it and stays there.
- *   step 8  once step 7 reached mission mode: QRTR's MHI channels and the card's first QRTR words
- *           (mhi_pcie_fw.c).
+ *   step 8  once step 7 reached mission mode: QRTR's MHI channels, the router on them (mhi_pcie_fw.c).
+ *   step 9  the exchange with the firmware's WLFW service up to FW_READY (mhi_pcie_wlfw.c).
  *
  * Without pcie_power=1 nothing persists -- everything written is restored -- so there is no quiesce on the
  * way out. pcie_power=1 with pcie=2 or more powers root complex 0 and the card up between steps 1
@@ -923,8 +923,8 @@ pcie_thread(void *parameter, __unused wait_result_t result)
 		struct mhi_pcie_card card = { parf, dm_core, conf, ep_bar0 & ~0xfu };
 
 		config_window();
-		if (mhi_pcie_firmware(&card) && steps >= 8) {
-			mhi_pcie_ipcr();
+		if (mhi_pcie_firmware(&card) && steps >= 8 && mhi_pcie_ipcr() && steps >= 9) {
+			mhi_pcie_wlfw();
 		}
 	}
 
@@ -947,8 +947,8 @@ mhi_pcie_init(void)
 	}
 	PE_parse_boot_argn("pcie_pause", &pause_s, sizeof(pause_s));
 	PE_parse_boot_argn("pcie_power", &power, sizeof(power));
-	if (steps > 8) {
-		steps = 8;
+	if (steps > 9) {
+		steps = 9;
 	}
 	if (kernel_thread_start(pcie_thread, (void *)(uintptr_t)steps, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);

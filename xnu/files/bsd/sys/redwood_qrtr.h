@@ -46,4 +46,20 @@ struct redwood_qrtr_ops {
 /* The transport there is; NULL takes it away (handles made before keep the one they were made with). */
 void redwood_qmi_set_transport(const struct redwood_qrtr_ops *ops);
 
+/*
+ * The router (bsd/dev/redwood_qrtr.c): the four calls above over whichever link is attached. The link
+ * names the function that sends one whole datagram, header and all (NULL: none, the router's tables
+ * emptied), and hands it each datagram it receives, and a moment to answer lookups, from its one thread.
+ */
+extern const struct redwood_qrtr_ops redwood_qrtr;
+void redwood_qrtr_attach(int (*send)(const void *data, uint32_t length));
+void redwood_qrtr_input(const void *data, uint32_t length);
+void redwood_qrtr_fresh(void);
+
+struct redwood_qrtr_counts {
+	uint32_t peer;                          /* the other side's node, 0 before it has sent anything */
+	uint32_t hellos, in, out, services;
+};
+void redwood_qrtr_counts(struct redwood_qrtr_counts *counts);
+
 #endif /* _SYS_REDWOOD_QRTR_H_ */

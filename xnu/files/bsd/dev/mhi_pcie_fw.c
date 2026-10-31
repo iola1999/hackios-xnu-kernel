@@ -26,13 +26,17 @@
  * the card's until the phone resets. Step 8, at the end of this file, starts QRTR's channels on top.
  */
 #include <kern/clock.h>
+#include <kern/locks.h>
+#include <kern/thread.h>
 #include <kern/sched_prim.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
+#include <sys/errno.h>
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/redwood_qrtr.h>
 #include "mhi_boot.h"
 #include "mhi_pcie_private.h"
 
@@ -150,6 +154,13 @@ dma_alloc(uint64_t bytes, uint64_t *pa)
 	*pa = dma.pa + at;
 	bzero((void *)(dma.va + at), (size_t)bytes);
 	return (void *)(dma.va + at);
+}
+
+/* for step 9 (mhi_pcie_wlfw.c): what the firmware asks for, and the M3 image */
+void *
+mhi_pcie_dma_alloc(uint64_t bytes, uint64_t *pa)
+{
+	return dma_alloc(bytes, pa);
 }
 
 /* ---- streams: the controller's table, then the SMMU ---------------------------------------------------------- */
@@ -559,13 +570,14 @@ mhi_pcie_firmware(const struct mhi_pcie_card *card)
 }
 
 /*
- * ---- step 8 (pcie=8): channels 20 and 21, "IPCR", and the router's first words ----------------------------------
+ * ---- step 8 (pcie=8): channels 20 and 21, "IPCR", under QRTR ------------------------------------------------------
  *
- * QRTR runs over the MHI channel pair IPCR (ath12k mhi.c: channel 20 to the card, 21 from it, both reporting on
- * event ring 1). The channels' contexts are filled, started with a command each (MHI_CMD_START_CHAN, completed on
- * event ring 0), receive buffers queued on 21, and what arrives is read as QRTR version 1 headers: the card's HELLO
- * is answered with ours, after which its name service tells of its services (NEW_SERVER), the Wi-Fi firmware's
- * (WLFW, 69) among them. Ring elements and events after Linux drivers/bus/mhi/common.h and internal.h.
+ * QRTR runs over the MHI channel pair IPCR (ath12k mhi.c: channel 20 to the card, 21 from it, both reporting on event
+ * ring 1). Their contexts are filled and each is started with a command (MHI_CMD_START_CHAN, completed on event ring
+ * 0); receive buffers wait on 21. The router (redwood_qrtr.c) is attached to channel 20 and becomes the QMI helpers'
+ * transport; a thread of ours then reads both event rings for as long as the phone runs, handing what arrives on 21
+ * to the router: the card's HELLO is answered there, and its name service tells of the Wi-Fi firmware's service
+ * (WLFW, 69). Ring elements and events after Linux drivers/bus/mhi/common.h and internal.h.
  */
 #define MHI_CRDB                0x70
 #define MHI_CHDB(n)             (rd(bar + 0x18) + 8 * (n))
@@ -573,14 +585,12 @@ mhi_pcie_firmware(const struct mhi_pcie_card *card)
 #define IPCR_UL                 20u
 #define IPCR_DL                 21u
 #define IPCR_ELEMENTS           16u
-#define IPCR_BUFFER             8192u
+#define IPCR_BUFFER             0x8000u
 #define PKT_TRANSFER            0x02u
 #define PKT_START_CHAN          0x12u
-#define EV_STATE_CHANGE         0x20u
 #define EV_CMD_COMPLETION       0x21u
 #define EV_TRANSFER             0x22u
-#define EV_EE                   0x40u
-#define QRTR_CONTROL_PORT       0xfffffffeu
+#define TRE_IEOT                (1u << 9)
 
 struct ring {
 	uint8_t *va;
@@ -588,12 +598,14 @@ struct ring {
 	uint32_t elements;
 };
 
+static LCK_GRP_DECLARE(ipcr_lock_group, "mhi-ipcr");
+static LCK_MTX_DECLARE(ul_lock, &ipcr_lock_group);      /* channel 20's ring and buffers, written by any sender */
 static struct ring cmd, ul, dl;
 static uint64_t ev_local[EVENT_RINGS];
-static uint8_t *dl_buffer[IPCR_ELEMENTS], *ul_buffer;
-static uint64_t dl_buffer_pa[IPCR_ELEMENTS], ul_buffer_pa;
+static uint8_t *dl_buffer[IPCR_ELEMENTS], *ul_buffer[IPCR_ELEMENTS];
+static uint64_t dl_buffer_pa[IPCR_ELEMENTS], ul_buffer_pa[IPCR_ELEMENTS];
 static uint8_t dl_at[IPCR_ELEMENTS];            /* which buffer each element of channel 21's ring holds */
-static unsigned commands_done, hellos, servers;
+static unsigned commands_done, ul_pending;
 
 static void
 put64(uint8_t *at, uint64_t v)
@@ -619,11 +631,10 @@ doorbell(uint32_t reg, uint64_t value)
 }
 
 /* one element at the ring's write pointer; the pointer moves on, in the context too */
-static uint64_t
+static void
 ring_put(struct ring *r, uint8_t *context_wp, uint64_t pointer, uint32_t dword0, uint32_t dword1)
 {
 	uint8_t *el = r->va + (r->wp - r->pa);
-	uint64_t at = r->wp;
 
 	put64(el, pointer);
 	memcpy(el + 8, &dword0, 4);
@@ -633,60 +644,36 @@ ring_put(struct ring *r, uint8_t *context_wp, uint64_t pointer, uint32_t dword0,
 		r->wp = r->pa;
 	}
 	put64(context_wp, r->wp);
-	return at;
 }
 
 static void
 dl_queue(uint8_t buffer)
 {
 	dl_at[(dl.wp - dl.pa) / ELEMENT] = buffer;
-	ring_put(&dl, ctx_va + IPCR_DL * CTX + 36, dl_buffer_pa[buffer], IPCR_BUFFER, PKT_TRANSFER << 16 | 1u << 9);
+	ring_put(&dl, ctx_va + IPCR_DL * CTX + 36, dl_buffer_pa[buffer], IPCR_BUFFER, PKT_TRANSFER << 16 | TRE_IEOT);
 }
 
-static void
-qrtr_hello(uint32_t node)
+/* the router's link: one datagram onto channel 20, in the buffer of the ring element it goes into */
+static int
+ipcr_send(const void *data, uint32_t length)
 {
-	uint32_t packet[8 + 5] = { 1, 2, 1, QRTR_CONTROL_PORT, 0, 20, node, QRTR_CONTROL_PORT, 2 };
+	uint32_t slot;
 
-	memcpy(ul_buffer, packet, sizeof(packet));
-	ring_put(&ul, ctx_va + IPCR_UL * CTX + 36, ul_buffer_pa, sizeof(packet), PKT_TRANSFER << 16 | 1u << 9);
+	if (length > IPCR_BUFFER) {
+		return EMSGSIZE;
+	}
+	lck_mtx_lock(&ul_lock);
+	if (ul_pending >= IPCR_ELEMENTS - 1) {
+		lck_mtx_unlock(&ul_lock);
+		return ENOBUFS;
+	}
+	slot = (uint32_t)((ul.wp - ul.pa) / ELEMENT);
+	memcpy(ul_buffer[slot], data, length);
+	ring_put(&ul, ctx_va + IPCR_UL * CTX + 36, ul_buffer_pa[slot], length, PKT_TRANSFER << 16 | TRE_IEOT);
+	ul_pending++;
 	doorbell(MHI_CHDB(IPCR_UL), ul.wp);
-	printf("pcie: step 8: qrtr: HELLO to node %u sent\n", node);
-}
-
-/* one QRTR packet from the card: the header said, the control port's messages read */
-static void
-qrtr_packet(const uint8_t *data, uint32_t length)
-{
-	uint32_t h[8], word[5] = { 0 };
-
-	if (length < sizeof(h) || data[0] != 1) {
-		printf("pcie: step 8: qrtr: %u bytes, first %#x: not a version 1 packet\n", length, length ? data[0] : 0);
-		return;
-	}
-	memcpy(h, data, sizeof(h));
-	memcpy(word, data + sizeof(h), MIN(sizeof(word), length - sizeof(h)));
-	if (h[7] != QRTR_CONTROL_PORT) {
-		printf("pcie: step 8: qrtr: type %u from %u:%#x to %u:%#x, %u bytes\n", h[1], h[2], h[3], h[6], h[7], h[5]);
-		return;
-	}
-	switch (word[0]) {
-	case 2:
-		printf("pcie: step 8: qrtr: HELLO from node %u\n", h[2]);
-		if (hellos++ == 0) {
-			qrtr_hello(h[2]);
-		}
-		break;
-	case 4:
-		servers++;
-		printf("pcie: step 8: qrtr: service %u (%#x) version %u instance %u at node %u port %#x\n", word[1], word[1],
-		    word[2] & 0xff, word[2] >> 8, word[3], word[4]);
-		break;
-	default:
-		printf("pcie: step 8: qrtr: control %u from node %u: %#x %#x %#x %#x\n", word[0], h[2], word[1], word[2],
-		    word[3], word[4]);
-		break;
-	}
+	lck_mtx_unlock(&ul_lock);
+	return 0;
 }
 
 static void
@@ -706,11 +693,13 @@ event(unsigned r, const uint8_t *el)
 	    pointer < dl.pa + IPCR_ELEMENTS * ELEMENT) {
 		uint8_t i = dl_at[(pointer - dl.pa) / ELEMENT];
 
-		qrtr_packet(dl_buffer[i], MIN(d0 & 0xffff, IPCR_BUFFER));
+		redwood_qrtr_input(dl_buffer[i], MIN(d0 & 0xffff, IPCR_BUFFER));
 		dl_queue(i);
 		doorbell(MHI_CHDB(IPCR_DL), dl.wp);
 	} else if (type == EV_TRANSFER && (d1 >> 24) == IPCR_UL) {
-		printf("pcie: step 8: channel 20 sent %u bytes (code %u)\n", d0 & 0xffff, code);
+		lck_mtx_lock(&ul_lock);
+		ul_pending -= ul_pending != 0;
+		lck_mtx_unlock(&ul_lock);
 	} else {
 		printf("pcie: step 8: event ring %u: type %#x code %u pointer %#llx (%#x %#x)\n", r, type, code, pointer, d0, d1);
 	}
@@ -775,10 +764,22 @@ channel(struct ring *r, uint32_t number, uint32_t type)
 	return commands_done != before;
 }
 
-void
+/* the link's thread: both event rings, every 5 ms, for as long as the phone runs */
+static void
+ipcr_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	for (;;) {
+		events(0);
+		events(1);
+		redwood_qrtr_fresh();
+		ms(5);
+	}
+}
+
+bool
 mhi_pcie_ipcr(void)
 {
-	uint64_t start;
+	thread_t thread;
 
 	cmd.va = ctx_va + (cmd_pa - ctx_pa);
 	cmd.pa = cmd_pa;
@@ -794,26 +795,27 @@ mhi_pcie_ipcr(void)
 	}
 	printf("pcie: step 8: MHI state %u, execution environment %u; event rings at %#llx %#llx, command ring %#llx\n",
 	    (rd(bar + 0x48) >> 8) & 0xff, rd(bar + rd(bar + 0x28) + 0x28), ev_local[0], ev_local[1], cmd.wp);
-	ul_buffer = dma_alloc(IPCR_BUFFER, &ul_buffer_pa);
-	for (unsigned i = 0; i < IPCR_ELEMENTS && ul_buffer != NULL; i++) {
+	for (unsigned i = 0; i < IPCR_ELEMENTS; i++) {
 		dl_buffer[i] = dma_alloc(IPCR_BUFFER, &dl_buffer_pa[i]);
-		if (dl_buffer[i] == NULL) {
-			ul_buffer = NULL;
+		ul_buffer[i] = dma_alloc(IPCR_BUFFER, &ul_buffer_pa[i]);
+		if (dl_buffer[i] == NULL || ul_buffer[i] == NULL) {
+			printf("pcie: step 8: no DMA memory for the IPCR buffers\n");
+			return false;
 		}
 	}
-	if (ul_buffer == NULL || !channel(&ul, IPCR_UL, 1) || !channel(&dl, IPCR_DL, 2)) {
+	if (!channel(&ul, IPCR_UL, 1) || !channel(&dl, IPCR_DL, 2)) {
 		printf("pcie: step 8: the IPCR channels did not start\n");
-		return;
+		return false;
 	}
+	redwood_qrtr_attach(ipcr_send);
+	redwood_qmi_set_transport(&redwood_qrtr);
 	for (uint8_t i = 0; i < IPCR_ELEMENTS - 1; i++) {
 		dl_queue(i);
 	}
 	doorbell(MHI_CHDB(IPCR_DL), dl.wp);
-	for (start = uptime_ms(); uptime_ms() - start < 15000;) {
-		events(0);
-		events(1);
-		ms(5);
+	if (kernel_thread_start(ipcr_thread, NULL, &thread) != KERN_SUCCESS) {
+		return false;
 	}
-	printf("pcie: step 8: the end: %u HELLO, %u services; MHI state %u, execution environment %u\n", hellos, servers,
-	    (rd(bar + 0x48) >> 8) & 0xff, rd(bar + rd(bar + 0x28) + 0x28));
+	thread_deallocate(thread);
+	return true;
 }

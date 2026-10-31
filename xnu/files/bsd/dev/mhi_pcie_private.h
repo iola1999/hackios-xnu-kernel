@@ -25,7 +25,9 @@ int mhi_pcie_say(const char *format, ...) __printflike(1, 2);
 void mhi_pcie_pause(const char *what);
 bool mhi_pcie_power_up(const struct mhi_pcie_windows *windows);
 bool mhi_pcie_firmware(const struct mhi_pcie_card *card);
-void mhi_pcie_ipcr(void);
+bool mhi_pcie_ipcr(void);
+void *mhi_pcie_dma_alloc(uint64_t bytes, uint64_t *pa);
+void mhi_pcie_wlfw(void);
 
 static inline uint32_t
 mhi_pcie_rd(vm_offset_t address)
