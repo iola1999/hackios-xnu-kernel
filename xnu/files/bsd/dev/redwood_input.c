@@ -39,18 +39,24 @@ extern void loader_log_line(const char *line);
 /*
  * A "tl:" line, for the kernel's drivers: into the loader's log as it is written -- the kernel's own
  * log keeps only the last of a run, and a live look at the loader's (XL_FOLLOW) then misses nothing.
+ * The buffer holds a kern.redwood.say line whole (255 bytes of text after "say PID NAME: "); a longer
+ * line is cut and still ends with its newline, so it does not run into the next one.
  */
 void redwood_tl(const char *format, ...) __printflike(1, 2);
 
 void
 redwood_tl(const char *format, ...)
 {
-	char line[192];
+	char line[320];
 	va_list list;
+	int length;
 
 	va_start(list, format);
-	vsnprintf(line, sizeof(line), format, list);
+	length = vsnprintf(line, sizeof(line), format, list);
 	va_end(list);
+	if (length >= (int)sizeof(line)) {
+		line[sizeof(line) - 2] = '\n';
+	}
 	loader_log_line(line);
 }
 

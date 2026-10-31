@@ -1,0 +1,89 @@
+diff --git a/osfmk/vm/vm_memory_entry.c b/osfmk/vm/vm_memory_entry.c
+index a92c3c0..284621a 100644
+--- a/osfmk/vm/vm_memory_entry.c
++++ b/osfmk/vm/vm_memory_entry.c
+@@ -112,6 +112,9 @@ vm_memory_entry_get_offset_in_page(
+ 	return offset_in_page;
+ }
+ 
++extern char *proc_name_address(void *p);
++extern int proc_selfpid(void);
++
+ static inline kern_return_t
+ mach_make_memory_entry_cleanup(
+ 	kern_return_t           kr,
+@@ -122,6 +125,20 @@ mach_make_memory_entry_cleanup(
+ 	vm_named_entry_t        user_entry __unused,
+ 	ipc_port_t             *object_handle)
+ {
++	/* redwood: every failed copy entry (MAP_MEM_VM_COPY), with what it was asked for; at most 16 a
++	 * boot. memory_entry_copy_failed below adds the map entry when the copy itself failed. */
++	if (kr != KERN_SUCCESS && (permission & MAP_MEM_VM_COPY)) {
++		static int said;
++		void *bsd = get_bsdtask_info(current_task());
++
++		if (os_atomic_inc(&said, relaxed) <= 16) {
++			printf("memory entry: %s[%d] copy entry for 0x%llx + 0x%llx permission 0x%x failed %d\n",
++			    bsd ? proc_name_address(bsd) : "?", proc_selfpid(),
++			    (unsigned long long)VM_SANITIZE_UNSAFE_UNWRAP(offset_u),
++			    (unsigned long long)VM_SANITIZE_UNSAFE_UNWRAP(*size_u), permission,
++			    vm_sanitize_get_kr(kr));
++		}
++	}
+ 	DEBUG4K_MEMENTRY("map %p offset 0x%llx size 0x%llx prot 0x%x -> entry "
+ 	    "%p kr 0x%x\n", target_map, VM_SANITIZE_UNSAFE_UNWRAP(offset_u),
+ 	    VM_SANITIZE_UNSAFE_UNWRAP(*size_u), permission, user_entry,
+@@ -481,6 +498,45 @@ mach_make_memory_entry_named_create(
+ 	return KERN_SUCCESS;
+ }
+ 
++/*
++ * redwood: say why a copy entry (MAP_MEM_VM_COPY) could not be made, with the map entry the range
++ * starts in. QuartzCore sends an ASTC image's bytes to the window server as such an entry, and a
++ * failure reaches backboardd as "CompressedImage port is MACH_PORT_NULL!". At most 16 lines a boot.
++ */
++static void
++memory_entry_copy_failed(vm_map_t map, vm_map_offset_t start, vm_map_size_t size, kern_return_t kr)
++{
++	static int said;
++	vm_map_entry_t entry;
++	void *bsd = get_bsdtask_info(current_task());
++
++	if (os_atomic_inc(&said, relaxed) > 16) {
++		return;
++	}
++	vm_map_ilk_lock_shared(map);
++	entry = vm_map_lookup(map, start);
++	if (entry == VM_MAP_ENTRY_NULL) {
++		printf("memory entry: %s[%d] copy of 0x%llx + 0x%llx failed %d: no map entry there\n",
++		    bsd ? proc_name_address(bsd) : "?", proc_selfpid(), (unsigned long long)start,
++		    (unsigned long long)size, kr);
++	} else {
++		vm_object_t object = entry->is_sub_map ? VM_OBJECT_NULL : VME_OBJECT(entry);
++
++		printf("memory entry: %s[%d] copy of 0x%llx + 0x%llx failed %d: entry 0x%llx-0x%llx "
++		    "submap %d tag %d prot %d/%d iokit %d; object %p internal %d private %d phys_contiguous %d "
++		    "copy_strategy %d true_share %d pager %d size 0x%llx\n",
++		    bsd ? proc_name_address(bsd) : "?", proc_selfpid(), (unsigned long long)start,
++		    (unsigned long long)size, kr, (unsigned long long)entry->vme_start,
++		    (unsigned long long)entry->vme_end, entry->is_sub_map, VME_ALIAS(entry),
++		    entry->protection, entry->max_protection, entry->iokit_acct, object,
++		    object ? object->internal : -1, object ? object->private : -1,
++		    object ? object->phys_contiguous : -1, object ? (int)object->copy_strategy : -1,
++		    object ? object->true_share : -1, object ? object->pager_created : -1,
++		    object ? (unsigned long long)object->vo_size : 0ULL);
++	}
++	vm_map_ilk_unlock_shared(map);
++}
++
+ static kern_return_t
+ mach_make_memory_entry_copy(
+ 	vm_map_t                      target_map,
+@@ -551,6 +607,7 @@ mach_make_memory_entry_copy(
+ 	    copyin_flags,
+ 	    &copy);
+ 	if (kr != KERN_SUCCESS) {
++		memory_entry_copy_failed(target_map, map_start, map_size, kr);
+ 		return mach_make_memory_entry_cleanup(kr, target_map,
+ 		           size_u, offset_u, permission, user_entry, object_handle);
+ 	}

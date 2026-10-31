@@ -121,6 +121,7 @@ struct rwa_compute_info {
 	 * every field above keeps the offset this file already reads -- and this file and
 	 * the library still have to be rebuilt together. */
 	unsigned argbuf_mask;
+	unsigned group_free;   /* any threadgroup size that divides the grid serves alike */
 };
 struct rwa_texture_shape {
 	unsigned pixel_format, type, width, height, depth;
@@ -1024,6 +1025,7 @@ struct gem_close { uint32_t handle, pad; };
 				info:(const struct rwa_compute_info *)info
 			  descriptor:(id)descriptor;
 - (struct rwa_compute *)compute;
+- (BOOL)groupFree;
 @end
 
 @interface RedwoodMetalCommandQueue : _MTLCommandQueue
@@ -1408,7 +1410,7 @@ struct gem_close { uint32_t handle, pad; };
 		return [self fail:error with:@"the fragment function has no bitcode"];
 	}
 
-	struct rwa_render_shape shape = { .sample_count = (unsigned)[descriptor sampleCount] };
+	struct rwa_render_shape shape = { .sample_count = rw_one_sample() ? 1u : (unsigned)[descriptor sampleCount] };
 
 	/*
 	 * THE COLOUR ATTACHMENTS, each one's format AND ITS BLEND STATE.
@@ -1830,8 +1832,13 @@ struct gem_close { uint32_t handle, pad; };
 		.sample_count = (unsigned)[descriptor sampleCount],
 		.usage = (unsigned)[descriptor usage],
 	};
-	struct rwa_texture *texture = mesa.texture_create(_mesa, &shape, why, sizeof(why));
+	struct rwa_texture_shape made = shape;   /* rw_one_sample */
 
+	if (rw_one_sample() && made.sample_count > 1) {
+		made.sample_count = 1;
+		made.type = made.type == MTLTextureType2DMultisampleArray ? MTLTextureType2DArray : MTLTextureType2D;
+	}
+	struct rwa_texture *texture = mesa.texture_create(_mesa, &made, why, sizeof(why));
 	if (texture == NULL) {
 		rw_print("%s\n", why);
 		return nil;
@@ -2337,20 +2344,11 @@ struct gem_close { uint32_t handle, pad; };
  * One sample by default, and four when REDWOOD_MSAA asks for it -- the switch exists
  * because the answer changes what every application that asks it does.
  *
- * The compiler library makes multisample textures since docs/metal.md 10.34: the Adreno
- * gives 2 and 4 samples, a render pass of that count fills one, and a shader reads one
- * with read(coord, sample). What an application then asks for is the result in a
- * one-sample texture -- MTLStoreActionMultisampleResolve, or
- * MTLRenderPassColorAttachmentDescriptor.resolveTexture -- and the resolve is done now,
- * as a blit from the multisample attachment at the end of every draw that names one
- * (struct rwa_draw.resolve). That is what makes a yes here honest.
- *
- * Four and not two: four is what CoreAnimation and the GL path ask for, the Adreno takes
- * both, and two would be a second path nobody has asked to measure. Eight is declined by
- * the back end itself (a6xx/fd6_screen.cc, valid_sample_count).
- *
- * The variable is read here on every call rather than cached: this is one getenv in a
- * selector that applications call a handful of times at startup.
+ * The compiler library makes multisample textures since docs/metal.md 10.34, and resolves
+ * one into the attachment's resolve texture with a blit at the end of every draw that names
+ * one (struct rwa_draw.resolve). Four and not two: four is what CoreAnimation and the GL
+ * path ask for. Eight is declined by the back end (a6xx/fd6_screen.cc, valid_sample_count).
+ * The variable is read on every call: applications call this a handful of times at startup.
  *
  * -supportsTextureSampleCount: is not a second answer to keep in step. It is one
  * instruction in _MTLDevice (0x181a17890) that tail-calls -supportsSampleCount:, which
@@ -2821,10 +2819,8 @@ struct gem_close { uint32_t handle, pad; };
 	[super dealloc];
 }
 
-- (struct rwa_compute *)compute
-{
-	return _compute;
-}
+- (struct rwa_compute *)compute { return _compute; }
+- (BOOL)groupFree { return _info.group_free != 0; }
 
 /* The three the base class answers with nothing at all (docs/metal.md 10.8), so they can
  * only come from whoever compiled the shader -- which is why the contract carries them. */
@@ -3293,10 +3289,10 @@ enum {
 	NSUInteger _vertexBufferOffsets[RW_MAX_BUFFERS];
 	id _fragmentBuffers[RW_MAX_BUFFERS];
 	NSUInteger _fragmentBufferOffsets[RW_MAX_BUFFERS];
-	id _fragmentTextures[RW_MAX_BUFFERS];
-	id _fragmentSamplers[RW_MAX_BUFFERS];
+	id _fragmentTextures[RW_MAX_BUFFERS], _vertexTextures[RW_MAX_BUFFERS];
+	id _fragmentSamplers[RW_MAX_BUFFERS], _vertexSamplers[RW_MAX_BUFFERS];
 	unsigned _vertexBufferCount, _fragmentBufferCount;
-	unsigned _fragmentTextureCount, _fragmentSamplerCount;
+	unsigned _fragmentTextureCount, _fragmentSamplerCount, _vertexTextureCount, _vertexSamplerCount;
 	BOOL _complained;
 }
 
@@ -3333,6 +3329,10 @@ enum {
 		 * alternative is a depth texture that reads as whatever it held before.
 		 */
 		_resolve[i] = [attachment resolveTexture];
+		if (rw_one_sample() && _resolve[i] != nil && [texture sampleCount] > 1) {
+			_color[i] = _resolve[i];
+			_resolve[i] = nil;
+		}
 		NSUInteger store = [attachment storeAction];
 
 		if ((store == MTLStoreActionMultisampleResolve ||
@@ -3464,26 +3464,23 @@ enum {
 	}
 }
 
-- (void)setFragmentTexture:(id)texture atIndex:(NSUInteger)index
+/* A texture or sampler slot of either stage; the count is the highest bound index plus one. */
+static void
+rw_bind_slot(id *slots, unsigned *count, id object, NSUInteger index)
 {
-	if (index >= RW_MAX_BUFFERS) {
+	if (index >= RW_MAX_BUFFERS)
 		return;
-	}
-	_fragmentTextures[index] = texture;
-	if (index + 1 > _fragmentTextureCount) {
-		_fragmentTextureCount = (unsigned)index + 1;
-	}
+	slots[index] = object;
+	*count = MAX(*count, (unsigned)index + 1);
 }
 
+- (void)setFragmentTexture:(id)texture atIndex:(NSUInteger)index
+{
+	rw_bind_slot(_fragmentTextures, &_fragmentTextureCount, texture, index);
+}
 - (void)setFragmentSamplerState:(id)sampler atIndex:(NSUInteger)index
 {
-	if (index >= RW_MAX_BUFFERS) {
-		return;
-	}
-	_fragmentSamplers[index] = sampler;
-	if (index + 1 > _fragmentSamplerCount) {
-		_fragmentSamplerCount = (unsigned)index + 1;
-	}
+	rw_bind_slot(_fragmentSamplers, &_fragmentSamplerCount, sampler, index);
 }
 
 /*
@@ -3659,13 +3656,13 @@ enum {
 		work->bufferOffsets[i] = (size_t)_fragmentBufferOffsets[i];
 	}
 	work->textureCount = _fragmentTextureCount;
-	for (unsigned i = 0; i < _fragmentTextureCount; i++) {
-		work->textures[i] = _fragmentTextures[i];
-	}
+	memcpy(work->textures, _fragmentTextures, _fragmentTextureCount * sizeof(id));
 	work->samplerCount = _fragmentSamplerCount;
-	for (unsigned i = 0; i < _fragmentSamplerCount; i++) {
-		work->samplers[i] = _fragmentSamplers[i];
-	}
+	memcpy(work->samplers, _fragmentSamplers, _fragmentSamplerCount * sizeof(id));
+	work->vertexTextureCount = _vertexTextureCount;
+	memcpy(work->vertexTextures, _vertexTextures, _vertexTextureCount * sizeof(id));
+	work->vertexSamplerCount = _vertexSamplerCount;
+	memcpy(work->vertexSamplers, _vertexSamplers, _vertexSamplerCount * sizeof(id));
 	rw_pipeline_note(_pipeline, _colorCount, _depth != nil ? 1u : 0u,
 	                 _colorCount > 0 ? (unsigned)[_color[0] width] : 0u,
 	                 _colorCount > 0 ? (unsigned)[_color[0] height] : 0u,
@@ -3752,34 +3749,37 @@ enum {
 	}
 }
 
+/* The vertex stage's textures, which the Space wallpaper's mesh vertex shader samples. */
 - (void)setVertexTexture:(id)texture atIndex:(NSUInteger)index
 {
-	(void)texture; (void)index;   /* the contract binds textures to the fragment stage only */
+	rw_bind_slot(_vertexTextures, &_vertexTextureCount, texture, index);
 }
 - (void)setVertexTextures:(const id *)textures withRange:(NSRange)range
 {
-	(void)textures; (void)range;
+	for (NSUInteger i = 0; i < range.length; i++)
+		[self setVertexTexture:textures[i] atIndex:range.location + i];
 }
 - (void)setVertexSamplerState:(id)sampler atIndex:(NSUInteger)index
 {
-	(void)sampler; (void)index;
+	rw_bind_slot(_vertexSamplers, &_vertexSamplerCount, sampler, index);
 }
 - (void)setVertexSamplerState:(id)sampler
 		  lodMinClamp:(float)lodMin
 		  lodMaxClamp:(float)lodMax
 		      atIndex:(NSUInteger)index
 {
-	(void)sampler; (void)lodMin; (void)lodMax; (void)index;
+	(void)lodMin; (void)lodMax;
+	[self setVertexSamplerState:sampler atIndex:index];
 }
 - (void)setVertexSamplerStates:(const id *)samplers withRange:(NSRange)range
 {
-	(void)samplers; (void)range;
+	for (NSUInteger i = 0; i < range.length; i++)
+		[self setVertexSamplerState:samplers[i] atIndex:range.location + i];
 }
 - (void)setFragmentTextures:(const id *)textures withRange:(NSRange)range
 {
-	for (NSUInteger i = 0; i < range.length; i++) {
+	for (NSUInteger i = 0; i < range.length; i++)
 		[self setFragmentTexture:textures[i] atIndex:range.location + i];
-	}
 }
 - (void)setFragmentSamplerState:(id)sampler
 		    lodMinClamp:(float)lodMin
@@ -3791,9 +3791,8 @@ enum {
 }
 - (void)setFragmentSamplerStates:(const id *)samplers withRange:(NSRange)range
 {
-	for (NSUInteger i = 0; i < range.length; i++) {
+	for (NSUInteger i = 0; i < range.length; i++)
 		[self setFragmentSamplerState:samplers[i] atIndex:range.location + i];
-	}
 }
 
 - (void)drawPrimitives:(NSUInteger)primitive
@@ -4802,28 +4801,27 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
 	[work release];
 }
 
-/* Metal counts threads here and threadgroups above; the division is Metal's own, and a
- * grid that does not divide evenly is refused rather than rounded, because rounding runs
- * threads the application did not ask for. */
+/* Metal counts threads here and threadgroups above. Rounding the grid up would run threads the
+ * application did not ask for, and freedreno has no partial threadgroups, so a grid the size does
+ * not divide is served only for a kernel any threadgroup size serves alike (-groupFree): per
+ * dimension the size becomes the largest divisor of the grid not above the one asked for. */
 - (void)dispatchThreads:(MTLSize)threads threadsPerThreadgroup:(MTLSize)size
 {
-	MTLSize groups;
+	NSUInteger t[3] = { threads.width, threads.height, threads.depth };
+	NSUInteger g[3] = { size.width, size.height, size.depth };
 
-	if (size.width == 0 || size.height == 0 || size.depth == 0 ||
-	    threads.width % size.width != 0 || threads.height % size.height != 0 ||
-	    threads.depth % size.depth != 0) {
-		rw_print("%lux%lux%lu threads do not divide into groups of "
-		         "%lux%lux%lu, and this driver does not have the partial-group support "
-		         "that would need\n", (unsigned long)threads.width,
-		         (unsigned long)threads.height, (unsigned long)threads.depth,
-		         (unsigned long)size.width, (unsigned long)size.height,
-		         (unsigned long)size.depth);
+	for (unsigned i = 0; i < 3; i++)
+		while (g[i] > 1 && t[i] % g[i] != 0 && [_pipeline groupFree])
+			g[i]--;
+	if (g[0] == 0 || g[1] == 0 || g[2] == 0 || t[0] % g[0] || t[1] % g[1] || t[2] % g[2]) {
+		rw_print("%lux%lux%lu threads do not divide into groups of %lux%lux%lu, and the kernel "
+		         "reads its threadgroup\n", (unsigned long)t[0], (unsigned long)t[1],
+		         (unsigned long)t[2], (unsigned long)g[0], (unsigned long)g[1],
+		         (unsigned long)g[2]);
 		return;
 	}
-	groups.width = threads.width / size.width;
-	groups.height = threads.height / size.height;
-	groups.depth = threads.depth / size.depth;
-	[self dispatchThreadgroups:groups threadsPerThreadgroup:size];
+	[self dispatchThreadgroups:MTLSizeMake(t[0] / g[0], t[1] / g[1], t[2] / g[2])
+	     threadsPerThreadgroup:MTLSizeMake(g[0], g[1], g[2])];
 }
 
 - (void)useResource:(id)resource usage:(NSUInteger)usage { (void)resource; (void)usage; }

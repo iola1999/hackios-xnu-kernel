@@ -5,7 +5,35 @@
  * "[progname pid] "; this driver's own lines go to the stream behind it with their own prefix.
  * stdio calls the write function with the stream locked, so the line buffer needs no lock.
  */
+#include <sys/stat.h>
+
 static FILE *rw_console;
+
+/* A line written here goes into the kernel log through kern.redwood.say. It replaces the console
+ * in a process whose standard output is /dev/null, an ExtensionKit extension such as
+ * MercuryPosterExtension, where every line of this driver and of the library was lost. The kernel
+ * keeps at most 200 said lines a second, and a REDWOOD_THUMBS sample prints 33 lines at once, so
+ * each line waits 5 ms. */
+static int
+rw_say_write(void *cookie, const char *bytes, int count)
+{
+	static char line[256];
+	static size_t length;
+
+	(void)cookie;
+	for (int i = 0; i < count; i++) {
+		if (bytes[i] != '\n')
+			line[length++] = bytes[i];
+		if (bytes[i] == '\n' || length == sizeof(line) - 1) {
+			if (length > 0) {
+				sysctlbyname("kern.redwood.say", NULL, NULL, line, length);
+				usleep(5000);
+			}
+			length = 0;
+		}
+	}
+	return count;
+}
 
 static int
 rw_console_write(void *cookie, const char *bytes, int count)
@@ -41,4 +69,13 @@ rw_console_init(void)
 	setvbuf(prefixed, NULL, _IOLBF, 0);
 	rw_console = stdout;
 	stdout = prefixed;
+
+	struct stat out, null;
+	FILE *said;
+
+	if (fstat(STDOUT_FILENO, &out) == 0 && stat("/dev/null", &null) == 0 && S_ISCHR(out.st_mode) &&
+	    out.st_rdev == null.st_rdev && (said = funopen(NULL, NULL, rw_say_write, NULL, NULL)) != NULL) {
+		setvbuf(said, NULL, _IOLBF, 0);
+		rw_console = said;
+	}
 }

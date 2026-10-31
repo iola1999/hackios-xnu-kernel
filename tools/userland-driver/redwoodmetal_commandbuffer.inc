@@ -645,16 +645,21 @@ static pthread_mutex_t rw_commit_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 	if (rw_thumbs_wanted(commit_count) && !rw_thumb_draws) {
 		NSMutableSet *seen = [NSMutableSet set];
 
+		/* "res" is a colour attachment's resolve target: a CAMetalLayer drawn with
+		 * multisampling shows that texture, and the multisample attachment cannot be sampled. */
 		for (RedwoodMetalWork *work in _work) {
-			for (unsigned i = 0; i < work->colorCount + work->textureCount; i++) {
-				bool out = i < work->colorCount;
-				id texture = out ? work->color[i] : work->textures[i - work->colorCount];
+			const unsigned colors = work->colorCount;
+
+			for (unsigned i = 0; i < 2 * colors + work->textureCount; i++) {
+				unsigned slot = i < colors ? i : i < 2 * colors ? i - colors : i - 2 * colors;
+				id texture = i < colors ? work->color[slot] : i < 2 * colors ? work->resolve[slot]
+										 : work->textures[slot];
 
 				if (texture == nil || [seen containsObject:texture])
 					continue;
 				[seen addObject:texture];
-				rw_thumb([texture mesaTexture], texture, commit_count, 0, out ? "out" : "in",
-					 out ? i : i - work->colorCount);
+				rw_thumb([texture mesaTexture], texture, commit_count, 0,
+					 i < colors ? "out" : i < 2 * colors ? "res" : "in", slot);
 			}
 		}
 	}
@@ -825,6 +830,8 @@ done:
 	struct rwa_buffer *fragment_buffers[RW_MAX_BUFFERS] = { NULL };
 	struct rwa_texture *fragment_textures[RW_MAX_BUFFERS] = { NULL };
 	struct rwa_sampler *fragment_samplers[RW_MAX_BUFFERS] = { NULL };
+	struct rwa_texture *vertex_textures[RW_MAX_BUFFERS] = { NULL };
+	struct rwa_sampler *vertex_samplers[RW_MAX_BUFFERS] = { NULL };
 	/* and Metal's own table for each stage: the same entries as the arrays above with
 	 * the OFFSET beside each, which rwa_bindings has nowhere to put. One array for
 	 * both of the things an offset means -- which encoding of an argument buffer, and
@@ -931,6 +938,10 @@ done:
 	for (unsigned i = 0; i < work->samplerCount; i++) {
 		fragment_samplers[i] = [work->samplers[i] mesaSampler];
 	}
+	for (unsigned i = 0; i < work->vertexTextureCount; i++)
+		vertex_textures[i] = [work->vertexTextures[i] mesaTexture];
+	for (unsigned i = 0; i < work->vertexSamplerCount; i++)
+		vertex_samplers[i] = [work->vertexSamplers[i] mesaSampler];
 	struct rwa_draw draw = {
 		.color = color,
 		.color_count = work->colorCount,
@@ -948,7 +959,9 @@ done:
 		.depth_range = work->hasDepthRange ? work->depthRange : NULL,
 		.viewport = work->hasViewportRect ? work->viewportRect : NULL,
 		.scissor = work->hasScissorRect ? work->scissorRect : NULL,
-		.vertex = { .buffers = vertex_buffers, .buffer_count = work->vertexBufferCount },
+		.vertex = { .buffers = vertex_buffers, .buffer_count = work->vertexBufferCount,
+			    .textures = vertex_textures, .texture_count = work->vertexTextureCount,
+			    .samplers = vertex_samplers, .sampler_count = work->vertexSamplerCount },
 		/* and the streams the layout fetches from, at Metal's own indices with
 		 * Metal's own offsets; the count is what the library needs covered, which
 		 * is the highest index the pipeline fetches from plus one. */

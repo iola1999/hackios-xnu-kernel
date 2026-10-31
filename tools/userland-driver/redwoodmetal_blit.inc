@@ -20,6 +20,16 @@ rw_run_copy(RedwoodMetalWork *work, char *why, size_t why_size)
 		return mesa.texture_generate_mipmaps([work->textures[0] mesaTexture], why,
 						     why_size);
 	}
+	/* Written by the processor from the buffer's memory when the command buffer reaches it,
+	 * which is how -replaceRegion: fills a texture; MercuryPosterExtension uploads its KTX
+	 * textures this way. */
+	if (work->copyKind == RW_COPY_BUFFER_TEXTURE && mesa.texture_write) {
+		const char *bytes = [work->buffers[0] contents];
+
+		return mesa.texture_write([work->textures[0] mesaTexture], work->copyLevels[1],
+			work->copySlices[1], work->copyOrigins[1], work->copySize,
+			bytes ? bytes + work->copyOffsets[0] : NULL, work->copyLength, why, why_size);
+	}
 	if (work->copyKind == RW_COPY_TEXTURE && mesa.texture_copy) {
 		return mesa.texture_copy([work->textures[0] mesaTexture], work->copyLevels[0],
 			work->copySlices[0], work->copyOrigins[0], [work->textures[1] mesaTexture],
@@ -110,6 +120,50 @@ protocol_declares(const char *name, SEL selector, struct objc_method_description
 	[work release];
 }
 
+- (void)copyFromBuffer:(id)source sourceOffset:(NSUInteger)sourceOffset
+     sourceBytesPerRow:(NSUInteger)bytesPerRow sourceBytesPerImage:(NSUInteger)bytesPerImage
+	    sourceSize:(MTLSize)size toTexture:(id)destination
+      destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level
+     destinationOrigin:(MTLOrigin)origin
+{
+	(void)bytesPerImage;   /* rwa_texture_write takes a 3D region's slices as packed rows */
+	if (_ended || ![source isKindOfClass:[RedwoodMetalBuffer class]] ||
+	    ![destination isKindOfClass:[RedwoodMetalTexture class]] ||
+	    [source device] != [self device] || [destination device] != [self device]) {
+		[self rejectCopy:"buffer-to-texture copy requires an active encoder and a buffer and "
+				 "a texture of its device"];
+		return;
+	}
+	RedwoodMetalWork *work = [[RedwoodMetalWork alloc] init];
+	work->copyKind = RW_COPY_BUFFER_TEXTURE;
+	work->count = 1;
+	work->buffers[0] = source;
+	work->textureCount = 1;
+	work->textures[0] = destination;
+	work->copyOffsets[0] = sourceOffset;
+	work->copyLength = bytesPerRow;
+	work->copyLevels[1] = (unsigned)level;
+	work->copySlices[1] = (unsigned)slice;
+	unsigned to[3] = { origin.x, origin.y, origin.z };
+	unsigned extent[3] = { size.width, size.height, size.depth };
+	memcpy(work->copyOrigins[1], to, sizeof(to));
+	memcpy(work->copySize, extent, sizeof(extent));
+	[_commandBuffer recordWork:work];
+	[work release];
+}
+
+- (void)copyFromBuffer:(id)source sourceOffset:(NSUInteger)sourceOffset
+     sourceBytesPerRow:(NSUInteger)bytesPerRow sourceBytesPerImage:(NSUInteger)bytesPerImage
+	    sourceSize:(MTLSize)size toTexture:(id)destination
+      destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level
+     destinationOrigin:(MTLOrigin)origin options:(NSUInteger)options
+{
+	(void)options;
+	[self copyFromBuffer:source sourceOffset:sourceOffset sourceBytesPerRow:bytesPerRow
+	 sourceBytesPerImage:bytesPerImage sourceSize:size toTexture:destination
+	    destinationSlice:slice destinationLevel:level destinationOrigin:origin];
+}
+
 - (void)copyFromTexture:(id)source sourceSlice:(NSUInteger)sourceSlice
 	   sourceLevel:(NSUInteger)sourceLevel sourceOrigin:(MTLOrigin)sourceOrigin
 	    sourceSize:(MTLSize)size toTexture:(id)destination
@@ -143,6 +197,29 @@ protocol_declares(const char *name, SEL selector, struct objc_method_description
 	memcpy(work->copySize, extent, sizeof(extent));
 	[_commandBuffer recordWork:work];
 	[work release];
+}
+
+/* Whole levels and slices, recorded as one region copy each. */
+- (void)copyFromTexture:(id)source sourceSlice:(NSUInteger)sourceSlice
+	   sourceLevel:(NSUInteger)sourceLevel toTexture:(id)destination
+      destinationSlice:(NSUInteger)destinationSlice destinationLevel:(NSUInteger)destinationLevel
+	    sliceCount:(NSUInteger)sliceCount levelCount:(NSUInteger)levelCount
+{
+	if (![self acceptSource:source destination:destination resourceClass:[RedwoodMetalTexture class]])
+		return;
+	id<MTLTexture> from = source;
+
+	for (NSUInteger l = 0; l < levelCount; l++) {
+		NSUInteger level = sourceLevel + l;
+		MTLSize size = MTLSizeMake(MAX([from width] >> level, 1), MAX([from height] >> level, 1),
+					   MAX([from depth] >> level, 1));
+
+		for (NSUInteger s = 0; s < sliceCount; s++)
+			[self copyFromTexture:source sourceSlice:sourceSlice + s sourceLevel:level
+				 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:size toTexture:destination
+			     destinationSlice:destinationSlice + s destinationLevel:destinationLevel + l
+			    destinationOrigin:MTLOriginMake(0, 0, 0)];
+	}
 }
 
 - (void)generateMipmapsForTexture:(id)texture

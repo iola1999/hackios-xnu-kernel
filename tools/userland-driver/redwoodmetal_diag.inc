@@ -64,6 +64,26 @@ rw_sync_draws(void)
 	return on != 0;
 }
 
+/*
+ * Without REDWOOD_MSAA, -supportsSampleCount:4 answers NO, and an application that asks for four
+ * samples anyway gets one: the library makes the multisample texture and the render pipeline with
+ * one sample, and a pass whose multisample colour attachment names a resolve texture draws straight
+ * into the resolve texture. MercuryPosterExtension draws the wallpaper that way; with four samples
+ * its resolve textures read all zero (bo36), with one the wallpaper shows (bo37). The texture object
+ * still answers the sample count it was asked for: that is how the encoder tells such an attachment
+ * from CoreAnimation's one-sample attachments, which also name a resolve texture and must leave it
+ * untouched (air_metal.c, the resolve).
+ */
+static bool
+rw_one_sample(void)
+{
+	static int on = -1;
+
+	if (on < 0)
+		on = getenv("REDWOOD_MSAA") == NULL;
+	return on != 0;
+}
+
 /* With rw_sync_draws, each render pipeline's modules are kept, so that the draw that does not
  * finish can have its shaders printed (air_dump, uncounted; airfail-extract.py reads them back,
  * stage names "hung-vertex" and "hung-fragment"). The modules are what the stitching made at run

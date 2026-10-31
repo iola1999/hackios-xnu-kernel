@@ -9,13 +9,15 @@
 @class RedwoodMetalRenderPipeline;
 
 enum RWCopyKind { RW_COPY_NONE, RW_COPY_BUFFER, RW_COPY_TEXTURE, RW_COPY_MIPMAP,
-                   RW_COPY_ERROR };
+                   RW_COPY_BUFFER_TEXTURE, RW_COPY_ERROR };
 
 @interface RedwoodMetalWork : NSObject {
 @private
 	BOOL _ownsResources;
 @public
-	/* Copies use buffers[0..1] or textures[0..1], owned like shader bindings. */
+	/* Copies use buffers[0..1] or textures[0..1], owned like shader bindings. A buffer-to-texture
+	 * copy uses buffers[0], textures[0] and the destination's [1] fields, and copyLength holds
+	 * the source's bytes per row. */
 	enum RWCopyKind copyKind;
 	size_t copyOffsets[2], copyLength;
 	unsigned copyLevels[2], copySlices[2], copyOrigins[2][3], copySize[3];
@@ -72,6 +74,9 @@ enum RWCopyKind { RW_COPY_NONE, RW_COPY_BUFFER, RW_COPY_TEXTURE, RW_COPY_MIPMAP,
 	id textures[RW_MAX_BUFFERS];
 	id samplers[RW_MAX_BUFFERS];
 	unsigned count, textureCount, samplerCount;
+	id vertexTextures[RW_MAX_BUFFERS];   /* a draw's vertex stage; the three above are its fragment stage */
+	id vertexSamplers[RW_MAX_BUFFERS];
+	unsigned vertexTextureCount, vertexSamplerCount;
 	unsigned groups[3], size[3];
 	unsigned threadgroupBytes;   /* -setThreadgroupMemoryLength: for threadgroup buffer 0 */
 }

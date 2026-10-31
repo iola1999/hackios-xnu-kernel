@@ -29,6 +29,12 @@
 	for (unsigned i = 0; i < samplerCount; i++) {
 		[samplers[i] retain];
 	}
+	for (unsigned i = 0; i < vertexTextureCount; i++) {
+		[vertexTextures[i] retain];
+	}
+	for (unsigned i = 0; i < vertexSamplerCount; i++) {
+		[vertexSamplers[i] retain];
+	}
 }
 
 - (void)dealloc
@@ -53,6 +59,12 @@
 		}
 		for (unsigned i = 0; i < samplerCount; i++) {
 			[samplers[i] release];
+		}
+		for (unsigned i = 0; i < vertexTextureCount; i++) {
+			[vertexTextures[i] release];
+		}
+		for (unsigned i = 0; i < vertexSamplerCount; i++) {
+			[vertexSamplers[i] release];
 		}
 	}
 	[super dealloc];
