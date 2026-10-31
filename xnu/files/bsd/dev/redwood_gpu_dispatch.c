@@ -19,6 +19,7 @@ adreno8_step_service(void)
 		adreno8_say("adreno8: RedwoodGPU external BO enable was refused\n");
 		return false;
 	}
+	adreno8_hfi_irq_attach();
 	gpu_va = 0; /* The shared address space has no per-client placement or BO-count query. */
 	PE_parse_boot_argn("gpu_log", &gpu_log, sizeof(gpu_log));
 	if (!RedwoodGPUStart()) {
@@ -132,6 +133,22 @@ redwood_gpu_done(uint32_t fence)
 {
 	if (!redwood_platform_is_annibale()) return legacy_gpu_done(fence);
 	return adreno8_bo_ready() && adreno8_context_done(fence);
+}
+
+uint32_t
+redwood_gpu_irqs(void)
+{
+	return redwood_platform_is_annibale() ? adreno8_hfi_irq_count() : 0;
+}
+
+void
+redwood_gpu_pause(uint32_t seen, uint32_t poll_us, uint32_t longest_us)
+{
+	if (redwood_platform_is_annibale()) {
+		adreno8_hfi_irq_pause(seen, poll_us, longest_us);
+	} else {
+		delay_for_interval(poll_us, NSEC_PER_USEC);
+	}
 }
 
 uint32_t

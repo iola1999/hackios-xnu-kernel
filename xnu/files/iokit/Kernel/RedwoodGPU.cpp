@@ -19,7 +19,8 @@
  * One request is not Linux's: a buffer that is the memory of an IOSurface (surfaceBuffer()), for
  * drawing into what the display shows and for reading pictures where other programs have drawn
  * them. Linux hands such memory around as file descriptors; here it has a name already. That
- * memory is ordinary, cached memory, which everybody else reads and writes as such.
+ * memory is ordinary, cached memory, which everybody else reads and writes as such. Another is a
+ * buffer that is the calling program's own memory (memoryBuffer()), for Metal's no-copy buffers.
  *
  * Not here yet: interrupts (waiting is asking again five times a millisecond), more than one
  * program's worth of care (every client's buffers are in the one address space; a client that
@@ -66,6 +67,8 @@ void redwood_gpu_to_memory(void * start, uint64_t size);
 uint32_t redwood_gpu_submit(const uint64_t * addresses, const uint32_t * words, uint32_t count);
 extern uint32_t gpu_log;
 bool redwood_gpu_done(uint32_t fence);
+uint32_t redwood_gpu_irqs(void);
+void redwood_gpu_pause(uint32_t seen, uint32_t poll_us, uint32_t longest_us);
 uint32_t redwood_gpu_last(void);
 uint32_t adreno8_context_depth(void);
 void redwood_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
@@ -94,6 +97,7 @@ enum {
 	kMsmSubmitQueueNew      = 0x4a,
 	kMsmSubmitQueueClose    = 0x4b,
 	kMsmSubmitQueueQuery    = 0x4c,
+	kRedwoodMemory          = 0x7c,         /* ours: the caller's own memory as a buffer */
 	kRedwoodGPUWorked       = 0x7d,         /* ours: how long the 3D core itself has worked, and on how many */
 	kRedwoodSurface         = 0x7e,         /* ours: an IOSurface's memory as a buffer */
 	kRedwoodShow            = 0x7f,         /* ours: pixels of the caller's onto the panel, to see a test's result */
@@ -161,6 +165,10 @@ struct redwood_surface {
 	uint32_t offset, rowBytes;              /* where the pixels start in it and how long a row of them is, */
 	uint32_t width, height, pixelFormat, planes;    /* and what they are */
 };
+struct redwood_memory {
+	uint64_t address, size;                 /* the caller's, in whole 4 KB pages */
+	uint32_t handle, pad;                   /* back: the buffer */
+};
 struct redwood_show {
 	uint64_t pixels;
 	uint32_t width, height, rowBytes, pad;
@@ -212,6 +220,7 @@ struct redwood_worked {
 #define GPU_SUBMIT_BOS          8192
 #define GPU_PATIENCE_MS         5000            /* for a buffer or a submission that somebody waits for without a limit */
 #define GPU_ASK_AGAIN_US        200             /* while waiting for the core: how long between two looks at how far it is */
+#define GPU_ASK_LONGEST_US      2000            /* ... and with its completion interrupt (gpu_irq): the longest sleep between two */
 #define GPU_PUSH_AGAIN_MS       4               /* a surface is pushed out of the cache again for a submission this long after the last */
 
 static IOLock * gGPULock;                       /* around everything that is the GPU's (redwood_gpu_...) */
@@ -232,6 +241,7 @@ static struct {
 	uint64_t locking;                       /* ... and waiting for gGPULock to enter them */
 	uint64_t submitting, rooming;           /* time in submit() from its start, and in it waiting for room in the A830's queue */
 } gGPUStat;
+static uint32_t gGPUIrqsSeen;                   /* redwood_gpu_irqs() at the last statistics */
 
 /* Wait for the 3D core to be done with submission `fence`; with the lock held, which is let go of while waiting. */
 static bool
@@ -241,6 +251,8 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 
 	nanoseconds_to_absolutetime(milliseconds * NSEC_PER_MSEC, &patience);
 	for (bool waited = false;; waited = true) {
+		uint32_t seen = redwood_gpu_irqs();
+
 		if (!gGPUReported && redwood_gpu_ready() && redwood_gpu_done(fence)) {
 			if (waited) {
 				gGPUStat.waits++;
@@ -252,7 +264,7 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 			break;                  /* (a GPU that has stopped answering is not waited for again) */
 		}
 		IOLockUnlock(gGPULock);
-		delay_for_interval(GPU_ASK_AGAIN_US, NSEC_PER_USEC);
+		redwood_gpu_pause(seen, GPU_ASK_AGAIN_US, GPU_ASK_LONGEST_US);
 		IOLockLock(gGPULock);
 	}
 	/*
@@ -495,6 +507,7 @@ class RedwoodGPUUserClient : public IOUserClient
 	void reap(void);
 	IOReturn gemNew(struct msm_gem_new * request);
 	IOReturn surfaceBuffer(struct redwood_surface * request);
+	IOReturn memoryBuffer(struct redwood_memory * request);
 	IOReturn gemInfo(struct msm_gem_info * request);
 	IOReturn submit(struct msm_gem_submit * request);
 	IOReturn show(const struct redwood_show * request);
@@ -621,7 +634,17 @@ RedwoodGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, I
 		b->memory->retain();
 		b->seen = true;
 		*memory = b->memory;
+		/*
+		 * A program's own memory (memoryBuffer(): no kernel address, no surface) is mapped again,
+		 * not handed back at the program's own address, which IOKit does for a mapping into the
+		 * task the memory is in: the program may unmap that address while the buffer is alive.
+		 * Guard pages are what makes IOKit map it again. kIOMapUnique does too, but then
+		 * IOConnectUnmapMemory64 cannot look the mapping up and panics in doMap (cmd35-bo8).
+		 */
 		*options = 0;
+		if (b->kernel == NULL && b->surface == NULL) {
+			*options = kIOMapGuardedSmall | ((b->flags & MSM_BO_GPU_READONLY) ? kIOMapReadOnly : 0);
+		}
 		ret = kIOReturnSuccess;
 	}
 	IOLockUnlock(gGPULock);
@@ -644,6 +667,7 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 		struct msm_submitqueue_query query;
 		struct drm_gem_close close;
 		struct redwood_surface surface;
+		struct redwood_memory memory;
 		struct redwood_show show;
 		struct redwood_worked worked;
 	} r;
@@ -766,6 +790,9 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 		break;
 	case kRedwoodSurface:
 		ret = surfaceBuffer(&r.surface);
+		break;
+	case kRedwoodMemory:
+		ret = memoryBuffer(&r.memory);
 		break;
 	case kRedwoodShow:
 		ret = show(&r.show);

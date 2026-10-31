@@ -110,14 +110,20 @@ static struct adreno8_block adreno8_qfprom = { "qfprom", 0x221c8000, 0x1000 };
 
 /*
  * KGSL selects qcom,sku-codes from socinfo feature_code/pcode, separately from speed_bin.
- * Until socinfo is available, expose only points on which all six live K90 DT tables agree:
- * 222 and 342 MHz have the same level and bus votes in every table and no qcom,acd-level;
- * 160 MHz is in five of them (not in the SKU 3/0 table) and has been the boot speed.
+ * Until socinfo is available, expose only points on which all six live K90 DT tables agree
+ * (docs/analysis/data/annibale.dts.gz, qcom,gpu-pwrlevel-bins): 160 to 832 MHz have the same
+ * level and bus votes in every table. From 389 MHz on the tables also give a qcom,acd-level;
+ * no ACD table is sent, so those points run at their level without adaptive clock distribution.
+ * The speeds above 607 MHz stay out until the ones up to it have run (adreno8_speed=7).
  */
 static const struct adreno8_gpu_level adreno8_boot_speeds[] = {
 	{ 160000000, 0x32, 2 },
 	{ 222000000, 0x34, 2 },
 	{ 342000000, 0x38, 3 },
+	{ 389000000, 0x3c, 4 },
+	{ 443000000, 0x40, 4 },
+	{ 525000000, 0x50, 4 },
+	{ 607000000, 0x80, 6 },
 };
 
 uint32_t adreno8_speed_bin;

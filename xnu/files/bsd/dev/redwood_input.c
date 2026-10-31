@@ -225,6 +225,13 @@ redwood_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y)
 	touch_post(type, finger, x, y, true);
 }
 
+/* Samples posted that the input service has not read yet (for the freeze watchdog's line; unlocked). */
+uint32_t
+redwood_touch_unread(void)
+{
+	return __atomic_load_n(&touch_tail, __ATOMIC_RELAXED) - __atomic_load_n(&touch_head, __ATOMIC_RELAXED);
+}
+
 static int
 touch_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
 {

@@ -5,6 +5,7 @@
 #include "adreno8_clock_private.h"
 #include "adreno8_context_private.h"
 #include <sys/redwood_input.h>
+#include <kern/sched_prim.h>
 
 #define printf adreno8_say
 
@@ -169,6 +170,85 @@ adreno8_hfi_worked(uint64_t *microseconds, uint32_t *count, uint32_t by[7])
 	memset(retired_by, 0, sizeof(retired_by));
 	retired_ticks = 0;
 	retired_count = 0;
+}
+
+/*
+ * The GMU's "hfi" interrupt (the K90 DT's gmu node: SPI 0x130, level-triggered) comes when the GMU
+ * posts to the message queue, which it does for every TS_RETIRE. With boot-arg gpu_irq=1 (the
+ * default) whoever waits for the GPU sleeps until the next one (adreno8_hfi_irq_pause) instead of
+ * looking again every 200 us; the EOP word in memory stays the completion check, so a missed
+ * interrupt costs at most the pause's limit. Over HFI_IRQ_FLOOD of them in 100 ms the interrupt is
+ * masked again for the run and the waits go back to looking.
+ */
+#define ADRENO8_HFI_INTID       (32 + 0x130)
+#define HFI_IRQ_FLOOD           20000
+extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
+extern void gic_v3_spi_mask(uint32_t intid);
+static uint32_t hfi_irqs;                 /* (atomic) */
+static bool hfi_irq_on;
+static uint64_t hfi_irq_window;
+static uint32_t hfi_irq_in_window;
+
+static void
+adreno8_hfi_interrupt(void *context __unused, uint32_t intid)
+{
+	uint64_t now = mach_absolute_time(), ns;
+	uint32_t info = adreno8_rd(adreno8_gmu.base + GMU_GMU2HOST_INFO);
+
+	adreno8_wr(adreno8_gmu.base + GMU_GMU2HOST_CLR, info & 5u);
+	absolutetime_to_nanoseconds(now - hfi_irq_window, &ns);
+	if (ns >= 100 * NSEC_PER_MSEC) {
+		hfi_irq_window = now;
+		hfi_irq_in_window = 0;
+	}
+	if (++hfi_irq_in_window > HFI_IRQ_FLOOD) {
+		adreno8_wr(adreno8_gmu.base + GMU_GMU2HOST_MASK, ~0u);
+		gic_v3_spi_mask(intid);
+		hfi_irq_on = false;
+	}
+	__atomic_fetch_add(&hfi_irqs, 1, __ATOMIC_RELAXED);
+	thread_wakeup((event_t)&hfi_irqs);
+}
+
+void
+adreno8_hfi_irq_attach(void)
+{
+	uint32_t wanted = 1;
+
+	PE_parse_boot_argn("gpu_irq", &wanted, sizeof(wanted));
+	if (wanted == 0 || adreno8_direct_ring || adreno8_gmu.base == 0) {
+		printf("adreno8: waits for the GPU look every 200 us (gpu_irq=%u)\n", wanted);
+		return;
+	}
+	if (gic_v3_spi_attach(ADRENO8_HFI_INTID, false, adreno8_hfi_interrupt, NULL) != KERN_SUCCESS) {
+		printf("adreno8: the GMU's interrupt %u could not be attached; waits look every 200 us\n", ADRENO8_HFI_INTID);
+		return;
+	}
+	hfi_irq_on = true;
+	adreno8_wr(adreno8_gmu.base + GMU_GMU2HOST_MASK, ~1u);     /* the message queue's bit only */
+	printf("adreno8: waits for the GPU sleep until the GMU's message interrupt %u\n", ADRENO8_HFI_INTID);
+}
+
+uint32_t
+adreno8_hfi_irq_count(void)
+{
+	return __atomic_load_n(&hfi_irqs, __ATOMIC_RELAXED);
+}
+
+/* `seen` is adreno8_hfi_irq_count() from before the caller's last look, so that one which came since is not slept through. */
+void
+adreno8_hfi_irq_pause(uint32_t seen, uint32_t poll_us, uint32_t longest_us)
+{
+	if (!hfi_irq_on) {
+		delay_for_interval(poll_us, NSEC_PER_USEC);
+		return;
+	}
+	assert_wait_timeout((event_t)&hfi_irqs, THREAD_UNINT, longest_us, NSEC_PER_USEC);
+	if (__atomic_load_n(&hfi_irqs, __ATOMIC_RELAXED) != seen) {
+		clear_wait(current_thread(), THREAD_AWAKENED);
+	} else {
+		thread_block(THREAD_CONTINUE_NULL);
+	}
 }
 
 /* The ACK waiter and EOP polling use the same message handling. A bounded drain

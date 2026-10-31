@@ -345,11 +345,31 @@ static volatile int32_t gic_prof_only;          /* > 0: only this pid's samples 
 static struct gic_prof_slot gic_prof[MAX_CPUS][GIC_PROF_SLOTS];
 static uint32_t gic_prof_lost[MAX_CPUS];
 
+/*
+ * Two return addresses above the interrupted kernel code, from its frame chain: pc and lr name a
+ * leaf such as ml_set_interrupts_enabled or a lock's spin, and these name who called it. The walk
+ * stays inside the thread's kernel stack and stops at the first frame outside it.
+ */
+static void
+gic_prof_frames(uint64_t fp, uint64_t up[2])
+{
+	thread_t thread = current_thread();
+	uint64_t base = thread->kernel_stack, top = base + kernel_stack_size;
+
+	for (unsigned i = 0; i < 2; i++) {
+		if (base == 0 || fp < base || fp + 16 > top || (fp & 7) != 0) {
+			return;
+		}
+		up[i] = VM_KERNEL_UNSLIDE(((uint64_t *)fp)[1]);
+		fp = ((uint64_t *)fp)[0];
+	}
+}
+
 static void
 gic_prof_sample(int cpu)
 {
 	arm_saved_state_t *state = getCpuDatap()->cpu_int_state;
-	uint64_t pc, lr = 0;
+	uint64_t pc, lr = 0, up[2] = { 0, 0 };
 	int32_t pid;
 	bool user;
 
@@ -366,19 +386,20 @@ gic_prof_sample(int cpu)
 		/* the caller of a leaf (ml_get_timebase, adreno8_rd) is what tells two spins apart */
 		lr = VM_KERNEL_UNSLIDE(get_saved_state_lr(state));
 		pid = current_thread() == current_processor()->idle_thread ? GIC_PROF_IDLE : task_pid(current_task());
+		gic_prof_frames(get_saved_state_fp(state), up);
 	}
 	if (gic_prof_only > 0 && pid != gic_prof_only) {
 		return;
 	}
-	uint32_t h = (uint32_t)((pc >> 2) ^ ((lr >> 2) * 0x9e3779b1u) ^ (uint32_t)pid) % GIC_PROF_SLOTS;
+	uint32_t h = (uint32_t)((pc >> 2) ^ ((lr >> 2) * 0x9e3779b1u) ^ (up[0] >> 2) ^ (uint32_t)pid) % GIC_PROF_SLOTS;
 	for (unsigned i = 0; i < GIC_PROF_PROBES; i++) {
 		struct gic_prof_slot *slot = &gic_prof[cpu][(h + i) % GIC_PROF_SLOTS];
 
 		if (slot->count == 0) {
-			*slot = (struct gic_prof_slot){ .pc = pc, .lr = lr, .pid = pid, .user = user, .count = 1 };
+			*slot = (struct gic_prof_slot){ .pc = pc, .lr = lr, .up = { up[0], up[1] }, .pid = pid, .user = user, .count = 1 };
 			return;
 		}
-		if (slot->pc == pc && slot->lr == lr && slot->pid == pid) {
+		if (slot->pc == pc && slot->lr == lr && slot->up[0] == up[0] && slot->up[1] == up[1] && slot->pid == pid) {
 			slot->count++;
 			return;
 		}

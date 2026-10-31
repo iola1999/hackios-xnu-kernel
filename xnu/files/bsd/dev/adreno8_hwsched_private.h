@@ -39,6 +39,10 @@ bool adreno8_hfi_send(uint32_t id, const uint32_t *payload, uint32_t count, cons
 /* Drain response/debug queues and stop allocations on transport or device faults. */
 bool adreno8_hfi_poll(void);
 void adreno8_hfi_worked(uint64_t *microseconds, uint32_t *count, uint32_t by[7]);
+/* Waits for the GPU between two looks: on the GMU's message interrupt (boot-arg gpu_irq). */
+void adreno8_hfi_irq_attach(void);
+uint32_t adreno8_hfi_irq_count(void);
+void adreno8_hfi_irq_pause(uint32_t seen, uint32_t poll_us, uint32_t longest_us);
 
 /* Produce an ACK payload, including the echoed request header, in at most ten words. */
 bool adreno8_hwsched_request(const uint32_t *request, uint32_t words,

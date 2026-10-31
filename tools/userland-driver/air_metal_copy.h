@@ -61,6 +61,11 @@ int rwa_texture_thumbnail(struct rwa_texture *texture, unsigned w, unsigned h, u
  * write their results back into it as well as into the buffer. NULL turns it off. */
 void rwa_buffer_set_mirror(struct rwa_buffer *buffer, void *mirror);
 
+/* A buffer that is the caller's memory itself (whole 4 KB pages), wired and entered into the GPU's
+ * address space by the kernel; NULL, and why, when the kernel will not, and a copy is made instead. */
+struct rwa_buffer *rwa_buffer_from_memory(struct rwa_device *device, void *bytes, size_t size,
+					  char *why, size_t why_size);
+
 /* A function linked into the fragment stage (MTLLinkedFunctions), node by node: the same
  * layout as air_metal.h's, see rwa_render_create_linked there. */
 struct rwa_stitch_node {

@@ -661,6 +661,7 @@ governor_thread(void *arg __unused, wait_result_t wr __unused)
 
 		assert_wait_timeout((event_t)&touch_at, THREAD_UNINT, TICK_MS, NSEC_PER_MSEC);
 		thread_block(THREAD_CONTINUE_NULL);
+		redwood_freeze_check(os_atomic_load(&touch_at, relaxed));
 		now = mach_absolute_time();
 		span = now - then;
 		if (span == 0) {

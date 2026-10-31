@@ -31,6 +31,7 @@ extern int              psci_smp_report(char *buf, size_t size);
 #define GIC_PROF_USER_MASK      0x0000007fffffffffULL   /* a user pc or lr without its signature */
 struct gic_prof_slot {
 	uint64_t pc, lr;
+	uint64_t up[2];                 /* a kernel sample's next two return addresses up the frame chain */
 	int32_t pid;                    /* 0: a kernel thread, -2: a processor's idle thread */
 	uint16_t user;
 	uint16_t pad;

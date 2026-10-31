@@ -416,10 +416,11 @@ psci_smp_report(char *buf, size_t size)
 }
 /*
  * kern.redwood.prof, read: the interrupt samples of all processors (gic_v3_irq.c) merged by
- * (pid, pc, lr). First the samples per pid, user and kernel apart (pid -2 is the idle threads,
- * 0 the kernel's own), then the PROF_TOP most frequent places: "count pid u|k pc lr".
+ * (pid, pc, lr, two return addresses above a kernel sample). First the samples per pid, user and
+ * kernel apart (pid -2 is the idle threads, 0 the kernel's own), then the PROF_TOP most frequent
+ * places: "count pid u|k pc lr up0 up1" (0 where a user sample or the walk has none).
  */
-#define PROF_TOP        64
+#define PROF_TOP        1024
 #define PROF_PIDS       48
 
 int
@@ -460,9 +461,10 @@ psci_smp_prof_report(char *buf, size_t size)
 			if (k < npids) {
 				*(slot->user ? &pids[k].user : &pids[k].kernel) += slot->count;
 			}
-			j = (unsigned int)(((slot->pc >> 2) ^ ((slot->lr >> 2) * 0x9e3779b1u) ^ (uint32_t)slot->pid) % capacity);
+			j = (unsigned int)(((slot->pc >> 2) ^ ((slot->lr >> 2) * 0x9e3779b1u) ^ (slot->up[0] >> 2) ^ (uint32_t)slot->pid) % capacity);
 			while (merged[j].count != 0 &&
-			    (merged[j].pid != slot->pid || merged[j].pc != slot->pc || merged[j].lr != slot->lr)) {
+			    (merged[j].pid != slot->pid || merged[j].pc != slot->pc || merged[j].lr != slot->lr ||
+			    merged[j].up[0] != slot->up[0] || merged[j].up[1] != slot->up[1])) {
 				j = (unsigned int)((j + 1) % capacity);
 			}
 			if (merged[j].count == 0) {
@@ -489,8 +491,8 @@ psci_smp_prof_report(char *buf, size_t size)
 		if (best == capacity) {
 			break;
 		}
-		n += (size_t)snprintf(buf + n, size - n, "%u %d %c %llx %llx\n", merged[best].count, merged[best].pid,
-		    merged[best].user ? 'u' : 'k', merged[best].pc, merged[best].lr);
+		n += (size_t)snprintf(buf + n, size - n, "%u %d %c %llx %llx %llx %llx\n", merged[best].count, merged[best].pid,
+		    merged[best].user ? 'u' : 'k', merged[best].pc, merged[best].lr, merged[best].up[0], merged[best].up[1]);
 		merged[best].count = 0;
 	}
 out:

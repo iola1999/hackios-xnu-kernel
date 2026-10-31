@@ -42,6 +42,7 @@
 #include <vm/vm_kern.h>
 #include <pexpert/pexpert.h>
 #include <sys/redwood_audio.h>
+#include <sys/redwood_input.h>
 
 SYSCTL_DECL(_kern_redwood);
 
@@ -157,20 +158,8 @@ redwood_task_exec_image(task_t task, char *name, uint32_t namelen)
 }
 
 static int
-redwood_thread_dump_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
-    struct sysctl_req *req)
+redwood_thread_dump_pid(int pid)
 {
-	int pid = 0;
-	int error;
-
-	error = sysctl_io_number(req, 0, sizeof(pid), &pid, NULL);
-	if (error != 0 || req->newptr == NULL) {
-		return error;
-	}
-	if (pid <= 0) {
-		return EINVAL;
-	}
-
 	proc_t p = proc_find(pid);
 
 	if (p == NULL) {
@@ -187,6 +176,124 @@ redwood_thread_dump_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1
 	redwood_thread_dump(task, pid, exec_base, exec_image);
 	proc_rele(p);
 	return 0;
+}
+
+static int
+redwood_thread_dump_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	int pid = 0;
+	int error;
+
+	error = sysctl_io_number(req, 0, sizeof(pid), &pid, NULL);
+	if (error != 0 || req->newptr == NULL) {
+		return error;
+	}
+	if (pid <= 0) {
+		return EINVAL;
+	}
+	return redwood_thread_dump_pid(pid);
+}
+
+/*
+ * With boot-arg touch_lat=1, on every tick of the processor governor (annibale_cpufreq.c, 50 ms), the
+ * threads of backboardd, SpringBoard and the input service go into the log as thread_dump writes
+ * them in two cases:
+ *   - a gesture with no answer: a touch began (the first after GESTURE_GAP_MS without one), and
+ *     QUIET_MS later the panel has had fewer than QUIET_FRAMES new frames. In kernel-12377-cmd40-bo16
+ *     and cmd41-bo17 the swipes that moved the screen had 9 to 26 frames by then, the others 0 to 4
+ *     (the clock icon's second hand draws at 10 Hz); in bo16 neither backboardd nor SpringBoard
+ *     submitted anything after those until the next gesture, about four seconds later;
+ *   - an animation that stops while the screen is being touched: the panel's frame count had been
+ *     moving since the gesture began (two changes at most STALL_FLOWING_MS apart, the last after the
+ *     gesture's first touch), has not moved for STALL_MS since, and the last touch is under a second
+ *     old.
+ * Each case dumps once per gesture or stall, and at most STALL_DUMPS times a boot.
+ */
+#define GESTURE_GAP_MS          300
+#define QUIET_MS                400
+#define QUIET_FRAMES            8
+#define STALL_MS                300
+#define STALL_FLOWING_MS        100
+#define STALL_DUMPS             8
+
+static void
+freeze_dump(void)
+{
+	static const char *const names[] = { "backboardd", "SpringBoard", "input26-service" };
+
+	for (int pid = 1; pid < 2000; pid++) {
+		char name[32] = "";
+
+		proc_name(pid, name, sizeof(name));
+		for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+			if (strcmp(name, names[i]) == 0) {
+				printf("freeze: %s pid %d\n", name, pid);
+				redwood_thread_dump_pid(pid);
+			}
+		}
+	}
+}
+
+void
+redwood_freeze_check(uint64_t touched)
+{
+	static int enabled = -1;
+	static uint32_t frames, dumps, began_frames, quiet_dumps;
+	static uint64_t moved, moved_before, touch_seen, began;
+	static bool dumped, began_dumped;
+	uint64_t now = mach_absolute_time(), touch_ns, still_ns, flowing_ns;
+
+	if (enabled < 0) {
+		uint32_t value = 0;
+
+		enabled = PE_parse_boot_argn("touch_lat", &value, sizeof(value)) && value != 0;
+	}
+	if (!enabled || touched > now) {
+		return;
+	}
+	if (touched != touch_seen) {
+		absolutetime_to_nanoseconds(touched - touch_seen, &touch_ns);
+		if (touch_seen == 0 || touch_ns > GESTURE_GAP_MS * NSEC_PER_MSEC) {
+			began = touched;
+			began_frames = redwood_frames_shown;
+			began_dumped = false;
+		}
+		touch_seen = touched;
+	}
+	if (began != 0 && !began_dumped && quiet_dumps < STALL_DUMPS && redwood_frames_shown - began_frames < QUIET_FRAMES) {
+		absolutetime_to_nanoseconds(now - began, &touch_ns);
+		if (touch_ns >= QUIET_MS * NSEC_PER_MSEC && touch_ns < NSEC_PER_SEC) {
+			began_dumped = true;
+			quiet_dumps++;
+			printf("freeze: %u frames %llu ms after a touch began (frame %u), %u touch samples unread; the "
+			    "threads of backboardd, SpringBoard and input26-service follow\n", redwood_frames_shown - began_frames,
+			    touch_ns / NSEC_PER_MSEC, began_frames, redwood_touch_unread());
+			freeze_dump();
+		}
+	}
+	if (redwood_frames_shown != frames || moved == 0) {
+		frames = redwood_frames_shown;
+		moved_before = moved;
+		moved = now;
+		dumped = false;
+		return;
+	}
+	if (dumped || dumps >= STALL_DUMPS || began == 0 || moved_before == 0 || moved < began) {
+		return;         /* (a screen that stopped before this gesture began is the other case's) */
+	}
+	absolutetime_to_nanoseconds(now - touched, &touch_ns);
+	absolutetime_to_nanoseconds(now - moved, &still_ns);
+	absolutetime_to_nanoseconds(moved - moved_before, &flowing_ns);
+	if (touch_ns > NSEC_PER_SEC || still_ns < STALL_MS * NSEC_PER_MSEC || flowing_ns > STALL_FLOWING_MS * NSEC_PER_MSEC) {
+		return;
+	}
+	dumped = true;
+	dumps++;
+	printf("freeze: no frame for %llu ms after frames %llu ms apart, touched %llu ms ago (frame %u); "
+	    "the threads of backboardd, SpringBoard and input26-service follow\n", still_ns / NSEC_PER_MSEC, flowing_ns / NSEC_PER_MSEC,
+	    touch_ns / NSEC_PER_MSEC, frames);
+	freeze_dump();
 }
 
 SYSCTL_PROC(_kern_redwood, OID_AUTO, thread_dump, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
@@ -388,7 +495,7 @@ static int
 redwood_prof_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
     struct sysctl_req *req)
 {
-	const size_t size = 8192;
+	const size_t size = 96 * 1024;  /* PROF_TOP lines of about 80 bytes */
 	char *text = kalloc_data(size, Z_WAITOK);
 	int n, error;
 

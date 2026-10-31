@@ -440,3 +440,60 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
 	}
 	return kIOReturnSuccess;
 }
+
+/*
+ * The caller's own memory as a buffer, for Metal's -newBufferWithBytesNoCopy:: the GPU reads and
+ * writes the pages the program writes and reads, and nothing is copied. The pages are wired for as
+ * long as the buffer is there (IOGeneralMemoryDescriptor::free completes the prepare), so a program
+ * that unmaps them first takes nothing from the GPU. Memory the program may only read (backboardd's
+ * images: cmd35-bo8) is wired for reading and is read-only to the GPU and in the second mapping.
+ * Only with gpu_coherent=1: these pages have no kernel address submit() could push out of the
+ * cache, and there the GPU snoops the caches itself.
+ */
+IOReturn
+RedwoodGPUUserClient::memoryBuffer(struct redwood_memory * request)
+{
+	static uint32_t refused;
+	IOMemoryDescriptor * memory;
+	struct gpu_buffer * b = NULL;
+	uint32_t flags = 0;
+	IOReturn ret;
+
+	if (!gGPUCoherent) {
+		return kIOReturnUnsupported;
+	}
+	if (request->size == 0 || request->size > GPU_BUFFER_MAX || ((request->address | request->size) & 4095) != 0) {
+		return kIOReturnBadArgument;
+	}
+	memory = IOMemoryDescriptor::withAddressRange(request->address, request->size, kIODirectionInOut, fTask);
+	if (memory == NULL) {
+		return kIOReturnNoMemory;
+	}
+	if ((ret = memory->prepare()) == KERN_PROTECTION_FAILURE) {
+		memory->release();
+		memory = IOMemoryDescriptor::withAddressRange(request->address, request->size, kIODirectionOut, fTask);
+		if (memory == NULL) {
+			return kIOReturnNoMemory;
+		}
+		ret = memory->prepare();
+		flags = MSM_BO_GPU_READONLY;
+	}
+	if (ret != kIOReturnSuccess) {
+		if (refused++ < 16) {
+			IOLog("RedwoodGPU: %llu bytes at %#llx cannot be wired: %#x\n", request->size, request->address, ret);
+		}
+		memory->release();
+		return ret;
+	}
+	IOLockLock(gGPULock);
+	if (!gGPUReported && redwood_gpu_ready() && (b = newBuffer(memory, 0, request->size, flags, &request->handle)) != NULL) {
+		b->memory = memory;
+		b->kernel = NULL;
+	}
+	IOLockUnlock(gGPULock);
+	if (b == NULL) {
+		memory->release();
+		return kIOReturnNoMemory;
+	}
+	return kIOReturnSuccess;
+}

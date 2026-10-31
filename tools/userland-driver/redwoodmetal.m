@@ -2409,10 +2409,9 @@ struct gem_close { uint32_t handle, pad; };
 		       options:(NSUInteger)options
 		   deallocator:(void (^)(void *, NSUInteger))deallocator
 {
-	/* The bytes are copied once, here. 64 KiB was the first limit (roundb's 109 requests were at
-	 * or under it); round lock3cpu4 of 2026-10-30 had backboardd ask for 114688 bytes over a
-	 * 640x155 image twice a second, and the image was not drawn. A full-screen BGRA image is
-	 * 11 MB, so 16 MiB covers what the window server composites, at about a millisecond a copy. */
+	/* 16 MiB covers what the window server composites: a full-screen BGRA image is 11 MB, about a
+	 * millisecond to copy when the kernel does not take the pages. The first limit, 64 KiB, left
+	 * backboardd's 114688-byte buffer over a 640x155 image undrawn (lock3cpu4, 2026-10-30). */
 	enum { NOCOPY_LIMIT = 16 << 20 };
 
 	(void)options;
@@ -2627,41 +2626,42 @@ struct gem_close { uint32_t handle, pad; };
 	return _mesa;
 }
 
-/* Memory the caller owns, held as a copy: the caller's pages cannot be mapped into the GPU's address
- * space yet. Textures over the buffer read the caller's memory and write their results back into
- * it (rwa_buffer_set_mirror); writing through -contents still does not reach the caller. */
+/* Memory the caller owns: the GPU's own if the kernel takes the pages (rwa_buffer_from_memory), else a
+ * copy, whose textures read and write back the caller's memory (rwa_buffer_set_mirror) and whose -contents does not. */
 - (instancetype)initWithDevice:(RedwoodMetalDevice *)device
 			   gpu:(io_connect_t)gpu
 			 bytes:(const void *)bytes
 			length:(NSUInteger)length
 		   deallocator:(void (^)(void *, NSUInteger))deallocator
 {
-	self = [self initWithDevice:device gpu:gpu length:length];
+	char why[256] = { 0 };
+	struct rwa_buffer *own = mesa_available() && [device mesaDevice] != NULL && mesa.buffer_from_memory != NULL ?
+	    mesa.buffer_from_memory([device mesaDevice], (void *)bytes, (length + 4095) & ~(NSUInteger)4095, why, sizeof(why)) : NULL;
+
+	self = own != NULL ? [super init] : [self initWithDevice:device gpu:gpu length:length];
 	if (self == nil) {
+		if (own != NULL) mesa.buffer_destroy(own);
 		return nil;
 	}
-	if (bytes != NULL && _contents != NULL) {
+	if (own != NULL)
+		_mesa = own, _owner = device, _length = length, _contents = (void *)bytes;
+	else if (bytes != NULL && _contents != NULL)
 		memcpy(_contents, bytes, length);
-	}
-	if (_mesa != NULL && mesa.buffer_set_mirror != NULL) mesa.buffer_set_mirror(_mesa, (void *)bytes);
+	if (own == NULL && _mesa != NULL && mesa.buffer_set_mirror != NULL) mesa.buffer_set_mirror(_mesa, (void *)bytes);
 	_callerBytes = (void *)bytes;
-	if (deallocator != NULL) {
-		_callerDeallocator = [deallocator copy];
-	}
-	static unsigned long copies;
-	unsigned long copy_n = __sync_add_and_fetch(&copies, 1);
-
-	if (copy_n <= 32 || copy_n % 256 == 0)
-		rw_print("rwa buffer: copied %p of %lu bytes, buffer at %p (copy %lu)\n", bytes,
-			 (unsigned long)length, _contents, copy_n);
+	if (deallocator != NULL) _callerDeallocator = [deallocator copy];
+	static unsigned long made;
+	unsigned long made_n = __sync_add_and_fetch(&made, 1);
+	if (made_n <= 32 || made_n % 256 == 0)
+		rw_print("rwa buffer: %s %p of %lu bytes, buffer at %p (%lu)%s%s\n", own ? "took" : "copied", bytes,
+			 (unsigned long)length, _contents, made_n, own ? "" : ": ", why);
 	return self;
 }
 
 - (void)dealloc
 {
 	/* The caller handed us its own memory and an expectation to be told when we are done with it:
-	 * the deallocator runs once, here, after the library has stopped mirroring that memory.
-	 * _callerBytes is what the block was given, not _contents, which is our copy. */
+	 * the deallocator runs once, here, with _callerBytes, after the library stopped mirroring it. */
 	uint64_t dealloc_n = rw_dealloc_count + 1;
 	bool dealloc_print = rw_dealloc_print();
 	if (dealloc_print) {

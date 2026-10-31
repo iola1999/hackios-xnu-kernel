@@ -214,10 +214,11 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
 		    "%u under 1, %u under 2, %u under 4, %u longer; %llu ms in all)\n",
 		    timed ? worked / timed : 0, timed, by[0], by[1], by[2], by[3], by[4], by[5], by[6], worked / 1000);
 		IOLog("RedwoodGPU: %u waits of %llu us, %u over before they began; %u IOSurfaces taken as buffers in %llu us each; "
-		    "%u buffers, %llu MB\n",
+		    "%u buffers, %llu MB; %u completion interrupts\n",
 		    gGPUStat.waits, gGPUStat.waits ? waiting / NSEC_PER_USEC / gGPUStat.waits : 0, gGPUStat.over,
 		    gGPUStat.surfaces, gGPUStat.surfaces ? taking / NSEC_PER_USEC / gGPUStat.surfaces : 0, fBufferCount,
-		    fBufferBytes >> 20);
+		    fBufferBytes >> 20, redwood_gpu_irqs() - gGPUIrqsSeen);
+		gGPUIrqsSeen = redwood_gpu_irqs();
 		uint32_t mhz, changes;
 
 		redwood_gpu_speed(&mhz, &changes);

@@ -96,6 +96,8 @@ void annibale_cpufreq_init(void);       /* ... on annibale: cpufreq=1 a governor
 void annibale_cpufreq_touch(void);      /* a touch: the governor's boost */
 bool annibale_gpu_temperature(int32_t *tenths); /* the hottest GPU sensor; false without cpufreq=N or a valid reading */
 uint64_t annibale_cpufreq_touched(void);        /* mach_absolute_time() of the last touch, 0 for none */
+void redwood_freeze_check(uint64_t touched);    /* bsd/dev/redwood_threads.c: thread dumps when a touched screen gets no frame */
+uint32_t redwood_touch_unread(void);              /* bsd/dev/redwood_input.c: touch samples the input service has not read */
 void redwood_adreno_init(void);         /* boot-arg adreno=N: the first N steps of waking the phone's GPU */
 void redwood_adreno_quiesce(void);      /* on the way back to the loader: the GPU block stopped, out of our memory */
 void redwood_adreno_stop(void);         /* before that, where the ending is no panic's: the GPU given back in order */
@@ -143,6 +145,9 @@ bool redwood_gpu_unmap(uint64_t address, uint64_t size);
 void redwood_gpu_to_memory(void *start, uint64_t size);
 uint32_t redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
 bool redwood_gpu_done(uint32_t fence);
+uint32_t redwood_gpu_irqs(void);                /* the GPU's completion interrupts so far; 0 where there are none */
+/* Between two looks at redwood_gpu_done(): until the next interrupt after `seen`, at most longest_us; without interrupts poll_us. */
+void redwood_gpu_pause(uint32_t seen, uint32_t poll_us, uint32_t longest_us);
 uint32_t redwood_gpu_last(void);
 void redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]);
 void redwood_gpu_speed(uint32_t *mhz, uint32_t *changes);      /* the A830's speed and its changes; 0 and 0 elsewhere */
