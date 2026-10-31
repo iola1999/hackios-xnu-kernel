@@ -8,6 +8,14 @@ static struct {
 	uint32_t width, height, stride;
 } SCREEN;
 static uint64_t win_base, win_size; /* XNU's physical memory window, claimed once */
+/*
+ * Memory below 4 GB for the Wi-Fi card, which takes 32-bit addresses only: its stream passes the
+ * apps SMMU untranslated and the kernel's window is above 4 GB. Claimed once, on the first run
+ * whose arguments ask for the card's firmware (pcie=7 or more), and handed to the kernel as
+ * lowdma=<address> lowdma_mb=<size>.
+ */
+#define LOW_DMA_SIZE        0x8000000ULL
+static uint64_t low_dma;
 static uint64_t resident_rd_size;   /* root image kept at win_base + RESIDENT_RD_OFFSET, 0 if none */
 static char last_result[64] = "idle";
 
@@ -437,7 +445,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	/* "bootcpu=N" among the kernel's arguments: run it on core N (see run_on_other_cpu) */
 	uint64_t this_mpidr = READ_SYSREG(MPIDR_EL1) & 0xFFFFFF, kernel_mpidr = this_mpidr;
 	/* "cpus=N" or "cpumask=M" there too: the kernel may have more cores than the one it starts on */
-	int more_cores = 0, battery_requested = 0, ufs_requested = 0;
+	int more_cores = 0, battery_requested = 0, ufs_requested = 0, low_dma_requested = 0;
 	/* "torch=N" (not 0) there too: the phone's flashlight is the kernel's (bsd/dev/redwood_torch.c) */
 	int torch_requested = 0;
 	/* "cam=5" there too: the phone's wide camera is iOS's (bsd/dev/redwood_camera.c) */
@@ -458,6 +466,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		torch_requested |= starts_with(c, "torch=") && (c == pi.cmdline || c[-1] == ' ') && c[6] >= '1' && c[6] <= '9';
 		camera_requested |= starts_with(c, "cam=5") && (c == pi.cmdline || c[-1] == ' ') && (c[5] == 0 || c[5] == ' ');
 		gamut_p3 |= starts_with(c, "gamut=p3") && (c == pi.cmdline || c[-1] == ' ');
+		low_dma_requested |= starts_with(c, "pcie=") && (c == pi.cmdline || c[-1] == ' ') && c[5] >= '7' &&
+		    c[5] <= '9' && (c[6] == 0 || c[6] == ' ');
 		if (starts_with(c, "ufs=") && (c == pi.cmdline || c[-1] == ' ') && c[4] >= '1' && c[4] <= '2' &&
 		    (c[5] == 0 || c[5] == ' ')) {
 			ufs_requested = c[4] - '0';
@@ -470,6 +480,15 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	}
 	if (battery_requested) {
 		charger_start();
+	}
+	if (low_dma_requested && low_dma == 0) {
+		uint64_t at = 0xFFFFFFFFULL;
+
+		if (EFI_ERROR(BS->allocate_pages(AllocateMaxAddress, EfiLoaderData, LOW_DMA_SIZE >> 12, &at))) {
+			at = 0;
+		}
+		low_dma = at;
+		print("low DMA memory %x size %x\n", low_dma, LOW_DMA_SIZE);
 	}
 	if (ufs_requested >= 2) {
 		hc_init();              /* (ufs_native=: UEFI's transfer list kept, before anything reads) */
@@ -605,6 +624,29 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		}
 		for (int shift = 60; shift >= 0 && n < BOOT_LINE_LENGTH - 1; shift -= 4) {
 			ba->commandLine[n++] = hex[(address >> shift) & 0xf];
+		}
+		if (n < BOOT_LINE_LENGTH - 1) ba->commandLine[n++] = ' ';
+	}
+	if (low_dma_requested && low_dma != 0) {
+		static const char prefix[] = "lowdma=0x";
+		static const char hex[] = "0123456789abcdef";
+		char size[16];
+		unsigned digits = 0;
+
+		for (const char *c = prefix; *c && n < BOOT_LINE_LENGTH - 1; c++) {
+			ba->commandLine[n++] = *c;
+		}
+		for (int shift = 60; shift >= 0 && n < BOOT_LINE_LENGTH - 1; shift -= 4) {
+			ba->commandLine[n++] = hex[(low_dma >> shift) & 0xf];
+		}
+		for (uint64_t mb = LOW_DMA_SIZE >> 20; mb != 0; mb /= 10) {
+			size[digits++] = (char)('0' + mb % 10);
+		}
+		for (const char *c = " lowdma_mb="; *c && n < BOOT_LINE_LENGTH - 1; c++) {
+			ba->commandLine[n++] = *c;
+		}
+		while (digits != 0 && n < BOOT_LINE_LENGTH - 1) {
+			ba->commandLine[n++] = size[--digits];
 		}
 		if (n < BOOT_LINE_LENGTH - 1) ba->commandLine[n++] = ' ';
 	}

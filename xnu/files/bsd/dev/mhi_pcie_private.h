@@ -14,9 +14,18 @@ struct mhi_pcie_windows {
 	vm_offset_t parf, phy, dm_core, gcc, tlmm;
 };
 
+/* what step 7 (mhi_pcie_fw.c) takes from the survey: the controller's windows, with region 0 left on
+ * the card's config space, and where BAR0 was assigned */
+struct mhi_pcie_card {
+	vm_offset_t parf, dm_core, conf;
+	uint32_t bar0;
+};
+
 int mhi_pcie_say(const char *format, ...) __printflike(1, 2);
 void mhi_pcie_pause(const char *what);
 bool mhi_pcie_power_up(const struct mhi_pcie_windows *windows);
+bool mhi_pcie_firmware(const struct mhi_pcie_card *card);
+void mhi_pcie_ipcr(void);
 
 static inline uint32_t
 mhi_pcie_rd(vm_offset_t address)

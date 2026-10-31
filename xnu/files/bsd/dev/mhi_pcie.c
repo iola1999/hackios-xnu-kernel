@@ -34,7 +34,7 @@
  * sizing test, written all-ones and restored, every write read back. Nothing happens at all
  * unless a boot-arg asks:
  *
- *   pcie=N   run steps 1 through N, clamped to 6.
+ *   pcie=N   run steps 1 through N, clamped to 8.
  *
  *   step 1  read-only, the clock controller and the pin controller only: the two PCIe power
  *           domains, the root complex's clocks, and the six pins the device tree wires to the
@@ -59,9 +59,12 @@
  *   step 6  read only SCR0, IDR0 and IDR1 from apps SMMU after checking that PCIe remains powered
  *           and linked. The SMMU window is read once at its global page; SID and context scans are
  *           a later step after this access succeeds on the device.
+ *   step 7  the card's firmware, PBL to mission mode (mhi_pcie_fw.c). Only with pcie_power=1; region 0
+ *           goes back to the card's config space for it and stays there.
+ *   step 8  once step 7 reached mission mode: QRTR's MHI channels and the card's first QRTR words
+ *           (mhi_pcie_fw.c).
  *
- * Firmware download and doorbell writes remain separate work. Without
- * pcie_power=1 nothing persists -- everything written is restored -- so there is no quiesce on the
+ * Without pcie_power=1 nothing persists -- everything written is restored -- so there is no quiesce on the
  * way out. pcie_power=1 with pcie=2 or more powers root complex 0 and the card up between steps 1
  * and 2 when step 1 finds them off (mhi_pcie_power.c); that is left on until the reset.
  *
@@ -525,12 +528,26 @@ assign_bar0(void)
 	    ep_bar1, ep_conf(0x04) & 0xffff, base, last);
 }
 
+/* region 0 onto the config space of the device on the link: bus 1 device 0 function 0 (pci-msm.c 3614) */
+static void
+config_window(void)
+{
+	uint32_t want[7] = { 0 };
+	unsigned secondary = (rd(dm_core + 0x18) >> 8) & 0xff;
+
+	want[0] = secondary <= 1 ? IATU_TYPE_CFG0 : IATU_TYPE_CFG1;
+	want[1] = IATU_ENABLE;                                /* the vendor enables what it programs, line 3601 */
+	want[2] = CONF_PHYS;
+	want[4] = CONF_PHYS + 0xfff;                          /* 4 KiB, pci-msm.c 3619 */
+	want[5] = BDF(secondary != 0 ? secondary : 1, 0);
+	region0_write(dm_core + IATU_OFF, want);
+}
+
 static void
 probe_endpoint(void)
 {
 	vm_offset_t iatu = dm_core + IATU_OFF;
-	uint32_t save[7], want[7], buses = rd(dm_core + 0x18);
-	unsigned secondary = (buses >> 8) & 0xff;
+	uint32_t save[7];
 
 	if (!link_up) {
 		printf("pcie: the link is down, so the endpoint is left untouched: the vendor's driver refuses\n"
@@ -542,13 +559,7 @@ probe_endpoint(void)
 	region0_read(iatu, save);
 	printf("pcie: step 3: region 0 was type %#x %s cpu %#010x..%#010x -> %#010x; remapped to config for the probe\n",
 	    save[0] & 0x1f, (save[1] & IATU_ENABLE) ? "enabled" : "disabled", save[2], save[4], save[5]);
-	bzero(want, sizeof(want));
-	want[0] = secondary <= 1 ? IATU_TYPE_CFG0 : IATU_TYPE_CFG1;
-	want[1] = IATU_ENABLE;                                /* the vendor enables what it programs, line 3601 */
-	want[2] = CONF_PHYS;
-	want[4] = CONF_PHYS + 0xfff;                          /* 4 KiB, pci-msm.c 3619 */
-	want[5] = BDF(secondary != 0 ? secondary : 1, 0);     /* bus 1 device 0 function 0, pci-msm.c 3614 */
-	region0_write(iatu, want);
+	config_window();
 
 	ep_vendor = ep_conf(0x00) & 0xffff;
 	ep_device = ep_conf(0x00) >> 16;
@@ -908,6 +919,14 @@ pcie_thread(void *parameter, __unused wait_result_t result)
 	if (steps >= 6) {
 		read_apps_smmu_header();
 	}
+	if (steps >= 7 && power && ep_alive && ep_device == WCN7850_DEVICE) {
+		struct mhi_pcie_card card = { parf, dm_core, conf, ep_bar0 & ~0xfu };
+
+		config_window();
+		if (mhi_pcie_firmware(&card) && steps >= 8) {
+			mhi_pcie_ipcr();
+		}
+	}
 
 out:
 	printf("pcie: the survey is over: %s%s; %s\n",
@@ -928,8 +947,8 @@ mhi_pcie_init(void)
 	}
 	PE_parse_boot_argn("pcie_pause", &pause_s, sizeof(pause_s));
 	PE_parse_boot_argn("pcie_power", &power, sizeof(power));
-	if (steps > 6) {
-		steps = 6;
+	if (steps > 8) {
+		steps = 8;
 	}
 	if (kernel_thread_start(pcie_thread, (void *)(uintptr_t)steps, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);

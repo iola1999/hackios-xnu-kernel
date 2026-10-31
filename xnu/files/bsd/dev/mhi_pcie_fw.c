@@ -1,0 +1,819 @@
+/*
+ * Step 7 of the PCIe survey (pcie=7 with pcie_power=1): the WCN7850's firmware, from the primary boot
+ * loader the card waits in (step 5 read execution environment 0, PBL) to mission mode. The order and
+ * the register work are those of hakios-arm64e-dada's bsd/dev/hakios_dada_wifi.c (HakiOS, APSL 2.0),
+ * which booted the Xiaomi 15's card on PCIe 0 of the same SoC; the card's own registers are ath12k's
+ * for WCN7850 (Linux drivers/net/wireless/ath/ath12k pci.c and hw.c: the hot reset at 0x1e40304).
+ *
+ *   - The controller's BDF-to-SID table on, the card (RID 0x100) at the slot its CRC-8 names, 0x15
+ *     (step 5 computed the same), as stream 0x1401 (the device tree's iommu-map). Left in its bypass,
+ *     the controller tags the card's DMA with a stream the SMMU does not let through; on dada the
+ *     card's first write after its boot loader started stopped the SoC a second later.
+ *   - The apps SMMU: streams 0x1400 and 0x1401 matched to the last context bank, which is set to not
+ *     translate (stage 1 off). dada routes its sound and Wi-Fi streams the same way: the hypervisor
+ *     gives no translating context. A stream already matched is left as found, and a last bank
+ *     already in use stops the step.
+ *   - DMA memory: the card takes 32-bit addresses and the kernel's RAM is above 4 GB, so all the card
+ *     reads or writes lies in the 128 MB the loader keeps below 4 GB (lowdma=, lowdma_mb=; loader v14).
+ *   - The card's own power-up (ath12k_pci_power_up's register work), MSI pointed at a page of that
+ *     memory nobody reads, ASPM off; then mhi_boot.c (UniXNU's MhiBoot): the secondary boot loader
+ *     (the image's first 512 KiB) through BHI, the MHI contexts at READY, M0, the whole image through
+ *     BHIe, mission mode. Everything is polled.
+ *
+ * The image is fw/amss20.bin of the RAM disk (redwood_image.c; package.py WIFI_FW=1) when the SoC
+ * version register says hardware 2.0, the only WCN7850 ath12k knows, else fw/amss.bin; pcie_fw=1 or 2
+ * picks one. Nothing is undone: the card keeps running, the streams stay matched and the memory stays
+ * the card's until the phone resets. Step 8, at the end of this file, starts QRTR's channels on top.
+ */
+#include <kern/clock.h>
+#include <kern/sched_prim.h>
+#include <libkern/libkern.h>
+#include <mach/mach_types.h>
+#include <machine/machine_routines.h>
+#include <pexpert/pexpert.h>
+#include <sys/param.h>
+#include <sys/systm.h>
+#include "mhi_boot.h"
+#include "mhi_pcie_private.h"
+
+extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+extern const uint8_t *redwood_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+
+#define printf mhi_pcie_say
+#define rd mhi_pcie_rd
+#define wr mhi_pcie_wr
+
+/* PARF (pcie-qcom.c qcom_pcie_config_sid_1_9_0) */
+#define PARF_BDF_TO_SID_TABLE     0x2000
+#define PARF_BDF_TO_SID_CFG       0x2c00            /* bit 0: bypass */
+#define CARD_SID_SLOT             0x15              /* CRC-8 of RID 0x100 */
+
+/* apps SMMU (ARM SMMUv2 global space 0; device tree reg 0x15000000 + 0x100000) */
+#define APPS_SMMU_PHYS            0x15000000UL
+#define APPS_SMMU_SIZE            0x100000UL
+#define SMMU_SMR(n)               (0x800 + 4 * (n))
+#define SMMU_S2CR(n)              (0xc00 + 4 * (n))
+#define SMMU_CBAR(n)              (0x1000 + 4 * (n))
+#define SMMU_CBA2R(n)             (0x1800 + 4 * (n))
+#define SMR_VALID                 (1u << 31)
+#define CBAR_S1_BYPASS_S2         0x10000u          /* type 1: stage 1 context, stage 2 bypassed */
+#define CBA2R_VA64                1u
+
+/* the card's registers above the first 512 KiB of BAR0 go through a window (ath12k_pci_select_window) */
+#define WINDOW_REG                0x310c
+#define WINDOW_ENABLE             0x40000000u
+#define WINDOW_START              0x80000u
+#define BAR_MAP                   0x100000u
+
+/* ath12k pci.h / pci.c, WCN7850 */
+#define TCSR_SOC_HW_VERSION       0x1b00000
+#define PCIE_PARF_LTSSM           0x1e081b0
+#define PARM_LTSSM_VALUE          0x111
+#define GCC_PCIE_HOT_RST          0x1e40304
+#define PCIE_INT_ALL_CLEAR        0x1e08228
+#define WLAON_QFPROM_PWR_CTRL     0x1f8031c
+#define PCIE_Q6_COOKIE            0x1f80500
+#define WLAON_WARM_SW_ENTRY       0x1f80504
+#define WLAON_SOC_RESET_CAUSE     0x1f8060c
+#define PCIE_SOC_GLOBAL_RESET     0x3008
+
+static vm_offset_t bar, conf, smmu;
+static uint32_t window = UINT32_MAX;
+
+static void
+ms(unsigned n)
+{
+	assert_wait_timeout((event_t)&window, THREAD_UNINT, n, NSEC_PER_MSEC);
+	thread_block(THREAD_CONTINUE_NULL);
+}
+
+static uint64_t
+uptime_ms(void)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns / NSEC_PER_MSEC;
+}
+
+static uint32_t
+card_rd(uint32_t off)
+{
+	if (off < WINDOW_START) {
+		return rd(bar + off);
+	}
+	if (((off >> 19) & 0x3f) != window) {
+		window = (off >> 19) & 0x3f;
+		wr(bar + WINDOW_REG, WINDOW_ENABLE | window);
+		(void)rd(bar + WINDOW_REG);
+	}
+	return rd(bar + WINDOW_START + (off & 0x7ffff));
+}
+
+static void
+card_wr(uint32_t off, uint32_t value)
+{
+	if (off < WINDOW_START) {
+		wr(bar + off, value);
+		return;
+	}
+	if (((off >> 19) & 0x3f) != window) {
+		window = (off >> 19) & 0x3f;
+		wr(bar + WINDOW_REG, WINDOW_ENABLE | window);
+		(void)rd(bar + WINDOW_REG);
+	}
+	wr(bar + WINDOW_START + (off & 0x7ffff), value);
+}
+
+/* ---- DMA memory: the loader's below 4 GB, write-combined (Normal non-cacheable, pmap.c) ------------------- */
+
+static struct {
+	vm_offset_t va;
+	uint64_t pa, size, used;
+} dma;
+
+/* aligned to its own size rounded up to a power of two, as the boot loader wants its image (UniXNU arenaAlloc) */
+static void *
+dma_alloc(uint64_t bytes, uint64_t *pa)
+{
+	uint64_t align, at;
+
+	bytes = (bytes + 4095) & ~4095ull;
+	for (align = 4096; align < bytes; align <<= 1) {
+	}
+	at = ((dma.pa + dma.used + align - 1) & ~(align - 1)) - dma.pa;
+	if (at + bytes > dma.size) {
+		return NULL;
+	}
+	dma.used = at + bytes;
+	*pa = dma.pa + at;
+	bzero((void *)(dma.va + at), (size_t)bytes);
+	return (void *)(dma.va + at);
+}
+
+/* ---- streams: the controller's table, then the SMMU ---------------------------------------------------------- */
+
+static void
+sid_table(vm_offset_t parf)
+{
+	uint32_t before = rd(parf + PARF_BDF_TO_SID_CFG);
+
+	for (uint32_t i = 0; i < 256; i++) {
+		wr(parf + PARF_BDF_TO_SID_TABLE + 4 * i, 0);
+	}
+	wr(parf + PARF_BDF_TO_SID_CFG, before & ~1u);
+	wr(parf + PARF_BDF_TO_SID_TABLE + 4 * CARD_SID_SLOT, 0x100u << 16 | 1u << 8);
+	printf("pcie: step 7: BDF-to-SID config %#x -> %#x, slot %#x %#x (RID 0x100, SID 0x1400 + 1)\n", before,
+	    rd(parf + PARF_BDF_TO_SID_CFG), CARD_SID_SLOT, rd(parf + PARF_BDF_TO_SID_TABLE + 4 * CARD_SID_SLOT));
+}
+
+static uint32_t smmu_streams, smmu_bank, smmu_cb;
+
+/* the SMMU's shape, the matches already in place for PCIe 0's streams, and the last bank's state */
+static bool
+smmu_open(void)
+{
+	uint32_t idr0, idr1, banks, pages, used = 0;
+
+	smmu = ml_io_map(APPS_SMMU_PHYS, APPS_SMMU_SIZE);
+	if (smmu == 0) {
+		return false;
+	}
+	idr0 = rd(smmu + 0x20);
+	idr1 = rd(smmu + 0x24);
+	smmu_streams = MIN(idr0 & 0xff, 128u);
+	banks = idr1 & 0xff;
+	pages = 1u << (((idr1 >> 28) & 7) + 1);
+	printf("pcie: step 7: apps SMMU SCR0 %#x IDR0 %#x IDR1 %#x: %u stream matches, %u context banks, %u pages\n",
+	    rd(smmu), idr0, idr1, smmu_streams, banks, pages);
+	if ((idr1 >> 31) != 0 || banks < 2 || pages > 128 || smmu_streams == 0) {
+		printf("pcie: step 7: 64 KiB pages or a shape the offsets here do not cover\n");
+		return false;
+	}
+	smmu_bank = banks - 1;
+	smmu_cb = (pages + smmu_bank) * 0x1000;
+	for (uint32_t i = 0; i < smmu_streams; i++) {
+		uint32_t smr = rd(smmu + SMMU_SMR(i));
+
+		if (!(smr & SMR_VALID)) {
+			continue;
+		}
+		used++;
+		if ((smr & 0x7fff) >= 0x1400 && (smr & 0x7fff) < 0x1800) {
+			printf("pcie: step 7: match %u: SMR %#x S2CR %#x\n", i, smr, rd(smmu + SMMU_S2CR(i)));
+		}
+	}
+	printf("pcie: step 7: %u of %u matches in use; bank %u: CBAR %#x CBA2R %#x SCTLR %#x\n", used, smmu_streams,
+	    smmu_bank, rd(smmu + SMMU_CBAR(smmu_bank)), rd(smmu + SMMU_CBA2R(smmu_bank)), rd(smmu + smmu_cb));
+	return true;
+}
+
+/* STREAM to the last bank without translation, in the first free match; true when it passes through */
+static bool
+smmu_pass(uint16_t stream)
+{
+	uint32_t slot = UINT32_MAX;
+
+	for (uint32_t i = 0; i < smmu_streams; i++) {
+		uint32_t smr = rd(smmu + SMMU_SMR(i)), mask = (smr >> 16) & 0x7fff, s2cr;
+
+		if (!(smr & SMR_VALID)) {
+			slot = MIN(slot, i);
+			continue;
+		}
+		if (((smr ^ stream) & 0x7fff & ~mask) == 0) {
+			s2cr = rd(smmu + SMMU_S2CR(i));
+			printf("pcie: step 7: stream %#x is matched already (%u: %#x -> %#x)\n", stream, i, smr, s2cr);
+			return ((s2cr >> 16) & 3) == 1 || ((s2cr & 0xff) == smmu_bank && !(rd(smmu + smmu_cb) & 1));
+		}
+	}
+	if (slot == UINT32_MAX || (rd(smmu + smmu_cb) & 1)) {
+		printf("pcie: step 7: stream %#x: no free match, or bank %u translates for somebody\n", stream, smmu_bank);
+		return false;
+	}
+	if (rd(smmu + SMMU_CBAR(smmu_bank)) != CBAR_S1_BYPASS_S2 || rd(smmu + SMMU_CBA2R(smmu_bank)) != CBA2R_VA64) {
+		wr(smmu + smmu_cb, 0);
+		wr(smmu + SMMU_CBA2R(smmu_bank), CBA2R_VA64);
+		wr(smmu + SMMU_CBAR(smmu_bank), CBAR_S1_BYPASS_S2);
+	}
+	wr(smmu + SMMU_S2CR(slot), smmu_bank);
+	wr(smmu + SMMU_SMR(slot), SMR_VALID | stream);
+	printf("pcie: step 7: stream %#x passes through: match %u -> bank %u\n", stream, slot, smmu_bank);
+	return rd(smmu + SMMU_SMR(slot)) == (SMR_VALID | stream);
+}
+
+/* ---- the card ----------------------------------------------------------------------------------------------- */
+
+/* ath12k_pci_power_up's register work: LTSSM, hot reset, interrupts left over, BHIe doorbells cleared, the warm
+ * boot marker cleared, the SoC's global reset pulsed, MHI reset */
+static void
+card_power_up(void)
+{
+	uint32_t v = card_rd(PCIE_PARF_LTSSM);
+
+	for (unsigned i = 0; v != PARM_LTSSM_VALUE && i < 5; i++) {
+		if (v == UINT32_MAX) {
+			ms(5);
+		}
+		card_wr(PCIE_PARF_LTSSM, PARM_LTSSM_VALUE);
+		v = card_rd(PCIE_PARF_LTSSM);
+	}
+	card_wr(GCC_PCIE_HOT_RST, card_rd(GCC_PCIE_HOT_RST) | 0x10);
+	ms(5);
+	card_wr(PCIE_INT_ALL_CLEAR, UINT32_MAX);
+	card_wr(WLAON_QFPROM_PWR_CTRL, card_rd(WLAON_QFPROM_PWR_CTRL) & ~4u);
+	card_wr(0x360, 0);                              /* BHIe TX and RX vector doorbells and status */
+	card_wr(0x368, 0);
+	card_wr(0x394, 0);
+	card_wr(0x39c, 0);
+	printf("pcie: step 7: card LTSSM %#x, Q6 cookie %#x, warm entry %#x, reset cause %#x\n", v,
+	    card_rd(PCIE_Q6_COOKIE), card_rd(WLAON_WARM_SW_ENTRY), card_rd(WLAON_SOC_RESET_CAUSE));
+	ms(10);
+	card_wr(WLAON_WARM_SW_ENTRY, 0);
+	ms(10);
+	v = card_rd(PCIE_SOC_GLOBAL_RESET);
+	card_wr(PCIE_SOC_GLOBAL_RESET, v | 1);
+	(void)card_rd(PCIE_SOC_GLOBAL_RESET);
+	ms(10);
+	card_wr(PCIE_SOC_GLOBAL_RESET, v & ~1u);
+	(void)card_rd(PCIE_SOC_GLOBAL_RESET);
+	ms(10);
+	window = UINT32_MAX;                            /* the reset took the window register with it */
+	printf("pcie: step 7: card global reset pulsed (%#x); MHI status %#x\n", v, rd(bar + 0x48));
+	wr(bar + 0x38, 2);                              /* MHI reset: clears the SYS_ERR the global reset leaves */
+	ms(10);
+	printf("pcie: step 7: after the MHI reset: status %#x, execution environment %u\n", rd(bar + 0x48),
+	    rd(bar + rd(bar + 0x28) + 0x28));
+}
+
+/* ASPM off while it loads; MSI on, its writes landing in SINK (UniXNU endpointLinkSetup) */
+static void
+card_link_setup(uint64_t sink)
+{
+	uint8_t cap = (uint8_t)(rd(conf + 0x34) & 0xfc);
+
+	for (unsigned guard = 0; cap >= 0x40 && guard < 48; guard++) {
+		uint32_t w = rd(conf + cap);
+		uint8_t id = (uint8_t)w, next = (uint8_t)(w >> 8) & 0xfc;
+
+		if (id == 0x10) {
+			wr(conf + cap + 0x10, rd(conf + cap + 0x10) & ~3u);
+		} else if (id == 0x05) {
+			bool is64 = (w >> 16) & 0x80;
+
+			wr(conf + cap + 4, (uint32_t)sink);
+			if (is64) {
+				wr(conf + cap + 8, (uint32_t)(sink >> 32));
+				wr(conf + cap + 0xc, 0);
+			} else {
+				wr(conf + cap + 8, 0);
+			}
+			wr(conf + cap, (w & 0xffff) | ((((w >> 16) & ~0x70u) | 0x20u | 1u) << 16));
+			printf("pcie: step 7: MSI at %#x: control %#x, address %#llx\n", cap, rd(conf + cap) >> 16, sink);
+		}
+		if (next == cap) {
+			break;
+		}
+		cap = next;
+	}
+}
+
+/* the device's context arrays (mhi_init_dev_ctxt; UniXNU programContexts): 128 channels off, two event rings, the
+ * command ring, and the registers that point at them */
+#define CTX                     44u
+#define CHANNELS                128u
+#define EVENT_RINGS             2u
+#define ELEMENT                 16u
+#define CMD_ELEMENTS            8u
+static const uint32_t ev_len[EVENT_RINGS] = { 32 * ELEMENT, 256 * ELEMENT };
+static uint8_t *ctx_va;
+static uint64_t ctx_pa, ev_pa[EVENT_RINGS], cmd_pa;
+
+static void
+contexts(uint64_t pa)
+{
+	uint32_t ev_off = CHANNELS * CTX, cmd_off = ev_off + EVENT_RINGS * CTX, cur = (cmd_off + CTX + 4095) & ~4095u;
+	uint64_t ev_base[EVENT_RINGS], cmd_base, v64;
+	uint32_t erdb, v32;
+
+#define W32(at, v) do { v32 = (v); memcpy(ctx_va + (at), &v32, 4); } while (0)
+#define W64(at, v) do { v64 = (v); memcpy(ctx_va + (at), &v64, 8); } while (0)
+	for (uint32_t i = 0; i < EVENT_RINGS; i++) {
+		uint32_t at = ev_off + i * CTX;
+
+		ev_base[i] = ev_pa[i] = pa + cur;
+		W32(at, i == 0 ? 0 : 1u << 16);             /* interrupt moderation */
+		W32(at + 4, 1);                             /* a valid event ring */
+		W32(at + 8, i + 1);                         /* its MSI vector */
+		W64(at + 12, ev_base[i]);
+		W64(at + 20, ev_len[i]);
+		W64(at + 28, ev_base[i]);
+		W64(at + 36, ev_base[i] + ev_len[i] - ELEMENT);
+		cur += ev_len[i];
+	}
+	cmd_base = cmd_pa = pa + cur;
+	W64(cmd_off + 12, cmd_base);
+	W64(cmd_off + 20, CMD_ELEMENTS * ELEMENT);
+	W64(cmd_off + 28, cmd_base);
+	W64(cmd_off + 36, cmd_base);
+#undef W32
+#undef W64
+	__builtin_arm_dsb(0xf);
+	wr(bar + 0x58, (uint32_t)pa);                   /* channel, event and command context arrays */
+	wr(bar + 0x5c, (uint32_t)(pa >> 32));
+	wr(bar + 0x60, (uint32_t)(pa + ev_off));
+	wr(bar + 0x64, (uint32_t)((pa + ev_off) >> 32));
+	wr(bar + 0x68, (uint32_t)(pa + cmd_off));
+	wr(bar + 0x6c, (uint32_t)((pa + cmd_off) >> 32));
+	wr(bar + 0x80, 0);                              /* control and data address ranges: all of 32 bits */
+	wr(bar + 0x84, 0);
+	wr(bar + 0x88, UINT32_MAX);
+	wr(bar + 0x8c, 0);
+	wr(bar + 0x98, 0);
+	wr(bar + 0x9c, 0);
+	wr(bar + 0xa0, UINT32_MAX);
+	wr(bar + 0xa4, 0);
+	wr(bar + 0x10, (rd(bar + 0x10) & ~0xffff0000u) | EVENT_RINGS << 16);
+	erdb = rd(bar + 0x20);
+	for (uint32_t i = 0; erdb + 8 * EVENT_RINGS <= BAR_MAP && i < EVENT_RINGS; i++) {
+		wr(bar + erdb + 8 * i, (uint32_t)(ev_base[i] + ev_len[i] - ELEMENT));
+		wr(bar + erdb + 8 * i + 4, (uint32_t)((ev_base[i] + ev_len[i] - ELEMENT) >> 32));
+	}
+}
+
+/* the host's half of the event rings: what the device posted is taken, the ring given back (UniXNU eventAck) */
+static unsigned
+events_ack(void)
+{
+	static uint64_t acked[EVENT_RINGS];
+	uint32_t erdb = rd(bar + 0x20);
+	unsigned moved = 0;
+
+	for (unsigned r = 0; r < EVENT_RINGS; r++) {
+		uint8_t *c = ctx_va + CHANNELS * CTX + r * CTX;
+		uint64_t base, len, rp, wp;
+
+		memcpy(&base, c + 12, 8);
+		memcpy(&len, c + 20, 8);
+		memcpy(&rp, c + 28, 8);
+		if (rp == acked[r] || rp < base || rp >= base + len) {
+			continue;
+		}
+		acked[r] = rp;
+		wp = rp == base ? base + len - ELEMENT : rp - ELEMENT;
+		memcpy(c + 36, &wp, 8);
+		__builtin_arm_dsb(0xf);
+		wr(bar + erdb + 8 * r, (uint32_t)wp);
+		wr(bar + erdb + 8 * r + 4, (uint32_t)(wp >> 32));
+		moved++;
+	}
+	return moved;
+}
+
+static uint32_t
+mhi_read(void *c __unused, uint32_t reg)
+{
+	return rd(bar + reg);
+}
+
+static void
+mhi_write(void *c __unused, uint32_t reg, uint32_t value)
+{
+	wr(bar + reg, value);
+}
+
+/* ---- the run ------------------------------------------------------------------------------------------------ */
+
+#define SEGMENT                 (512u << 10)        /* ath12k WCN7850: sbl_size and seg_len, 512 KiB */
+#define MAX_SEGMENTS            32u
+#define PHASE_LIMIT_MS          20000u
+#define RUN_LIMIT_MS            60000u
+
+static const char *const phases[] = { "idle", "resetting", "loading the boot loader", "waiting for READY", "contexts",
+	                              "waiting for the boot loader", "loading the image", "waiting for mission mode",
+	                              "done", "failed" };
+
+/* the card's DMA memory and image, laid out; false (said why) when something is missing */
+static bool
+stage_image(uint64_t *seg_pa, uint32_t *size, uint32_t *segments)
+{
+	uint64_t low = 0, mb = 0, soc_version, disk_size = 0;
+	uint32_t which = 0;
+	const uint8_t *image;
+	int disk = 0;
+
+	if (!PE_parse_boot_argn("lowdma", &low, sizeof(low)) || !PE_parse_boot_argn("lowdma_mb", &mb, sizeof(mb)) ||
+	    mb < 32 || low == 0 || low + (mb << 20) > 0x100000000ULL) {
+		printf("pcie: step 7: no memory below 4 GB from the loader (lowdma=, lowdma_mb=): loader v14 or later\n");
+		return false;
+	}
+	dma.pa = low;
+	dma.size = mb << 20;
+	dma.va = ml_io_map_wcomb((vm_offset_t)dma.pa, (vm_size_t)dma.size);
+	if (dma.va == 0) {
+		return false;
+	}
+	soc_version = card_rd(TCSR_SOC_HW_VERSION);
+	(void)PE_parse_boot_argn("pcie_fw", &which, sizeof(which));
+	if (which == 0) {
+		which = ((soc_version >> 8) & 0xf) == 2 ? 2 : 1;
+	}
+	image = redwood_image_file("fw", which == 2 ? "amss20.bin" : "amss.bin", &disk_size, &disk);
+	printf("pcie: step 7: SoC version %#llx (major %llu minor %llu): %s, %llu bytes from md%d\n", soc_version,
+	    (soc_version >> 8) & 0xf, (soc_version >> 4) & 0xf, which == 2 ? "amss20.bin" : "amss.bin", disk_size, disk);
+	if (image == NULL || disk_size == 0 || disk_size > MAX_SEGMENTS * SEGMENT) {
+		printf("pcie: step 7: no image in fw/ of the RAM disk (package.py WIFI_FW=1)\n");
+		return false;
+	}
+	*size = (uint32_t)disk_size;
+	*segments = (*size + SEGMENT - 1) / SEGMENT;
+	for (uint32_t i = 0; i < *segments; i++) {
+		uint8_t *seg = dma_alloc(SEGMENT, &seg_pa[i]);
+
+		if (seg == NULL) {
+			printf("pcie: step 7: no DMA memory for segment %u\n", i);
+			return false;
+		}
+		memcpy(seg, image + i * SEGMENT, MIN(SEGMENT, *size - i * SEGMENT));
+	}
+	return true;
+}
+
+bool
+mhi_pcie_firmware(const struct mhi_pcie_card *card)
+{
+	uint64_t seg_pa[MAX_SEGMENTS], table_pa, sink_pa, start, since;
+	uint32_t size = 0, segments = 0, entries, phase, last;
+	unsigned acks = 0;
+	MhiBhieEntry *table;
+	MhiBoot boot;
+	MhiIo io = { mhi_read, mhi_write, NULL, BAR_MAP };
+
+	conf = card->conf;
+	bar = card->bar0 != 0 ? ml_io_map(card->bar0, BAR_MAP) : 0;
+	if (bar == 0) {
+		printf("pcie: step 7: no BAR0 to map\n");
+		return false;
+	}
+	if (!stage_image(seg_pa, &size, &segments)) {
+		return false;
+	}
+	table = dma_alloc(4096, &table_pa);
+	ctx_va = dma_alloc(32 << 10, &ctx_pa);
+	if (table == NULL || ctx_va == NULL || dma_alloc(4096, &sink_pa) == NULL) {
+		return false;
+	}
+	entries = mhi_bhie_table(table, 4096 / sizeof(MhiBhieEntry), seg_pa, size, SEGMENT);
+	__builtin_arm_dsb(0xf);
+	printf("pcie: step 7: image %u bytes in %u segments from %#llx, table %#llx (%u entries), contexts %#llx\n",
+	    size, segments, seg_pa[0], table_pa, entries, ctx_pa);
+
+	mhi_pcie_pause("step 7: the controller's BDF-to-SID table");
+	sid_table(card->parf);
+	mhi_pcie_pause("step 7: the apps SMMU's matches for streams 0x1400 and 0x1401");
+	if (!smmu_open() || !smmu_pass(0x1400) || !smmu_pass(0x1401)) {
+		printf("pcie: step 7: the card's streams cannot be passed through; stopped before its power-up\n");
+		return false;
+	}
+	mhi_pcie_pause("step 7: the card's power-up");
+	card_power_up();
+	card_link_setup(sink_pa);
+	if (mhi_boot_open(&boot, &io) != 0) {
+		printf("pcie: step 7: MHI registers out of shape (BHI %#x, BHIe %#x)\n", rd(bar + 0x28), rd(bar + 0x2c));
+		return false;
+	}
+	contexts(ctx_pa);
+	mhi_pcie_pause("step 7: the boot loader through BHI");
+	phase = mhi_boot_begin(&boot, 0, seg_pa[0], MIN(SEGMENT, size), table_pa,
+	    entries * (uint32_t)sizeof(MhiBhieEntry), 0x5eed);
+	printf("pcie: step 7: boot loader asked for (execution environment %u, state %u): %s\n", boot.ee, boot.state,
+	    phases[phase]);
+	last = phase;
+	start = since = uptime_ms();
+	while (phase != MhiDone && phase != MhiFailed && uptime_ms() - start < RUN_LIMIT_MS) {
+		if (phase == MhiNeedContexts) {
+			contexts(ctx_pa);               /* the boot loader clears the MHI registers when it starts */
+			phase = mhi_boot_contexts_done(&boot);
+		} else {
+			phase = mhi_boot_step(&boot);
+		}
+		if (phase != MhiNeedContexts && phase != MhiDone && phase != MhiFailed) {
+			acks += events_ack();
+		}
+		if (phase != last) {
+			printf("pcie: step 7: %s after %llu ms (execution environment %u, state %u, status %#x)\n",
+			    phases[phase], uptime_ms() - start, boot.ee, boot.state, boot.last_status);
+			last = phase;
+			since = uptime_ms();
+		} else if (uptime_ms() - since > PHASE_LIMIT_MS) {
+			phase = mhi_boot_timeout(&boot);
+		}
+		ms(5);
+	}
+	printf("pcie: step 7: the end after %llu ms: %s (error %u in %s; execution environment %u, state %u, BHI status "
+	    "%#x error %#x; %u event ring moves)\n", uptime_ms() - start, phases[MIN(phase, 9u)], boot.error,
+	    phases[MIN(boot.failed_phase, 9u)], mhi_boot_ee(&boot), mhi_boot_state(&boot),
+	    rd(bar + boot.bhi + 0x2c), rd(bar + boot.bhi + 0x30), acks);
+	return phase == MhiDone;
+}
+
+/*
+ * ---- step 8 (pcie=8): channels 20 and 21, "IPCR", and the router's first words ----------------------------------
+ *
+ * QRTR runs over the MHI channel pair IPCR (ath12k mhi.c: channel 20 to the card, 21 from it, both reporting on
+ * event ring 1). The channels' contexts are filled, started with a command each (MHI_CMD_START_CHAN, completed on
+ * event ring 0), receive buffers queued on 21, and what arrives is read as QRTR version 1 headers: the card's HELLO
+ * is answered with ours, after which its name service tells of its services (NEW_SERVER), the Wi-Fi firmware's
+ * (WLFW, 69) among them. Ring elements and events after Linux drivers/bus/mhi/common.h and internal.h.
+ */
+#define MHI_CRDB                0x70
+#define MHI_CHDB(n)             (rd(bar + 0x18) + 8 * (n))
+#define MHI_ERDB(n)             (rd(bar + 0x20) + 8 * (n))
+#define IPCR_UL                 20u
+#define IPCR_DL                 21u
+#define IPCR_ELEMENTS           16u
+#define IPCR_BUFFER             8192u
+#define PKT_TRANSFER            0x02u
+#define PKT_START_CHAN          0x12u
+#define EV_STATE_CHANGE         0x20u
+#define EV_CMD_COMPLETION       0x21u
+#define EV_TRANSFER             0x22u
+#define EV_EE                   0x40u
+#define QRTR_CONTROL_PORT       0xfffffffeu
+
+struct ring {
+	uint8_t *va;
+	uint64_t pa, wp;
+	uint32_t elements;
+};
+
+static struct ring cmd, ul, dl;
+static uint64_t ev_local[EVENT_RINGS];
+static uint8_t *dl_buffer[IPCR_ELEMENTS], *ul_buffer;
+static uint64_t dl_buffer_pa[IPCR_ELEMENTS], ul_buffer_pa;
+static uint8_t dl_at[IPCR_ELEMENTS];            /* which buffer each element of channel 21's ring holds */
+static unsigned commands_done, hellos, servers;
+
+static void
+put64(uint8_t *at, uint64_t v)
+{
+	memcpy(at, &v, 8);
+}
+
+static uint64_t
+get64(const uint8_t *at)
+{
+	uint64_t v;
+
+	memcpy(&v, at, 8);
+	return v;
+}
+
+static void
+doorbell(uint32_t reg, uint64_t value)
+{
+	__builtin_arm_dsb(0xf);
+	wr(bar + reg + 4, (uint32_t)(value >> 32));
+	wr(bar + reg, (uint32_t)value);
+}
+
+/* one element at the ring's write pointer; the pointer moves on, in the context too */
+static uint64_t
+ring_put(struct ring *r, uint8_t *context_wp, uint64_t pointer, uint32_t dword0, uint32_t dword1)
+{
+	uint8_t *el = r->va + (r->wp - r->pa);
+	uint64_t at = r->wp;
+
+	put64(el, pointer);
+	memcpy(el + 8, &dword0, 4);
+	memcpy(el + 12, &dword1, 4);
+	r->wp += ELEMENT;
+	if (r->wp == r->pa + (uint64_t)r->elements * ELEMENT) {
+		r->wp = r->pa;
+	}
+	put64(context_wp, r->wp);
+	return at;
+}
+
+static void
+dl_queue(uint8_t buffer)
+{
+	dl_at[(dl.wp - dl.pa) / ELEMENT] = buffer;
+	ring_put(&dl, ctx_va + IPCR_DL * CTX + 36, dl_buffer_pa[buffer], IPCR_BUFFER, PKT_TRANSFER << 16 | 1u << 9);
+}
+
+static void
+qrtr_hello(uint32_t node)
+{
+	uint32_t packet[8 + 5] = { 1, 2, 1, QRTR_CONTROL_PORT, 0, 20, node, QRTR_CONTROL_PORT, 2 };
+
+	memcpy(ul_buffer, packet, sizeof(packet));
+	ring_put(&ul, ctx_va + IPCR_UL * CTX + 36, ul_buffer_pa, sizeof(packet), PKT_TRANSFER << 16 | 1u << 9);
+	doorbell(MHI_CHDB(IPCR_UL), ul.wp);
+	printf("pcie: step 8: qrtr: HELLO to node %u sent\n", node);
+}
+
+/* one QRTR packet from the card: the header said, the control port's messages read */
+static void
+qrtr_packet(const uint8_t *data, uint32_t length)
+{
+	uint32_t h[8], word[5] = { 0 };
+
+	if (length < sizeof(h) || data[0] != 1) {
+		printf("pcie: step 8: qrtr: %u bytes, first %#x: not a version 1 packet\n", length, length ? data[0] : 0);
+		return;
+	}
+	memcpy(h, data, sizeof(h));
+	memcpy(word, data + sizeof(h), MIN(sizeof(word), length - sizeof(h)));
+	if (h[7] != QRTR_CONTROL_PORT) {
+		printf("pcie: step 8: qrtr: type %u from %u:%#x to %u:%#x, %u bytes\n", h[1], h[2], h[3], h[6], h[7], h[5]);
+		return;
+	}
+	switch (word[0]) {
+	case 2:
+		printf("pcie: step 8: qrtr: HELLO from node %u\n", h[2]);
+		if (hellos++ == 0) {
+			qrtr_hello(h[2]);
+		}
+		break;
+	case 4:
+		servers++;
+		printf("pcie: step 8: qrtr: service %u (%#x) version %u instance %u at node %u port %#x\n", word[1], word[1],
+		    word[2] & 0xff, word[2] >> 8, word[3], word[4]);
+		break;
+	default:
+		printf("pcie: step 8: qrtr: control %u from node %u: %#x %#x %#x %#x\n", word[0], h[2], word[1], word[2],
+		    word[3], word[4]);
+		break;
+	}
+}
+
+static void
+event(unsigned r, const uint8_t *el)
+{
+	uint64_t pointer = get64(el);
+	uint32_t d0, d1, type, code;
+
+	memcpy(&d0, el + 8, 4);
+	memcpy(&d1, el + 12, 4);
+	type = (d1 >> 16) & 0xff;
+	code = d0 >> 24;
+	if (type == EV_CMD_COMPLETION) {
+		commands_done += code == 1;
+		printf("pcie: step 8: command at %#llx completed with code %u\n", pointer, code);
+	} else if (type == EV_TRANSFER && (d1 >> 24) == IPCR_DL && pointer >= dl.pa &&
+	    pointer < dl.pa + IPCR_ELEMENTS * ELEMENT) {
+		uint8_t i = dl_at[(pointer - dl.pa) / ELEMENT];
+
+		qrtr_packet(dl_buffer[i], MIN(d0 & 0xffff, IPCR_BUFFER));
+		dl_queue(i);
+		doorbell(MHI_CHDB(IPCR_DL), dl.wp);
+	} else if (type == EV_TRANSFER && (d1 >> 24) == IPCR_UL) {
+		printf("pcie: step 8: channel 20 sent %u bytes (code %u)\n", d0 & 0xffff, code);
+	} else {
+		printf("pcie: step 8: event ring %u: type %#x code %u pointer %#llx (%#x %#x)\n", r, type, code, pointer, d0, d1);
+	}
+}
+
+/* what the card posted since the last look, handled, and the ring given back */
+static void
+events(unsigned r)
+{
+	uint8_t *c = ctx_va + CHANNELS * CTX + r * CTX;
+	uint64_t device = get64(c + 28), end = ev_pa[r] + ev_len[r];
+	uint8_t *ring = ctx_va + (ev_pa[r] - ctx_pa);
+	unsigned moved = 0;
+
+	if (device < ev_pa[r] || device >= end) {
+		return;
+	}
+	while (ev_local[r] != device && moved < ev_len[r] / ELEMENT) {
+		event(r, ring + (ev_local[r] - ev_pa[r]));
+		ev_local[r] += ELEMENT;
+		if (ev_local[r] == end) {
+			ev_local[r] = ev_pa[r];
+		}
+		moved++;
+	}
+	if (moved != 0) {
+		uint64_t wp = ev_local[r] == ev_pa[r] ? end - ELEMENT : ev_local[r] - ELEMENT;
+
+		put64(c + 36, wp);
+		doorbell(MHI_ERDB(r), wp);
+	}
+}
+
+static bool
+channel(struct ring *r, uint32_t number, uint32_t type)
+{
+	uint8_t *c = ctx_va + number * CTX;
+	uint32_t chcfg = 1u | 2u << 8, erindex = 1, before = commands_done;
+	uint64_t start;
+
+	r->elements = IPCR_ELEMENTS;
+	r->va = dma_alloc(IPCR_ELEMENTS * ELEMENT, &r->pa);
+	if (r->va == NULL) {
+		return false;
+	}
+	r->wp = r->pa;
+	memcpy(c, &chcfg, 4);                           /* enabled, doorbell burst mode off */
+	memcpy(c + 4, &type, 4);                        /* 1 to the card, 2 from it */
+	memcpy(c + 8, &erindex, 4);
+	put64(c + 12, r->pa);
+	put64(c + 20, IPCR_ELEMENTS * ELEMENT);
+	put64(c + 28, r->pa);
+	put64(c + 36, r->pa);
+	ring_put(&cmd, ctx_va + CHANNELS * CTX + EVENT_RINGS * CTX + 36, 0, 0, number << 24 | PKT_START_CHAN << 16);
+	doorbell(MHI_CRDB, cmd.wp);
+	for (start = uptime_ms(); commands_done == before && uptime_ms() - start < 2000;) {
+		events(0);
+		ms(5);
+	}
+	printf("pcie: step 8: channel %u: %s, context state %#x\n", number, commands_done != before ? "started" : "no answer",
+	    rd((vm_offset_t)c) & 0xff);
+	return commands_done != before;
+}
+
+void
+mhi_pcie_ipcr(void)
+{
+	uint64_t start;
+
+	cmd.va = ctx_va + (cmd_pa - ctx_pa);
+	cmd.pa = cmd_pa;
+	cmd.elements = CMD_ELEMENTS;
+	cmd.wp = get64(ctx_va + CHANNELS * CTX + EVENT_RINGS * CTX + 36);
+	for (unsigned r = 0; r < EVENT_RINGS; r++) {
+		uint64_t device = get64(ctx_va + CHANNELS * CTX + r * CTX + 28);
+
+		ev_local[r] = device;
+		put64(ctx_va + CHANNELS * CTX + r * CTX + 36, device == ev_pa[r] ? ev_pa[r] + ev_len[r] - ELEMENT :
+		    device - ELEMENT);
+		doorbell(MHI_ERDB(r), get64(ctx_va + CHANNELS * CTX + r * CTX + 36));
+	}
+	printf("pcie: step 8: MHI state %u, execution environment %u; event rings at %#llx %#llx, command ring %#llx\n",
+	    (rd(bar + 0x48) >> 8) & 0xff, rd(bar + rd(bar + 0x28) + 0x28), ev_local[0], ev_local[1], cmd.wp);
+	ul_buffer = dma_alloc(IPCR_BUFFER, &ul_buffer_pa);
+	for (unsigned i = 0; i < IPCR_ELEMENTS && ul_buffer != NULL; i++) {
+		dl_buffer[i] = dma_alloc(IPCR_BUFFER, &dl_buffer_pa[i]);
+		if (dl_buffer[i] == NULL) {
+			ul_buffer = NULL;
+		}
+	}
+	if (ul_buffer == NULL || !channel(&ul, IPCR_UL, 1) || !channel(&dl, IPCR_DL, 2)) {
+		printf("pcie: step 8: the IPCR channels did not start\n");
+		return;
+	}
+	for (uint8_t i = 0; i < IPCR_ELEMENTS - 1; i++) {
+		dl_queue(i);
+	}
+	doorbell(MHI_CHDB(IPCR_DL), dl.wp);
+	for (start = uptime_ms(); uptime_ms() - start < 15000;) {
+		events(0);
+		events(1);
+		ms(5);
+	}
+	printf("pcie: step 8: the end: %u HELLO, %u services; MHI state %u, execution environment %u\n", hellos, servers,
+	    (rd(bar + 0x48) >> 8) & 0xff, rd(bar + rd(bar + 0x28) + 0x28));
+}
