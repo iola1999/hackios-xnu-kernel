@@ -897,14 +897,16 @@ mhi_pcie_radio_registers(uint64_t *pa, uint64_t *size)
 /*
  * The files ath12k asks for, by the names of Linux's firmware tree ("ath12k/WCN7850/hw2.0/board.bin"), from what
  * Android's driver loads (fw/ of the RAM disk, package.py WIFI_FW=1): the board's data as cnss2 picks it when the
- * firmware gives no board id (pcie_bdf=NAME picks another), the regulatory database, and the M3 image. Those that
- * ath12k can do without (board-2.bin, firmware-2.bin, calibration) are not there.
+ * firmware gives no board id (pcie_bdf=NAME picks another), the regulatory database, and the M3 image (linux-firmware's
+ * with pcie_fw=3, mhi_pcie_fw.c). Those that ath12k can do without (board-2.bin, firmware-2.bin, calibration) are not
+ * there.
  */
 const uint8_t *
 mhi_pcie_radio_file(const char *name, uint64_t *size)
 {
 	static char board[32] = "bdwlan.elf";
 	const char *last = strrchr(name, '/'), *file = NULL;
+	uint32_t firmware = 0;
 	int disk = 0;
 
 	last = last == NULL ? name : last + 1;
@@ -914,7 +916,8 @@ mhi_pcie_radio_file(const char *name, uint64_t *size)
 	} else if (strcmp(last, "regdb.bin") == 0) {
 		file = "regdb.bin";
 	} else if (strcmp(last, "m3.bin") == 0) {
-		file = "phy_ucode20.elf";
+		(void)PE_parse_boot_argn("pcie_fw", &firmware, sizeof(firmware));
+		file = firmware == 3 ? "lfw-m3.bin" : "phy_ucode20.elf";
 	}
 	printf("pcie: the driver asks for %s: %s\n", last, file == NULL ? "not there" : file);
 	return file == NULL ? NULL : redwood_image_file("fw", file, size, &disk);

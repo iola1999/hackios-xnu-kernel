@@ -66,13 +66,15 @@ driver_says(const char *kind, const char *format, va_list list, bool always)
 	char line[320];
 	size_t length;
 
+	unsigned long long ms = lx_os_nanoseconds() / 1000000ull;
+
 	vsnprintf(line, sizeof(line), format, list);
 	length = strlen(line);
-	/* (Linux ends a line for whoever has not) */
+	/* (at the kernel's uptime, as the kernel's MHI lines have it; Linux ends a line for whoever has not) */
 	if (always) {
-		lx_tell("ath12k%s: %s%s", kind, line, length != 0 && line[length - 1] == '\n' ? "" : "\n");
+		lx_tell("ath12k%s at %llu ms: %s%s", kind, ms, line, length != 0 && line[length - 1] == '\n' ? "" : "\n");
 	} else {
-		printf("ath12k%s: %s%s", kind, line, length != 0 && line[length - 1] == '\n' ? "" : "\n");
+		printf("ath12k%s at %llu ms: %s%s", kind, ms, line, length != 0 && line[length - 1] == '\n' ? "" : "\n");
 	}
 }
 
@@ -181,6 +183,50 @@ bus_write32(struct ath12k_base *ab, u32 offset, u32 value)
  * groups (dp.h: ath12k_dp_service_srng(), what pci.c's NAPI poll calls). Once a millisecond while
  * nothing comes; again at once while a group has used up what it was allowed in one go.
  */
+/*
+ * The WMI endpoint's receive callback, wrapped once the endpoint is there: an event of the STATS group that
+ * ath12k does not handle (0x16005, which the firmware sends right after WMI_INIT) is said in hex before
+ * ath12k gets it. ath12k_wmi_op_rx() is static; its address comes from the endpoint.
+ */
+static void (*wmi_rx)(struct ath12k_base *, struct sk_buff *);
+
+static void
+wmi_rx_said(struct ath12k_base *ab, struct sk_buff *skb)
+{
+	u32 id = skb->len >= sizeof(struct wmi_cmd_hdr) ?
+	    le32_get_bits(((struct wmi_cmd_hdr *)skb->data)->cmd_id, WMI_CMD_HDR_CMD_ID) : 0;
+
+	if ((id >> 12) == WMI_GRP_STATS) {
+		printf("lx: WMI event %#x, %u bytes:\n", id, skb->len);
+		for (unsigned at = 0; at < skb->len && at < 1024; at += 32) {
+			char line[3 * 32 + 1];
+			unsigned n = 0;
+
+			for (unsigned i = at; i < skb->len && i < at + 32; i++) {
+				n += snprintf(line + n, sizeof(line) - n, " %02x", skb->data[i]);
+			}
+			printf("lx:   %04x%s\n", at, line);
+		}
+	}
+	wmi_rx(ab, skb);
+}
+
+static void
+wmi_rx_wrap(struct ath12k_base *ab)
+{
+	struct ath12k_htc_ep *ep;
+
+	if (wmi_rx != NULL || ab->wmi_ab.wmi_endpoint_id[0] == ATH12K_HTC_EP_0 ||
+	    ab->wmi_ab.wmi_endpoint_id[0] >= ATH12K_HTC_EP_COUNT) {
+		return;
+	}
+	ep = &ab->htc.endpoint[ab->wmi_ab.wmi_endpoint_id[0]];
+	if (ep->ep_ops.ep_rx_complete != NULL && ep->ep_ops.ep_rx_complete != wmi_rx_said) {
+		wmi_rx = ep->ep_ops.ep_rx_complete;
+		ep->ep_ops.ep_rx_complete = wmi_rx_said;
+	}
+}
+
 static void
 bus_looks(void *argument)
 {
@@ -197,6 +243,7 @@ bus_looks(void *argument)
 			lx_memory_say();
 		}
 		bus.in_pass = true;
+		wmi_rx_wrap(ab);
 		for (unsigned i = 0; i < ab->hw_params->ce_count; i++) {
 			ath12k_ce_per_engine_service(ab, i);
 		}
@@ -439,6 +486,21 @@ probe(struct ath12k_base **out)
 	    (ret = ath12k_hal_srng_init(ab)) != 0 || (ret = ath12k_ce_alloc_pipes(ab)) != 0) {
 		lx_tell("lx: the driver does not get as far as its exchange with the firmware: %d\n", ret);
 		return (-ret);
+	}
+	if (lx_os_option("wifi_hostcap") == 1) {
+		/*
+		 * The host capability as Android's cnss2 sends it on this phone: feature list 0x6 and no nm_modem
+		 * (its device tree has no qcom,sleep-clk-support). ath12k sends 0x18 and nm_modem 0xe (internal
+		 * sleep clock, host C-states, PCIe global reset), both from hw_params.
+		 */
+		static struct ath12k_hw_params cnss2;
+
+		cnss2 = *ab->hw_params;
+		cnss2.internal_sleep_clock = false;
+		cnss2.qmi_cnss_feature_bitmap = BIT(1) | BIT(2);
+		ab->hw_params = &cnss2;
+		printf("lx: wifi_hostcap=1: feature list %#llx, no nm_modem\n",
+		    (unsigned long long)cnss2.qmi_cnss_feature_bitmap);
 	}
 	/* pci.c: ath12k_pci_init_qmi_ce_config() */
 	ab->qmi.ce_cfg.tgt_ce = ab->hw_params->target_ce_config;

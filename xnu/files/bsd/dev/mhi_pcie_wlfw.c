@@ -13,7 +13,8 @@
  *     hardware 2.0) placed in that memory;
  *   - FW_READY awaited. With pcie_mission=1 also what ath12k_qmi_firmware_start() sends then: the logging, the
  *     configuration (copy engines and services, without the shadow registers, which ath12k works out from its
- *     rings) and the mode "mission".
+ *     rings) and the mode "mission". With pcie_mission=7 instead the first half of Android cnss2's cold-boot
+ *     calibration: the calibration report, the mode "calibration", the CAL_DONE indication awaited, the mode "off".
  *
  * pcie_sleep_clock=internal sends the bits ath12k sends for this chip on laptops (internal sleep clock, host C
  * state, PCIe global reset); without it the host capability says nothing about the sleep clock, as on a
@@ -49,10 +50,52 @@ mhi_pcie_wlfw(void)
 extern const uint8_t *redwood_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 
 #define ATH12K_FIRMWARE_MODE_NORMAL     0       /* core.h: the mode "mission" */
+#define WLFW_MODE_OFF                   4
+#define WLFW_MODE_CALIBRATION           7
+
+/* cnss2's cold-boot calibration messages, which ath12k does not have (the WLFW interface's calibration report and
+ * CAL_DONE indication): of the report only the download size is sent, the size of the CALDB segment given to the
+ * firmware, as cnss2 sends it (8454144 bytes on this phone, the segment of type 4) */
+#define WLFW_CAL_REPORT_REQ             0x0026
+#define WLFW_CAL_REPORT_REQ_MAX_LEN     43
+#define WLFW_CAL_DONE_IND               0x003e
+
+struct cal_report_req {
+	uint32_t meta_data_len;
+	uint32_t meta_data[5];
+	uint8_t download_size_valid;
+	uint64_t download_size;
+};
+struct cal_report_resp {
+	struct qmi_response_type_v01 resp;
+};
+struct cal_done_ind {
+	char unused;
+};
+
+static const struct qmi_elem_info cal_report_req_ei[] = {
+	{ .data_type = QMI_DATA_LEN, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY, .tlv_type = 0x01,
+	  .offset = offsetof(struct cal_report_req, meta_data_len) },
+	{ .data_type = QMI_SIGNED_4_BYTE_ENUM, .elem_len = 5, .elem_size = sizeof(uint32_t), .array_type = VAR_LEN_ARRAY,
+	  .tlv_type = 0x01, .offset = offsetof(struct cal_report_req, meta_data) },
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY, .tlv_type = 0x12,
+	  .offset = offsetof(struct cal_report_req, download_size_valid) },
+	{ .data_type = QMI_UNSIGNED_8_BYTE, .elem_len = 1, .elem_size = sizeof(uint64_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x12, .offset = offsetof(struct cal_report_req, download_size) },
+	{ .data_type = QMI_EOTI, .array_type = NO_ARRAY, .tlv_type = QMI_COMMON_TLV_TYPE },
+};
+static const struct qmi_elem_info cal_report_resp_ei[] = {
+	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct qmi_response_type_v01), .array_type = NO_ARRAY,
+	  .tlv_type = 0x02, .offset = offsetof(struct cal_report_resp, resp), .ei_array = qmi_response_type_v01_ei },
+	{ .data_type = QMI_EOTI, .array_type = NO_ARRAY, .tlv_type = QMI_COMMON_TLV_TYPE },
+};
+static const struct qmi_elem_info cal_done_ind_ei[] = {
+	{ .data_type = QMI_EOTI, .array_type = NO_ARRAY, .tlv_type = QMI_COMMON_TLV_TYPE },
+};
 
 static struct qmi_handle handle;
 static struct {
-	volatile bool server, gone, mem_requested, mem_ready, ready;
+	volatile bool server, gone, mem_requested, mem_ready, ready, cal_done;
 	uint64_t began;
 	uint32_t segments;
 	struct qmi_wlanfw_mem_seg_s_v01 segment[ATH12K_QMI_WLANFW_MAX_NUM_MEM_SEG_V01];
@@ -123,6 +166,14 @@ wlfw_ready(__unused struct qmi_handle *qmi, __unused struct sockaddr_qrtr *sq, _
 	wlfw.ready = true;
 }
 
+static void
+wlfw_cal_done(__unused struct qmi_handle *qmi, __unused struct sockaddr_qrtr *sq, __unused struct qmi_txn *txn,
+    __unused const void *decoded)
+{
+	printf("pcie: step 9: +%llu ms: the firmware indicates CAL_DONE\n", now_ms() - wlfw.began);
+	wlfw.cal_done = true;
+}
+
 static const struct qmi_ops wlfw_ops = { .new_server = wlfw_new_server, .del_server = wlfw_del_server };
 static const struct qmi_msg_handler wlfw_handlers[] = {
 	{ QMI_INDICATION, QMI_WLFW_REQUEST_MEM_IND_V01, qmi_wlanfw_request_mem_ind_msg_v01_ei,
@@ -131,6 +182,7 @@ static const struct qmi_msg_handler wlfw_handlers[] = {
 	  sizeof(struct qmi_wlanfw_fw_mem_ready_ind_msg_v01), wlfw_mem_ready },
 	{ QMI_INDICATION, QMI_WLFW_FW_READY_IND_V01, qmi_wlanfw_fw_ready_ind_msg_v01_ei,
 	  sizeof(struct qmi_wlanfw_fw_ready_ind_msg_v01), wlfw_ready },
+	{ QMI_INDICATION, WLFW_CAL_DONE_IND, cal_done_ind_ei, sizeof(struct cal_done_ind), wlfw_cal_done },
 	{ 0 },
 };
 
@@ -217,12 +269,28 @@ send_file(const char *what, const char *name, uint8_t type, uint32_t board_id)
 	return true;
 }
 
+/*
+ * ath12k's description of the host capability leaves the DDR range's members undescribed (a QMI_STRUCT without an
+ * ei_array: ath12k never sends the range, and the encoder refuses it with EINVAL), so the message goes out through
+ * a copy of that description that has them.
+ */
+static const struct qmi_elem_info ddr_range_ei[] = {
+	{ .data_type = QMI_UNSIGNED_8_BYTE, .elem_len = 1, .elem_size = sizeof(uint64_t), .array_type = NO_ARRAY,
+	  .offset = offsetof(struct qmi_wlanfw_host_ddr_range, start) },
+	{ .data_type = QMI_UNSIGNED_8_BYTE, .elem_len = 1, .elem_size = sizeof(uint64_t), .array_type = NO_ARRAY,
+	  .offset = offsetof(struct qmi_wlanfw_host_ddr_range, size) },
+	{ .data_type = QMI_EOTI, .array_type = NO_ARRAY, .tlv_type = QMI_COMMON_TLV_TYPE },
+};
+static struct qmi_elem_info host_cap_ei[sizeof(qmi_wlanfw_host_cap_req_msg_v01_ei) / sizeof(qmi_wlanfw_host_cap_req_msg_v01_ei[0])];
+
 static bool
 host_capability(void)
 {
 	static struct qmi_wlanfw_host_cap_req_msg_v01 request;
 	struct qmi_wlanfw_host_cap_resp_msg_v01 reply = { 0 };
 	char clock[16] = "";
+	uint64_t low = 0, mb = 0, size = 0;
+	uint32_t range = 0;
 
 	bzero(&request, sizeof(request));
 	request.num_clients_valid = 1;
@@ -243,8 +311,35 @@ host_capability(void)
 		request.nm_modem_valid = 1;
 		request.nm_modem = HOST_CSTATE_BIT | SLEEP_CLOCK_SELECT_INTERNAL_BIT | PLATFORM_CAP_PCIE_GLOBAL_RESET;
 	}
+	/*
+	 * The host's DMA window, which cnss2 sends ("Sending iova starting 0x98000000 with size 0x18010000", its SMMU
+	 * window; the memory it gives the firmware lies inside) and ath12k never does. pcie_ddr_range=1 sends the
+	 * loader's memory below 4 GB, where everything the card is given lies; WLAN.HMT.2.0-02977 takes the message
+	 * and then stops at the memory reply (fatal 3268, code at 0x185dccc): when a range is sent, the highest end
+	 * of its entries must be 0xb0010000, the end of cnss2's window. pcie_ddr_range=2 sends cnss2's window as it is.
+	 */
+	(void)PE_parse_boot_argn("pcie_ddr_range", &range, sizeof(range));
+	if (range == 2) {
+		low = 0x98000000;
+		size = 0x18010000;
+	} else if (range == 1 && PE_parse_boot_argn("lowdma", &low, sizeof(low)) && PE_parse_boot_argn("lowdma_mb", &mb, sizeof(mb))) {
+		size = mb << 20;
+	}
+	if (size != 0) {
+		request.ddr_range_valid = 1;
+		request.ddr_range[0].start = low;
+		request.ddr_range[0].size = size;
+		printf("pcie: step 9: the host's DMA window sent: %#llx, %#llx bytes\n", low, size);
+	}
+	memcpy(host_cap_ei, qmi_wlanfw_host_cap_req_msg_v01_ei, sizeof(host_cap_ei));
+	for (size_t i = 0; i < sizeof(host_cap_ei) / sizeof(host_cap_ei[0]); i++) {
+		if (host_cap_ei[i].data_type == QMI_STRUCT &&
+		    host_cap_ei[i].offset == offsetof(struct qmi_wlanfw_host_cap_req_msg_v01, ddr_range)) {
+			host_cap_ei[i].ei_array = ddr_range_ei;
+		}
+	}
 	return ask(request.nm_modem_valid ? "host capability, internal sleep clock" : "host capability",
-	           QMI_WLANFW_HOST_CAP_REQ_V01, QMI_WLANFW_HOST_CAP_REQ_MSG_V01_MAX_LEN, qmi_wlanfw_host_cap_req_msg_v01_ei,
+	           QMI_WLANFW_HOST_CAP_REQ_V01, QMI_WLANFW_HOST_CAP_REQ_MSG_V01_MAX_LEN, host_cap_ei,
 	           &request, qmi_wlanfw_host_cap_resp_msg_v01_ei, &reply, false);
 }
 
@@ -376,6 +471,44 @@ mission(void)
 	    qmi_wlanfw_wlan_mode_req_msg_v01_ei, &mode, qmi_wlanfw_wlan_mode_resp_msg_v01_ei, &mode_reply, false);
 }
 
+/* cnss2's cnss_wlfw_cal_report_req_send_sync(), mode "calibration", CAL_DONE awaited (cnss2 allows 130 s), mode "off" */
+static void
+calibrate(void)
+{
+	struct cal_report_req report = { 0 };
+	struct cal_report_resp report_reply = { 0 };
+	struct qmi_wlanfw_wlan_mode_req_msg_v01 mode = { 0 };
+	struct qmi_wlanfw_wlan_mode_resp_msg_v01 mode_reply = { 0 };
+	uint64_t began;
+
+	report.download_size_valid = 1;
+	for (uint32_t i = 0; i < wlfw.segments; i++) {
+		if ((uint32_t)wlfw.segment[i].type == CALDB_MEM_REGION_TYPE) {
+			report.download_size = wlfw.segment[i].size;
+		}
+	}
+	printf("pcie: step 9: the calibration report says %llu bytes\n", report.download_size);
+	(void)ask("the calibration report", WLFW_CAL_REPORT_REQ, WLFW_CAL_REPORT_REQ_MAX_LEN, cal_report_req_ei, &report,
+	    cal_report_resp_ei, &report_reply, false);
+	mode.mode = WLFW_MODE_CALIBRATION;
+	mode.hw_debug_valid = 1;
+	if (!ask("the mode: calibration", QMI_WLANFW_WLAN_MODE_REQ_V01, QMI_WLANFW_WLAN_MODE_REQ_MSG_V01_MAX_LEN,
+	    qmi_wlanfw_wlan_mode_req_msg_v01_ei, &mode, qmi_wlanfw_wlan_mode_resp_msg_v01_ei, &mode_reply, false)) {
+		return;
+	}
+	began = now_ms();
+	if (!wait_for(&wlfw.cal_done, 30000)) {
+		printf("pcie: step 9: no CAL_DONE within %llu ms of the mode \"calibration\"%s\n", now_ms() - began,
+		    wlfw.gone ? " (the service went away)" : "");
+		return;
+	}
+	printf("pcie: step 9: the calibration took %llu ms\n", now_ms() - began);
+	mode.mode = WLFW_MODE_OFF;
+	bzero(&mode_reply, sizeof(mode_reply));
+	ask("the mode: off", QMI_WLANFW_WLAN_MODE_REQ_V01, QMI_WLANFW_WLAN_MODE_REQ_MSG_V01_MAX_LEN,
+	    qmi_wlanfw_wlan_mode_req_msg_v01_ei, &mode, qmi_wlanfw_wlan_mode_resp_msg_v01_ei, &mode_reply, false);
+}
+
 void
 mhi_pcie_wlfw(void)
 {
@@ -427,7 +560,9 @@ mhi_pcie_wlfw(void)
 		return;
 	}
 	(void)PE_parse_boot_argn("pcie_mission", &want_mission, sizeof(want_mission));
-	if (want_mission) {
+	if (want_mission == WLFW_MODE_CALIBRATION) {
+		calibrate();
+	} else if (want_mission) {
 		mission();
 	}
 	printf("pcie: step 9: the end, %llu ms after the lookup%s\n", now_ms() - wlfw.began,

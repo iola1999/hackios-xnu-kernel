@@ -16,6 +16,7 @@
 #include <kern/locks.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
+#include <pexpert/pexpert.h>
 #include <sys/errno.h>
 #include <sys/redwood_input.h>
 #include <sys/redwood_qrtr.h>
@@ -27,7 +28,8 @@
 #define QRTR_US                 1u
 #define QRTR_CONTROL            0xfffffffeu     /* the control port */
 #define QRTR_FIRST_PORT         0x4000u         /* where Linux begins numbering ports that ask for no number */
-enum { QRTR_DATA = 1, QRTR_HELLO = 2, QRTR_BYE = 3, QRTR_NEW_SERVER = 4, QRTR_DEL_SERVER = 5, QRTR_DEL_CLIENT = 6, QRTR_RESUME_TX = 7 };
+enum { QRTR_DATA = 1, QRTR_HELLO = 2, QRTR_BYE = 3, QRTR_NEW_SERVER = 4, QRTR_DEL_SERVER = 5, QRTR_DEL_CLIENT = 6, QRTR_RESUME_TX = 7,
+       QRTR_NEW_LOOKUP = 10, QRTR_DEL_LOOKUP = 11 };
 
 struct qrtr_header {                            /* version 1, which Linux sends; version 2 is read as well */
 	uint32_t version, type, from_node, from_port, confirm, size, to_node, to_port;
@@ -58,7 +60,7 @@ static struct {
 	bool there;
 } qrtr_servers[64];
 static uint32_t qrtr_peer;                      /* the other side's node; 0: it has not said */
-static uint32_t qrtr_next_port = QRTR_FIRST_PORT, qrtr_in, qrtr_out, qrtr_hellos;
+static uint32_t qrtr_next_port = QRTR_FIRST_PORT, qrtr_in, qrtr_out, qrtr_hellos, qrtr_dropped;
 static thread_t calling_thread;                 /* the link's thread, while it holds qrtr_calling */
 static int (*link_send)(const void *data, uint32_t length);
 
@@ -122,7 +124,11 @@ qrtr_tell(uint32_t service, uint32_t instance, uint32_t node, uint32_t port, boo
 	}
 }
 
-/* The control port's part: Linux's name service, without services of our own to tell of. */
+/*
+ * The control port's part: Linux's name service, without services of our own to tell of. A lookup from the other
+ * side is said; with qrtr_answer=1 it is answered as Linux's ns.c answers one it has nothing for: the terminating
+ * "new server" of all zeros, a data message from the control port to the port that asked.
+ */
 static void
 qrtr_control(const struct qrtr_header *header, const struct qrtr_control *control)
 {
@@ -177,6 +183,17 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
 			}
 		}
 		break;
+	case QRTR_NEW_LOOKUP: {
+		struct qrtr_control end = { .command = QRTR_NEW_SERVER };
+		uint32_t answer = 0;
+
+		(void)PE_parse_boot_argn("qrtr_answer", &answer, sizeof(answer));
+		error = answer ? qrtr_out_packet(QRTR_DATA, QRTR_CONTROL, header->from_node, header->from_port, &end, sizeof(end)) : 0;
+		printf("qrtr: node %u port %u looks up service %u (%#x), instance %#x: %s\n", header->from_node, header->from_port,
+		    control->words[0], control->words[0], control->words[1],
+		    !answer ? "not answered (qrtr_answer=1 answers it)" : error == 0 ? "none here, said so" : "the answer was not sent");
+		break;
+	}
 	default:
 		break;                                  /* (a client's going, and what else there is: nothing here wants it) */
 	}
@@ -245,6 +262,9 @@ qrtr_input(const uint8_t *data, uint32_t length)
 	lck_mtx_unlock(&qrtr_lock);
 	if (receive != NULL) {
 		receive(context, header.from_node, header.from_port, data + at, header.size);
+	} else if (qrtr_dropped++ < 16) {
+		printf("qrtr: type %u, %u bytes from node %u port %u to port %#x, which nobody here has: dropped\n", header.type,
+		    header.size, header.from_node, header.from_port, header.to_port);
 	}
 }
 

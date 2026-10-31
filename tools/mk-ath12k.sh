@@ -104,7 +104,7 @@ CFLAGS="-mkernel -mgeneral-regs-only -fno-builtin -fno-common -ffreestanding -fn
 # the kernel's two headers come from this repository's copy of them (xnu/files, which both kernels share)
 K=$ROOT/xnu/files/bsd/sys
 DFLAGS="-Isrc/ath12k -Isrc -include $W/include/lx_prelude.h -include $W/ath12k/lx_ath12k.h -DCONFIG_ATH12K_DEBUG
-	-DLX_POOL_MB=80u -DLX_RINGS_MB=48u
+	-DLX_POOL_MB=96u -DLX_RINGS_MB=64u -DLX_ALIGN_NATURAL
 	-DKBUILD_MODNAME=\"ath12k\"
 	-DLX_REDWOOD_LX_H=\"$K/redwood_lx.h\" -DLX_REDWOOD_QMI_H=\"$K/redwood_qmi.h\""
 mkdir -p obj out
@@ -112,7 +112,7 @@ rm -f obj/*.err
 compile() {		# compile SOURCE OBJECT [FLAGS]: only when the object is older than anything it was made of
 	local src=$1 obj=$2
 	shift 2
-	if [ -f "$obj" ] && [ -f "$obj.d" ] && [ -z "$(find $(sed -e 's/^[^:]*://' -e 's/\\$//' "$obj.d") "$0" -newer "$obj" 2>/dev/null | head -1)" ]; then
+	if [ -f "$obj" ] && [ -f "$obj.d" ] && [ -z "$(find $(sed -e 's/^[^:]*://' -e 's/\\$//' "$obj.d") "$ROOT/tools/mk-ath12k.sh" -newer "$obj" 2>/dev/null | head -1)" ]; then
 		return
 	fi
 	$CC $CFLAGS "$@" -MMD -MF "$obj.d" -c "$src" -o "$obj" 2> "$obj.err" || rm -f "$obj"

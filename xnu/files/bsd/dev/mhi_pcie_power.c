@@ -9,8 +9,9 @@
  * tree. The ordered list with the source of each step is the local evidence file
  * wifi-pcie-plan/powerup-steps.txt; the letters below are its sections.
  *
- *   A  read only: GPLL0 locked; the eleven RPMh resources found in the command database, each tagged
- *      as a regulator ("VRM")
+ *   A  GPLL0 locked; the eleven RPMh resources found in the command database, each tagged as a regulator
+ *      ("VRM"); the sleep clock's PMIC pin read (and set with pcie_sleep_clock=board); with
+ *      pcie_aop_pdc=1, the WLAN PDC settings handed to AOP
  *   B  PERST (GPIO102) and the card's enable (GPIO16) driven low before any supply
  *   C  RPMh votes: the PHY's two supplies, the card's eight, the card's crystal (rfclka1)
  *   D  clock controller: power domains, aux at 19.2 MHz and rchng at 100 MHz, the reference clock, the
@@ -18,7 +19,8 @@
  *   E  core and PHY resets
  *   F  PARF, the controller's glue
  *   G  the PHY sequence, the pipe clock, PHY start, PHYSTATUS
- *   H  the card's enable, then CLKREQ and WAKE to their functions
+ *   H  BT_EN read (and driven high with pcie_bt_en=1), the card's enable, then CLKREQ and WAKE to their
+ *      functions
  *   I  the root port's own header, the link capped at Gen1 for this first batch
  *   J  PERST released 100 ms after the card's enable, link training, the link awaited
  *
@@ -30,6 +32,7 @@
 #include <kern/clock.h>
 #include <libkern/libkern.h>
 #include <machine/machine_routines.h>
+#include <sys/redwood_audio.h>
 #include <sys/systm.h>
 
 #include "mhi_pcie_private.h"
@@ -182,7 +185,11 @@ rpmh_write(const uint32_t *address, const uint32_t *data, unsigned count)
  * The supplies, in the order the vendor's cnss driver turns the card's on (io, io12, ant-share, vdd,
  * aon, dig, rfa1, rfa2), after the PHY's two. min/max: the regulator's range in the vendor device
  * tree intersected with the card's (qcom,vdd-wlan-*-config) or the PHY's (sm8750-mtp.dts), microvolts.
- * smpd1's 976 mV is the regulator's init voltage, inside the card's 916-1100 mV.
+ * smpd1's 976 mV is the regulator's init voltage, inside the card's 916-1100 mV. smpf5 and smpg3 are at
+ * what this phone's card asks for in its OL CPR table (Android's cnss2 hands AOP s5f 954 mV and s3g
+ * 1866 mV, above the device tree's 932 and 1864; docs/progress/2026-11-01-wifi-ath12k-driver.md).
+ * The switching regulators get no mode vote unless pcie_smps_hpm=1, which votes them into high-power mode (PWM; 7 on
+ * PMIC5, the same number as an LDO's HPM), as mainline's sm8750-mtp.dts starts s5f, s4d, s1d and s7i.
  */
 static const struct supply {
 	const char *name, *what;
@@ -194,10 +201,10 @@ static const struct supply {
 	{ "ldof3", "card vdd-wlan-io (L3F)", 1800, 1800000, 1800000, true },
 	{ "ldof2", "card vdd-wlan-io12 (L2F)", 1200, 1200000, 1200000, true },
 	{ "ldok6", "card vdd-wlan-ant-share (L6K)", 1800, 1800000, 1800000, true },
-	{ "smpf5", "card vdd-wlan (S5F)", 932, 932000, 1000000, false },
+	{ "smpf5", "card vdd-wlan (S5F)", 954, 932000, 1000000, false },
 	{ "smpd4", "card vdd-wlan-aon (S4D)", 976, 976000, 1036000, false },
 	{ "smpd1", "card vdd-wlan-dig (S1D)", 976, 916000, 1100000, false },
-	{ "smpg3", "card vdd-wlan-rfa1 (S3G)", 1864, 1864000, 2000000, false },
+	{ "smpg3", "card vdd-wlan-rfa1 (S3G)", 1866, 1864000, 2000000, false },
 	{ "smpi7", "card vdd-wlan-rfa2 (S7I)", 1316, 1316000, 1340000, false },
 };
 #define XO_NAME                 "rfclka1"           /* RPMH_RF_CLK1, the card's crystal (clk-rpmh.c) */
@@ -229,6 +236,9 @@ supplies_found(uint32_t *found, uint32_t *xo)
 static bool
 supplies_on(const uint32_t *found, uint32_t xo)
 {
+	uint32_t smps_hpm = 0;
+
+	(void)PE_parse_boot_argn("pcie_smps_hpm", &smps_hpm, sizeof(smps_hpm));
 	for (unsigned i = 0; i < sizeof(supplies) / sizeof(supplies[0]); i++) {
 		const struct supply *s = &supplies[i];
 		uint32_t address[3] = { found[i] + VRM_VOLTAGE, found[i] + VRM_ENABLE, found[i] + VRM_MODE };
@@ -238,11 +248,11 @@ supplies_on(const uint32_t *found, uint32_t xo)
 			printf("pcie: power: %u mV for %s is outside %u-%u uV; refused\n", s->mv, s->name, s->min_uv, s->max_uv);
 			return false;
 		}
-		if (!rpmh_write(address, data, s->ldo ? 3 : 2)) {
+		if (!rpmh_write(address, data, s->ldo || smps_hpm ? 3 : 2)) {
 			printf("pcie: power: the vote for %s was not confirmed\n", s->name);
 			return false;
 		}
-		printf("pcie: power: %s on at %u mV\n", s->name, s->mv);
+		printf("pcie: power: %s on at %u mV%s\n", s->name, s->mv, s->ldo || smps_hpm ? ", high-power mode" : "");
 	}
 	{
 		uint32_t address = xo + VRM_CLOCK_ENABLE, data = 1;
@@ -254,6 +264,259 @@ supplies_on(const uint32_t *found, uint32_t xo)
 	}
 	printf("pcie: power: the card's crystal is on\n");
 	return true;
+}
+
+/* ---- A: the WLAN PDC, through the always-on processor -------------------------------------------- */
+
+/*
+ * pcie_aop_pdc=1: hand AOP the WLAN PDC settings Android's cnss2 sends, before any supply is voted.
+ * The PDC raises and lowers the card's rf rails (s3g, s7i, s1d) and bb rails (s4d, s5f) when the card
+ * asks; which rails these are is this board's wiring, from the vendor device tree's
+ * qcom,pdc_init_table, which cnss2 sends at probe (cnss_aop_pdc_reconfig). cnss2 then sends this
+ * chip's OL CPR voltages after the target capability (cnss_aop_ol_cpr_cfg_setup); they go right after
+ * the table here (docs/analysis/2026-11-01-android-cnss2-wlan-bringup.md, section 2). The mailbox is
+ * the AOSS QMP message RAM (dt: aoss_qmp, power-controller@c300000), rung through IPCC (dt:
+ * qcom,ipcc@406000; aoss_qmp's mboxes: client 0, signal 0), with mainline qcom_aoss.c's protocol.
+ * AOP takes a message by setting its length back to 0 and answers nothing else.
+ */
+#define AOSS_PHYS               0x0c300000UL
+#define AOSS_SIZE               0x400UL
+#define IPCC_PHYS               0x00406000UL
+#define IPCC_SEND               0x0c
+#define QMP_MAGIC               0x00
+#define QMP_MAGIC_VALUE         0x4d41494c
+#define QMP_VERSION             0x04
+#define QMP_THEIR_LINK          0x0c
+#define QMP_THEIR_LINK_ACK      0x10
+#define QMP_THEIR_CHANNEL       0x14
+#define QMP_THEIR_CHANNEL_ACK   0x18
+#define QMP_OUR_LINK            0x24
+#define QMP_OUR_LINK_ACK        0x28
+#define QMP_OUR_CHANNEL         0x2c
+#define QMP_OUR_CHANNEL_ACK     0x30
+#define QMP_OUR_BOX_SIZE        0x34
+#define QMP_OUR_BOX             0x38
+#define QMP_UP                  0x0000ffffu
+#define QMP_MESSAGE             64                  /* cnss2's CNSS_MBOX_MSG_MAX_LEN */
+
+static const char *const pdc_messages[] = {
+	"{class: wlan_pdc, ss: rf, res: s3g.v, upval: 1856}",
+	"{class: wlan_pdc, ss: rf, res: s3g.v, dwnval: 1844}",
+	"{class: wlan_pdc, ss: rf, res: s7i.v, upval: 1316}",
+	"{class: wlan_pdc, ss: rf, res: s7i.v, dwnval: 972}",
+	"{class: wlan_pdc, ss: rf, res: s1d.m, enable: 1}",
+	"{class: wlan_pdc, ss: rf, res: s1d.v, enable: 1}",
+	"{class: wlan_pdc, ss: rf, res: s1d.v, upval: 916}",
+	"{class: wlan_pdc, ss: rf, res: s1d.v, dwnval: 880}",
+	"{class: wlan_pdc, ss: bb, res: s4d.v, upval: 976}",
+	"{class: wlan_pdc, ss: bb, res: s4d.v, dwnval: 536}",
+	"{class: wlan_pdc, ss: bb, res: s5f.m, enable: 1}",
+	"{class: wlan_pdc, ss: bb, res: s5f.v, enable: 1}",
+	"{class: wlan_pdc, ss: bb, res: s5f.v, upval: 932}",
+	"{class: wlan_pdc, ss: bb, res: s5f.v, dwnval: 444}",
+	/* the OL CPR voltages */
+	"{class: wlan_pdc, ss: rf, res: s1d.v, upval: 914}",
+	"{class: wlan_pdc, ss: bb, res: s5f.v, upval: 954}",
+	"{class: wlan_pdc, ss: bb, res: s5f.v, dwnval: 414}",
+	"{class: wlan_pdc, ss: bb, res: s4d.v, upval: 974}",
+	"{class: wlan_pdc, ss: bb, res: s4d.v, dwnval: 586}",
+	"{class: wlan_pdc, ss: rf, res: s7i.v, upval: 1314}",
+	"{class: wlan_pdc, ss: rf, res: s3g.v, upval: 1866}",
+};
+
+static vm_offset_t aoss, ipcc;
+
+static void
+aop_ring(void)
+{
+	wr(ipcc + IPCC_SEND, 0);
+}
+
+/* Linux's qmp_open(); a mailbox found open (the boot firmware, or a kernel before this one) is used as it is */
+static uint32_t
+aop_open(void)
+{
+	uint32_t box, size;
+
+	aoss = ml_io_map(AOSS_PHYS, AOSS_SIZE);
+	ipcc = ml_io_map(IPCC_PHYS, 0x1000);
+	if (aoss == 0 || ipcc == 0) {
+		printf("pcie: power: the AOP mailbox cannot be mapped\n");
+		return 0;
+	}
+	box = rd(aoss + QMP_OUR_BOX);
+	size = rd(aoss + QMP_OUR_BOX_SIZE);
+	printf("pcie: power: AOP mailbox: magic %#x version %u, ours at %#x (%u bytes); links %#x %#x, channels %#x %#x\n",
+	    rd(aoss + QMP_MAGIC), rd(aoss + QMP_VERSION), box, size, rd(aoss + QMP_OUR_LINK), rd(aoss + QMP_THEIR_LINK),
+	    rd(aoss + QMP_OUR_CHANNEL), rd(aoss + QMP_THEIR_CHANNEL));
+	if (rd(aoss + QMP_MAGIC) != QMP_MAGIC_VALUE || rd(aoss + QMP_VERSION) != 1 || size < QMP_MESSAGE + 4 ||
+	    box < 0x3c || box + size > AOSS_SIZE || (box & 3)) {
+		printf("pcie: power: not a mailbox this knows\n");
+		return 0;
+	}
+	if (rd(aoss + QMP_OUR_LINK) == QMP_UP && rd(aoss + QMP_OUR_LINK_ACK) == QMP_UP &&
+	    rd(aoss + QMP_OUR_CHANNEL) == QMP_UP && rd(aoss + QMP_THEIR_CHANNEL) == QMP_UP &&
+	    rd(aoss + QMP_OUR_CHANNEL_ACK) == QMP_UP) {
+		return box;
+	}
+	wr(aoss + QMP_THEIR_LINK_ACK, rd(aoss + QMP_THEIR_LINK));
+	wr(aoss + QMP_OUR_LINK, QMP_UP);
+	aop_ring();
+	if (!poll(aoss + QMP_OUR_LINK_ACK, ~0u, QMP_UP, 100, 1000000, "AOP's acknowledgement of our link")) {
+		return 0;
+	}
+	wr(aoss + QMP_OUR_CHANNEL, QMP_UP);
+	aop_ring();
+	if (!poll(aoss + QMP_THEIR_CHANNEL, ~0u, QMP_UP, 100, 1000000, "AOP's channel")) {
+		return 0;
+	}
+	wr(aoss + QMP_THEIR_CHANNEL_ACK, QMP_UP);
+	aop_ring();
+	if (!poll(aoss + QMP_OUR_CHANNEL_ACK, ~0u, QMP_UP, 100, 1000000, "AOP's acknowledgement of our channel")) {
+		return 0;
+	}
+	printf("pcie: power: the AOP mailbox is open\n");
+	return box;
+}
+
+static void
+aop_pdc(void)
+{
+	uint32_t box = aop_open(), taken = 0;
+
+	for (unsigned m = 0; box != 0 && m < sizeof(pdc_messages) / sizeof(pdc_messages[0]); m++) {
+		uint32_t words[QMP_MESSAGE / 4] = { 0 };
+
+		strlcpy((char *)words, pdc_messages[m], sizeof(words));
+		if (rd(aoss + box) != 0) {
+			printf("pcie: power: our mailbox still holds %u bytes; \"%s\" not sent\n", rd(aoss + box), pdc_messages[m]);
+			break;
+		}
+		for (unsigned i = 0; i < QMP_MESSAGE / 4; i++) {
+			wr(aoss + box + 4 + 4 * i, words[i]);
+		}
+		wr(aoss + box, QMP_MESSAGE);
+		(void)rd(aoss + box);
+		aop_ring();
+		if (!poll(aoss + box, ~0u, 0, 100, 1000000, "AOP's taking of a message")) {
+			wr(aoss + box, 0);
+			break;
+		}
+		taken++;
+	}
+	printf("pcie: power: AOP took %u of the %u WLAN PDC messages\n", taken,
+	    (unsigned)(sizeof(pdc_messages) / sizeof(pdc_messages[0])));
+}
+
+/* ---- A and H: two PMIC GPIOs the card's side of the board uses ---------------------------------- */
+
+/*
+ * The PMK8550's GPIO3 is the board's 32 kHz sleep clock for the card. Under Android it is func1, output, no pull,
+ * enabled (MODE_CTL 0x01, DIG_PULL_CTL 0x05, DIG_OUT_SOURCE_CTL 0x02, EN_CTL 0x80: the device tree's
+ * alt_sleep_clk_default, which Linux's pinctrl applies); the boot firmware leaves it an input with a pull-down
+ * (12377-cmd62). pcie_sleep_clock=board sets it as Android has it, at step A; without it the pin is only read.
+ *
+ * GPIO3 of the PM8550VE at slave 5 is the chip's BT_EN (qcom,bt-en-gpio, pinctrl bt_en: normal function, output,
+ * VIN1, no pull). Android's BT stack drives it high once Bluetooth is on, and from then on the WLAN half has run
+ * with it high, mission mode included. pcie_bt_en=1 drives it high at step H, before the card's own enable.
+ *
+ * Writes go in the order of Linux's pinctrl-spmi-gpio.c (an LV/MV pin's output level is bit 7 of
+ * DIG_OUT_SOURCE_CTL). The arbiter v7 windows, the channel lookup and the write channel are annibale_buttons.c's
+ * and annibale_torch.c's, under their lock.
+ */
+#define ARB_CORE_PHYS           0x0c400000UL
+#define ARB_CORE_SIZE           0x3000UL
+#define ARB_CNFG_PHYS           0x0c42d000UL        /* [2:0] of word n: the system that may write channel n */
+#define ARB_CNFG_SIZE           0x4000UL
+#define ARB_CHNLS_PHYS          0x0c500000UL        /* the write channels, 0x1000 each */
+#define ARB_OBSRV_PHYS          0x0c440000UL        /* system 0's read channels, 0x20 each */
+#define ARB_OBSRV_SIZE          0x8000UL
+
+struct pmic_gpio {
+	const char *name;
+	uint16_t ppid;                          /* slave << 8 | the peripheral's address >> 8 */
+	uint8_t writes[6][2];                   /* DIG_VIN_CTL, DIG_PULL_CTL, DIG_OUT_CTL, MODE_CTL, DIG_OUT_SOURCE_CTL, EN_CTL */
+};
+static const struct pmic_gpio sleep_clock_pin = { "the PMK8550's GPIO3 (sleep clock)", 0x0ba,
+	{ { 0x41, 0x00 }, { 0x42, 0x05 }, { 0x45, 0x01 }, { 0x40, 0x01 }, { 0x44, 0x02 }, { 0x46, 0x80 } } };
+static const struct pmic_gpio bt_en_pin = { "the PM8550VE-F's GPIO3 (BT_EN)", 0x58a,
+	{ { 0x41, 0x01 }, { 0x42, 0x05 }, { 0x45, 0x01 }, { 0x40, 0x01 }, { 0x44, 0x80 }, { 0x46, 0x80 } } };
+
+static uint32_t
+spmi_wait(vm_offset_t channel)
+{
+	uint32_t status = 0;
+
+	for (unsigned i = 0; i < 2000 && !(status & 1); i++) {
+		status = rd(channel + 0x08);
+		sleep_us(1);
+	}
+	return status;
+}
+
+static void
+pmic_gpio_read(const struct pmic_gpio *pin, vm_offset_t obsrv, uint32_t channel, const char *when)
+{
+	uint32_t status, data[2];
+
+	annibale_spmi_lock();
+	wr(obsrv, 1u << 27 | 0x40u << 4 | 7);              /* extended read, 8 registers from 0x40 */
+	status = spmi_wait(obsrv);
+	data[0] = rd(obsrv + 0x18);
+	data[1] = rd(obsrv + 0x1c);
+	annibale_spmi_unlock();
+	printf("pcie: power: %s %s, channel %u, status %#x: MODE_CTL %#x, DIG_VIN_CTL %#x, DIG_PULL_CTL %#x, "
+	    "DIG_OUT_SOURCE_CTL %#x, EN_CTL %#x\n", pin->name, when, channel, status, data[0] & 0xff, data[0] >> 8 & 0xff,
+	    data[0] >> 16 & 0xff, data[1] & 0xff, data[1] >> 16 & 0xff);
+}
+
+/* Read the pin, and with `set` configure it as `writes` says and read it again. */
+static void
+pmic_gpio(const struct pmic_gpio *pin, bool set)
+{
+	static vm_offset_t core, cnfg, obsrv;
+	vm_offset_t out;
+	uint32_t channel, status;
+
+	if (core == 0) {
+		core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
+		cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
+		obsrv = ml_io_map(ARB_OBSRV_PHYS, ARB_OBSRV_SIZE);
+	}
+	if (core == 0 || cnfg == 0 || obsrv == 0) {
+		return;
+	}
+	for (channel = 0; channel < (ARB_CORE_SIZE - 0x2000) / 4; channel++) {
+		if ((rd(core + 0x2000 + 4 * channel) >> 8 & 0xfff) == pin->ppid) {
+			break;
+		}
+	}
+	if (channel == (ARB_CORE_SIZE - 0x2000) / 4) {
+		printf("pcie: power: %s has no channel on the arbiter\n", pin->name);
+		return;
+	}
+	pmic_gpio_read(pin, obsrv + 0x20UL * channel, channel, "as found");
+	if (!set) {
+		return;
+	}
+	if ((rd(cnfg + 4 * channel) & 7) != 0 || (out = ml_io_map(ARB_CHNLS_PHYS + 0x1000UL * channel, 0x1000)) == 0) {
+		printf("pcie: power: %s: channel %u is written by system %u; not set\n", pin->name, channel,
+		    rd(cnfg + 4 * channel) & 7);
+		return;
+	}
+	for (unsigned i = 0; i < sizeof(pin->writes) / sizeof(pin->writes[0]); i++) {
+		annibale_spmi_lock();
+		wr(out + 0x10, pin->writes[i][1]);
+		wr(out, (uint32_t)pin->writes[i][0] << 4);  /* extended write, one register */
+		status = spmi_wait(out);
+		annibale_spmi_unlock();
+		if ((status & 0xf) != 1) {
+			printf("pcie: power: %s: the write of %#x to register %#x ended with status %#x\n", pin->name,
+			    pin->writes[i][1], pin->writes[i][0], status);
+			return;
+		}
+	}
+	pmic_gpio_read(pin, obsrv + 0x20UL * channel, channel, "as set");
 }
 
 /* ---- B, H, J: pins ------------------------------------------------------------------------------ */
@@ -467,6 +730,19 @@ mhi_pcie_power_up(const struct mhi_pcie_windows *windows)
 	if (!(rd(w->gcc + GCC_GPLL0_MODE) & (1u << 31)) || (rd(rsc) >> 16 & 0xff) != 3 || !supplies_found(found, &xo)) {
 		return false;
 	}
+	{
+		char source[16] = "";
+
+		(void)PE_parse_boot_argn("pcie_sleep_clock", source, sizeof(source));
+		pmic_gpio(&sleep_clock_pin, strcmp(source, "board") == 0);
+	}
+	{
+		uint32_t pdc = 0;
+
+		if (PE_parse_boot_argn("pcie_aop_pdc", &pdc, sizeof(pdc)) && pdc != 0) {
+			aop_pdc();
+		}
+	}
 
 	mhi_pcie_pause("B: PERST and the card's enable driven low");
 	wr(PIN_IO(PIN_PERST), 0);
@@ -491,6 +767,12 @@ mhi_pcie_power_up(const struct mhi_pcie_windows *windows)
 	}
 
 	mhi_pcie_pause("H: the card's enable");
+	{
+		uint32_t bt_en = 0;
+
+		(void)PE_parse_boot_argn("pcie_bt_en", &bt_en, sizeof(bt_en));
+		pmic_gpio(&bt_en_pin, bt_en != 0);
+	}
 	wr(PIN_IO(PIN_WLAN_EN), PIN_IO_OUT_HIGH);
 	delay_for_interval(50, NSEC_PER_MSEC);
 	wr(PIN_CTL(PIN_CLKREQ), CTL_CLKREQ_FUNCTION);

@@ -35,7 +35,7 @@ export KERNEL_UUID=${KERNEL_UUID:-c71f02b3-2965-3ecc-9398-8915830464c4}
 LX=$XNU26_ROOT/xnu-deps/build/ath12k/out/ath12k.o
 if [ -f "$LX" ]; then now="$LX $(stat -f %m "$LX")"; else LX= now=; fi
 if [ -d BUILD/obj ] && [ "$(cat BUILD/obj/redwood-objects 2>/dev/null)" != "$now" ]; then
-  rm -f BUILD/obj/*/mach.*.unstripped
+  rm -f BUILD/obj/*/mach.*.unstripped BUILD/obj/*/mach.*.unstripped.noctf    # (the link's output, and its copy)
   echo "$now" > BUILD/obj/redwood-objects
 fi
 

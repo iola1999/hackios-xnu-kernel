@@ -22,7 +22,8 @@
  *
  * The image is fw/amss20.bin of the RAM disk (redwood_image.c; package.py WIFI_FW=1) when the SoC
  * version register says hardware 2.0, the only WCN7850 ath12k knows, else fw/amss.bin; pcie_fw=1 or 2
- * picks one. Nothing is undone: the card keeps running, the streams stay matched and the memory stays
+ * picks one. pcie_fw=3 takes fw/lfw-amss.bin, linux-firmware's ath12k/WCN7850/hw2.0/amss.bin (the build
+ * made for ath12k; with its m3.bin as fw/lfw-m3.bin, mhi_pcie.c), copied there by hand. Nothing is undone: the card keeps running, the streams stay matched and the memory stays
  * the card's until the phone resets. Step 8, at the end of this file, starts QRTR's channels on top.
  */
 #include <kern/clock.h>
@@ -37,11 +38,13 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/redwood_qrtr.h>
+#include <vm/vm_kern.h>
 #include "mhi_boot.h"
 #include "mhi_pcie_private.h"
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+extern uint64_t kvtophys(vm_offset_t va);
 extern const uint8_t *redwood_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 
 #define printf mhi_pcie_say
@@ -487,6 +490,7 @@ static const char *const phases[] = { "idle", "resetting", "loading the boot loa
 static bool
 stage_image(uint64_t *seg_pa, uint32_t *size, uint32_t *segments)
 {
+	static const char *const names[] = { NULL, "amss.bin", "amss20.bin", "lfw-amss.bin" };
 	uint64_t soc_version, disk_size = 0;
 	uint32_t which = 0;
 	const uint8_t *image;
@@ -497,12 +501,12 @@ stage_image(uint64_t *seg_pa, uint32_t *size, uint32_t *segments)
 	}
 	soc_version = card_rd(TCSR_SOC_HW_VERSION);
 	(void)PE_parse_boot_argn("pcie_fw", &which, sizeof(which));
-	if (which == 0) {
+	if (which == 0 || which >= sizeof(names) / sizeof(names[0])) {
 		which = ((soc_version >> 8) & 0xf) == 2 ? 2 : 1;
 	}
-	image = redwood_image_file("fw", which == 2 ? "amss20.bin" : "amss.bin", &disk_size, &disk);
+	image = redwood_image_file("fw", names[which], &disk_size, &disk);
 	printf("pcie: step 7: SoC version %#llx (major %llu minor %llu): %s, %llu bytes from md%d\n", soc_version,
-	    (soc_version >> 8) & 0xf, (soc_version >> 4) & 0xf, which == 2 ? "amss20.bin" : "amss.bin", disk_size, disk);
+	    (soc_version >> 8) & 0xf, (soc_version >> 4) & 0xf, names[which], disk_size, disk);
 	if (image == NULL || disk_size == 0 || disk_size > MAX_SEGMENTS * SEGMENT) {
 		printf("pcie: step 7: no image in fw/ of the RAM disk (package.py WIFI_FW=1)\n");
 		return false;
@@ -519,6 +523,110 @@ stage_image(uint64_t *seg_pa, uint32_t *size, uint32_t *segments)
 		memcpy(seg, image + i * SEGMENT, MIN(SEGMENT, *size - i * SEGMENT));
 	}
 	return true;
+}
+
+/*
+ * pcie_rddm=1: room for the card's RAM dump. A card that faults goes to execution environment 3 (RDDM)
+ * and writes its memory into the buffers of the BHIe receive vector the host left it (Linux
+ * drivers/bus/mhi/host/boot.c, mhi_rddm_prepare and mhi_download_rddm_image); 0x780000 bytes is the
+ * vendor device tree's qcom,wlan-ramdump-dynamic. The loader stages only the kernel's own window, so the
+ * dump is copied into a contiguous block of it, and run-auto.py saves the block a "fetch:" line names
+ * before it resets the phone.
+ */
+#define BHIE_RXVECADDR_LOW      0x60
+#define BHIE_RXVECADDR_HIGH     0x64
+#define BHIE_RXVECSIZE          0x68
+#define BHIE_RXVECDB            0x70
+#define BHIE_RXVECSTATUS        0x78
+#define RDDM_SIZE               0x780000u
+
+static struct {
+	uint32_t bhie, seq, entries;
+	uint64_t pa, table_pa;
+	uint8_t *va;
+} rddm;
+
+static void
+rddm_arm(uint32_t seq)
+{
+	rddm.seq = seq;
+	wr(bar + rddm.bhie + BHIE_RXVECADDR_HIGH, (uint32_t)(rddm.table_pa >> 32));
+	wr(bar + rddm.bhie + BHIE_RXVECADDR_LOW, (uint32_t)rddm.table_pa);
+	wr(bar + rddm.bhie + BHIE_RXVECSIZE, rddm.entries * (uint32_t)sizeof(MhiBhieEntry));
+	wr(bar + rddm.bhie + BHIE_RXVECDB, seq & MHI_SEQ_MASK);
+}
+
+static void
+rddm_prepare(uint32_t bhie)
+{
+	uint64_t seg_pa[RDDM_SIZE / SEGMENT];
+	MhiBhieEntry *table;
+	uint32_t on = 0;
+
+	if (!PE_parse_boot_argn("pcie_rddm", &on, sizeof(on)) || on == 0) {
+		return;
+	}
+	rddm.va = dma_alloc(RDDM_SIZE, &rddm.pa);
+	table = dma_alloc(4096, &rddm.table_pa);
+	if (rddm.va == NULL || table == NULL) {
+		printf("pcie: rddm: no DMA memory for the card's RAM dump\n");
+		rddm.va = NULL;
+		return;
+	}
+	for (uint32_t i = 0; i < RDDM_SIZE / SEGMENT; i++) {
+		seg_pa[i] = rddm.pa + (uint64_t)i * SEGMENT;
+	}
+	rddm.entries = mhi_bhie_table(table, 4096 / sizeof(MhiBhieEntry), seg_pa, RDDM_SIZE, SEGMENT);
+	rddm.bhie = bhie;
+	__builtin_arm_dsb(0xf);
+	rddm_arm(0x2dd3);
+	printf("pcie: rddm: %u bytes at %#llx in %u segments, table %#llx, left with the card\n", RDDM_SIZE, rddm.pa,
+	    rddm.entries, rddm.table_pa);
+}
+
+/* at SYS_ERR, from step 8's thread: the dump awaited (armed once more if the card ignores the first), then kept */
+static void
+rddm_collect(void)
+{
+	uint32_t status = 0, used = RDDM_SIZE;
+	vm_offset_t copy = 0;
+
+	if (rddm.va == NULL) {
+		return;
+	}
+	for (unsigned attempt = 0; attempt < 2 && status >> 30 != MHI_XFER_SUCCESS; attempt++) {
+		if (attempt == 1) {
+			printf("pcie: rddm: nothing after 2 s (receive status %#x); the vector armed again\n", status);
+			rddm_arm(rddm.seq + 1);
+		}
+		for (unsigned i = 0; i < (attempt == 0 ? 400u : 600u); i++) {
+			status = rd(bar + rddm.bhie + BHIE_RXVECSTATUS);
+			if (status >> 30 != 0) {
+				break;
+			}
+			ms(5);
+		}
+	}
+	while (used > 0 && rddm.va[used - 1] == 0) {
+		used--;
+	}
+	printf("pcie: rddm: receive status %#x (sequence %#x), %u bytes up to the last one not 0\n", status, rddm.seq, used);
+	for (uint32_t at = 0; at < 64 && at < used; at += 16) {
+		const uint8_t *b = rddm.va + at;
+
+		printf("pcie: rddm: %04x: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n", at, b[0], b[1], b[2],
+		    b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+	}
+	if (used == 0) {
+		return;
+	}
+	if (kmem_alloc_contig(kernel_map, &copy, round_page(used), PAGE_MASK, 0, 0, KMA_KOBJECT | KMA_DATA,
+	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		printf("pcie: rddm: no contiguous memory for a copy the loader can stage\n");
+		return;
+	}
+	memcpy((void *)copy, rddm.va, used);
+	printf("pcie: rddm: copied for the host; fetch: rddm %#llx %#x\n", kvtophys(copy), used);
 }
 
 bool
@@ -597,6 +705,9 @@ mhi_pcie_firmware(const struct mhi_pcie_card *card)
 	    "%#x error %#x; %u event ring moves)\n", uptime_ms() - start, phases[MIN(phase, 9u)], boot.error,
 	    phases[MIN(boot.failed_phase, 9u)], mhi_boot_ee(&boot), mhi_boot_state(&boot),
 	    rd(bar + boot.bhi + 0x2c), rd(bar + boot.bhi + 0x30), acks);
+	if (phase == MhiDone) {
+		rddm_prepare(boot.bhie);
+	}
 	return phase == MhiDone;
 }
 
@@ -621,6 +732,8 @@ mhi_pcie_firmware(const struct mhi_pcie_card *card)
 #define PKT_START_CHAN          0x12u
 #define EV_CMD_COMPLETION       0x21u
 #define EV_TRANSFER             0x22u
+#define EV_STATE_CHANGE         0x20u
+#define MHI_SYS_ERR             0xffu
 #define TRE_IEOT                (1u << 9)
 
 struct ring {
@@ -732,7 +845,17 @@ event(unsigned r, const uint8_t *el)
 		ul_pending -= ul_pending != 0;
 		lck_mtx_unlock(&ul_lock);
 	} else {
-		printf("pcie: step 8: event ring %u: type %#x code %u pointer %#llx (%#x %#x)\n", r, type, code, pointer, d0, d1);
+		printf("pcie: step 8: at %llu ms, event ring %u: type %#x code %u pointer %#llx (%#x %#x)\n", uptime_ms(), r, type,
+		    code, pointer, d0, d1);
+	}
+	if (type == EV_STATE_CHANGE && code == MHI_SYS_ERR) {
+		uint32_t bhi = rd(bar + 0x28);
+
+		/* the firmware's own account of its fault, as step 5 reads the BHI block (Linux drivers/bus/mhi: BHI_ERRCODE..) */
+		printf("pcie: step 8: SYS_ERR: MHI status %#x, execution environment %u; BHI ERRCODE %#x ERRDBG1 %#x ERRDBG2 %#x "
+		    "ERRDBG3 %#x\n", rd(bar + 0x48), rd(bar + bhi + 0x28), rd(bar + bhi + 0x30), rd(bar + bhi + 0x34),
+		    rd(bar + bhi + 0x38), rd(bar + bhi + 0x3c));
+		rddm_collect();
 	}
 }
 

@@ -12,9 +12,14 @@ static uint64_t win_base, win_size; /* XNU's physical memory window, claimed onc
  * Memory below 4 GB for the Wi-Fi card, which takes 32-bit addresses only: its stream passes the
  * apps SMMU untranslated and the kernel's window is above 4 GB. Claimed once, on the first run
  * whose arguments ask for the card's firmware (pcie=7 or more), and handed to the kernel as
- * lowdma=<address> lowdma_mb=<size>.
+ * lowdma=<address> lowdma_mb=<size>. The block is asked for at LOW_DMA_AT first: the Wi-Fi firmware
+ * (WLAN.HMT.2.0-02977) takes host memory only inside the window Android's cnss2 declares to it,
+ * 0x98000000 to 0xb0010000, and this block lies inside it, clear of the loader's own image at
+ * 0xA1000000 and of the device tree's two lost_reg_mem regions. If UEFI has it in use, the highest
+ * free block below 4 GB is taken as before.
  */
 #define LOW_DMA_SIZE        0x8000000ULL
+#define LOW_DMA_AT          0xA8000000ULL
 static uint64_t low_dma;
 static uint64_t resident_rd_size;   /* root image kept at win_base + RESIDENT_RD_OFFSET, 0 if none */
 static char last_result[64] = "idle";
@@ -483,10 +488,14 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		charger_start();
 	}
 	if (low_dma_requested && low_dma == 0) {
-		uint64_t at = 0xFFFFFFFFULL;
+		uint64_t at = LOW_DMA_AT;
 
-		if (EFI_ERROR(BS->allocate_pages(AllocateMaxAddress, EfiLoaderData, LOW_DMA_SIZE >> 12, &at))) {
-			at = 0;
+		if (EFI_ERROR(BS->allocate_pages(AllocateAddress, EfiLoaderData, LOW_DMA_SIZE >> 12, &at))) {
+			print("low DMA memory: %x is in use\n", LOW_DMA_AT);
+			at = 0xFFFFFFFFULL;
+			if (EFI_ERROR(BS->allocate_pages(AllocateMaxAddress, EfiLoaderData, LOW_DMA_SIZE >> 12, &at))) {
+				at = 0;
+			}
 		}
 		low_dma = at;
 		print("low DMA memory %x size %x\n", low_dma, LOW_DMA_SIZE);
