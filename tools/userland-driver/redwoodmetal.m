@@ -3318,26 +3318,25 @@ enum {
 		_color[i] = rw_attachment_level(texture, [attachment level]);
 		_colorCount = i + 1;
 		/*
-		 * The resolve target, handed to the compiler library, which does the resolve as
-		 * a blit from the multisample attachment at the end of every draw that names one
-		 * (struct rwa_draw.resolve says why per draw rather than per pass).
+		 * The resolve target, which the compiler library blits into after every draw
+		 * (struct rwa_draw.resolve says why per draw). A depth resolve is not done.
 		 *
-		 * The depth aspect is not resolved: MTLStoreActionMultisampleResolve on a depth
-		 * attachment names the same one-sample depth texture through
-		 * -resolveTexture of MTLRenderPassDepthAttachmentDescriptor, and nothing has
-		 * asked for one yet. It is still said out loud rather than ignored, because the
-		 * alternative is a depth texture that reads as whatever it held before.
-		 */
+		 * A one-sample attachment with storeAction 2 is drawn straight into its resolve
+		 * texture (off with REDWOOD_RESOLVE_BLIT=1): Apple's GPU writes tile memory to the
+		 * resolve target at the end of a pass whatever the sample count, and storeAction 2
+		 * leaves the attachment undefined, so only a pass that loads it could tell. */
 		_resolve[i] = [attachment resolveTexture];
-		if (rw_one_sample() && _resolve[i] != nil && [texture sampleCount] > 1) {
-			_color[i] = _resolve[i];
+		NSUInteger store = [attachment storeAction];
+		BOOL one = [texture sampleCount] <= 1 && store == MTLStoreActionMultisampleResolve &&
+		    [attachment loadAction] != MTLLoadActionLoad && getenv("REDWOOD_RESOLVE_BLIT") == NULL &&
+		    [_resolve[i] pixelFormat] == [texture pixelFormat];
+		if (_resolve[i] != nil && (one || (rw_one_sample() && [texture sampleCount] > 1))) {
+			_color[i] = rw_attachment_level(_resolve[i], [attachment resolveLevel]);
 			_resolve[i] = nil;
 		}
-		NSUInteger store = [attachment storeAction];
-
 		if ((store == MTLStoreActionMultisampleResolve ||
 		     store == MTLStoreActionStoreAndMultisampleResolve) &&
-		    _resolve[i] == nil) {
+		    [attachment resolveTexture] == nil) {
 			rw_print("colour attachment %u asks for storeAction %lu with no "
 			         "resolveTexture: Metal's own rule is that the two come "
 			         "together, so the attachment is stored and nothing is "

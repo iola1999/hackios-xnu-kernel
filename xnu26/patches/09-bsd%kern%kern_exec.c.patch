@@ -1,5 +1,5 @@
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 2467b24045cd..5aceb70e242e 100644
+index 2467b24045cd..40afa39a3a7f 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -1919,6 +1919,9 @@ SYSCTL_PROC(_vm, OID_AUTO, shared_region_control,
@@ -42,7 +42,7 @@ index 2467b24045cd..5aceb70e242e 100644
  	if (error) {
  		goto bad;
  	}
-@@ -3517,6 +3529,57 @@ exec_handle_exception_port_actions(const struct image_params *imgp,
+@@ -3517,6 +3529,58 @@ exec_handle_exception_port_actions(const struct image_params *imgp,
  }
  
  
@@ -51,7 +51,8 @@ index 2467b24045cd..5aceb70e242e 100644
 + * terminal say is worth reading here. Their standard output and error, which launchd opens on
 + * /dev/null, go to the console instead (that shows NSLog and the "Terminating app due to
 + * uncaught exception" kind of message). With applog=2 every program also gets
-+ * OS_ACTIVITY_DT_MODE in its environment, which makes os_log write to standard error as well:
++ * OS_ACTIVITY_DT_MODE, ACTIVITY_LOG_STDERR and CFLOG_FORCE_STDERR in its environment, which
++ * make os_log and CFLog write to standard error as well:
 + * everything any program logs, and a much slower system. applog_name=NAME[,NAME...] with
 + * applog=1 does that for the programs whose file names begin with one of the NAMEs only,
 + * which is how to read what one application extension has to say (launchd starts those for
@@ -100,7 +101,7 @@ index 2467b24045cd..5aceb70e242e 100644
  /*
   * exec_handle_file_actions
   *
-@@ -3587,7 +3650,7 @@ exec_handle_file_actions(struct image_params *imgp, short psa_flags)
+@@ -3587,7 +3651,7 @@ exec_handle_file_actions(struct image_params *imgp, short psa_flags)
  			AUDIT_SUBCALL_ENTER(OPEN, p, uthread);
  
  			NDINIT(ndp, LOOKUP, OP_OPEN, FOLLOW | AUDITVNPATH1, UIO_SYSSPACE,
@@ -109,7 +110,7 @@ index 2467b24045cd..5aceb70e242e 100644
  			    imgp->ip_vfs_context);
  
  			error = open1(imgp->ip_vfs_context, ndp,
-@@ -3750,6 +3813,12 @@ exec_handle_file_actions(struct image_params *imgp, short psa_flags)
+@@ -3750,6 +3814,12 @@ exec_handle_file_actions(struct image_params *imgp, short psa_flags)
  
  		/* All file actions failures are considered fatal, per POSIX */
  
@@ -122,7 +123,7 @@ index 2467b24045cd..5aceb70e242e 100644
  		if (error) {
  			if (PSFA_OPEN == psfa->psfaa_type) {
  				DTRACE_PROC1(spawn__open__failure, uintptr_t,
-@@ -3968,12 +4037,17 @@ spawn_validate_persona(struct _posix_spawn_persona_info *px_persona)
+@@ -3968,12 +4038,17 @@ spawn_validate_persona(struct _posix_spawn_persona_info *px_persona)
  {
  	int error = 0;
  	struct persona *persona = NULL;
@@ -145,27 +146,27 @@ index 2467b24045cd..5aceb70e242e 100644
  	if (px_persona->pspi_flags & POSIX_SPAWN_PERSONA_GROUPS) {
  		if (px_persona->pspi_ngroups > NGROUPS_MAX) {
  			return EINVAL;
-@@ -3981,17 +4055,9 @@ spawn_validate_persona(struct _posix_spawn_persona_info *px_persona)
+@@ -3981,17 +4056,9 @@ spawn_validate_persona(struct _posix_spawn_persona_info *px_persona)
  	}
  
  	persona = persona_lookup(px_persona->pspi_id);
 -	if (!persona) {
 -		return ESRCH;
-+	if (persona) {
-+		persona_put(persona);
- 	}
+-	}
 -
 -	// non-root process should not be allowed to set persona with uid/gid 0
 -	if (!kauth_cred_issuser(mycred) &&
 -	    (px_persona->pspi_uid == 0 || px_persona->pspi_gid == 0)) {
 -		error = EPERM;
--	}
++	if (persona) {
++		persona_put(persona);
+ 	}
 -
 -	persona_put(persona);
  	return error;
  }
  
-@@ -4038,7 +4104,38 @@ spawn_persona_adopt(proc_t p, struct _posix_spawn_persona_info *px_persona)
+@@ -4038,7 +4105,38 @@ spawn_persona_adopt(proc_t p, struct _posix_spawn_persona_info *px_persona)
  	 */
  	persona = persona_lookup(px_persona->pspi_id);
  	if (!persona) {
@@ -205,7 +206,7 @@ index 2467b24045cd..5aceb70e242e 100644
  	}
  
  	return persona_proc_adopt(p, persona,
-@@ -4913,6 +5010,9 @@ do_fork1:
+@@ -4913,6 +5011,9 @@ do_fork1:
  		uthread->uu_ar = NULL;
  #endif
  		error = exec_handle_port_actions(imgp, &port_actions);
@@ -215,7 +216,7 @@ index 2467b24045cd..5aceb70e242e 100644
  #if CONFIG_AUDIT
  		/* Restore the AUE_POSIX_SPAWN audit record. */
  		uthread->uu_ar = save_uu_ar;
-@@ -4954,6 +5054,9 @@ do_fork1:
+@@ -4954,6 +5055,9 @@ do_fork1:
  			}
  
  			error = spawn_posix_cred_adopt(p, imgp->ip_px_pcred_info);
@@ -225,7 +226,7 @@ index 2467b24045cd..5aceb70e242e 100644
  			if (error != 0) {
  				goto bad;
  			}
-@@ -4975,6 +5078,9 @@ do_fork1:
+@@ -4975,6 +5079,9 @@ do_fork1:
  			 * being executed.
  			 */
  			error = spawn_persona_adopt(p, imgp->ip_px_persona);
@@ -235,7 +236,7 @@ index 2467b24045cd..5aceb70e242e 100644
  			if (error != 0) {
  				goto bad;
  			}
-@@ -5219,6 +5325,9 @@ bad_px_sa:
+@@ -5219,6 +5326,9 @@ bad_px_sa:
  	}
  
  bad:
@@ -245,7 +246,7 @@ index 2467b24045cd..5aceb70e242e 100644
  
  	if (error == 0) {
  		/* reset delay idle sleep status if set */
-@@ -6724,10 +6833,75 @@ bad:
+@@ -6724,10 +6834,75 @@ bad:
   * Note:	The argument and environment vectors are user space pointers
   *		to arrays of user space pointers.
   */
@@ -321,7 +322,7 @@ index 2467b24045cd..5aceb70e242e 100644
  	int error = 0;
  	int     ptr_size = (imgp->ip_flags & IMGPF_WAS_64BIT_ADDR) ? 8 : 4;
  	int new_ptr_size = (imgp->ip_flags & IMGPF_IS_64BIT_ADDR) ? 8 : 4;
-@@ -6897,6 +7071,33 @@ exec_extract_strings(struct image_params *imgp)
+@@ -6897,6 +7072,41 @@ exec_extract_strings(struct image_params *imgp)
  		imgp->ip_envc++;
  	}
  
@@ -338,9 +339,17 @@ index 2467b24045cd..5aceb70e242e 100644
 +		imgp->ip_argspace -= new_ptr_size;
 +		imgp->ip_envc++;
 +	}
-+	/* ... and one for everybody when the logs are wanted on the console (see exec_applog_path) */
-+	if (exec_applog_oslog(imgp)) {
-+		error = exec_add_user_string(imgp, CAST_USER_ADDR_T("OS_ACTIVITY_DT_MODE=YES"), UIO_SYSSPACE, TRUE);
++	/*
++	 * ... and three for everybody when the logs are wanted on the console (see
++	 * exec_applog_path). iOS 26's libsystem_trace also wants ACTIVITY_LOG_STDERR before it
++	 * copies os_log to standard error, and CoreFoundation's own log (the uncaught exception
++	 * reason) wants CFLOG_FORCE_STDERR.
++	 */
++	static const char *const applog_env[] = {
++		"OS_ACTIVITY_DT_MODE=YES", "ACTIVITY_LOG_STDERR=1", "CFLOG_FORCE_STDERR=1",
++	};
++	for (unsigned i = 0; exec_applog_oslog(imgp) && i < sizeof(applog_env) / sizeof(applog_env[0]); i++) {
++		error = exec_add_user_string(imgp, CAST_USER_ADDR_T(applog_env[i]), UIO_SYSSPACE, TRUE);
 +		if (error) {
 +			goto bad;
 +		}
@@ -355,7 +364,7 @@ index 2467b24045cd..5aceb70e242e 100644
  	/* Save space for envv[] NULL terminator */
  	if (imgp->ip_argspace < new_ptr_size) {
  		error = E2BIG;
-@@ -7788,12 +7989,26 @@ handle_mac_transition:
+@@ -7788,12 +7998,26 @@ handle_mac_transition:
  	/* Update the process' identity version and set the security token.
  	 * Also, ensure we always see a modified identity version (rdar://129775819).
  	 */
@@ -388,7 +397,7 @@ index 2467b24045cd..5aceb70e242e 100644
  	task_set_uniqueid(proc_task(p));
  
  	/*
-@@ -8767,6 +8982,11 @@ process_signature(proc_t p, struct image_params *imgp)
+@@ -8767,6 +8991,11 @@ process_signature(proc_t p, struct image_params *imgp)
  	}
  
  done:
