@@ -19,7 +19,8 @@
  *            FocalTech: read the report at register 0x01 with FTS 5.x SPI framing (cmd 0xC1 for
  *            read, 0xC0 for write, two-byte CRC-16/Kermit)
  * No interrupt is used: a thread looks at the interrupt line 125 times a second (boot-arg
- * touch_poll_us=N: every N microseconds instead of 8000). With touch_lat=1 a line for every report
+ * touch_poll_us=N: every N microseconds instead of 8000), and on the K90 at the edge the TLMM
+ * latched for it (int_latch_on). With touch_lat=1 a line for every report
  * read ("tl: c before US seen US read US": the look before, the look that found the line low, the
  * report read), for measuring how long a touch takes to show (tools/latency.py).
  *
@@ -526,6 +527,30 @@ board_setup(uint32_t which)
 	}
 }
 
+/*
+ * On the K90 the interrupt line does not stay low until the report is read: with the level looked at
+ * every 9 ms, a moving finger's reports were taken 36 to 90 ms apart, most of them by the 80 ms
+ * fallback read, which found a new position each time (kernel-12377-cmd52-bo61). The TLMM latches a
+ * falling edge in the pin's interrupt status while raw status is enabled, also with the interrupt
+ * disabled, so the thread reads that bit as well: an edge since the last look is a report waiting.
+ * Field layout from Linux pinctrl-sm8750.c; bits 5 and up (wakeup, target) are left as they were.
+ */
+#define GPIO_INTR_CFG(n)        (tlmm + 0x1000UL * (n) + 8)     /* [0] enable, [1] polarity, [3:2] detection, [4] raw status */
+#define GPIO_INTR_STATUS(n)     (tlmm + 0x1000UL * (n) + 0xc)   /* [0] an edge was latched */
+static bool int_latched;
+
+static void
+int_latch_on(void)
+{
+	uint32_t before = rd(GPIO_INTR_CFG(PIN_INT));
+
+	wr(GPIO_INTR_CFG(PIN_INT), (before & ~0x1fu) | 1u << 4 | 2u << 2 | 1u << 1);
+	wr(GPIO_INTR_STATUS(PIN_INT), 0);
+	int_latched = true;
+	printf("goodix: interrupt pin %u: intr_cfg %#x -> %#x, falling edges latched in the status bit\n", PIN_INT, before,
+	    rd(GPIO_INTR_CFG(PIN_INT)));
+}
+
 static void
 goodix_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -559,6 +584,9 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 		thread_terminate(current_thread());
 		return;
 	}
+	if (board_annibale) {
+		int_latch_on();
+	}
 	printf("goodix: %s touch screen ready; the interrupt line is looked at every %u us\n", chip_name(), poll_us);
 	{
 		uint32_t rate = 0;
@@ -575,8 +603,15 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 	for (unsigned tick = 1;; tick++) {
 		uint64_t looked = micros_now(), read_at;
 
-		/* the interrupt line is low while a report waits; look anyway every 80 ms in case it is missed */
-		if (!gpio_get(PIN_INT)) {
+		/* the interrupt line is low while a report waits, or an edge was latched since the last look;
+		 * look anyway every 80 ms in case both are missed */
+		bool waiting = !gpio_get(PIN_INT);
+
+		if (int_latched && (rd(GPIO_INTR_STATUS(PIN_INT)) & 1)) {
+			wr(GPIO_INTR_STATUS(PIN_INT), 0);       /* before the read, so an edge during it is kept */
+			waiting = true;
+		}
+		if (waiting) {
 			idle = 0;
 			chip_poll();
 			read_at = micros_now();

@@ -1,0 +1,19 @@
+diff --git a/osfmk/vm/vm_map_store.c b/osfmk/vm/vm_map_store.c
+index a55d833..1135a42 100644
+--- a/osfmk/vm/vm_map_store.c
++++ b/osfmk/vm/vm_map_store.c
+@@ -63,7 +63,13 @@ static bool vmgo_enabled = false;
+  */
+ #define VMGO_SMALL_CONFIG       1
+ 
+-#define VMGO_MAX_KDATA_SIZE     MiB(128)
++/*
++ * redwood: data allocations from 1 MB up are placed without guard objects. A guard object takes the
++ * next power of two and a chunk of 4 such slots, so the GPU's 2 to 8 MB buffers (one kernel data
++ * allocation each) used more than twice their size of the 2.2 GB data range and ran it out at about
++ * 1 GB of buffers (kernel-12377-cmd53-bo62). Data ranges hold no pointers.
++ */
++#define VMGO_MAX_KDATA_SIZE     MiB(1)
+ 
+ #define VMGO_CHUNK_LIMIT_2      MiB(64)
+ #define VMGO_CHUNK_LIMIT_3      MiB(2)
