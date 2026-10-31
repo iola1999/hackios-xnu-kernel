@@ -20,6 +20,7 @@ extern kern_return_t thread_terminate(thread_t);
 #define SCL 1
 #define OUTPUT (1u << 9)
 #define GAUGE_ADDRESS 0x55
+#define CHARGE_FLOW_UA 50000    /* 50 mA */
 static vm_offset_t pins;
 static uint32_t saved_cfg[2], saved_io[2], input_cfg[2];
 static bool bus_ok;
@@ -172,9 +173,12 @@ sample(void)
 	state.current_ua = (int16_t)values[2] * 1000;
 	state.temperature_hundredths = values[3] * 10 - 27315;
 	state.present = 1;
-	/* Current confirms energy flow; USB connection and limits need a separate source. */
-	state.status = state.current_ua > 0 ? 1 : state.current_ua < 0 ? 2 : 3;
-	state.external = state.current_ua > 0;
+	/* Current confirms energy flow; USB connection and limits need a separate source. On USB
+	 * near full charge the gauge reads within a few tens of mA of 0 either way (+17 mA once in
+	 * kernel-12377-cmd47-bo42), and one such sample made iOS show "Charging" for 5 seconds, so
+	 * flow under CHARGE_FLOW_UA counts as none. */
+	state.status = state.current_ua > CHARGE_FLOW_UA ? 1 : state.current_ua < -CHARGE_FLOW_UA ? 2 : 3;
+	state.external = state.current_ua > CHARGE_FLOW_UA;
 	state.charge_uah = values[4] * 1000;
 	state.full_uah = values[5] * 1000;
 	state.design_uah = values[6] * 1000;

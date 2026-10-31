@@ -591,6 +591,30 @@ rw_linked_fragment_functions(id descriptor, struct rwa_linked_function *out, uns
 	return n;
 }
 
+/* The modules of the functions a refused pipeline links into its fragment stage, as
+ * air_fail_dump prints them ("linked" in tools/mesa/air/airfail-extract.py): a stitched
+ * fragment calls them, and the instruction the frontend refuses can be in one of them. */
+static void
+rw_dump_linked(id descriptor)
+{
+	id linked = [descriptor respondsToSelector:@selector(fragmentLinkedFunctions)]
+	    ? [descriptor fragmentLinkedFunctions] : nil;
+	NSMutableArray *all = [NSMutableArray array];
+
+	if ([linked functions] != nil)
+		[all addObjectsFromArray:[linked functions]];
+	if ([linked privateFunctions] != nil)
+		[all addObjectsFromArray:[linked privateFunctions]];
+	for (id function in all) {
+		const char *module_name = NULL;
+		NSData *air = [function respondsToSelector:@selector(redwoodGraph)]
+		    ? nil : rw_function_bitcode(function, &module_name);
+
+		if ([air length] > 0)
+			air_fail_dump([air bytes], [air length], "linked", [[function name] UTF8String]);
+	}
+}
+
 /* Frees what rw_linked_fragment_functions allocated. */
 static void
 rw_linked_free(NSMutableData *scratch)

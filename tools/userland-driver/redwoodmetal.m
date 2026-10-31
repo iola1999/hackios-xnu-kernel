@@ -1625,9 +1625,8 @@ struct gem_close { uint32_t handle, pad; };
 	}
 
 	if (render == NULL) {
-		/* Both modules go out, whichever of them the sentence names: the driver cannot
-		 * tell from here which stage the frontend gave up on, and a dump of the wrong
-		 * one is a boot spent learning nothing. */
+		/* Both modules and the functions linked into them go out, whichever of them the
+		 * sentence names: the driver cannot tell which one the frontend gave up on. */
 		if (fragment_air != nil) {
 			air_fail_dump([fragment_air bytes], [fragment_air length], "fragment",
 			    fragment_name);
@@ -1636,6 +1635,7 @@ struct gem_close { uint32_t handle, pad; };
 			air_fail_dump([vertex_air bytes], [vertex_air length], "vertex",
 			    [[vertex name] UTF8String]);
 		}
+		rw_dump_linked(descriptor);
 		/* PRINTED as well as returned, and RW_AGAIN because the same specification
 		 * is asked for over and over: -fail: puts the sentence in an NSError and
 		 * nothing more, and whether anyone ever sees it is then the caller's
@@ -3315,7 +3315,7 @@ enum {
 		if (texture == nil) {
 			continue;
 		}
-		_color[i] = texture;
+		_color[i] = rw_attachment_level(texture, [attachment level]);
 		_colorCount = i + 1;
 		/*
 		 * The resolve target, handed to the compiler library, which does the resolve as

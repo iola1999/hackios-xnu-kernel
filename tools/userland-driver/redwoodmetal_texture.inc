@@ -329,8 +329,8 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 			     levels:(NSRange)levels
 			     slices:(NSRange)slices
 {
-	NSUInteger layers = _shape.type == 3 || _shape.type == 4 ? 6 * MAX(_shape.array_length, 1)
-								  : MAX(_shape.array_length, 1);
+	NSUInteger layers = _shape.type == MTLTextureTypeCube || _shape.type == MTLTextureTypeCubeArray
+				? 6 * MAX(_shape.array_length, 1) : MAX(_shape.array_length, 1);
 
 	if (type == _shape.type && slices.location == 0 && slices.length == layers) {
 		return [self redwoodViewWithPixelFormat:format levels:levels];
@@ -357,11 +357,10 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 - (id)newSharedTextureHandle { return nil; }   /* nothing here is shared between processes */
 
 /* Served out of the shape this texture was made with, which is the only place that
- * knowledge exists: a cube is six faces (MTLTextureTypeCube is 3, CubeArray is 4),
- * everything else is one. */
+ * knowledge exists: a cube is six faces, everything else is one. */
 - (NSUInteger)numFaces
 {
-	return (_shape.type == 3 || _shape.type == 4) ? 6 : 1;
+	return _shape.type == MTLTextureTypeCube || _shape.type == MTLTextureTypeCubeArray ? 6 : 1;
 }
 /* The identity swizzle, and it is the truth rather than a default: a texture of this driver
  * is made from a descriptor's format alone and nothing reorders its channels, so red reads
@@ -686,3 +685,23 @@ rw_surface_through_copy(RedwoodMetalDevice *device, MTLTextureDescriptor *d, voi
 }
 
 @end
+
+/*
+ * The colour attachment of a pass that names a level other than 0
+ * (MTLRenderPassAttachmentDescriptor.level): a view of that one level, released by the
+ * autorelease pool that releases the encoder, and kept as long as the work by the work's own
+ * retain. CoreAnimation's glass draws its blur pyramid one level a pass; drawing every pass into
+ * level 0 cleared the level the next pass reads, and the glass came out empty
+ * (kernel-12377-cmd47-bo40). A view that cannot be made leaves the texture itself.
+ */
+static id
+rw_attachment_level(id texture, NSUInteger level)
+{
+	if (texture == nil || level == 0)
+		return texture;
+	id view = [texture newTextureViewWithPixelFormat:[texture pixelFormat]
+					    textureType:[texture textureType]
+						 levels:NSMakeRange(level, 1)
+						 slices:NSMakeRange(0, MAX([texture arrayLength], 1))];
+	return view != nil ? [view autorelease] : texture;
+}
