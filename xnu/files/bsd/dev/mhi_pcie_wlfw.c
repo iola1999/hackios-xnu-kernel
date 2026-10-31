@@ -11,6 +11,8 @@
  *     (fw/regdb.bin), the board data (fw/bdwlan.eNN, NN the board id in hex, or fw/bdwlan.elf when the firmware
  *     gives none: Android's cnss2 names them so) and the M3 image (fw/phy_ucode20.elf, Android's phy_ucode for
  *     hardware 2.0) placed in that memory;
+ *   - with pcie_qdss=1 the QDSS trace configuration (fw/qdss_trace_config_v2.cfg), which cnss2 sends right after
+ *     the M3 information: with cnss2's feature list (pcie_features=6) the firmware sends FW_READY only after it.
  *   - FW_READY awaited. With pcie_mission=1 also what ath12k_qmi_firmware_start() sends then: the logging, the
  *     configuration (copy engines and services, without the shadow registers, which ath12k works out from its
  *     rings) and the mode "mission". With pcie_mission=7 instead the first half of Android cnss2's cold-boot
@@ -59,6 +61,9 @@ extern const uint8_t *redwood_image_file(const char *dir, const char *name, uint
 #define WLFW_CAL_REPORT_REQ             0x0026
 #define WLFW_CAL_REPORT_REQ_MAX_LEN     43
 #define WLFW_CAL_DONE_IND               0x003e
+#define WLFW_QDSS_CONFIG_REQ            0x0044
+#define WLFW_QDSS_CONFIG_REQ_MAX_LEN    6167
+#define WLFW_MAX_DATA_SIZE              6144
 
 struct cal_report_req {
 	uint32_t meta_data_len;
@@ -66,7 +71,18 @@ struct cal_report_req {
 	uint8_t download_size_valid;
 	uint64_t download_size;
 };
-struct cal_report_resp {
+struct qdss_config_req {
+	uint8_t total_size_valid;
+	uint32_t total_size;
+	uint8_t seg_id_valid;
+	uint32_t seg_id;
+	uint8_t data_valid;
+	uint32_t data_len;
+	uint8_t data[WLFW_MAX_DATA_SIZE];
+	uint8_t end_valid;
+	uint8_t end;
+};
+struct result_only {
 	struct qmi_response_type_v01 resp;
 };
 struct cal_done_ind {
@@ -84,9 +100,30 @@ static const struct qmi_elem_info cal_report_req_ei[] = {
 	  .tlv_type = 0x12, .offset = offsetof(struct cal_report_req, download_size) },
 	{ .data_type = QMI_EOTI, .array_type = NO_ARRAY, .tlv_type = QMI_COMMON_TLV_TYPE },
 };
-static const struct qmi_elem_info cal_report_resp_ei[] = {
+static const struct qmi_elem_info qdss_config_req_ei[] = {
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY, .tlv_type = 0x10,
+	  .offset = offsetof(struct qdss_config_req, total_size_valid) },
+	{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = sizeof(uint32_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x10, .offset = offsetof(struct qdss_config_req, total_size) },
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY, .tlv_type = 0x11,
+	  .offset = offsetof(struct qdss_config_req, seg_id_valid) },
+	{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = sizeof(uint32_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x11, .offset = offsetof(struct qdss_config_req, seg_id) },
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY, .tlv_type = 0x12,
+	  .offset = offsetof(struct qdss_config_req, data_valid) },
+	{ .data_type = QMI_DATA_LEN, .elem_len = 1, .elem_size = sizeof(uint16_t), .array_type = NO_ARRAY, .tlv_type = 0x12,
+	  .offset = offsetof(struct qdss_config_req, data_len) },
+	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = WLFW_MAX_DATA_SIZE, .elem_size = sizeof(uint8_t),
+	  .array_type = VAR_LEN_ARRAY, .tlv_type = 0x12, .offset = offsetof(struct qdss_config_req, data) },
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY, .tlv_type = 0x13,
+	  .offset = offsetof(struct qdss_config_req, end_valid) },
+	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x13, .offset = offsetof(struct qdss_config_req, end) },
+	{ .data_type = QMI_EOTI, .array_type = NO_ARRAY, .tlv_type = QMI_COMMON_TLV_TYPE },
+};
+static const struct qmi_elem_info result_only_ei[] = {
 	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct qmi_response_type_v01), .array_type = NO_ARRAY,
-	  .tlv_type = 0x02, .offset = offsetof(struct cal_report_resp, resp), .ei_array = qmi_response_type_v01_ei },
+	  .tlv_type = 0x02, .offset = offsetof(struct result_only, resp), .ei_array = qmi_response_type_v01_ei },
 	{ .data_type = QMI_EOTI, .array_type = NO_ARRAY, .tlv_type = QMI_COMMON_TLV_TYPE },
 };
 static const struct qmi_elem_info cal_done_ind_ei[] = {
@@ -269,6 +306,44 @@ send_file(const char *what, const char *name, uint8_t type, uint32_t board_id)
 	return true;
 }
 
+/* cnss2's QDSS trace configuration download, in pieces the way send_file() sends the board data */
+static bool
+send_qdss(void)
+{
+	static struct qdss_config_req request;
+	struct result_only reply;
+	uint64_t size = 0;
+	int disk = 0;
+	const uint8_t *data = redwood_image_file("fw", "qdss_trace_config_v2.cfg", &size, &disk);
+	uint32_t left, pieces = 0;
+
+	if (data == NULL || size == 0 || size > 1024 * 1024) {
+		printf("pcie: step 9: no fw/qdss_trace_config_v2.cfg in the RAM disk (%llu bytes)\n", size);
+		return false;
+	}
+	bzero(&request, sizeof(request));
+	for (left = (uint32_t)size; left > 0; pieces++) {
+		request.total_size_valid = 1;
+		request.total_size = left;
+		request.seg_id_valid = 1;
+		request.data_valid = 1;
+		request.end_valid = 1;
+		request.end = left <= WLFW_MAX_DATA_SIZE;
+		request.data_len = request.end ? left : WLFW_MAX_DATA_SIZE;
+		memcpy(request.data, data, request.data_len);
+		bzero(&reply, sizeof(reply));
+		if (!ask("the QDSS configuration", WLFW_QDSS_CONFIG_REQ, WLFW_QDSS_CONFIG_REQ_MAX_LEN, qdss_config_req_ei,
+		    &request, result_only_ei, &reply, false)) {
+			return false;
+		}
+		left -= request.data_len;
+		data += request.data_len;
+		request.seg_id++;
+	}
+	printf("pcie: step 9: fw/qdss_trace_config_v2.cfg (%llu bytes) accepted in %u pieces\n", size, pieces);
+	return true;
+}
+
 /*
  * ath12k's description of the host capability leaves the DDR range's members undescribed (a QMI_STRUCT without an
  * ei_array: ath12k never sends the range, and the encoder refuses it with EINVAL), so the message goes out through
@@ -289,8 +364,8 @@ host_capability(void)
 	static struct qmi_wlanfw_host_cap_req_msg_v01 request;
 	struct qmi_wlanfw_host_cap_resp_msg_v01 reply = { 0 };
 	char clock[16] = "";
-	uint64_t low = 0, mb = 0, size = 0;
-	uint32_t range = 0;
+	uint64_t low = 0, mb = 0, size = 0, features = 0;
+	uint32_t range = 0, mlo = 0;
 
 	bzero(&request, sizeof(request));
 	request.num_clients_valid = 1;
@@ -306,6 +381,33 @@ host_capability(void)
 	request.cal_done_valid = 1;
 	request.feature_list_valid = 1;
 	request.feature_list = BIT(CNSS_QDSS_CFG_MISS_V01) | BIT(CNSS_PCIE_PERST_NO_PULL_V01);
+	/* pcie_features=6: cnss2's list on this phone (driver support, WLAN_EN support), in place of ath12k's */
+	if (PE_parse_boot_argn("pcie_features", &features, sizeof(features))) {
+		request.feature_list = features;
+		printf("pcie: step 9: feature list %#llx\n", features);
+	}
+	/*
+	 * pcie_mlo=1: the single-chip MLO fields, with the values cnss2 sends for this chip (KIWI). In
+	 * WLAN.HMT.2.0-02977 max_mlo_peer (offset 0x142 of this message) is copied, through the word at 0x15610f0, to
+	 * the count the location service's start (0x189f7dc) sizes two pools by, min(n, 3) and n - 3. Without the
+	 * fields n stays 0 and the second request overflows: fatal 386 in the ROM's pool allocator. ath12k sends
+	 * them only when the PHY capability reports single_chip_mlo_support, and this firmware reports 0.
+	 */
+	if (PE_parse_boot_argn("pcie_mlo", &mlo, sizeof(mlo)) && mlo) {
+		request.mlo_capable_valid = request.mlo_capable = 1;
+		request.mlo_chip_id_valid = 1;
+		request.mlo_group_id_valid = 1;
+		request.max_mlo_peer_valid = 1;
+		request.max_mlo_peer = 32;
+		request.mlo_num_chips_valid = 1;
+		request.mlo_num_chips = 1;
+		request.mlo_chip_info_valid = 1;
+		request.mlo_chip_info[0].num_local_links = 2;
+		request.mlo_chip_info[0].hw_link_id[1] = 1;
+		request.mlo_chip_info[0].valid_mlo_link_id[0] = 1;
+		request.mlo_chip_info[0].valid_mlo_link_id[1] = 1;
+		printf("pcie: step 9: single-chip MLO sent: max_mlo_peer %u, 1 chip, 2 links\n", request.max_mlo_peer);
+	}
 	(void)PE_parse_boot_argn("pcie_sleep_clock", clock, sizeof(clock));
 	if (strcmp(clock, "internal") == 0) {
 		request.nm_modem_valid = 1;
@@ -476,7 +578,7 @@ static void
 calibrate(void)
 {
 	struct cal_report_req report = { 0 };
-	struct cal_report_resp report_reply = { 0 };
+	struct result_only report_reply = { 0 };
 	struct qmi_wlanfw_wlan_mode_req_msg_v01 mode = { 0 };
 	struct qmi_wlanfw_wlan_mode_resp_msg_v01 mode_reply = { 0 };
 	uint64_t began;
@@ -489,7 +591,7 @@ calibrate(void)
 	}
 	printf("pcie: step 9: the calibration report says %llu bytes\n", report.download_size);
 	(void)ask("the calibration report", WLFW_CAL_REPORT_REQ, WLFW_CAL_REPORT_REQ_MAX_LEN, cal_report_req_ei, &report,
-	    cal_report_resp_ei, &report_reply, false);
+	    result_only_ei, &report_reply, false);
 	mode.mode = WLFW_MODE_CALIBRATION;
 	mode.hw_debug_valid = 1;
 	if (!ask("the mode: calibration", QMI_WLANFW_WLAN_MODE_REQ_V01, QMI_WLANFW_WLAN_MODE_REQ_MSG_V01_MAX_LEN,
@@ -516,7 +618,7 @@ mhi_pcie_wlfw(void)
 	struct qmi_wlanfw_phy_cap_resp_msg_v01 phy_reply = { 0 };
 	static struct qmi_wlanfw_ind_register_req_msg_v01 ind;
 	struct qmi_wlanfw_ind_register_resp_msg_v01 ind_reply = { 0 };
-	uint32_t want_mission = 0;
+	uint32_t want_mission = 0, want_qdss = 0;
 	int error;
 
 	wlfw.began = now_ms();
@@ -555,8 +657,12 @@ mhi_pcie_wlfw(void)
 		printf("pcie: step 9: stopped at the board data (FW_MEM_READY: %s)\n", wlfw.mem_ready ? "yes" : "no");
 		return;
 	}
+	(void)PE_parse_boot_argn("pcie_qdss", &want_qdss, sizeof(want_qdss));
+	if (want_qdss && !send_qdss()) {
+		return;
+	}
 	if (!wait_for(&wlfw.ready, 10000)) {
-		printf("pcie: step 9: no FW_READY within 10 s of the M3 information\n");
+		printf("pcie: step 9: no FW_READY within 10 s of the %s\n", want_qdss ? "QDSS configuration" : "M3 information");
 		return;
 	}
 	(void)PE_parse_boot_argn("pcie_mission", &want_mission, sizeof(want_mission));

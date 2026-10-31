@@ -502,6 +502,16 @@ probe(struct ath12k_base **out)
 		printf("lx: wifi_hostcap=1: feature list %#llx, no nm_modem\n",
 		    (unsigned long long)cnss2.qmi_cnss_feature_bitmap);
 	}
+	if (lx_os_option("wifi_mlo") == 1) {
+		/*
+		 * Single-chip MLO, as cnss2 runs this chip, so that the host capability carries the MLO fields
+		 * (max_mlo_peer 32, one chip, two links): WLAN.HMT.2.0-02977 sizes its location service's pools by
+		 * max_mlo_peer and fails with fatal 386 when it is absent (bsd/dev/mhi_pcie_wlfw.c, pcie_mlo). ath12k
+		 * takes the bit from the PHY capability, which this firmware reports as 0; the reply only ever sets it.
+		 */
+		ab->single_chip_mlo_support = true;
+		printf("lx: wifi_mlo=1: single-chip MLO, max_mlo_peer %u\n", ab->hw_params->max_mlo_peer);
+	}
 	/* pci.c: ath12k_pci_init_qmi_ce_config() */
 	ab->qmi.ce_cfg.tgt_ce = ab->hw_params->target_ce_config;
 	ab->qmi.ce_cfg.tgt_ce_len = ab->hw_params->target_ce_count;
