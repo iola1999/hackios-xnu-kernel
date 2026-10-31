@@ -85,6 +85,13 @@ linuxkpi_ieee80211_ifattach(struct ieee80211_hw *hw)
 	struct lx_radio *radio = lx_radio_of(hw);
 	char bands[96] = "";
 
+	/*
+	 * ath12k takes the radio's address only from the firmware's ready event (ath11k asks the device first, which
+	 * is the kernel's wifi_mac), and the WCN7850's firmware on this phone has none: the kernel's, then.
+	 */
+	if (is_zero_ether_addr(hw->wiphy->perm_addr)) {
+		(void)lx_os_radio_address(hw->wiphy->perm_addr);
+	}
 	for (unsigned band = 0; band < NUM_NL80211_BANDS; band++) {
 		if (hw->wiphy->bands[band] != NULL) {
 			snprintf(bands + strlen(bands), sizeof(bands) - strlen(bands), " %d in band %u,", hw->wiphy->bands[band]->n_channels,

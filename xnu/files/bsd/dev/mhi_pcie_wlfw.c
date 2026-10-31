@@ -389,7 +389,7 @@ host_capability(void)
 	/*
 	 * pcie_mlo=1: the single-chip MLO fields, with the values cnss2 sends for this chip (KIWI). In
 	 * WLAN.HMT.2.0-02977 max_mlo_peer (offset 0x142 of this message) is copied, through the word at 0x15610f0, to
-	 * the count the location service's start (0x189f7dc) sizes two pools by, min(n, 3) and n - 3. Without the
+	 * the count the location service's start (0x189f7d8) sizes two pools by, min(n, 3) and n - 3. Without the
 	 * fields n stays 0 and the second request overflows: fatal 386 in the ROM's pool allocator. ath12k sends
 	 * them only when the PHY capability reports single_chip_mlo_support, and this firmware reports 0.
 	 */
