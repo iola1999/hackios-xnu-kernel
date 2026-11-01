@@ -629,19 +629,46 @@ lx_management(struct lx_radio *radio, uint8_t *frame, unsigned kind)
 	return (frame + 24);
 }
 
-/* An Ethernet frame, through the driver's data path: the firmware makes 802.11 of it, and ciphers it once there is a key. */
+/*
+ * An Ethernet frame, through the driver's data path. When the interface is in the firmware's Ethernet mode
+ * (IEEE80211_OFFLOAD_ENCAP_ENABLED) the firmware makes 802.11 of it, and ciphers it once there is a key. Otherwise it
+ * goes as mac80211 sends one: a data frame to the access point (QoS data if it has WMM: TID 7 for the handshake, 0 for
+ * the rest), LLC and SNAP before the type, marked protected once there is a key, which the hardware applies. ath12k's
+ * Wi-Fi 7 descriptors take the frame's kind from the interface and not from the frame, and the WCN7850's firmware on
+ * this phone offers no Ethernet mode.
+ */
 bool
 lx_ethernet_send(struct lx_radio *radio, const uint8_t *frame, unsigned length)
 {
+	static const uint8_t llc_snap[6] = { 0xaa, 0xaa, 0x03, 0, 0, 0 };
+	bool ethernet = radio->vif != NULL && (radio->vif->offload_flags & IEEE80211_OFFLOAD_ENCAP_ENABLED);
+	bool qos = radio->sta != NULL && radio->sta->wme;
+	unsigned header = qos ? 26 : 24;
 	struct sk_buff *skb;
 	uint8_t *bytes;
 
-	if (radio->vif == NULL || radio->sta == NULL || (skb = lx_frame_new(radio, length, &bytes)) == NULL) {
+	if (radio->vif == NULL || radio->sta == NULL || length < 14 ||
+	    (skb = lx_frame_new(radio, ethernet ? length : header + 8 + length - 12, &bytes)) == NULL) {
 		radio->sent_lost++;
 		return (false);
 	}
-	memcpy(bytes, frame, length);
-	IEEE80211_SKB_CB(skb)->flags |= IEEE80211_TX_CTL_HW_80211_ENCAP;
+	if (ethernet) {
+		memcpy(bytes, frame, length);
+		IEEE80211_SKB_CB(skb)->flags |= IEEE80211_TX_CTL_HW_80211_ENCAP;
+	} else {
+		bzero(bytes, header);
+		bytes[0] = qos ? 0x88 : 0x08;
+		bytes[1] = 0x01 | (radio->pairwise_key != NULL ? 0x40 : 0);	/* to the access point; protected */
+		memcpy(bytes + 4, radio->target.address, ETH_ALEN);
+		memcpy(bytes + 10, radio->vif->addr, ETH_ALEN);
+		memcpy(bytes + 16, frame, ETH_ALEN);
+		if (qos) {
+			skb->priority = frame[12] == 0x88 && frame[13] == 0x8e ? 7 : 0;
+			bytes[24] = (uint8_t)skb->priority;
+		}
+		memcpy(bytes + header, llc_snap, sizeof(llc_snap));
+		memcpy(bytes + header + 6, frame + 12, length - 12);
+	}
 	IEEE80211_SKB_CB(skb)->control.hw_key = radio->pairwise_key;
 	radio->sent++;
 	lx_frame_send(radio, skb);

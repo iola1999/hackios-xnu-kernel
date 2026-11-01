@@ -876,9 +876,68 @@ lkpi_dma_map_phys(struct device *dev, vm_paddr_t address, size_t length, enum dm
 	return (address);
 }
 
+/*
+ * A buffer of the kernel's heap handed to the radio (dma_map_single(): ath12k's receive queue descriptors, kzalloc()
+ * memory, one for each traffic class of a station it meets). It is copied into a slot of the pool, which the radio is
+ * given instead, and the slot is given back when the buffer is unmapped, copied back first unless the radio was
+ * only to read it. That is enough for ath12k, which does not touch the buffer in between.
+ */
+#define BOUNCES		64
+
+static struct {
+	void *memory;
+	size_t length;
+	uint32_t slot;
+} bounces[BOUNCES];
+static volatile unsigned bounced;		/* (how many are out: most unmaps are the pool's own buffers) */
+
+dma_addr_t
+lkpi_dma_map_single(struct device *dev, void *memory, size_t length, enum dma_data_direction direction, unsigned long attributes)
+{
+	unsigned i;
+
+	if (in_pool(memory, length)) {
+		return (pool.address + ((uint8_t *)memory - pool.memory));
+	}
+	lx_os_lock();
+	for (i = 0; i < BOUNCES && bounces[i].memory != NULL; i++) {
+	}
+	if (length > POOL_SLOT || i == BOUNCES || pool.free_count == 0) {
+		lx_os_unlock();
+		printf("lx: memory is given to the radio that it cannot reach (%zu bytes), and it cannot be copied where it can\n",
+		    length);
+		return (DMA_MAPPING_ERROR);
+	}
+	bounces[i].memory = memory;
+	bounces[i].length = length;
+	bounces[i].slot = pool.free_slots[--pool.free_count];
+	bounced++;
+	lx_os_unlock();
+	memcpy(pool.memory + POOL_RINGS + (size_t)bounces[i].slot * POOL_SLOT, memory, length);
+	return (pool.address + POOL_RINGS + (dma_addr_t)bounces[i].slot * POOL_SLOT);
+}
+
 void
 lkpi_dma_unmap(struct device *dev, dma_addr_t address, size_t length, enum dma_data_direction direction, unsigned long attributes)
 {
+	uint8_t *copy = pool.memory + (address - pool.address);
+
+	if (bounced == 0) {
+		return;
+	}
+	lx_os_lock();
+	for (unsigned i = 0; i < BOUNCES; i++) {
+		if (bounces[i].memory != NULL && copy == pool.memory + POOL_RINGS + (size_t)bounces[i].slot * POOL_SLOT) {
+			if (direction != DMA_TO_DEVICE) {
+				memcpy(bounces[i].memory, copy, bounces[i].length);
+			}
+			pool.free_slots[pool.free_count++] = bounces[i].slot;
+			bounces[i].memory = NULL;
+			bounced--;
+			break;
+		}
+	}
+	lx_os_unlock();
 }
 
 void

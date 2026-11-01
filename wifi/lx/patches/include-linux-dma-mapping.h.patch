@@ -1,0 +1,21 @@
+--- a/sys/compat/linuxkpi/common/include/linux/dma-mapping.h
++++ b/sys/compat/linuxkpi/common/include/linux/dma-mapping.h
+@@ -100,6 +100,8 @@
+     void *addr, dma_addr_t dma_handle);
+ dma_addr_t linux_dma_map_phys(struct device *dev, vm_paddr_t phys, size_t len);	/* backward compat */
+ dma_addr_t lkpi_dma_map_phys(struct device *, vm_paddr_t, size_t,
++    enum dma_data_direction, unsigned long);
++dma_addr_t lkpi_dma_map_single(struct device *, void *, size_t,
+     enum dma_data_direction, unsigned long);
+ void linux_dma_unmap(struct device *dev, dma_addr_t dma_addr, size_t size);	/* backward compat */
+ void lkpi_dma_unmap(struct device *, dma_addr_t, size_t,
+@@ -342,8 +344,7 @@
+ _dma_map_single_attrs(struct device *dev, void *ptr, size_t size,
+     enum dma_data_direction direction, unsigned long attrs)
+ {
+-	return (lkpi_dma_map_phys(dev, vtophys(ptr), size,
+-	    direction, attrs));
++	return (lkpi_dma_map_single(dev, ptr, size, direction, attrs));	/* (the memory itself: it may need copying) */
+ }
+ 
+ static inline void
