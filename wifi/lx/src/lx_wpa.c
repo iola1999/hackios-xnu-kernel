@@ -168,6 +168,22 @@ lx_wpa_pmk(const unsigned char *passphrase, unsigned passphrase_length, const un
 	}
 }
 
+/*
+ * Two bytes of the key's SHA-1, for the log: two joins with the same fingerprint were given the same key. Sixteen
+ * bits of a hash tell nothing usable about the key itself.
+ */
+unsigned
+lx_wpa_fingerprint(const unsigned char pmk[32])
+{
+	struct sha1 s;
+	uint8_t digest[20];
+
+	sha1_begin(&s);
+	sha1_more(&s, pmk, 32);
+	sha1_end(&s, digest);
+	return (unsigned)digest[0] << 8 | digest[1];
+}
+
 /* The standard's PRF: HMAC-SHA1 of (label, a zero byte, data, a counter byte), block after block. */
 static void
 prf(const uint8_t *key, unsigned key_length, const char *label, const uint8_t *data, unsigned data_length, uint8_t *out,

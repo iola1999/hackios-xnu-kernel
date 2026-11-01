@@ -114,7 +114,7 @@ struct apple80211_channels_info {
 	uint8_t unknown_3[3600];
 } __attribute__((packed));
 
-/* SCAN_REQ (10): 5456 bytes */
+/* SCAN_REQ (10): 5456 bytes. iOS 26 sends 5528 whose first 0x1548 are these (fields added at 0x1310 and from 0x154c on) */
 struct apple80211_scan_request {
 	uint32_t version, bss_type;
 	uint8_t bssid[6], unused_0[2];
@@ -133,7 +133,10 @@ struct apple80211_scan_request {
 	uint32_t short_ssid, unused_3;
 };
 
-/* SCAN_RESULT (11) and CURRENT_NETWORK (103): 1164 bytes */
+/*
+ * SCAN_RESULT (11) and CURRENT_NETWORK (103): 1164 bytes. iOS 26 asks with 2272: the same fields, room for 2048
+ * bytes of elements, and fields of its own from 0x8d0 on, which are left 0.
+ */
 struct apple80211_scan_result {
 	uint32_t version;
 	struct apple80211_channel channel;
@@ -163,6 +166,24 @@ struct apple80211_assoc {
 	uint8_t rest[0x250 - 0x88];
 };
 
+/*
+ * ASSOCIATE as iOS 26 sends it: 908 bytes, the two authentication fields 32 bits wide, so everything after them is 4
+ * bytes further on (IO80211's Apple80211AssociateAsync: the name's length at 0x10, the access point at 0x34, the
+ * key's length and kind at 0x40 and 0x44, the key at 0x4c).
+ */
+struct apple80211_assoc_26 {
+	uint32_t version;
+	uint16_t mode, unused_0;
+	uint32_t auth_lower, auth_upper;
+	uint32_t ssid_length;
+	uint8_t ssid[32];
+	uint8_t bssid[6], unused_1[2];
+	uint32_t key_version, key_length, key_cipher;
+	uint16_t key_flags, key_index;
+	uint8_t key[64];
+	uint8_t rest[0x38c - 0x8c];
+};
+
 #define CIPHER_PMK              6
 #define CIPHER_PASSPHRASE       10
 
@@ -179,6 +200,9 @@ struct apple80211_link_changed {
 
 _Static_assert(sizeof(struct apple80211_assoc) == 592 && offsetof(struct apple80211_assoc, key) == 0x48,
     "the association request as iOS 16.5 has it");
+_Static_assert(sizeof(struct apple80211_assoc_26) == 908 && offsetof(struct apple80211_assoc_26, ssid_length) == 0x10 &&
+    offsetof(struct apple80211_assoc_26, bssid) == 0x34 && offsetof(struct apple80211_assoc_26, key_cipher) == 0x44 &&
+    offsetof(struct apple80211_assoc_26, key) == 0x4c, "the association request as iOS 26 has it");
 _Static_assert(sizeof(struct apple80211_link_changed) == 32 && offsetof(struct apple80211_link_changed, reason) == 0x14,
     "the link event as iOS 16.5 reads it");
 _Static_assert(sizeof(struct apple80211_channels) == 4824, "the channel list as iOS 16.5 has it");
@@ -244,7 +268,10 @@ give(const struct apple80211req *request, const void *data, size_t length)
 static int
 give_network(const struct apple80211req *request, const struct redwood_sta_bss *bss)
 {
-	struct apple80211_scan_result *result = kalloc_data(sizeof(*result), Z_WAITOK | Z_ZERO);
+	/* (all the room the caller gave, the part after our fields 0: iOS 26 reads fields of its own there) */
+	size_t size = request->req_len > sizeof(struct apple80211_scan_result) && request->req_len <= 4096 ? request->req_len :
+	    sizeof(struct apple80211_scan_result);
+	struct apple80211_scan_result *result = kalloc_data(size, Z_WAITOK | Z_ZERO);
 	unsigned room = sizeof(result->elements);
 	int error;
 
@@ -278,8 +305,8 @@ give_network(const struct apple80211req *request, const struct redwood_sta_bss *
 			}
 		}
 	}
-	error = give(request, result, sizeof(*result));
-	kfree_data(result, sizeof(*result));
+	error = give(request, result, size);
+	kfree_data(result, size);
 	return error;
 }
 
@@ -462,7 +489,7 @@ set_scan(const struct apple80211req *request, char *said, size_t said_size)
 	unsigned unknown = 0;
 	int error;
 
-	if (request->req_len != sizeof(*asked)) {
+	if (request->req_len < sizeof(*asked)) {
 		return EINVAL;
 	}
 	if (!redwood_sta_present()) {
@@ -511,6 +538,34 @@ out:
 	return error;
 }
 
+/* iOS 26's association request, into the fields of iOS 16.5's that set_join() reads */
+static int
+assoc_26(const struct apple80211req *request, struct apple80211_assoc *asked)
+{
+	struct apple80211_assoc_26 *sent = kalloc_data(sizeof(*sent), Z_WAITOK | Z_ZERO);
+	int error;
+
+	if (sent == NULL) {
+		return ENOMEM;
+	}
+	error = copyin(request->req_data, sent, offsetof(struct apple80211_assoc_26, rest));
+	if (error == 0) {
+		asked->version = sent->version;
+		asked->mode = sent->mode;
+		asked->auth_lower = (uint16_t)sent->auth_lower;
+		asked->auth_upper = (uint16_t)sent->auth_upper;
+		asked->ssid_length = sent->ssid_length;
+		memcpy(asked->ssid, sent->ssid, sizeof(asked->ssid));
+		memcpy(asked->bssid, sent->bssid, sizeof(asked->bssid));
+		asked->key_length = sent->key_length;
+		asked->key_cipher = sent->key_cipher;
+		memcpy(asked->key, sent->key, sizeof(asked->key));
+	}
+	memset_s(sent, sizeof(*sent), 0, sizeof(*sent));
+	kfree_data(sent, sizeof(*sent));
+	return error;
+}
+
 static int
 set_join(const struct apple80211req *request, char *said, size_t said_size)
 {
@@ -523,8 +578,16 @@ set_join(const struct apple80211req *request, char *said, size_t said_size)
 	}
 	asked = kalloc_data(sizeof(*asked), Z_WAITOK | Z_ZERO);
 	what = kalloc_data(sizeof(*what), Z_WAITOK | Z_ZERO);
-	if (asked == NULL || what == NULL || (error = copyin(request->req_data, asked, offsetof(struct apple80211_assoc, rest))) != 0) {
-		error = asked == NULL || what == NULL ? ENOMEM : error;
+	if (asked == NULL || what == NULL) {
+		error = ENOMEM;
+		goto out;
+	}
+	if (request->req_len == sizeof(struct apple80211_assoc_26)) {
+		error = assoc_26(request, asked);
+	} else {
+		error = copyin(request->req_data, asked, offsetof(struct apple80211_assoc, rest));
+	}
+	if (error != 0) {
 		goto out;
 	}
 	/* (lengths and kinds only: the name, the access point and the key stay out of the log) */

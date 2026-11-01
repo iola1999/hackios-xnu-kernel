@@ -29,6 +29,7 @@
 29-iokit%bsddev%IOKitBSDInit.cpp.patch
 30-iokit%conf%files.patch
 31-libkern%conf%files.patch
+31a-libkern%c++%OSKext.cpp.patch
 32-makedefs%MakeInc.cmd.patch
 33-makedefs%MakeInc.def.patch
 34-makedefs%MakeInc.top.patch

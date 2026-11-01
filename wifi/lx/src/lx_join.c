@@ -595,8 +595,9 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
 	radio->wpa.rsn = radio->rsn;
 	radio->wpa.rsn_length = 22;
 	radio->handshake = LX_WPA_NOTHING;
-	printf("lx: the key of the name (%u bytes) and the passphrase (%u bytes; 0: the key itself was given) is there: %llu ms\n",
-	    name_length, what->passphrase_length, (lx_os_nanoseconds() - began) / 1000000ull);
+	printf("lx: the key of the name (%u bytes) and the passphrase (%u bytes; 0: the key itself was given) is there: %llu ms; "
+	    "its fingerprint %04x\n", name_length, what->passphrase_length, (lx_os_nanoseconds() - began) / 1000000ull,
+	    lx_wpa_fingerprint(radio->wpa.pmk));
 
 	/* the access point's address, and its channel, 20 MHz wide */
 	vif->bss_conf.bssid = target->address;

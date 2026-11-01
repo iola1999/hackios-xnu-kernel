@@ -12,6 +12,7 @@
 /* The key ("PMK") of a network's name and passphrase: 32 bytes. Slow on purpose: 8192 rounds of HMAC-SHA1. */
 void lx_wpa_pmk(const unsigned char *passphrase, unsigned passphrase_length, const unsigned char *name, unsigned name_length,
     unsigned char pmk[32]);
+unsigned lx_wpa_fingerprint(const unsigned char pmk[32]);
 
 struct lx_wpa {
 	unsigned char pmk[32];

@@ -386,9 +386,30 @@ linuxkpi_ieee80211_handle_wake_tx_queue(struct ieee80211_hw *hw, struct ieee8021
 {
 }
 
+/*
+ * What became of our own messages of the handshake: an access point that sends message 1 again has not taken
+ * message 2, and only the driver's report tells whether the frame was lost on the air (not acknowledged) or
+ * arrived and was refused. The driver may have taken the QoS field out by now, so the LLC/SNAP header with the
+ * type 0x888e is looked for where either header would leave it.
+ */
+static void
+handshake_sent(const struct sk_buff *skb, const char *what)
+{
+	static const uint8_t eapol[8] = { 0xaa, 0xaa, 0x03, 0, 0, 0, 0x88, 0x8e };
+
+	if (skb == NULL || skb->len < 34 || (skb->data[0] & 0x0c) != 0x08 || (skb->data[1] & 0x40) != 0) {
+		return;
+	}
+	if (memcmp(skb->data + 24, eapol, sizeof(eapol)) == 0 || memcmp(skb->data + 26, eapol, sizeof(eapol)) == 0) {
+		printf("lx: the handshake: our message of %u bytes %s\n", skb->len, what);
+	}
+}
+
 void
 linuxkpi_ieee80211_tx_status(struct ieee80211_hw *hw, struct sk_buff *skb)
 {
+	handshake_sent(skb, IEEE80211_SKB_CB(skb)->flags & IEEE80211_TX_STAT_ACK ? "was acknowledged" :
+	    "WAS NOT ACKNOWLEDGED");
 	dev_kfree_skb_any(skb);
 }
 
@@ -396,6 +417,8 @@ void
 linuxkpi_ieee80211_tx_status_ext(struct ieee80211_hw *hw, struct ieee80211_tx_status *status)
 {
 	if (status->skb != NULL) {
+		handshake_sent(status->skb, status->info != NULL && (status->info->flags & IEEE80211_TX_STAT_ACK) ?
+		    "was acknowledged" : "WAS NOT ACKNOWLEDGED");
 		dev_kfree_skb_any(status->skb);
 	}
 }
@@ -403,6 +426,7 @@ linuxkpi_ieee80211_tx_status_ext(struct ieee80211_hw *hw, struct ieee80211_tx_st
 void
 linuxkpi_ieee80211_free_txskb(struct ieee80211_hw *hw, struct sk_buff *skb, int status)
 {
+	handshake_sent(skb, "WAS DROPPED by the driver");
 	dev_kfree_skb_any(skb);
 }
 

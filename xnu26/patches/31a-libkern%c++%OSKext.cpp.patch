@@ -1,0 +1,18 @@
+diff --git a/libkern/c++/OSKext.cpp b/libkern/c++/OSKext.cpp
+index 186c3a980315..00ad5654e3cc 100644
+--- a/libkern/c++/OSKext.cpp
++++ b/libkern/c++/OSKext.cpp
+@@ -15715,7 +15715,12 @@ OSKext::foreachKextInBacktrace(
+ 		IOLockLock(sKextSummariesLock);
+ 	}
+ 
+-	for (uint32_t i = 0; i < gLoadedKextSummaries->numSummaries; ++i) {
++	/*
++	 * No kext has loaded on this kernel, so there is no summary table. Trap telemetry walks
++	 * it for every event it submits (telemetry_backtrace_add_kexts), and a late UBSAN or
++	 * timeout event reached here and took a data abort at 0x8.
++	 */
++	for (uint32_t i = 0; gLoadedKextSummaries != NULL && i < gLoadedKextSummaries->numSummaries; ++i) {
+ 		OSKextLoadedKextSummary * summary;
+ 
+ 		summary = gLoadedKextSummaries->summaries + i;
