@@ -116,7 +116,13 @@ void
 RedwoodBattery::report(const struct redwood_battery_state * b)
 {
 	int percent = (b->percent_hundredths + 50) / 100;
-	bool charging = b->external && b->status == 1;          /* POWER_SUPPLY_STATUS_CHARGING */
+	/*
+	 * Charging means plugged in and the battery not feeding the phone, as an iPhone and Android show it:
+	 * near full the charger stops (POWER_SUPPLY_STATUS_NOT_CHARGING) until the recharge threshold, and
+	 * with only STATUS_CHARGING counted the status bar lost its bolt at 99% on a charger. On the K90
+	 * both fields come from the fuel gauge's current (annibale_battery.c).
+	 */
+	bool charging = b->external && b->status != 2;          /* not POWER_SUPPLY_STATUS_DISCHARGING */
 
 	percent = percent < 0 ? 0 : percent > 100 ? 100 : percent;
 	setBatteryInstalled(b->present != 0);
@@ -227,4 +233,13 @@ RedwoodBatteryReport(const void * state, unsigned size)
 		return;
 	}
 	battery->report(b);
+	/* each change of charger or charging state, to tell a charger that drops out from one that stops charging */
+	static int32_t external = -1, status = -1;
+	if (b->external != external || b->status != status) {
+		external = b->external;
+		status = b->status;
+		IOLog("RedwoodBattery: %d%%, %s, status %d, %d mA; USB type %d, %d mV, %d mA\n", (b->percent_hundredths + 50) / 100,
+		    b->external ? "on a charger" : "not on a charger", b->status, b->current_ua / 1000, b->usb_type,
+		    b->usb_voltage_uv / 1000, b->usb_current_ua / 1000);
+	}
 }

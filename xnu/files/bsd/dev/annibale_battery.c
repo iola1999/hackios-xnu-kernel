@@ -175,10 +175,13 @@ sample(void)
 	state.present = 1;
 	/* Current confirms energy flow; USB connection and limits need a separate source. On USB
 	 * near full charge the gauge reads within a few tens of mA of 0 either way (+17 mA once in
-	 * kernel-12377-cmd47-bo42), and one such sample made iOS show "Charging" for 5 seconds, so
-	 * flow under CHARGE_FLOW_UA counts as none. */
+	 * kernel-12377-cmd47-bo42), so flow under CHARGE_FLOW_UA counts as none. Running iOS draws
+	 * hundreds of mA from the battery, so a battery that is not being drained is on external power:
+	 * a charger that holds a full battery shows as plugged in and not charging (status 3), which
+	 * RedwoodBattery reports as charging, as an iPhone shows it. A supply weaker than the phone's
+	 * draw (a computer's USB port) still reads as discharging. */
 	state.status = state.current_ua > CHARGE_FLOW_UA ? 1 : state.current_ua < -CHARGE_FLOW_UA ? 2 : 3;
-	state.external = state.current_ua > CHARGE_FLOW_UA;
+	state.external = state.current_ua >= -CHARGE_FLOW_UA;
 	state.charge_uah = values[4] * 1000;
 	state.full_uah = values[5] * 1000;
 	state.design_uah = values[6] * 1000;
