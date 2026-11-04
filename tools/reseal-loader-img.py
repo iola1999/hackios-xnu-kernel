@@ -6,8 +6,8 @@ usage: reseal-loader-img.py REFERENCE.img PAYLOAD.bin -o OUT.img
 The slot-booted loader images (handoff-loader-v6 and later) are an Android boot image, header
 version 1, whose kernel is gzip(BootShim + UEFI FD + XNUP container) followed by the merged
 DTB. Everything except the container is taken from REFERENCE byte for byte: the legacy 176-byte
-BootShim, the FD, the DTB (an image with any other tail returns to LK about 7 s after the jump,
-docs/plan/2026-10-25-session-handoff.md section 4) and the ramdisk bytes. mkxnuimg.py builds the
+BootShim, the FD, the DTB (an image with any other tail returns to LK about 7 s after the jump)
+and the ramdisk bytes. mkxnuimg.py builds the
 shim from the current BootShim.S instead, which is a different shim.
 
 The container is padded to 16 bytes: the legacy shim copies its size rounded up to 16. The gzip

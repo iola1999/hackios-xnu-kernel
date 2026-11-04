@@ -2,7 +2,7 @@
 
 > **REDMI K90 移植分支：`k90-port`。** 本仓库基于 [OOSEX GANG 的原内核仓库](https://github.com/oosexgang/hackios-xnu-kernel)，保留其 Git 历史并维护 annibale 适配。感谢原作者及贡献者开放 XNU 移植、EFI loader、固件集成、驱动和构建工具。本项目的修改建立在这些工作之上。
 
-本项目由三个仓库组成：[顶层工作区](https://github.com/iola1999/hackios-k90-port)保存计划、实测和子模块版本，本仓库维护内核侧修改，[K90 用户态仓库](https://github.com/iola1999/hackios-xnu-userland/tree/k90-port)维护用户态及镜像工具。本仓库已建立与上游的 GitHub fork 关系，默认分支为 `k90-port`。原许可证和版权声明保留。下文继承原项目的 POCO X5 Pro／QEMU 说明，K90 的实际验证范围以顶层工作区文档为准。
+本项目由三个仓库组成：[顶层工作区](https://github.com/iola1999/hackios-redmi-k90-annibale)保存计划、实测和子模块版本，本仓库维护内核侧修改，[K90 用户态仓库](https://github.com/iola1999/hackios-xnu-userland/tree/k90-port)维护用户态及镜像工具。annibale 的 UEFI 源码在 [hackios-mu-silicium](https://github.com/iola1999/hackios-mu-silicium) 的 `k90-port` 分支，克隆到本仓库的 `Mu-Silicium/` 后由 `mkxnuimg.py` 使用。本仓库已建立与上游的 GitHub fork 关系，默认分支为 `k90-port`。原许可证和版权声明保留。下文继承原项目的 POCO X5 Pro／QEMU 说明，K90 的实际验证范围以顶层工作区文档为准。
 
 建立本分支的构建树时，克隆本仓库的 `k90-port`，并向 `common/setup.sh` 显式传入 `USERLAND_URL=https://github.com/iola1999/hackios-xnu-userland.git USERLAND_REF=k90-port`。该脚本会将 userland 放入同一工作树，以 `.userland.git` 管理；下文的上游快速开始命令保留其原始来源。
 

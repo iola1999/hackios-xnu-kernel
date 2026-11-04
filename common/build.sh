@@ -12,8 +12,7 @@
 #                                                                  (-DDIRECT_PHONE_PLAT for phones:
 #                                                                  that build writes only
 #                                                                  xnuloader/loader-phone.efi and
-#                                                                  never touches loader.efi,
-#                                                                  playbook trap 9)
+#                                                                  never touches loader.efi)
 #   3. images   userland/build.sh (REST=1 and the profile's USERLAND_VARS)
 #                                                               -- needs ios165/fetch.sh to have run
 #   4. boot     mkxnuimg.py -> out/<device>-boot.img             -- phones: the UEFI image for `fastboot boot`
@@ -66,7 +65,7 @@ if ! skip boot && [ "$KIND" = phone ]; then
 	# the UEFI with the loader inside, the way `xl enter` makes it: the loader then brings up its USB link
 	# The image carries the variant the profile asked for. A phone that needs the phone macros
 	# never falls back to the generic prebuilt -- wrong-platform loader bytes boot-loop silently
-	# (trap 9), so here they are refused out loud (F04).
+	# (in QEMU the kernel hangs at 616 bytes), so here they are refused out loud (F04).
 	L=xnuloader/$LOADER_OUT
 	if [ ! -f $L ] && [ $LOADER_OUT = loader.efi ] && [ -f prebuilt/loader.efi ]; then
 		L=prebuilt/loader.efi

@@ -1187,7 +1187,7 @@ struct gem_close { uint32_t handle, pad; };
 	 * Diagnostic only, paired with the kernel's `redwood: <comm> bad access at ... pc ...` line
 	 * (e933479): without this address the pc cannot be attributed to an image, because the dylib is
 	 * position independent and its slide differs per process. Kept while the nil-buffer line is
-	 * suspended -- docs/plan/2026-10-28-widget-stall-control-round.md section 3.80.
+	 * suspended.
 	 *
 	 * Behind REDWOOD_DIAG like every other print that exists only for one investigation: with the
 	 * variable unset the load prints nothing, so turning a diagnostic on does not change the library

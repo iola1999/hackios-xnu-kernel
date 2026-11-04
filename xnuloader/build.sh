@@ -3,7 +3,7 @@
 # EXTRA_CFLAGS=-DDIRECT_PHONE_PLAT builds the phone image: a framebuffer that
 # matches no table entry selects platform_annibale instead of QEMU's ramfb.
 #
-# The variants are separate files on purpose (review F04, playbook trap 9: feeding the phone
+# The variants are separate files on purpose (review F04: feeding the phone
 # loader to QEMU hangs the kernel at 616 bytes): a phone build writes only loader-phone.efi and
 # never touches loader.efi, so a QEMU run cannot pick up phone macros by accident. The default
 # build writes loader.efi -- the name every consumer already uses -- and drops an identical
