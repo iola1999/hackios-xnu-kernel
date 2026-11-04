@@ -1,50 +1,15 @@
-# UEFI for redwood
+# uefi/：Mu-Silicium 的覆盖文件
 
-A port of [Project Silicium / Mu-Silicium](https://github.com/Project-Silicium/Mu-Silicium) to the POCO X5 Pro 5G
-(redwood). The device is not upstream; the port follows `lisa` (the same SoC package, `KodiakPkg`).
+K90（annibale）的 UEFI 源码在 [hackios-mu-silicium](https://github.com/iola1999/hackios-mu-silicium) 的 `k90-port` 分支，克隆到 `Mu-Silicium/` 后直接构建，不经过本目录的 `apply.sh`。构建步骤见顶层工作区的 [annibale UEFI 与 loader 镜像构建](https://github.com/iola1999/hackios-redmi-k90-annibale/blob/main/docs/analysis/annibale-uefi-build.md)。
 
-You do not need to rebuild the UEFI to run HackiOS -- a ready image is in `prebuilt/uefi`, and `mkxnuimg.py`
-takes it by itself.
+本目录与 K90 有关的部分：
 
-What is here:
+- `files/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/XnuLoader.[ch]`：从载荷启动 `loader.efi`，没有可启动的载荷或 loader 返回时冷重启。两个文件与 Mu 仓库 `k90-port` 的同名文件逐字节相同，`tools/test-xnu-payload-terminal.py` 检查一致性和控制流。
+- `annibale/`：annibale 专属文件的维护副本，见 [annibale/README.md](annibale/README.md)。
+- `mu-silicium.patch`：BootShim（把 UEFI 镜像后面的 XNUP 容器复制到 `0xF0000000`）与 BootManagerLib（不进启动菜单，改为启动载荷里的 loader）的改动，Mu 仓库的 `k90-port` 已包含。
 
-- `BASE` -- the Mu-Silicium commit the port is made on;
-- `mu-silicium.patch` -- changes to existing files:
-  `BootShim/BootShim.S` (copies our "XNUP" container, which follows the UEFI image, to 0xF0000000),
-  `BootManagerLib` (starts the XNU loader from the container instead of the boot menu);
-- `files/` -- new files: `Platforms/Xiaomi/redwoodPkg` (memory map, driver list),
-  `Silicon/.../BootManagerLib/XnuLoader.[ch]`, `Resources/Configs/redwood.toml`, `Resources/DTBs/redwood.dtb`
-  (the device tree from the phone's vendor_boot), `Binaries/redwood` (UEFI drivers from the firmware
-  `OS1.0.3.0.UMSMIXM`, extracted with [UEFIReader](https://github.com/WOA-Project/UEFIReader) from `xbl.img`,
-  with Silicium's five usual patches -- see `files/Binaries/redwood/README.md`).
+其余内容来自上游的 POCO X5 Pro（redwood）移植，本分支不维护：
 
-## Building
-
-Packages as in Mu-Silicium's `setup_env.sh` (on Arch: `git base-devel lld nasm clang llvm aarch64-linux-gnu-gcc
-python python-pip python-virtualenv`).
-
-```sh
-uefi/apply.sh                                   # clones Mu-Silicium (with submodules, ~3 GB) and applies the port
-python3 -m venv venv && venv/bin/pip install -r Mu-Silicium/pip-requirements.txt
-cd Mu-Silicium
-source ../venv/bin/activate
-python3 build_uefi.py -d redwood -r RELEASE     # -> Build/redwoodPkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd
-```
-
-A pitfall: the `mu_nasm` dependency is installed through NuGet and needs Mono. To do without Mono, put the
-system nasm in its place:
-
-```sh
-D=Mu_Basecore/BaseTools/Bin/mu_nasm_extdep
-mkdir -p $D/Linux-x86-64
-echo 'version: 20016.1.1' > $D/extdep_state.yaml
-ln -s /usr/bin/nasm /usr/bin/ndisasm $D/Linux-x86-64/
-```
-
-After a build, `mkxnuimg.py` (called by `./xl enter` and `common/build.sh`) takes the UEFI from `Mu-Silicium/`,
-and `tools/update-prebuilt.sh` refreshes `prebuilt/uefi`.
-
-`uefi/export.sh` is the reverse: save the changes made in `Mu-Silicium/` back here.
-
-A build from scratch by these instructions has not been re-run since (the tree was built along the way while
-the port was made). For a port to another phone, see `docs/PORTING.md`.
+- `BASE` 是 redwood 移植所基于的 Mu-Silicium 提交。`apply.sh` 克隆 Mu-Silicium、应用 `mu-silicium.patch` 并复制 `files/`；`export.sh` 把 `Mu-Silicium/` 里的修改导回本目录。不要对 annibale 工作树运行这两个脚本。
+- `files/Platforms/Xiaomi/redwoodPkg`、`files/Resources/` 与 `files/Binaries/redwood` 是 redwood 的平台描述、设备树和 UEFI 驱动，驱动来源见 [files/Binaries/redwood/README.md](files/Binaries/redwood/README.md)。
+- 新机型的移植步骤见 [docs/PORTING.md](../docs/PORTING.md)。
