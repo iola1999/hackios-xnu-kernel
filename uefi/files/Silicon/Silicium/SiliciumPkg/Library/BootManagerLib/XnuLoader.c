@@ -5,9 +5,8 @@
   (see XnuLoader.h) to a fixed reserved address; if it carries "loader.efi",
   the image is started straight from memory so the loader can be iterated on
   without rebuilding this firmware. XnuLoaderMain does not return: a missing,
-  invalid or returned-from payload ends in a local CPU halt with no firmware,
-  console or storage call, so a failed boot stays dark and recovery is the
-  agreed physical power-cycle.
+  invalid or returned-from payload ends in a cold reset, with no console or
+  storage call before it, so the device boots again without a key press.
 
   SPDX-License-Identifier: BSD-2-Clause-Patent
 **/
@@ -16,6 +15,7 @@
 
 #include <Library/BaseLib.h>
 #include <Library/UefiBootServicesTableLib.h>
+#include <Library/UefiRuntimeServicesTableLib.h>
 
 #include "XnuLoader.h"
 
@@ -25,17 +25,19 @@ __attribute__((noreturn))
 STATIC
 VOID
 EFIAPI
-XnuTerminalHalt (
+XnuTerminalReset (
   VOID
   )
 {
   //
-  // Stops this CPU only: other cores, submitted DMA and the watchdog keep
-  // running, so this is not a whole-system quiesce. Masking DAIF is a system
-  // register write; no MMIO and no firmware call follow it and no path here
-  // returns. A synchronous exception taken after the mask still depends on
-  // the exception environment and is not converted by this loop.
+  // Nothing is written to storage before the reset: the loader image is on a
+  // boot partition (boot_a on annibale), and a log written there would damage
+  // the image the next boot reads. ResetSystem does not return when the reset
+  // is taken; if it does, this CPU stops with interrupts masked and only a
+  // long press of the power key brings the device back.
   //
+  gRT->ResetSystem (EfiResetCold, EFI_SUCCESS, 0, NULL);
+
   __asm__ volatile ("msr daifset, #0xf" ::: "memory");
 
   for (;;) {
@@ -121,5 +123,5 @@ XnuLoaderMain ()
   // returned -- StartImage returning EFI_SUCCESS is included, because a
   // payload that keeps running never comes back here.
   //
-  XnuTerminalHalt ();
+  XnuTerminalReset ();
 }

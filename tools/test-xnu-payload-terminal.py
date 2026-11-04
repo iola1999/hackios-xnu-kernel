@@ -3,27 +3,29 @@
 
 The real XnuLoader.c and XnuLoader.h are compiled and run: only the #include
 lines are dropped and the block between the XNU-TERM markers is replaced by a
-halt that records the event and longjmps, so a host process can observe what
-the production control flow did. Everything between the markers is checked
-before the swap (DAIF mask, self-loop, no calls), and the swap itself must
-find the markers exactly once. Payload, Boot Services and Runtime Services are
-host stubs that record every call in order; LocateHandleBuffer, HandleProtocol,
-GetMemoryMap, LocateProtocol, SetWatchdogTimer, ResetSystem, SetVariable, GetTime,
-AsciiVSPrint and the allocators count as forbidden. Nineteen scenarios cover a
+stand-in that records the event and longjmps, so a host process can observe
+what the production control flow did. Everything between the markers is
+checked before the swap (one cold ResetSystem, then the DAIF mask and the
+self-loop, no Boot Services call), and the swap itself must find the markers
+exactly once. Outside the block, payload, Boot Services and Runtime Services
+are host stubs that record every call in order; LocateHandleBuffer,
+HandleProtocol, GetMemoryMap, LocateProtocol, SetWatchdogTimer, ResetSystem,
+SetVariable, GetTime, AsciiVSPrint and the allocators count as forbidden, so
+no storage write and no reset happens before the terminal block. Nineteen scenarios cover a
 missing, bad, oversized, empty, truncated, out-of-range and zero-size payload,
 a non-16-byte-aligned entry before the loader, the declared body at the
 container cap minus the header, one byte past it and the whole container size,
 entry data ending exactly at End and one byte short of it, LoadImage failure,
 StartImage returning success or an error, StartImage that never returns, and a
 container built from independent "XNUP" wire bytes. Eight mutations prove the
-checks bite: making the halt return must show XnuLoaderMain returning,
+checks bite: making the terminal return must show XnuLoaderMain returning,
 re-inserting one diagnostic write must show a forbidden call, dropping the
 magic check, the size cap, the 16-byte entry padding or stepping by a fixed 24
 bytes must each break the scenario suite, dropping the header subtraction from
 the size cap must accept an over-by-one body, and retargeting the magic macro
-in the header must reject the independent wire bytes. The AArch64 halt body
-itself is verified by cross disassembly outside this test; the host run carries
-no hardware semantics.
+in the header must reject the independent wire bytes. The terminal body
+itself (the ResetSystem call and the fallback loop) only gets the text checks
+above; the host run carries no firmware or hardware semantics.
 
 The Mu-Silicium root under test is optional argv[1] or $MU_SILICIUM_ROOT and
 defaults to <kernel-root>/Mu-Silicium, so the test also runs from this tracked
@@ -201,7 +203,7 @@ __attribute__((noreturn))
 STATIC
 VOID
 EFIAPI
-XnuTerminalHalt (
+XnuTerminalReset (
   VOID
   )
 {
@@ -307,7 +309,7 @@ static void call_main(void)
     int code = setjmp(g_jmp);
     if (code == 0) {
         XnuLoaderMain();
-        g_returned = 1;      /* code 0: the halt fell through, code 2: payload is running */
+        g_returned = 1;      /* code 0: the terminal fell through, code 2: payload is running */
     }
 }
 
@@ -375,10 +377,13 @@ def assemble(c_source, header_source, terminal, main_returned_mutation=False, lo
              parse_mutation=None, header_mutation=None):
     body = "\n".join(l for l in c_source.splitlines() if not l.startswith("#include"))
     beg, end = body.index(BEG), body.index(END) + len(END)
-    for probe in ("daifset", "for (;;)"):
-        assert probe in body[beg:end], "terminal block lost %s" % probe
-    for absent in ("gBS->", "ResetSystem", "SetVariable", "CpuDeadLoop"):
-        assert absent not in body[beg:end], "terminal block calls %s" % absent
+    block = body[beg:end]
+    for probe in ("gRT->ResetSystem (EfiResetCold, ", "daifset", "for (;;)"):
+        assert probe in block, "terminal block lost %s" % probe
+    assert block.count("->ResetSystem") == 1, "terminal block resets more than once"
+    assert block.index("->ResetSystem") < block.index("msr daifset"), "terminal block masks before the reset"
+    for absent in ("gBS->", "SetVariable", "CpuDeadLoop"):
+        assert absent not in block, "terminal block calls %s" % absent
     if parse_mutation:
         old, new, _ = {**PARSE_MUTATIONS, **BOUNDARY_MUTATIONS}[parse_mutation]
         assert body.count(old) == 1, "mutation %s: %d copies of its anchor in production source" % (
@@ -391,10 +396,10 @@ def assemble(c_source, header_source, terminal, main_returned_mutation=False, lo
         header_source = header_source.replace(old, new)
     body = body[:beg] + terminal + body[end:]
     if log_write_mutation:
-        assert body.count("  XnuTerminalHalt ();") == 1
-        body = body.replace("  XnuTerminalHalt ();", "  ProbeLogWrite ();\n  XnuTerminalHalt ();")
+        assert body.count("  XnuTerminalReset ();") == 1
+        body = body.replace("  XnuTerminalReset ();", "  ProbeLogWrite ();\n  XnuTerminalReset ();")
     if main_returned_mutation:
-        body = body.replace(TERMINAL, "STATIC\nVOID\nEFIAPI\nXnuTerminalHalt (\n  VOID\n  )\n{\n  g_term_count++;\n  Record(\"TERMINAL\");\n}\n")
+        body = body.replace(TERMINAL, "STATIC\nVOID\nEFIAPI\nXnuTerminalReset (\n  VOID\n  )\n{\n  g_term_count++;\n  Record(\"TERMINAL\");\n}\n")
         header_source = header_source.replace("__attribute__((noreturn))\nVOID\nXnuLoaderMain ();", "VOID\nXnuLoaderMain ();")
     return ("#define XNU_HOST_MAX ((UINTN)%sULL)\n" % host_constants(header_source)
             + PRELUDE + header_source + "\n#undef XNU_PAYLOAD_BASE\n#define XNU_PAYLOAD_BASE ((UINTN)g_payload)\n" + body + SCENARIOS)
@@ -450,12 +455,18 @@ def main():
     header_source = tree_bytes("XnuLoader.h").decode()
     inf = tree_bytes("BootManagerLib.inf").decode()
 
-    # wiring: the diagnostics tail is gone and the halt is a plain masked loop
+    # wiring: no diagnostics tail, and Runtime Services appear only in the
+    # terminal block, as one cold reset
     ck(c_source.count(BEG) == 1 and c_source.count(END) == 1, "terminal_markers_once")
-    for gone in ("FlushLog", "FindPartition", "ResetSystem", "SetVariable", "BlockIo", "PartitionInfo",
-                 "AllocateZeroPool", "AsciiVSPrint", "GetTime", "gRT", "LOG_SIZE", "mLog", "wfi", "wfe"):
+    for gone in ("FlushLog", "FindPartition", "SetVariable", "BlockIo", "PartitionInfo",
+                 "AllocateZeroPool", "AsciiVSPrint", "GetTime", "LOG_SIZE", "mLog", "wfi", "wfe"):
         ck(gone not in c_source, "%s_removed" % gone)
-    ck(c_source.count("XnuTerminalHalt") == 2, "one_halt_definition_and_call")
+    if c_source.count(BEG) == 1 and c_source.count(END) == 1:
+        block = c_source[c_source.index(BEG):c_source.index(END)]
+        outside = c_source.replace(block, "")
+        ck("gRT" not in outside and "ResetSystem" not in outside, "runtime_services_only_in_terminal")
+        ck(block.count("gRT->ResetSystem (EfiResetCold, ") == 1, "terminal_resets_cold_once")
+    ck(c_source.count("XnuTerminalReset") == 2, "one_terminal_definition_and_call")
     ck(c_source.count("StartPayloadLoader") == 2, "one_loader_definition_and_call")
     ck("XNU_LOG_PARTITION" not in header_source and "XNU_MARKER_MAGIC" not in header_source, "header_diagnostics_gone")
     ck("__attribute__((noreturn))\nVOID\nXnuLoaderMain ();" in header_source, "header_declares_noreturn")
@@ -479,7 +490,7 @@ def main():
                 ck(" forbidden=0 " in line, "no_forbidden_calls")
 
         m1 = compile_run(assemble(c_source, header_source, TERMINAL, main_returned_mutation=True), "mut-return", workdir)
-        ck(m1.returncode != 0 and "FAIL missing_magic_returned" in m1.stdout, "mutation_removed_halt_caught")
+        ck(m1.returncode != 0 and "FAIL missing_magic_returned" in m1.stdout, "mutation_removed_terminal_caught")
 
         m2 = compile_run(assemble(c_source, header_source, TERMINAL, log_write_mutation=True), "mut-write", workdir)
         ck(m2.returncode != 0 and "FAIL missing_magic_forbidden" in m2.stdout, "mutation_diagnostic_write_caught")
