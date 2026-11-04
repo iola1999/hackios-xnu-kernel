@@ -27,11 +27,13 @@
 #include "ce.h"
 #include "debug.h"
 #include "dp.h"
+#include "dp_peer.h"
 #include "hal.h"
 #include "hif.h"
 #include "pci.h"
 #include "qmi.h"
 #include "wifi7/core.h"
+#include "wifi7/hal_desc.h"
 #include "wifi7/hw.h"
 
 #include <lx_os.h>
@@ -184,9 +186,12 @@ bus_write32(struct ath12k_base *ab, u32 offset, u32 value)
  * nothing comes; again at once while a group has used up what it was allowed in one go.
  */
 /*
- * The WMI endpoint's receive callback, wrapped once the endpoint is there: an event of the STATS group that
- * ath12k does not handle (0x16005, which the firmware sends right after WMI_INIT) is said in hex before
- * ath12k gets it. ath12k_wmi_op_rx() is static; its address comes from the endpoint.
+ * The WMI endpoint's receive callback, wrapped once the endpoint is there: some events are said in hex before
+ * ath12k gets them. Those of the STATS group, which ath12k does not handle (0x16005, which the firmware sends
+ * right after WMI_INIT); the answer to ath12k's hardware mode request and the firmware's own change of mode
+ * (seen at the first vdev start at 5 GHz), neither of which ath12k reads: old and new mode, and which MAC each
+ * vdev is on; and each vdev start response, which names the MAC the vdev was started on. ath12k_wmi_op_rx() is
+ * static; its address comes from the endpoint.
  */
 static void (*wmi_rx)(struct ath12k_base *, struct sk_buff *);
 
@@ -196,7 +201,8 @@ wmi_rx_said(struct ath12k_base *ab, struct sk_buff *skb)
 	u32 id = skb->len >= sizeof(struct wmi_cmd_hdr) ?
 	    le32_get_bits(((struct wmi_cmd_hdr *)skb->data)->cmd_id, WMI_CMD_HDR_CMD_ID) : 0;
 
-	if ((id >> 12) == WMI_GRP_STATS) {
+	if ((id >> 12) == WMI_GRP_STATS || id == WMI_PDEV_SET_HW_MODE_RESP_EVENTID || id == WMI_PDEV_HW_MODE_TRANSITION_EVENTID ||
+	    id == WMI_VDEV_START_RESP_EVENTID) {
 		printf("lx: WMI event %#x, %u bytes:\n", id, skb->len);
 		for (unsigned at = 0; at < skb->len && at < 1024; at += 32) {
 			char line[3 * 32 + 1];
@@ -227,6 +233,109 @@ wmi_rx_wrap(struct ath12k_base *ab)
 	}
 }
 
+/*
+ * What becomes of the frames given to the data path, as the chip has them, read before ath12k takes the
+ * completions: each descriptor put on a TCL ring, with how far the chip has read that ring and the peers the
+ * firmware has mapped (the descriptor names its peer by AST index and hash); and each completion, with the block
+ * that gave the frame back (TQM, or the firmware), its reason (enum hal_wbm_tqm_rel_reason, or for the firmware
+ * enum hal_wbm_htt_tx_comp_status), how many times it was sent, and for which peer and traffic class. It is for
+ * the first join after a start, whose message 2 of the handshake can stay queued until the vdev is stopped: this
+ * says where it waits. The first TX_SAID_MOST lines only.
+ */
+#define TX_SAID_MOST	64
+
+static struct {
+	u32 queued[DP_TCL_NUM_RING_MAX];	/* each TCL ring's head as last looked at, in words */
+	u32 done[DP_TCL_NUM_RING_MAX];		/* each completion ring's, likewise */
+	unsigned said;
+} watch;
+
+static void
+say_peers(struct ath12k_dp *dp)
+{
+	struct ath12k_dp_link_peer *peer;
+	char line[240] = "";
+
+	spin_lock_bh(&dp->dp_lock);
+	list_for_each_entry(peer, &dp->peers, list) {
+		snprintf(line + strlen(line), sizeof(line) - strlen(line), " %d (AST index %u, hash %u, vdev %d%s)", peer->peer_id,
+		    peer->hw_peer_id, peer->ast_hash, peer->vdev_id, peer->sta != NULL ? ", a station" : "");
+	}
+	spin_unlock_bh(&dp->dp_lock);
+	printf("lx:   the peers mapped:%s\n", line[0] != 0 ? line : " none");
+	watch.said++;
+}
+
+static void
+tx_watch(struct ath12k_base *ab)
+{
+	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
+	unsigned long long ms = lx_os_nanoseconds() / 1000000ull;
+
+	for (unsigned i = 0; i < dp->hw_params->max_tx_ring && i < DP_TCL_NUM_RING_MAX; i++) {
+		struct hal_srng *tcl = &dp->hal->srng_list[dp->tx_ring[i].tcl_data_ring.ring_id];
+		struct hal_srng *done = &dp->hal->srng_list[dp->tx_ring[i].tcl_comp_ring.ring_id];
+		bool queued = false;
+		u32 head, at;
+
+		if (!tcl->initialized || !done->initialized) {
+			continue;
+		}
+		for (;;) {
+			struct hal_tcl_data_cmd d;
+			u32 read;
+
+			spin_lock_bh(&tcl->lock);
+			head = tcl->u.src_ring.hp;
+			read = READ_ONCE(*tcl->u.src_ring.tp_addr);
+			if ((at = watch.queued[i]) != head) {
+				memcpy(&d, tcl->ring_base_vaddr + at, sizeof(d));
+				watch.queued[i] = (at + tcl->entry_size) % tcl->ring_size;
+			}
+			spin_unlock_bh(&tcl->lock);
+			if (at == head || watch.said >= TX_SAID_MOST) {
+				break;
+			}
+			printf("lx: tx at %llu ms: ring %u, entry %u queued (the chip has read to %u): bank %u, metadata %#x, %u bytes%s%s, "
+			    "vdev %u, pmac %u, tid %u, AST index %u, hash %u\n", ms, i, at / tcl->entry_size, read / tcl->entry_size,
+			    (unsigned)le32_get_bits(d.info0, HAL_TCL_DATA_CMD_INFO0_BANK_ID),
+			    (unsigned)le32_get_bits(d.info1, HAL_TCL_DATA_CMD_INFO1_CMD_NUM),
+			    (unsigned)le32_get_bits(d.info2, HAL_TCL_DATA_CMD_INFO2_DATA_LEN),
+			    le32_get_bits(d.info0, HAL_TCL_DATA_CMD_INFO0_DESC_TYPE) ? " behind an extension descriptor" : "",
+			    le32_get_bits(d.info2, HAL_TCL_DATA_CMD_INFO2_TO_FW) ? ", to the firmware" : "",
+			    (unsigned)le32_get_bits(d.info3, HAL_TCL_DATA_CMD_INFO3_VDEV_ID),
+			    (unsigned)le32_get_bits(d.info3, HAL_TCL_DATA_CMD_INFO3_PMAC_ID),
+			    (unsigned)le32_get_bits(d.info3, HAL_TCL_DATA_CMD_INFO3_TID),
+			    (unsigned)le32_get_bits(d.info4, HAL_TCL_DATA_CMD_INFO4_SEARCH_INDEX),
+			    (unsigned)le32_get_bits(d.info4, HAL_TCL_DATA_CMD_INFO4_CACHE_SET_NUM));
+			watch.said++;
+			queued = true;
+		}
+		if (queued && watch.said < TX_SAID_MOST) {
+			say_peers(dp);
+		}
+
+		/* (the chip writes a completion before it moves the head; ath12k takes them later in this same pass) */
+		head = READ_ONCE(*done->u.dst_ring.hp_addr);
+		dma_rmb();
+		for (at = watch.done[i]; at != head && watch.said < TX_SAID_MOST; at = (at + done->entry_size) % done->ring_size) {
+			const struct hal_wbm_completion_ring_tx *c = (const void *)(done->ring_base_vaddr + at);
+			u32 source = le32_get_bits(c->info0, HAL_WBM_COMPL_TX_INFO0_REL_SRC_MODULE);
+
+			printf("lx: tx at %llu ms: ring %u, a completion: given back by %s, reason %u, sent %u times, peer %u, tid %u "
+			    "(the chip has read the ring to %u of %u)\n", ms, i, source == HAL_WBM_REL_SRC_MODULE_TQM ? "TQM" :
+			    source == HAL_WBM_REL_SRC_MODULE_FW ? "the firmware" : "another block",
+			    (unsigned)le32_get_bits(c->info0, HAL_WBM_COMPL_TX_INFO0_TQM_RELEASE_REASON),
+			    (unsigned)le32_get_bits(c->info1, HAL_WBM_COMPL_TX_INFO1_TRANSMIT_COUNT),
+			    (unsigned)le32_get_bits(c->info3, HAL_WBM_COMPL_TX_INFO3_PEER_ID),
+			    (unsigned)le32_get_bits(c->info3, HAL_WBM_COMPL_TX_INFO3_TID),
+			    READ_ONCE(*tcl->u.src_ring.tp_addr) / tcl->entry_size, tcl->u.src_ring.hp / tcl->entry_size);
+			watch.said++;
+		}
+		watch.done[i] = head;
+	}
+}
+
 static void
 bus_looks(void *argument)
 {
@@ -246,6 +355,9 @@ bus_looks(void *argument)
 		wmi_rx_wrap(ab);
 		for (unsigned i = 0; i < ab->hw_params->ce_count; i++) {
 			ath12k_ce_per_engine_service(ab, i);
+		}
+		if (bus.data && watch.said < TX_SAID_MOST) {
+			tx_watch(ab);
 		}
 		for (unsigned i = 0; bus.data && i < ATH12K_EXT_IRQ_GRP_NUM_MAX; i++) {
 			more |= ath12k_dp_service_srng(ath12k_ab_to_dp(ab), &ab->ext_irq_grp[i], DATA_BUDGET) >= DATA_BUDGET;

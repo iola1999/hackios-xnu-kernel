@@ -102,7 +102,9 @@ struct lx_radio {
 	volatile bool joined;			/* keys set: frames pass */
 	volatile bool joining;
 	int reached;				/* how far the access point has come as the driver's station (IEEE80211_STA_...) */
-	int8_t signal;				/* dBm, of the last beacon of the network joined */
+	int8_t signal;				/* dBm, of its last frame: an answer while joining, or a beacon */
+	unsigned beacons;			/* its beacons heard since the join began ... */
+	int8_t weakest;				/* ... and the weakest of its frames since then, dBm (0: none yet) */
 	int last_error;
 	unsigned sent, sent_lost, received, received_group, eapol, rekeys;
 	unsigned long long joined_at;		/* nanoseconds */

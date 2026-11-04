@@ -530,6 +530,8 @@ heard(struct lx_radio *radio, const uint8_t *frame, unsigned length, unsigned fr
 	}
 	if (radio->sta != NULL && memcmp(radio->target.address, frame + 16, ETH_ALEN) == 0) {
 		radio->signal = (int8_t)signal;
+		radio->weakest = signal < radio->weakest ? (int8_t)signal : radio->weakest;
+		radio->beacons++;
 	}
 	if (signal > network->signal) {
 		network->signal = (int8_t)signal;
@@ -782,9 +784,14 @@ ethernet_received(struct lx_radio *radio, struct sk_buff *skb)
 	}
 }
 
-/* A management frame from the access point of the network being joined. */
+/*
+ * A management frame from the access point of the network being joined, heard at `signal` dBm. Its answers while
+ * joining are heard on its own channel moments before the network is joined: how strongly they come is what the
+ * join reports, in place of the scan's figure, which can rest on a single frame read some 70 dB weaker than the
+ * access point's other frames.
+ */
 static void
-management_received(struct lx_radio *radio, const uint8_t *f, unsigned length)
+management_received(struct lx_radio *radio, const uint8_t *f, unsigned length, int signal)
 {
 	int answer = ANSWER_NONE;
 	unsigned status = 0;
@@ -793,6 +800,8 @@ management_received(struct lx_radio *radio, const uint8_t *f, unsigned length)
 	    memcmp(f + 4, radio->vif->addr, ETH_ALEN) != 0) {
 		return;
 	}
+	radio->signal = (int8_t)signal;
+	radio->weakest = signal < radio->weakest ? (int8_t)signal : radio->weakest;
 	if (f[0] == 0xb0 && length >= 30) {		/* authentication: algorithm, step (2: the answer), status */
 		status = f[28] | f[29] << 8;
 		answer = (f[26] | f[27] << 8) != 2 ? ANSWER_NONE : status == 0 ? ANSWER_AUTHENTICATED : ANSWER_REFUSED;
@@ -866,7 +875,7 @@ linuxkpi_ieee80211_rx(struct ieee80211_hw *hw, struct sk_buff *skb, struct ieee8
 		heard(radio, skb->data, skb->len, status->freq, status->signal);
 	} else if (skb->len >= 24 && (skb->data[0] & 0x0c) == 0x00) {
 		radio->others++;
-		management_received(radio, skb->data, skb->len);
+		management_received(radio, skb->data, skb->len, status->signal);
 	} else if (to_ethernet(skb, (status->flag & RX_FLAG_IV_STRIPPED) != 0)) {
 		ethernet_received(radio, skb);
 	} else {

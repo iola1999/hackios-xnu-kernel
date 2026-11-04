@@ -634,6 +634,9 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
 	}
 
 	/* the access point as a station of the driver's: the firmware learns of it, and the radio goes to its channel */
+	radio->signal = target->signal;
+	radio->weakest = 0;
+	radio->beacons = 0;
 	radio->sta = (struct ieee80211_sta *)roundup2((uintptr_t)radio->sta_memory, 64);
 	memcpy(radio->sta->addr, target->address, ETH_ALEN);
 	memcpy(radio->sta->deflink.addr, target->address, ETH_ALEN);
@@ -756,10 +759,10 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
 	radio->reached = IEEE80211_STA_AUTHORIZED;
 	radio->sent = radio->sent_lost = radio->received = radio->received_group = radio->rekeys = 0;
 	radio->joined_at = lx_os_nanoseconds();
-	radio->signal = target->signal;
 	radio->joined = true;
 	lx_os_net_link(1);
-	lx_tell("lx: THE NETWORK IS JOINED: frames can pass\n");
+	lx_tell("lx: THE NETWORK IS JOINED: frames can pass; the access point is heard at %d dBm on its channel (the scan said %d), "
+	    "%u of its beacons so far\n", radio->signal, target->signal, radio->beacons);
 	return (0);
 out:
 	station_leave(radio);
@@ -803,9 +806,10 @@ lx_station_say(void)
 	if (radio != NULL) {
 		lx_tell("lx: the network is %s, %llu s after it was joined: %u frames sent (%u could not be), %u received for us and "
 		    "%u sent to everybody; %u messages of the handshake, the group's key changed %u times; block ack: %u classes "
-		    "taken, %u refused\n", radio->joined ? "joined" : "NOT joined", radio->joined_at != 0 ? (lx_os_nanoseconds() -
-		    radio->joined_at) / 1000000000ull : 0, radio->sent, radio->sent_lost, radio->received, radio->received_group,
-		    radio->eapol, radio->rekeys, radio->ba_sessions, radio->ba_refused);
+		    "taken, %u refused; the access point last heard at %d dBm, at its weakest %d, %u of its beacons since the join\n",
+		    radio->joined ? "joined" : "NOT joined", radio->joined_at != 0 ? (lx_os_nanoseconds() - radio->joined_at) /
+		    1000000000ull : 0, radio->sent, radio->sent_lost, radio->received, radio->received_group, radio->eapol,
+		    radio->rekeys, radio->ba_sessions, radio->ba_refused, radio->signal, radio->weakest, radio->beacons);
 	}
 }
 
