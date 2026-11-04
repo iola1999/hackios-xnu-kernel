@@ -140,7 +140,8 @@ static TUNABLE(uint32_t, gDiff, "fb_diff", 0);
  * neighbour leaves out every 25th column and every 67th row, and where one of them goes through a
  * letter or a slanting line, that is a step in it or a stroke a pixel thinner -- text and lines a
  * little crooked, here and there and never in the same places twice. By default every pixel of the
- * panel is worked out from the four of the picture around where it falls (bilinear).
+ * panel is worked out from the four of the picture around where it falls (bilinear). fb_filter=2:
+ * nearest neighbour while frames come, bilinear once they stop (MiniFramebufferPacing.inc).
  */
 static TUNABLE(uint32_t, gFilter, "fb_filter", 1);
 static TUNABLE(uint32_t, gRefreshHz, "fb_hz", kFBRefreshHz);
@@ -277,6 +278,8 @@ public:
 	uint64_t *      fRowHash;
 	uint32_t        fRowHashSize, fRowHashRows;
 	int32_t         fRowHashGeometry[8];
+	uint64_t        fBandAt;                /* when the frame before came; frames in a row that changed whole, frames unhashed since */
+	uint32_t        fWholeFrames, fUnhashed, fStatUnhashed;
 	bool            fSingleLayer;           /* this frame is one surface, in the bottom layer */
 	uint32_t        fStatUnchanged;         /* frames with no row changed, not drawn */
 	uint64_t        fStatBandRows;          /* panel rows drawn */
@@ -291,6 +294,10 @@ public:
 	uint64_t        fFirstFrame, fRecFirst; /* when the first frame was shown, and the first recorded */
 	bool            fRecDone;
 	bool            fRecWrapped;            /* (rec_ring) the memory has been full once: frames go over the oldest */
+	/* fb_filter=2 (MiniFramebufferPacing.inc): drawing the frame again filtered; a layer of this frame drawn unfiltered */
+	bool            fSettling, fDrewNearest;
+	uint32_t        fStatSettled;           /* frames drawn again filtered, and how long that took together */
+	uint64_t        fStatSettleTime;
 
 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
 	void publishModes(void);
@@ -299,6 +306,7 @@ public:
 	void show(const uint8_t * swap, MiniIOSurface ** surfaces);
 	void presenter(void);
 	static void presenterMain(void * self, wait_result_t result);
+	void settle(const uint8_t * swap, MiniIOSurface ** surfaces);
 	void reportFrameTimes(void);
 	void drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
 	void drawRows(const struct RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow);
@@ -326,6 +334,8 @@ setNumber(OSDictionary * dict, const char * key, uint64_t value)
 		n->release();
 	}
 }
+
+#include "MiniFramebufferPacing.inc"
 
 /*
  * The modes of the display, the way CoreAnimation reads them (the properties TimingElements
@@ -379,6 +389,7 @@ IOMobileFramebuffer::publishModes(void)
 
 	setProperty("TimingElements", timings);
 	setProperty("ColorElements", colors);
+	publish_refresh(this);
 	OSSafeReleaseNULL(timings);
 	OSSafeReleaseNULL(colors);
 	OSSafeReleaseNULL(timing);
@@ -402,7 +413,7 @@ IOMobileFramebuffer::start(IOService * provider)
 	}
 	fLock = IOLockAlloc();
 	fSwapLock = IOLockAlloc();
-	if (kernel_thread_start(&IOMobileFramebuffer::presenterMain, this, &thread) != KERN_SUCCESS) {
+	if (panel_thread_start(&IOMobileFramebuffer::presenterMain, this, &thread) != KERN_SUCCESS) {
 		IOLog("MiniIOMobileFramebuffer: no thread to put frames on the panel with\n");
 		return false;
 	}
@@ -411,7 +422,7 @@ IOMobileFramebuffer::start(IOService * provider)
 	fThreads = gThreads >= 1 && gThreads <= 8 ? gThreads : 1;
 	fHelperLock = IOLockAlloc();
 	for (unsigned i = 0; i + 1 < fThreads; i++) {
-		if (kernel_thread_start(&IOMobileFramebuffer::helperMain, this, &thread) != KERN_SUCCESS) {
+		if (panel_thread_start(&IOMobileFramebuffer::helperMain, this, &thread) != KERN_SUCCESS) {
 			fThreads = i + 1;
 			break;
 		}
@@ -576,7 +587,7 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	int32_t sx = src[0], sy = src[1], sw = src[2], sh = src[3];
 	int32_t dx = dst[0], dy = dst[1], dw = dst[2], dh = dst[3];
 	int32_t px0, py0, px1, py1, cx0, cx1;
-	bool filter = gFilter != 0;
+	bool filter = gFilter == 1 || (gFilter == 2 && fSettling);
 	RowJob job;
 
 	if (sw <= 0 || sh <= 0) {
@@ -655,6 +666,7 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 		fStatUnchanged++;
 		return;
 	}
+	fDrewNearest = fDrewNearest || (gFilter == 2 && !fSettling);
 	flip_band(&job.by0, &job.by1, job.py0, job.py1);
 	fStatBandRows += (uint64_t) (job.by1 - job.by0);
 	if (fThreads <= 1 || fDiff || fHelpersStarted + 1 < fThreads) {
@@ -756,36 +768,6 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 	fSwapsWaiting++;
 	IOLockWakeup(fSwapLock, fSwap, true);
 	IOLockUnlock(fSwapLock);
-}
-
-void
-IOMobileFramebuffer::presenterMain(void * self, wait_result_t result __unused)
-{
-	((IOMobileFramebuffer *) self)->presenter();
-}
-
-void
-IOMobileFramebuffer::presenter(void)
-{
-	static uint8_t swap[SWAP_SIZE];         /* (one thread) */
-	MiniIOSurface * surfaces[SWAP_LAYERS];
-
-	for (;;) {
-		IOLockLock(fSwapLock);
-		while (fSwapsWaiting == 0) {
-			IOLockSleep(fSwapLock, fSwap, THREAD_UNINT);
-		}
-		memcpy(swap, fSwap[fSwapFirst], SWAP_SIZE);
-		memcpy(surfaces, fSwapSurfaces[fSwapFirst], sizeof(surfaces));
-		IOLockUnlock(fSwapLock);
-		show(swap, surfaces);
-		for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
-			if (surfaces[layer] != NULL) {
-				MiniIOSurfaceDrop(surfaces[layer]);
-			}
-		}
-		MiniIOSurfaceClearKept();               /* (the next frame is some milliseconds away) */
-	}
 }
 
 /* A swap's surfaces onto the panel, once the GPU is done with them. */
@@ -952,9 +934,17 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		    fStatHeld, fStatLost, fStatSwapsLate);
 		if (gRows) {
 			IOLog("MiniIOMobileFramebuffer: %u of the frames had no row changed; %llu panel rows drawn a frame; "
-			    "source rows %d to %d changed\n", fStatUnchanged, fStatBandRows / fStatFrames, fStatRowsFrom, fStatRowsTo);
+			    "source rows %d to %d changed; %u drawn whole unhashed\n", fStatUnchanged, fStatBandRows / fStatFrames,
+			    fStatRowsFrom, fStatRowsTo, fStatUnhashed);
 		}
-		fStatUnchanged = 0;
+		if (gFilter == 2) {
+			absolutetime_to_nanoseconds(fStatSettleTime, &beat);
+			IOLog("MiniIOMobileFramebuffer: %u frames drawn again filtered, %llu us each\n", fStatSettled,
+			    fStatSettled ? beat / fStatSettled / NSEC_PER_USEC : 0);
+			fStatSettled = 0;
+			fStatSettleTime = 0;
+		}
+		fStatUnchanged = fStatUnhashed = 0;
 		fStatBandRows = 0;
 		fStatRowsFrom = fStatRowsTo = -1;
 		fStatSwapsLate = 0;

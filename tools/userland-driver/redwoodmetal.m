@@ -317,6 +317,7 @@ struct rwa_draw {
 	/* the resolveTexture of each colour attachment, or NULL where there is none.
 	 * Appended with the two above: air_metal.h says what the library does with one. */
 	struct rwa_texture *const *resolve;
+	unsigned discard;   /* colour attachments the pass does not load (bit i) */
 };
 
 /*
@@ -3233,6 +3234,7 @@ enum {
 	id _resolve[8];   /* the resolveTexture of each colour attachment, or nil */
 	float _clearColor[4];
 	BOOL _clears;
+	unsigned _discards;   /* colour attachments loaded with MTLLoadActionDontCare (bit i) */
 	id _depth;
 	id _depthStencilState;
 	float _clearDepth;
@@ -3302,6 +3304,7 @@ enum {
 			         "together, so the attachment is stored and nothing is "
 			         "resolved\n", i, (unsigned long)store);
 		}
+		_discards |= [attachment loadAction] == MTLLoadActionDontCare ? 1u << i : 0;
 		if (i == 0 && [attachment loadAction] == MTLLoadActionClear) {
 			MTLClearColor c = [attachment clearColor];
 
@@ -3554,6 +3557,7 @@ rw_bind_slot(id *slots, unsigned *count, id object, NSUInteger index)
 		work->resolve[i] = _resolve[i];
 	}
 	work->clears = _clears;
+	work->discards = _discards;
 	for (unsigned i = 0; i < 4; i++) {
 		work->clearColor[i] = _clearColor[i];
 	}
@@ -3577,9 +3581,11 @@ rw_bind_slot(id *slots, unsigned *count, id object, NSUInteger index)
 	 * -setColorAttachmentDescriptor: is not a call Metal has, the load actions are fixed
 	 * when the encoder is created, and a pass that wants its target cleared again ends
 	 * this encoder and makes another. That new encoder has its own copy of these three
-	 * flags, so it clears.
+	 * flags, so it clears. The attachments it does not load are the same: what they held
+	 * stops mattering once, before the first draw.
 	 */
 	_clears = NO;
+	_discards = 0;
 	_clearsDepth = NO;
 	_clearsStencil = NO;
 	work->stencilReference[0] = _stencilReference[0];

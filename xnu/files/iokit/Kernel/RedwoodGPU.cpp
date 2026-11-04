@@ -455,7 +455,7 @@ struct gpu_left {
 	uint64_t                        address, size;
 	uint32_t                        fence, flags;
 };
-#define GPU_LEFT                64
+#define GPU_LEFT                256     /* given back while the GPU is busy: about a frame of an animation's worth */
 
 /*
  * A buffer of the program's own given back, and done with: kept, memory and place in the GPU's

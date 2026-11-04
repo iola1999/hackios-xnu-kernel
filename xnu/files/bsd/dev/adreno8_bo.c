@@ -265,25 +265,25 @@ bo_owned(uint64_t pte)
 	    attributes == adreno8_bo_attributes(prot | ADRENO8_MEM_WRITE));
 }
 
-/* Each unmap waits for the GPU to be idle: how often, and how long, every 5 s while it goes on. */
+/* How many unmaps, and the time in them (TLB synchronization), every 5 s while they go on. */
 static struct {
 	uint32_t count;
-	uint64_t since, waiting;
+	uint64_t since, spent;
 } unmap_cost;
 
 static void
 unmap_note(uint64_t began, uint64_t ended)
 {
-	uint64_t span, waiting;
+	uint64_t span, spent;
 
 	unmap_cost.count++;
-	unmap_cost.waiting += ended - began;
+	unmap_cost.spent += ended - began;
 	if (unmap_cost.since == 0) unmap_cost.since = began;
 	absolutetime_to_nanoseconds(ended - unmap_cost.since, &span);
 	if (span < 5 * NSEC_PER_SEC) return;
-	absolutetime_to_nanoseconds(unmap_cost.waiting, &waiting);
-	printf("adreno8: %u external buffers unmapped in %llu ms, %llu us waiting for the GPU to be idle in all\n",
-	    unmap_cost.count, span / NSEC_PER_MSEC, waiting / 1000);
+	absolutetime_to_nanoseconds(unmap_cost.spent, &spent);
+	printf("adreno8: %u external buffers unmapped in %llu ms, %llu us in the unmaps\n",
+	    unmap_cost.count, span / NSEC_PER_MSEC, spent / 1000);
 	memset(&unmap_cost, 0, sizeof(unmap_cost));
 }
 
@@ -296,12 +296,14 @@ adreno8_bo_unmap(uint64_t address, uint64_t size)
 		uint64_t *entry = adreno8_space_entry(&adreno8_gpu_space, (uint32_t)(address + at));
 		if (!entry || !bo_owned(*entry)) return bo_fail("unmap ownership");
 	}
+	/* No wait for the GPU: the caller unmaps only once every submission that could still read the
+	 * buffer has retired (RedwoodGPUMemory.inc, freeBuffer()). */
 	uint64_t began = mach_absolute_time();
-	if (!adreno8_context_wait_idle("external BO unmap")) return bo_fail("unmap idle");
-	unmap_note(began, mach_absolute_time());
 	for (uint64_t at = 0; at < size; at += SMMU_GRANULE)
 		*adreno8_space_entry(&adreno8_gpu_space, (uint32_t)(address + at)) = ADRENO8_PTE_EXTERNAL;
-	return adreno8_space_publish_range(&adreno8_gpu_space, address, size) || bo_fail("unmap TLB synchronization");
+	bool published = adreno8_space_publish_range(&adreno8_gpu_space, address, size);
+	unmap_note(began, mach_absolute_time());
+	return published || bo_fail("unmap TLB synchronization");
 }
 
 extern unsigned int ml_phys_read_word(vm_offset_t paddr);

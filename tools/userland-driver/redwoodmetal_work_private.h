@@ -31,6 +31,7 @@ enum RWCopyKind { RW_COPY_NONE, RW_COPY_BUFFER, RW_COPY_TEXTURE, RW_COPY_MIPMAP,
 	id resolve[8];
 	float clearColor[4];
 	BOOL clears;
+	unsigned discards;   /* first draw of a pass: colour attachments it does not load (bit i) */
 	/* the depth/stencil attachment of the pass, its two load actions and the state
 	 * bound when the draw was encoded. Separate flags per aspect because Metal keeps
 	 * two attachment descriptors over one texture and a pass that clears the depth and

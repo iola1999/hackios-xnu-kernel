@@ -1001,6 +1001,7 @@ done:
 		 * the library reads the array and skips the holes, so an ordinary pass costs it
 		 * one loop over its attachments and nothing else. */
 		.resolve = resolve,
+		.discard = work->discards,
 	};
 
 	if (work->indexBuffer != nil && draw.index_buffer == NULL) {

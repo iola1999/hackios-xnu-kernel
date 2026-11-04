@@ -114,8 +114,11 @@ static struct adreno8_block adreno8_qfprom = { "qfprom", 0x221c8000, 0x1000 };
  * (docs/analysis/data/annibale.dts.gz, qcom,gpu-pwrlevel-bins): 160 to 832 MHz have the same
  * level and bus votes in every table. From 389 MHz on the tables also give a qcom,acd-level;
  * no ACD table is sent, so those points run at their level without adaptive clock distribution.
- * The speeds above 607 MHz stay out until the ones up to it have run (adreno8_speed=7).
+ * Up to 607 MHz ran from bo15 on (adreno8_speed=7); 660, 734 and 832 MHz are speeds 8 to 10. Bin 232
+ * (this K90's) has 900, 967, 1050 and 1100 MHz above that in both tables that can apply to it (the
+ * one for speed bin 0xe8 and the one for SKU codes 1 and 2): speeds 11 to 14, for that bin only.
  */
+#define ADRENO8_SPEEDS_SHARED   10
 static const struct adreno8_gpu_level adreno8_boot_speeds[] = {
 	{ 160000000, 0x32, 2 },
 	{ 222000000, 0x34, 2 },
@@ -124,6 +127,13 @@ static const struct adreno8_gpu_level adreno8_boot_speeds[] = {
 	{ 443000000, 0x40, 4 },
 	{ 525000000, 0x50, 4 },
 	{ 607000000, 0x80, 6 },
+	{ 660000000, 0x90, 6 },
+	{ 734000000, 0xc0, 8 },
+	{ 832000000, 0xe0, 10 },
+	{ 900000000, 0x100, 10 },
+	{ 967000000, 0x140, 11 },
+	{ 1050000000, 0x1a0, 11 },
+	{ 1100000000, 0x1c0, 11 },
 };
 
 uint32_t adreno8_speed_bin;
@@ -323,8 +333,9 @@ adreno8_step_outside(void)
 	bin = adreno8_get(&adreno8_qfprom, "speed bin", QFPROM_GPU_SPEED_BIN);
 	adreno8_speed_bin = bin &= 0x1ff;
 	adreno8_speeds = adreno8_boot_speeds;
-	adreno8_speeds_count = sizeof(adreno8_boot_speeds) / sizeof(adreno8_boot_speeds[0]);
-	printf("adreno8: %u: speed bin %u; SKU unavailable, limiting GX to the points all stock tables share\n", adreno8_step, bin);
+	adreno8_speeds_count = bin == 232 ? sizeof(adreno8_boot_speeds) / sizeof(adreno8_boot_speeds[0]) : ADRENO8_SPEEDS_SHARED;
+	printf("adreno8: %u: speed bin %u; SKU unavailable, limiting GX to the points %s\n", adreno8_step, bin,
+	    bin == 232 ? "of the bin's tables" : "all stock tables share");
 	adreno8_gx_count = 1;
 	adreno8_gx_hz[0] = 0;
 	adreno8_gx_level[0] = 0;                        /* the idling speed the message tables start with (Linux prepends the 0 Hz operating point) */
@@ -335,6 +346,12 @@ adreno8_step_outside(void)
 	}
 	printf("adreno8: %u: bin %u: the 3D core has %u speeds, to %u Hz; levels %#x..%#x\n", adreno8_step, bin, adreno8_speeds_count,
 	    adreno8_speeds[adreno8_speeds_count - 1].hz, adreno8_speeds[0].level, adreno8_speeds[adreno8_speeds_count - 1].level);
+	if (adreno8_speed_asked > adreno8_speeds_count) {
+		/* (a speed this bin does not have would stop the bring-up at step 15) */
+		printf("adreno8: %u: adreno8_speed=%u is past this bin's %u speeds: %u it is\n", adreno8_step, adreno8_speed_asked,
+		    adreno8_speeds_count, adreno8_speeds_count);
+		adreno8_speed_asked = adreno8_speeds_count;
+	}
 
 	adreno8_announce("read GCC DDRSS_GPU_AXI; preserve the loader's CFG_AHB configuration because gcc_sun_clocks has no entry for it; step 2 checks GPUCC register access");
 	adreno8_get(&adreno8_gcc, "ddrss_gpu_axi", GCC_DDRSS_GPU_AXI);

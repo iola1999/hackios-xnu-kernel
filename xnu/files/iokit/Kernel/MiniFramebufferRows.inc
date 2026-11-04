@@ -138,13 +138,25 @@ IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
  * match draws nothing. The home screen sends ten frames a second while it sits still and each one
  * cost a whole scaling, 5 to 11 ms of two processors (kernel-12377-cmd37-bo13). False: nothing to
  * draw; otherwise the band is in job->by0..by1.
+ *
+ * An animation of the whole picture changes every row, and hashing them costs the presenter alone
+ * up to 1.6 ms a frame before the scaling can start (kernel-12377-rate6-sk1: a window in which 489
+ * of 567 frames changed nothing took 1623 us a frame in the driver). So after two frames in
+ * a row that changed nine tenths of the rows or more, each less than ROWS_SOON_NS after the one
+ * before, the next ROWS_UNHASHED frames are drawn whole unhashed; then one is hashed to know the
+ * rows again (it draws whole, the hashes being old) and one to see whether the frames still change
+ * whole. A pause of ROWS_SOON_NS or more goes back to hashing every frame.
  */
+#define ROWS_SOON_NS    (25 * NSEC_PER_MSEC)
+#define ROWS_UNHASHED   6
+
 bool
 IOMobileFramebuffer::dirtyBand(RowJob * job)
 {
 	int32_t geometry[8] = { job->sx, job->sy, job->sw, job->sh, job->px0, job->py0, job->px1, job->py1 };
 	int32_t first = -1, last = -1, words = job->sw / 2;
 	int64_t span = job->py1 - job->py0;
+	uint64_t now = mach_absolute_time(), gap;
 	bool known;
 
 	job->by0 = job->py0;
@@ -153,7 +165,18 @@ IOMobileFramebuffer::dirtyBand(RowJob * job)
 		fRowHashRows = 0;
 		return true;
 	}
-	if (fRowHashRows != (uint32_t) job->sh) {
+	absolutetime_to_nanoseconds(now - fBandAt, &gap);
+	fBandAt = now;
+	if (gap >= ROWS_SOON_NS) {
+		fWholeFrames = 0;
+	}
+	if (fWholeFrames >= 2 && fUnhashed < ROWS_UNHASHED) {
+		fUnhashed++;
+		fStatUnhashed++;
+		fRowHashRows = 0;
+		return true;
+	}
+	if (fRowHashSize != (uint32_t) job->sh) {
 		if (fRowHash != NULL) {
 			IODelete(fRowHash, uint64_t, fRowHashSize);
 			fRowHash = NULL;
@@ -194,6 +217,10 @@ IOMobileFramebuffer::dirtyBand(RowJob * job)
 	}
 	fRowHashRows = (uint32_t) job->sh;
 	memcpy(fRowHashGeometry, geometry, sizeof(geometry));
+	if (known) {
+		fWholeFrames = first >= 0 && (int64_t) (last - first + 1) * 10 >= (int64_t) job->sh * 9 ? fWholeFrames + 1 : 0;
+		fUnhashed = 0;
+	}
 	if (first < 0) {
 		return false;
 	}

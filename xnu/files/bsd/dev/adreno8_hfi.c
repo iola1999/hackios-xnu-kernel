@@ -144,6 +144,14 @@ adreno8_hfi_health(void)
 static uint64_t retired_ticks;
 uint64_t adreno8_retired_total;                 /* never reset: adreno8_speed_tick()'s measure of load */
 static uint32_t retired_count, retired_by[7];
+extern void redwood_tl(const char *format, ...) __printflike(1, 2);
+
+/*
+ * Boot-arg gpu_tl=1: a line for every submission retired, "tl: R TIMESTAMP sub US sop US eop US",
+ * the always-on counts in microseconds: TIMESTAMP is the one tl: Q printed at the submission, so
+ * the two give the time from the submission to the GPU starting on it, and how long it ran.
+ */
+static int retire_lines = -1;
 
 static void
 adreno8_retire_note(const uint32_t *msg)
@@ -152,6 +160,31 @@ adreno8_retire_note(const uint32_t *msg)
 	uint64_t sop = msg[6] | (uint64_t)msg[7] << 32, eop = msg[8] | (uint64_t)msg[9] << 32;
 	uint64_t ticks = eop > sop ? eop - sop : 0;
 	unsigned bucket = 0;
+
+	if (retire_lines < 0) {
+		uint32_t on = 0;
+
+		retire_lines = PE_parse_boot_argn("gpu_tl", &on, sizeof(on)) && on != 0;
+	}
+	if (retire_lines) {
+		uint64_t submitted = msg[4] | (uint64_t)msg[5] << 32, nanos;
+		static bool clocked;
+
+		if (!clocked) {
+			/* the two clocks side by side once, for matching these lines with the ones in mach time */
+			uint32_t hi = adreno8_rd(adreno8_gmu.base + GMU_ALWAYS_ON_HI), lo = adreno8_rd(adreno8_gmu.base + GMU_ALWAYS_ON_LO);
+
+			absolutetime_to_nanoseconds(mach_absolute_time(), &nanos);
+			if (hi != adreno8_rd(adreno8_gmu.base + GMU_ALWAYS_ON_HI)) {
+				lo = adreno8_rd(adreno8_gmu.base + GMU_ALWAYS_ON_LO);
+				hi = adreno8_rd(adreno8_gmu.base + GMU_ALWAYS_ON_HI);
+			}
+			redwood_tl("tl: R clock ao %llu mach %llu\n", ((uint64_t)hi << 32 | lo) * 10 / 192, nanos / 1000);
+			clocked = true;
+		}
+
+		redwood_tl("tl: R %u sub %llu sop %llu eop %llu\n", msg[2], submitted * 10 / 192, sop * 10 / 192, eop * 10 / 192);
+	}
 
 	while (bucket < 6 && ticks * 10 / 192 >= limits_us[bucket]) bucket++;
 	retired_by[bucket]++;

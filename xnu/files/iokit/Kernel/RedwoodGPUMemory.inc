@@ -11,14 +11,22 @@ gpuReleaseMapping(uint64_t address, uint64_t size)
 	return true;
 }
 
-/* With the lock held. A pending buffer moves to fLeft; failed unmap retains its existing record. */
+/*
+ * With the lock held. Any submission made before the buffer was given back may still read it, named
+ * in it or not (an argument buffer holds bare GPU addresses), so its pages leave the GPU's address
+ * space once the last submission of that moment has retired: until then it waits in fLeft and reap()
+ * lets it go. adreno8_bo_unmap() used to wait for the whole GPU to go idle here, with this lock held,
+ * which stopped every other program's submissions for up to a frame of GPU work. A failed unmap
+ * retains its existing record.
+ */
 void
 RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
 {
-	bool busy = gGPUReported || !redwood_gpu_ready() || (b->fence != 0 && !redwood_gpu_done(b->fence));
+	uint32_t last = redwood_gpu_ready() ? redwood_gpu_last() : 0;
+	bool busy = gGPUReported || !redwood_gpu_ready() || (last != 0 && !redwood_gpu_done(last));
 
 	if (busy && fLeftCount == GPU_LEFT && !gGPUReported && redwood_gpu_ready()) {
-		busy = !gpuWait(b->fence, 1000);        /* (nowhere to keep it: this one is waited for) */
+		busy = !gpuWait(last, 1000);            /* (nowhere to keep it: this one is waited for) */
 	}
 	if (busy && fLeftCount < GPU_LEFT) {
 		struct gpu_left * left = &fLeft[fLeftCount++];
@@ -27,7 +35,7 @@ RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
 		left->surface = b->surface;
 		left->address = b->address;
 		left->size = b->size;
-		left->fence = b->fence;
+		left->fence = last;
 		left->flags = b->flags;
 	} else {
 		if (!busy && b->surface == NULL && keep(b->memory, b->kernel, b->address, b->size, b->flags)) {
