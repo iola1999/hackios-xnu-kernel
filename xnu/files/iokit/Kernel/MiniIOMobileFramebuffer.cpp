@@ -38,6 +38,7 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
 
+#include "MiniDrivers.h"
 #include "MiniIOSurface.h"
 #include "MiniFramebufferScale.h"
 #include "MiniFramebufferSwap.h"
@@ -300,6 +301,12 @@ public:
 	uint64_t        fStatSettleTime;
 
 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
+	/* CoreBrightness's IOMFBBrightnessLevel goes to the backlight; anything else is refused, as without this */
+	virtual IOReturn
+	setProperties(OSObject * properties) APPLE_KEXT_OVERRIDE
+	{
+		return MiniAppleARMBacklightFramebufferProperties(properties);
+	}
 	void publishModes(void);
 	MiniIOSurface * defaultSurface(void);
 	void present(const uint8_t * swap);
@@ -323,17 +330,6 @@ public:
 };
 
 OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
-
-static void
-setNumber(OSDictionary * dict, const char * key, uint64_t value)
-{
-	OSNumber * n = OSNumber::withNumber(value, 32);
-
-	if (n != NULL) {
-		dict->setObject(key, n);
-		n->release();
-	}
-}
 
 #include "MiniFramebufferPacing.inc"
 

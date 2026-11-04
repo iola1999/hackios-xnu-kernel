@@ -326,6 +326,7 @@ GenericARMPE::start(IOService * provider)
 	/* Stand-ins for the closed graphics drivers that the iOS window server talks to. */
 	MiniIOSurfaceStart(this);
 	MiniIOMobileFramebufferStart(this);
+	MiniAppleARMBacklightStart(this);
 	MiniAppleKeyStoreStart();
 	MiniIONetworkStackStart();
 	return true;

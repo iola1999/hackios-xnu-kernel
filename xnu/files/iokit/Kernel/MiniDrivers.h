@@ -5,6 +5,7 @@
  *
  *   MiniIOSurface.cpp              IOSurface: pixel buffers shared between processes
  *   MiniIOMobileFramebuffer.cpp    IOMobileFramebuffer: the display (the boot framebuffer)
+ *   MiniAppleARMBacklight.cpp      AppleARMBacklight: the display's brightness, as CoreBrightness sets it
  *   MiniAppleKeyStore.cpp          AppleKeyStore: the keybag of a device without a passcode
  *   MiniIONetworkStack.cpp         IONetworkStack: what configd's interface namer waits for
  */
@@ -12,10 +13,30 @@
 #define _IOKIT_MINIDRIVERS_H
 
 #include <IOKit/IOService.h>
+#include <libkern/c++/OSDictionary.h>
+#include <libkern/c++/OSNumber.h>
 
 void MiniIOSurfaceStart(IOService * provider);
 void MiniIOMobileFramebufferStart(IOService * provider);
+void MiniAppleARMBacklightStart(IOService * provider);
 void MiniAppleKeyStoreStart(void);
 void MiniIONetworkStackStart(void);
+
+/* A 32-bit number into a property dictionary (IOMobileFramebuffer's modes, the backlight's parameters). */
+static inline void
+setNumber(OSDictionary * dict, const char * key, uint64_t value)
+{
+	OSNumber * n = OSNumber::withNumber(value, 32);
+
+	if (n != NULL) {
+		dict->setObject(key, n);
+		n->release();
+	}
+}
+
+/* Between the framebuffer and the backlight: IOMFBBrightnessLevel handed on, the picture darkened (fb_dim). */
+IOReturn MiniAppleARMBacklightFramebufferProperties(OSObject * properties);
+void MiniIOMobileFramebufferDim(uint32_t level);
+int MiniIOMobileFramebufferDimShown(void);
 
 #endif /* _IOKIT_MINIDRIVERS_H */
