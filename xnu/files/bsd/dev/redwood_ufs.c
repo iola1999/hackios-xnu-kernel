@@ -199,7 +199,8 @@ static int ufs_var_busy_pid;
 /* ufs_write=1 and the one partition it is for: everything else answers EROFS as it always did */
 static int ufs_write_part = -1;
 static int ufs_darwin_var_part = -1;
-static uint64_t ufs_darwin_bytes, ufs_darwin_var_bytes;
+uint64_t ufs_darwin_bytes, ufs_darwin_var_bytes;
+extern void RedwoodDiskStart(uint64_t size_bytes);
 static volatile bool ufs_write_busy;            /* a write of ours has this kernel's list out: not a failure */
 static bool ufs_write_out, ufs_write_was_native;        /* the list is out for writing, and was in before */
 static uint64_t ufs_writes, ufs_write_bytes, ufs_write_errors, ufs_write_refused;
@@ -997,6 +998,7 @@ redwood_ufs_init(void)
 	vm_offset_t base;
 
 	if (!PE_parse_boot_argn("ufs_shared_pa", &pa, sizeof(pa)) || pa == 0) {
+		RedwoodDiskStart(0);
 		return;                 /* the loader was not asked for ufs=2: there is nothing to read through */
 	}
 	base = ml_io_map_unmappable((vm_offset_t)(pa & ~(UFS_PAGE - 1)),
@@ -1046,6 +1048,7 @@ redwood_ufs_init(void)
 		made++;
 	}
 	ufs_ready = true;
+	RedwoodDiskStart(ufs_darwin_bytes + ufs_darwin_var_bytes);
 	printf("ufs: %u partitions of the phone's storage as /dev/ufs_NAME and /dev/rufs_NAME, read only, "
 	    "through the loader's page at %llx and its %u KB buffer\n", made, pa, ufs_buffer_size >> 10);
 

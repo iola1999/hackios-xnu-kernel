@@ -177,17 +177,3 @@ rw_pipe_forget(struct rwa_device *device)
 		mine = next;
 	}
 }
-
-static struct rwa_render *
-rw_fallback_render_create(struct rwa_device *device, NSData *vertex_air, const char *vertex_name,
-    const struct rwa_render_shape *shape, struct rwa_render_info *fb_info, const char *why)
-{
-	char fb_why[256] = { 0 };
-	struct rwa_render *fb = mesa.render_create != NULL
-	    ? mesa.render_create(device, [vertex_air bytes], [vertex_air length], vertex_name,
-	                         NULL, 0, NULL, shape, fb_info, fb_why, sizeof(fb_why))
-	    : NULL;
-	if (fb == NULL)
-		RW_AGAIN("this render pipeline is totally refused including fallback: %s (orig: %s)\n", fb_why, why);
-	return fb;
-}

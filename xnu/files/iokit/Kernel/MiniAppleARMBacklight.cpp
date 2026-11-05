@@ -96,7 +96,10 @@ static struct {
 	IOLock *                lock;           /* around this, the level, and the mixers' writes */
 	thread_call_t           later;          /* prints the last request of a burst */
 	uint64_t                logged;         /* when the last line was printed */
+	uint64_t                last_slider_t;  /* timestamp of previous DisplayBrightness update */
+	uint64_t                user_until;     /* deadline until which slider updates are active */
 	uint32_t                unlogged;       /* requests since then, not printed yet */
+	bool                    initialized;    /* true once boot or user brightness has been applied */
 	char                    line[320];      /* the last request, as it is printed */
 } bl;
 
@@ -137,7 +140,9 @@ publish_calibration(IOService * service)
 {
 	OSDictionary * calibration = OSDictionary::withCapacity(9);
 	uint32_t table[sizeof(kBLMarketingMilliNits) / sizeof(kBLMarketingMilliNits[0])];
+	uint32_t zero = 0;
 	OSData * marketing;
+	OSData * zero_data = OSData::withBytes(&zero, sizeof(zero));
 
 	for (unsigned i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
 		table[i] = (uint32_t) fixed_nits(kBLMarketingMilliNits[i]);
@@ -158,6 +163,12 @@ publish_calibration(IOService * service)
 	if (marketing != NULL) {
 		service->setProperty("backlight-marketing-table", marketing);
 	}
+	if (zero_data != NULL) {
+		service->setProperty("use-AAP", zero_data);
+		service->setProperty("use-cabal", zero_data);
+		service->setProperty("use-new-AAP-ramp", zero_data);
+	}
+	OSSafeReleaseNULL(zero_data);
 	OSSafeReleaseNULL(marketing);
 	OSSafeReleaseNULL(calibration);
 }
@@ -231,16 +242,41 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 	static uint64_t last_millinits = kBLMilliNitsMax;
 	OSNumber * nits = OSDynamicCast(OSNumber, dict->getObject(nits_key));
 	OSNumber * value = value_key != NULL ? OSDynamicCast(OSNumber, dict->getObject(value_key)) : NULL;
-	uint64_t v, millinits;
+	uint64_t now = mach_absolute_time(), burst_gap, active_win;
+	uint64_t v, millinits, diff;
 	uint32_t level, mixed;
 	int alpha;
 	char who[24] = "?", shown[32];
 	size_t used;
 
+	if (value_key != NULL && nits == NULL && value == NULL) {
+		nits = OSDynamicCast(OSNumber, dict->getObject("DisplayBrightnessNitsNVRAM"));
+	}
+	if (value_key != NULL) {
+		nanoseconds_to_absolutetime(250 * NSEC_PER_MSEC, &burst_gap);
+		nanoseconds_to_absolutetime(400 * NSEC_PER_MSEC, &active_win);
+		if (dict->getObject("DisplayBrightnessSliderPosition") != NULL) {
+			bl.user_until = now + active_win;
+		}
+		if (dict->getObject("DisplayBrightness") != NULL) {
+			if (bl.last_slider_t != 0 && now - bl.last_slider_t <= burst_gap) {
+				bl.user_until = now + active_win;
+			}
+			bl.last_slider_t = now;
+		}
+	}
+
 	proc_selfname(who, sizeof(who));
 	used = (size_t) snprintf(bl.line, sizeof(bl.line), "%s[%d] to the %s:", who, proc_selfpid(),
 	    value_key != NULL ? "backlight" : "framebuffer");
 	used = list_keys(bl.line, sizeof(bl.line), used < sizeof(bl.line) ? used : sizeof(bl.line), dict);
+	if (value_key == NULL) {
+		snprintf(bl.line + used, sizeof(bl.line) - used,
+		    "; framebuffer brightness ignored, keeping %llu.%03llu nits",
+		    last_millinits / 1000, last_millinits % 1000);
+		bl_log();
+		return;
+	}
 	if (nits != NULL) {
 		uint64_t n16 = nits->unsigned64BitValue();
 		int64_t s16 = (int64_t) n16;
@@ -258,14 +294,10 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 			millinits = (n16 < (uint64_t) kBLMilliNitsMax << 16 ? n16 : (uint64_t) kBLMilliNitsMax << 16) * 1000 >> 16;
 			millinits = millinits < kBLMilliNitsMin ? kBLMilliNitsMin : millinits > kBLMilliNitsMax ? kBLMilliNitsMax : millinits;
 			v = kBLValueMin + (millinits - kBLMilliNitsMin) * (kBLValueMax - kBLValueMin) / (kBLMilliNitsMax - kBLMilliNitsMin);
-			last_v = v;
-			last_millinits = millinits;
 		} else if (n16 >= 1 && n16 <= kBLLevelFull) {
 			/* Integer step in 1..1024, map linearly to [kBLMilliNitsMin, kBLMilliNitsMax] */
 			millinits = kBLMilliNitsMin + (n16 - 1) * (kBLMilliNitsMax - kBLMilliNitsMin) / (kBLLevelFull - 1);
 			v = kBLValueMin + (millinits - kBLMilliNitsMin) * (kBLValueMax - kBLValueMin) / (kBLMilliNitsMax - kBLMilliNitsMin);
-			last_v = v;
-			last_millinits = millinits;
 		} else {
 			/* Invalid transient (> 1024 and < 65536): discard and keep previous stable brightness */
 			snprintf(bl.line + used, sizeof(bl.line) - used,
@@ -278,13 +310,22 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 		v = value->unsigned64BitValue();
 		v = v < kBLValueMin ? kBLValueMin : v > kBLValueMax ? kBLValueMax : v;
 		millinits = kBLMilliNitsMin + (v - kBLValueMin) * (kBLMilliNitsMax - kBLMilliNitsMin) / (kBLValueMax - kBLValueMin);
-		last_v = v;
-		last_millinits = millinits;
 	} else {
 		snprintf(bl.line + used, sizeof(bl.line) - used, "; nothing taken");
 		bl_log();
 		return;
 	}
+	diff = millinits > last_millinits ? millinits - last_millinits : last_millinits - millinits;
+	if (bl.initialized && now > bl.user_until && diff * 4 <= last_millinits) {
+		snprintf(bl.line + used, sizeof(bl.line) - used,
+		    "; autonomous ramp ignored (%llu.%03llu nits), keeping %llu.%03llu nits",
+		    millinits / 1000, millinits % 1000, last_millinits / 1000, last_millinits % 1000);
+		bl_log();
+		return;
+	}
+	last_v = v;
+	last_millinits = millinits;
+	bl.initialized = true;
 	level = (uint32_t) (millinits * kBLLevelFull / kBLMilliNitsMax);
 	/* with fb_dcs=4 the panel takes v itself, and the mixers are given the full level */
 	mixed = MiniIOMobileFramebufferDCS((uint32_t) v) ? kBLLevelFull : level;

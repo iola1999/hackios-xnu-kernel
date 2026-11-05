@@ -16,6 +16,7 @@
 
 extern "C" void RedwoodBTStart(const char * bsdname, const uint8_t * address);
 extern "C" void RedwoodBTSetAddress(const uint8_t * address);
+extern "C" void RedwoodDiskStart(uint64_t size_bytes);
 
 class RedwoodBT : public IOService
 {
@@ -24,7 +25,15 @@ class RedwoodBT : public IOService
 
 OSDefineMetaClassAndStructors(RedwoodBT, IOService);
 
+class RedwoodDisk : public IOService
+{
+	OSDeclareDefaultStructors(RedwoodDisk);
+};
+
+OSDefineMetaClassAndStructors(RedwoodDisk, IOService);
+
 static RedwoodBT * gRedwoodBT;
+static RedwoodDisk * gRedwoodDisk;
 
 static void
 bt_set_address(RedwoodBT * bt, const uint8_t * address)
@@ -81,6 +90,9 @@ RedwoodBTStart(const char * bsdname, const uint8_t * address)
 	OSString * s;
 	uint8_t initial[6];
 
+	if (gRedwoodDisk == NULL) {
+		RedwoodDiskStart(0);
+	}
 	if (gRedwoodBT != NULL) {
 		if (address != NULL) {
 			RedwoodBTSetAddress(address);
@@ -128,4 +140,47 @@ RedwoodBTSetAddress(const uint8_t * address)
 	bt_set_address(gRedwoodBT, address);
 	IOLog("RedwoodBT: local-mac-address %02x:%02x:%02x:%02x:%02x:%02x\n", address[0], address[1], address[2],
 	    address[3], address[4], address[5]);
+}
+
+void
+RedwoodDiskStart(uint64_t size_bytes)
+{
+	IOService * platform = IOService::getPlatform();
+	RedwoodDisk * disk;
+	OSString * s;
+	OSNumber * n;
+	uint64_t sz = size_bytes != 0 ? size_bytes : (120ULL << 30);
+
+	if (gRedwoodDisk != NULL) {
+		if ((n = OSNumber::withNumber(sz, 64)) != NULL) {
+			gRedwoodDisk->setProperty("Size", n);
+			n->release();
+		}
+		return;
+	}
+	disk = OSTypeAlloc(RedwoodDisk);
+	if (platform == NULL || disk == NULL || !disk->init()) {
+		OSSafeReleaseNULL(disk);
+		return;
+	}
+	if ((s = OSString::withCString("disk0")) != NULL) {
+		disk->setProperty("BSD Name", s);
+		s->release();
+	}
+	if ((n = OSNumber::withNumber(sz, 64)) != NULL) {
+		disk->setProperty("Size", n);
+		n->release();
+	}
+	if ((n = OSNumber::withNumber(4096ULL, 32)) != NULL) {
+		disk->setProperty("Preferred Block Size", n);
+		n->release();
+	}
+	disk->setProperty("Whole", true);
+	disk->setProperty("Writable", true);
+	disk->setProperty("Internal", true);
+	disk->setProperty("IOBuiltin", true);
+	if (bt_publish(disk, platform, "disk0") != NULL) {
+		IOLog("RedwoodDisk: published IOKit service 'disk0' (Size %llu bytes)\n", sz);
+		gRedwoodDisk = disk;
+	}
 }

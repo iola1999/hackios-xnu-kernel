@@ -1481,11 +1481,18 @@ ramfs_mount(mount_t mp, __unused vnode_t devvp, __unused user_addr_t data, __unu
 	vfs_setextendedsecurity(mp);
 	vfs_getnewfsid(mp);
 
+	extern uint64_t ufs_darwin_bytes, ufs_darwin_var_bytes;
+	uint64_t cap_bytes = ufs_darwin_bytes + ufs_darwin_var_bytes;
+	uint64_t cap_pages = cap_bytes != 0 ? (cap_bytes / PAGE_SIZE) : ((120ULL << 30) / PAGE_SIZE);
+	if (cap_pages < rm->rm_max_pages) {
+		cap_pages = rm->rm_max_pages;
+	}
+
 	sp = vfs_statfs(mp);
 	sp->f_bsize = PAGE_SIZE;
 	sp->f_iosize = PAGE_SIZE;
-	sp->f_blocks = rm->rm_max_pages;
-	sp->f_bfree = sp->f_bavail = rm->rm_max_pages;
+	sp->f_blocks = cap_pages;
+	sp->f_bfree = sp->f_bavail = cap_pages;
 	sp->f_bused = 0;
 	/* there is no table of nodes to run out of; report as many as there could be pages */
 	sp->f_files = rm->rm_max_pages;
@@ -1575,20 +1582,27 @@ ramfs_vfs_vget(mount_t mp, ino64_t ino, vnode_t *vpp, __unused vfs_context_t ctx
 static int
 ramfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
 {
+	extern uint64_t ufs_darwin_bytes, ufs_darwin_var_bytes;
 	struct ramfs_mount *rm = RAMFS_MP(mp);
-	uint64_t used, nodes;
+	uint64_t used, nodes, cap_bytes, cap_pages;
 
 	lck_mtx_lock(&rm->rm_lock);
 	used = rm->rm_pages;
 	nodes = rm->rm_nodes;
 	lck_mtx_unlock(&rm->rm_lock);
 
+	cap_bytes = ufs_darwin_bytes + ufs_darwin_var_bytes;
+	cap_pages = cap_bytes != 0 ? (cap_bytes / PAGE_SIZE) : ((120ULL << 30) / PAGE_SIZE);
+	if (cap_pages < rm->rm_max_pages) {
+		cap_pages = rm->rm_max_pages;
+	}
+
 	VFSATTR_RETURN(fsap, f_objcount, nodes);
 	VFSATTR_RETURN(fsap, f_bsize, PAGE_SIZE);
 	VFSATTR_RETURN(fsap, f_iosize, PAGE_SIZE);
-	VFSATTR_RETURN(fsap, f_blocks, rm->rm_max_pages);
-	VFSATTR_RETURN(fsap, f_bfree, rm->rm_max_pages - MIN(used, rm->rm_max_pages));
-	VFSATTR_RETURN(fsap, f_bavail, rm->rm_max_pages - MIN(used, rm->rm_max_pages));
+	VFSATTR_RETURN(fsap, f_blocks, cap_pages);
+	VFSATTR_RETURN(fsap, f_bfree, cap_pages - MIN(used, cap_pages));
+	VFSATTR_RETURN(fsap, f_bavail, cap_pages - MIN(used, cap_pages));
 	VFSATTR_RETURN(fsap, f_bused, used);
 	VFSATTR_RETURN(fsap, f_files, rm->rm_max_pages);
 	VFSATTR_RETURN(fsap, f_ffree, rm->rm_max_pages - MIN(nodes, rm->rm_max_pages));

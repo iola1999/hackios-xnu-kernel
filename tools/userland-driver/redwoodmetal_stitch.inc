@@ -206,7 +206,7 @@ rw_stitch_dump_linked(id descriptor)
 
 - (NSString *)name { return _name; }
 - (id)redwoodConstantValues { return _constantValues; }
-- (id)redwoodUnspecializedFunction { return _function; }
+- (id)redwoodUnspecializedFunction { return _cachedBitcode != nil ? self : _function; }
 - (NSData *)bitcodeData
 {
 	if (_cachedBitcode != nil)
@@ -238,9 +238,11 @@ rw_stitch_dump_linked(id descriptor)
 }
 - (BOOL)respondsToSelector:(SEL)sel
 {
-	return sel == @selector(redwoodConstantValues) ||
-	       sel == @selector(redwoodUnspecializedFunction) ||
-	       sel == sel_getUid("bitcodeData") || [_function respondsToSelector:sel];
+	if (sel == @selector(redwoodUnspecializedFunction))
+		return _cachedBitcode == nil;
+	if (sel == sel_getUid("bitcodeData"))
+		return _cachedBitcode != nil || [_function respondsToSelector:sel];
+	return sel == @selector(redwoodConstantValues) || [_function respondsToSelector:sel];
 }
 - (BOOL)isKindOfClass:(Class)cls { return [_function isKindOfClass:cls]; }
 - (BOOL)conformsToProtocol:(Protocol *)protocol { return [_function conformsToProtocol:protocol]; }
@@ -395,15 +397,7 @@ rw_library_new_function_with_descriptor(id self, SEL _cmd, id descriptor, NSErro
 	    ? [descriptor specializedName] : nil;
 	id values = [descriptor respondsToSelector:@selector(constantValues)]
 	    ? [descriptor constantValues] : nil;
-
 	NSString *cache_key = rw_air_cache_key(self, name, specialized, values);
-	NSData *cached = rw_air_cache_lookup(cache_key);
-	if (cached != nil) {
-		id proxy = rw_specialize_by_proxy(self, name, specialized, values, descriptor, nil, cached);
-		if (proxy != nil)
-			return proxy;
-	}
-
 	NSError *why = nil;
 	id function = rw_library_function_with_descriptor(self, _cmd, descriptor, &why);
 
@@ -415,7 +409,8 @@ rw_library_new_function_with_descriptor(id self, SEL _cmd, id descriptor, NSErro
 				rw_air_cache_store(cache_key, bc);
 		}
 	} else {
-		function = rw_specialize_by_proxy(self, name, specialized, values, descriptor, why, nil);
+		NSData *cached = rw_air_cache_lookup(cache_key);
+		function = rw_specialize_by_proxy(self, name, specialized, values, descriptor, why, cached);
 	}
 	if (function == nil && error != NULL) {
 		*error = why;
@@ -428,13 +423,6 @@ rw_library_new_function_with_constants(id self, SEL _cmd, NSString *name, id val
 				       NSError **error)
 {
 	NSString *cache_key = rw_air_cache_key(self, name, nil, values);
-	NSData *cached = rw_air_cache_lookup(cache_key);
-	if (cached != nil) {
-		id proxy = rw_specialize_by_proxy(self, name, nil, values, name, nil, cached);
-		if (proxy != nil)
-			return proxy;
-	}
-
 	NSError *why = nil;
 	id function = rw_library_function_with_constants(self, _cmd, name, values, &why);
 
@@ -446,7 +434,8 @@ rw_library_new_function_with_constants(id self, SEL _cmd, NSString *name, id val
 				rw_air_cache_store(cache_key, bc);
 		}
 	} else {
-		function = rw_specialize_by_proxy(self, name, nil, values, name, why, nil);
+		NSData *cached = rw_air_cache_lookup(cache_key);
+		function = rw_specialize_by_proxy(self, name, nil, values, name, why, cached);
 	}
 	if (function == nil && error != NULL) {
 		*error = why;
@@ -643,14 +632,6 @@ static NSData *
 rw_function_bitcode(id function, const char **module_name)
 {
 	SEL bitcode = sel_getUid("bitcodeData");
-	if ([function respondsToSelector:bitcode]) {
-		NSData *data = ((NSData *(*)(id, SEL))objc_msgSend)(function, bitcode);
-		if (data != nil && [data length] > 0) {
-			if (module_name != NULL)
-				*module_name = [[function name] UTF8String];
-			return data;
-		}
-	}
 	id body = [function respondsToSelector:@selector(redwoodUnspecializedFunction)]
 	    ? [function redwoodUnspecializedFunction] : function;
 

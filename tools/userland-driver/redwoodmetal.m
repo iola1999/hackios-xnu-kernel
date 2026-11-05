@@ -1636,11 +1636,7 @@ struct gem_close { uint32_t handle, pad; };
 		if (vertex_air != nil)
 			air_fail_dump([vertex_air bytes], [vertex_air length], "vertex", [[vertex name] UTF8String]);
 		rw_dump_linked(descriptor);
-		RW_AGAIN("this render pipeline is refused: %s; constructing safe passthrough fallback pipeline\n", why);
-		struct rwa_render_info fb_info = { 0 };
-		struct rwa_render *fb = rw_fallback_render_create(_mesa, vertex_air, vertex_name, &shape, &fb_info, why);
-		if (fb != NULL)
-			return [[RedwoodMetalRenderPipeline alloc] initWithRedwoodDevice:self render:fb info:&fb_info descriptor:descriptor];
+		RW_AGAIN("this render pipeline is refused: %s\n", why);
 		return [self fail:error with:[NSString stringWithUTF8String:why]];
 	}
 	rw_keep_air(render, vertex_air, vertex != nil ? [[vertex name] UTF8String] : NULL, fragment_air,
@@ -3281,7 +3277,15 @@ enum {
 		_colorSlice[i] = (unsigned)[attachment slice];
 		_resolve[i] = [attachment resolveTexture];
 		NSUInteger store = [attachment storeAction];
-		if (store == MTLStoreActionMultisampleResolve ||
+		BOOL one = [texture sampleCount] <= 1 &&
+		    store == MTLStoreActionMultisampleResolve &&
+		    [attachment loadAction] != MTLLoadActionLoad &&
+		    getenv("REDWOOD_RESOLVE_BLIT") == NULL &&
+		    [_resolve[i] pixelFormat] == [texture pixelFormat];
+		if (_resolve[i] != nil && (one || (rw_one_sample() && [texture sampleCount] > 1))) {
+			_color[i] = rw_attachment_level(_resolve[i], [attachment resolveLevel]);
+			_resolve[i] = nil;
+		} else if (store == MTLStoreActionMultisampleResolve ||
 		    store == MTLStoreActionStoreAndMultisampleResolve) {
 			if (_resolve[i] != nil) {
 				_resolveTo[i] = [_resolve[i] retain];
@@ -4597,8 +4601,6 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
  */
 - (void)endEncoding
 {
-	rw_record_resolve_blits(_commandBuffer, _colorCount, _color, _resolveTo, _colorLevel,
-	    _colorSlice, _resolveLevel, _resolveSlice);
 	[super endEncoding];
 }
 
