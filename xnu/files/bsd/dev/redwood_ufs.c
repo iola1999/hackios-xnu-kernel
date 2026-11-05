@@ -14,13 +14,13 @@
  *
  * Read only wherever a write could do harm, by construction. The block devices never write: the
  * strategy routine refuses, so no filesystem mounted from one can write, and opening one for
- * writing is refused. With ufs_write=1 one character device alone takes writes -- /dev/rufs_darwin,
- * the port's own partition -- and in it only whole blocks from UFS_WRITE_FIRST on, past the iOS
- * volume and both cryptexes that the build writes from the computer (tools/darwin-write.py); that
- * is where the data volume of iOS is kept between runs (userland/src/var_store.c). The partition
- * has to be the one the port was set up with (its name, size, place and logical unit here; its
- * GUIDs as well on the loader's side), and the loader refuses the same things over again and reads
- * every write back before it answers. Without ufs_write=1 nothing writes at all.
+ * writing is refused. With ufs_write=1 one character device alone takes writes --
+ * /dev/rufs_dsu_store, the last 4 GiB of the slot Android's DSU installer keeps the iOS system
+ * image in, which the loader lists as a partition of its own (xnuloader/loader_dsu.inc); that is
+ * where the data volume of iOS is kept between runs (userland/src/var_store.c). The loader lists
+ * it only when the slot holds this run's system image, offers it for writing only when its two
+ * header blocks hold zeros or headers, refuses writes anywhere else and reads every write back
+ * before it answers. Without ufs_write=1 nothing writes at all.
  *
  * One request at a time (the page has one), so requests are serialized by a mutex and split into
  * pieces of the buffer's size. The kernel writes only the request's cache lines and core 0 only
@@ -69,15 +69,9 @@ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);   /* osfmk/arm
 #define BLOCK_OP_READ      0u
 #define BLOCK_OP_WRITE     1u
 
-/*
- * Where a write may go, and nowhere else: darwin, the port's own 20 GiB at the end of logical
- * unit 0, and in it only past what the build puts there from the computer -- the iOS volume
- * (blocks 0..1374207) and the two cryptexes behind it (..2042367). The loader keeps the same
- * bounds and the GUIDs of the partition besides (xnuloader/loader.c, BLOCK_WRITE_FIRST).
- */
-#define UFS_WRITE_FIRST    2042368ULL                  /* darwin's blocks of 4096 */
-#define UFS_DARWIN_FIRST   25374720ULL                 /* its first LBA on the unit, as the GPT has it */
-#define UFS_DARWIN_BLOCKS  5242875ULL
+/* Where a write may go, and nowhere else: the loader's dsu_store, all of it (xnuloader/loader_dsu.inc). */
+#define UFS_STORE_NAME     "dsu_store"
+#define UFS_STORE_BLOCKS   (4ULL << 30 >> 12)          /* 4 GiB in blocks of 4096 */
 
 struct loader_block_part {
 	char name[36];
@@ -186,7 +180,7 @@ static LCK_MTX_DECLARE(ufs_write_mtx, &ufs_lck_grp);
  *                           nothing waited for, so a run without a saver returns as it always did.
  *                           A panic does not come this way at all -- there is no program left to
  *                           ask -- and then the store simply keeps what it had.
- *   kern.redwood.var_busy   the claim. A write to /dev/rufs_darwin is refused unless the writer
+ *   kern.redwood.var_busy   the claim. A write to /dev/rufs_dsu_store is refused unless the writer
  *                           holds it, so two savers cannot interleave into one slot. It is held by
  *                           process number, and a claimant may take it from a process that is gone
  *                           (a saver killed in the middle leaves no lock behind for the rest of the
@@ -220,13 +214,13 @@ SYSCTL_QUAD(_kern_redwood, OID_AUTO, ufs_wait_us, CTLFLAG_RD | CTLFLAG_LOCKED, &
 SYSCTL_QUAD(_kern_redwood, OID_AUTO, ufs_copy_us, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_copy_us,
     "microseconds spent copying out of the loader's buffer");
 SYSCTL_QUAD(_kern_redwood, OID_AUTO, ufs_writes, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_writes,
-    "requests written into darwin and read back by the loader");
+    "requests written into the DSU store and read back by the loader");
 SYSCTL_QUAD(_kern_redwood, OID_AUTO, ufs_write_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_write_bytes,
-    "bytes written into darwin");
+    "bytes written into the DSU store");
 SYSCTL_QUAD(_kern_redwood, OID_AUTO, ufs_write_errors, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_write_errors,
     "writes the loader refused or did not finish");
 SYSCTL_QUAD(_kern_redwood, OID_AUTO, ufs_write_refused, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_write_refused,
-    "writes refused here: not darwin, or not past what the build writes");
+    "writes refused here: not the DSU store, or past its end");
 
 /* The handshake: 1 to register as the saver, 3 to say the volume is in the flash. 2 is the kernel's. */
 static int
@@ -291,7 +285,7 @@ ufs_sysctl_var_busy(__unused struct sysctl_oid *oidp, __unused void *arg1, __unu
 }
 
 SYSCTL_PROC(_kern_redwood, OID_AUTO, var_busy, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
-    ufs_sysctl_var_busy, "I", "the claim a writer of /dev/rufs_darwin must hold: 1 takes it, 0 gives it back");
+    ufs_sysctl_var_busy, "I", "the claim a writer of /dev/rufs_dsu_store must hold: 1 takes it, 0 gives it back");
 
 /*
  * Native blocks [lba, lba + count) of partition part, one request of at most the buffer's size:
@@ -428,7 +422,7 @@ redwood_ufs_report(const char *when)
 	    "copying %llu ms\n", when, ufs_requests, ufs_small, ufs_medium, ufs_large, ufs_sequential,
 	    ufs_errors, ufs_bytes, ufs_wait_us / 1000, loader_ns / 1000000, ufs_copy_us / 1000);
 	if (ufs_write_part >= 0 || ufs_writes != 0 || ufs_write_refused != 0) {
-		printf("ufs: %s: %llu writes into darwin, %llu bytes, read back by the loader; %llu did not "
+		printf("ufs: %s: %llu writes into the DSU store, %llu bytes, read back by the loader; %llu did not "
 		    "finish, %llu refused here\n", when, ufs_writes, ufs_write_bytes, ufs_write_errors,
 		    ufs_write_refused);
 	}
@@ -576,9 +570,8 @@ ufs_write(uint32_t part, uint64_t offset, const uint8_t *src, uint64_t len)
 	if (len == 0 || offset % nbs != 0 || len % nbs != 0) {
 		return EINVAL;          /* whole blocks only: nothing is read before a write */
 	}
-	if (offset / nbs < UFS_WRITE_FIRST || offset > ufs_part_bytes(part) ||
-	    len > ufs_part_bytes(part) - offset) {
-		/* the iOS volume, the cryptexes, and anything past the partition's end: never */
+	if (offset > ufs_part_bytes(part) || len > ufs_part_bytes(part) - offset) {
+		/* past the store's end: never */
 		ufs_write_refused++;
 		return EROFS;
 	}
@@ -598,7 +591,7 @@ ufs_write(uint32_t part, uint64_t offset, const uint8_t *src, uint64_t len)
 		ufs_write_out = true;
 		if (ufs_write_was_native) {
 			ufs_native_on = false;
-			ufs_native_out("writing the data volume into darwin");
+			ufs_native_out("writing the data volume into the DSU store");
 		}
 	}
 	while (len > 0 && error == 0) {
@@ -673,7 +666,7 @@ ufs_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused
 
 static void ufs_write_restore(void);
 
-/* The last close of /dev/rufs_darwin ends the writing: this kernel's own transfer list goes back in. */
+/* The last close of /dev/rufs_dsu_store ends the writing: this kernel's own transfer list goes back in. */
 static int
 ufs_cclose(dev_t dev, int flags, int devtype, proc_t p)
 {
@@ -815,7 +808,7 @@ ufs_cread(dev_t dev, struct uio *uio, __unused int ioflag)
 }
 
 /*
- * A write to /dev/rufs_darwin: whole blocks, out of user memory a bufferful at a time and into the
+ * A write to /dev/rufs_dsu_store: whole blocks, out of user memory a bufferful at a time and into the
  * partition. Nothing of this driver is held while user memory is touched -- a fault there can come
  * back as a read of the storage -- so the bytes are taken first and written after.
  */
@@ -1492,52 +1485,32 @@ redwood_ufs_init(void)
 	    "through the loader's page at %llx and its %u KB buffer\n", made, pa, ufs_buffer_size >> 10);
 
 	/*
-	 * ufs_write=1: /dev/rufs_darwin takes writes, past the iOS volume and the cryptexes. darwin
-	 * has to be the partition the port was set up with, in everything the loader's table says of
-	 * it; the loader looks at its GUIDs besides, and refuses the same bounds of its own accord.
+	 * ufs_write=1: /dev/rufs_dsu_store takes writes, if the loader offers it: it lists the store
+	 * only for a slot holding this run's system image and offers it only when both var_store
+	 * headers there are zeros or headers. Its size and block size are checked here once more.
 	 */
 	check = 0;
 	if (PE_parse_boot_argn("ufs_write", &check, sizeof(check)) && check == 1) {
 		uint32_t offered = ufs_page->write_part_plus_one;
+		const char *why = NULL;
 
-		if (offered == 0 || offered > ufs_parts || ufs_page->write_first != UFS_WRITE_FIRST) {
-			printf("ufs: the loader offers no partition to write into (ufs_write=1 on its command "
-			    "line too, and a loader that knows about writes)\n");
+		if (offered == 0 || offered > ufs_parts || ufs_page->write_first != 0) {
+			why = "the loader offers nothing to write into (ufs_write=1 on its command line too, and a DSU slot that checks out)";
+		} else if (strncmp((const char *)ufs_page->part[offered - 1].name, UFS_STORE_NAME,
+		    sizeof(UFS_STORE_NAME)) != 0) {
+			why = "the loader offers another partition";
+		} else if (ufs_page->part[offered - 1].flags & BLOCK_PART_UNIT) {
+			why = "it is a whole logical unit";
+		} else if (ufs_page->part[offered - 1].block_size != 4096 ||
+		    ufs_page->part[offered - 1].blocks != UFS_STORE_BLOCKS) {
+			why = "it is not 4 GiB in blocks of 4096";
 		}
-		for (uint32_t i = 0; offered != 0 && i < ufs_parts; i++) {
-			const char *why = NULL;
-
-			if (strncmp((const char *)ufs_page->part[i].name, "darwin", 7) != 0) {
-				continue;
-			}
-			if (i != offered - 1) {
-				why = "the loader offers another partition";
-			} else if (ufs_page->part[i].flags & BLOCK_PART_UNIT) {
-				why = "it is a whole logical unit, not the partition";
-			} else if (ufs_page->part[i].unit != 0) {
-				/* the first unit UEFI lists, which this kernel's own driver reads as LUN 0 and
-				 * has compared with the loader's reads; the device path this firmware gives
-				 * says no logical unit number at all, so part[].lun is 0xff for every unit */
-				why = "it is not on the first logical unit";
-			} else if (ufs_page->part[i].start_lba != UFS_DARWIN_FIRST) {
-				why = "it does not begin where it did";
-			} else if (ufs_page->part[i].blocks != UFS_DARWIN_BLOCKS) {
-				why = "it is not the size it was";
-			} else if (ufs_page->part[i].block_size != 4096) {
-				why = "its blocks are not 4096 bytes";
-			}
-			if (why != NULL) {
-				printf("ufs: darwin: no write will be asked for: %s\n", why);
-				continue;
-			}
-			ufs_write_part = (int)i;
-		}
-		if (ufs_write_part >= 0) {
-			printf("ufs: /dev/rufs_darwin takes writes, whole blocks from %llu on (%llu MB of it); "
-			    "everything else of the storage is read only\n", UFS_WRITE_FIRST,
-			    (UFS_DARWIN_BLOCKS - UFS_WRITE_FIRST) * 4096 >> 20);
+		if (why == NULL) {
+			ufs_write_part = (int)(offered - 1);
+			printf("ufs: /dev/rufs_" UFS_STORE_NAME " takes writes (%llu MB); everything else of the "
+			    "storage is read only\n", UFS_STORE_BLOCKS * 4096 >> 20);
 		} else {
-			printf("ufs: nothing takes writes: darwin is not among the partitions\n");
+			printf("ufs: nothing takes writes: %s\n", why);
 		}
 	}
 

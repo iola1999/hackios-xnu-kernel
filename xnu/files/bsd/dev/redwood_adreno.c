@@ -3169,15 +3169,16 @@ static bool(*const steps[])(void) = {
 /* ---- beside the steps: how warm the GPU is ------------------------------------------------------------------ */
 
 /*
- * The SoC's temperature sensors report by themselves, in a block that is always on (dt: tsens1,
- * whose readings are at 0xc265000; Linux's tsens-v2.c): a status word a sensor, the last reading
- * in its low 12 bits, signed, in tenths of a degree, and bit 21 when there is one. Sensors 1 and
- * 2 sit at the GPU (dt: gpuss-0, gpuss-1). Read, never written: once a minute while the GPU is
+ * The SoC's temperature sensors report by themselves, in a block that is always on (Linux's
+ * tsens-v2.c): a status word a sensor, the last reading in its low 12 bits, signed, in tenths of a
+ * degree, and bit 21 when there is one. On SM8750 the GPU's group is at 0xc22a000, sensors 1 to 8
+ * (stock thermal-zones gpuss-*, the same group annibale_cpufreq.c's tsens_groups reads); this
+ * reads its first two. Read, never written: once a minute while the GPU is
  * kept, for the line beside the kernel's line about memory (osfmk/arm64/loader_return.c). A
  * sensor caught between two readings has none for a moment and is asked again; one that still
  * has none is put down as -273.0.
  */
-static struct block tsens = { "tsens1", 0x0c265000, 0x200 };
+static struct block tsens = { "tsens-gpu", 0x0c22a000, 0x200 };
 #define TSENS_STATUS(sensor)    (0xa0 + 4 * (sensor))
 #define TSENS_VALID             (1u << 21)
 

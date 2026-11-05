@@ -10,12 +10,13 @@
  * with that driver's ReadBlocks into a buffer both can see. The kernel's side is
  * bsd/dev/redwood_ufs.c; it gets the page's address as ufs_shared_pa= on its command line.
  *
- * Reads, and -- with ufs_write=1 on the command line -- writes into one partition and nowhere
- * else: the port's own darwin, proved by its GPT entry (name, both GUIDs, first and last LBA, its
- * logical unit), and in it only past everything the build writes from the computer, so that no
- * answer to the kernel can reach Android's partitions, the iOS volume or the cryptexes. The
- * refusals are here, in the kernel (bsd/dev/redwood_ufs.c) and in UEFI's own driver, which gives
- * out a partition's BlockIo and bounds it: a request has to pass all three.
+ * Reads, and -- with ufs_write=1 on the command line -- writes into one place and nowhere else:
+ * dsu_store, the last 4 GiB of the slot Android's DSU installer keeps the iOS system image in
+ * (loader_dsu.inc, dsu_store_open). It is not a GPT partition: this loader lists it in the table as
+ * one, of its own blocks, and maps them onto the extents of the DSU file in userdata. No answer to
+ * the kernel can reach any other part of the storage. The refusals are here, in the kernel
+ * (bsd/dev/redwood_ufs.c) and in UEFI's own driver, which bounds userdata: a request has to pass
+ * all three.
  *
  * Each side writes its own cache lines only: the kernel the request, core 0 the answer (and the
  * table, once, before the kernel starts). A line one side cleans out of its cache therefore never
@@ -31,20 +32,6 @@
 #define BLOCK_PART_UNIT    1u                          /* the entry is a whole logical unit, not a partition */
 #define BLOCK_OP_READ      0u
 #define BLOCK_OP_WRITE     1u
-
-/*
- * The one partition a write may reach, and from which of its blocks. darwin is the port's own
- * 20 GiB at the end of logical unit 0 (README, "The port's partition"); what the build puts there
- * from the computer (tools/darwin-write.py) is the iOS volume at its start and the two cryptexes
- * behind it, and nothing of this port reads or writes the rest -- so the data of iOS lives there
- * and a write is refused before that block. The identity is the whole of darwin-write.py's: the
- * same partition, named the same, of the same size, in the same place, on logical unit 0.
- */
-#define BLOCK_WRITE_FIRST  2042368ULL                  /* darwin's blocks of 4096: past both cryptexes */
-#define BLOCK_DARWIN_FIRST 25374720ULL                 /* its first and last LBA of unit 0, as the GPT has them */
-#define BLOCK_DARWIN_LAST  30617594ULL
-#define BLOCK_DARWIN_TYPE  { 0x7c3457ef, 0x0000, 0x11aa, { 0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac } }
-#define BLOCK_DARWIN_UNIQ  { 0xfd6854ad, 0x24aa, 0x4fc3, { 0x94, 0xfe, 0x29, 0x01, 0x16, 0x85, 0x8d, 0x68 } }
 
 /*
  * The partitions first, then the logical units they are on (BLOCK_PART_UNIT, named unit0, unit1,
@@ -130,7 +117,11 @@ static efi_block_io *block_bios[BLOCK_MAX_PARTS];
 static int block_enabled;
 static int block_write_requested;       /* ufs_write=1 on the command line */
 static int block_write_part = -1;       /* the only partition a write may reach; -1: none, writes refused */
+static int block_dsu_part = -1;         /* dsu_store's index in the table; -1: not listed this run */
 static uint64_t block_writes, block_writes_refused, block_write_bytes;
+/* loader_dsu.inc, included after this file */
+static int dsu_store_open(struct loader_block_part *bp, int want_write, int *writable);
+static efi_status dsu_store_io(int write, uint64_t lba, uint64_t bytes, uint8_t *buf);
 
 /* the bytes of a device path before its end node */
 static uint64_t
@@ -376,47 +367,6 @@ block_tables(void)
 	}
 }
 
-/*
- * Is this partition the one a write may reach? Everything about it has to be what it was when the
- * port was set up; one field out of place and nothing is written this run. The name UEFI reports
- * is already in bp->name (ufs_name), in ASCII.
- */
-static int
-block_is_darwin(const efi_partition_info *info, const efi_block_io *bio, const struct loader_block_part *bp)
-{
-	static const efi_guid type = BLOCK_DARWIN_TYPE, uniq = BLOCK_DARWIN_UNIQ;
-	static const char name[] = "darwin";
-	const char *why = NULL;
-
-	for (unsigned i = 0; i < sizeof(name); i++) {
-		if (bp->name[i] != name[i]) {
-			return 0;               /* another partition: nothing to say about it */
-		}
-	}
-	if (memcmp(&info->type_guid, &type, sizeof(type)) != 0) {
-		why = "its type GUID is not the one it had";
-	} else if (memcmp(&info->unique_guid, &uniq, sizeof(uniq)) != 0) {
-		why = "its unique GUID is not the one it had";
-	} else if (info->start_lba != BLOCK_DARWIN_FIRST || info->end_lba != BLOCK_DARWIN_LAST) {
-		why = "it does not begin and end where it did";
-	} else if (bp->unit != 0) {
-		/* the first unit UEFI lists: this firmware's device paths say no logical unit number
-		 * (device_path_print finds no 3.19 node), so bp->lun is 0xff for every unit */
-		why = "it is not on the first logical unit";
-	} else if (bp->block_size != 4096 || bp->blocks != BLOCK_DARWIN_LAST - BLOCK_DARWIN_FIRST + 1) {
-		why = "its blocks are not what they were";
-	} else if (bio->media->read_only) {
-		why = "UEFI gives it out read only";
-	}
-	if (why != NULL) {
-		print("ufs: darwin: no write will be served: %s\n", why);
-		return 0;
-	}
-	print("ufs: darwin (LBA %d..%d of unit 0): its blocks from %d on may be written this run\n",
-	    info->start_lba, info->end_lba, BLOCK_WRITE_FIRST);
-	return 1;
-}
-
 static void
 block_start(void)
 {
@@ -487,13 +437,23 @@ block_start(void)
 				}
 			}
 		}
-		if (block_write_requested && block_is_darwin(info, bio, bp)) {
-			block_write_part = (int)block_shared.parts;
-		}
 		block_bios[block_shared.parts++] = bio;
 		if (block_probe_requested && bp->name[0] == 'd' && bp->name[1] == 'a' && bp->name[2] == 'r' &&
 		    bp->name[3] == 'w' && bp->name[4] == 'i' && bp->name[5] == 'n' && bp->name[6] == 0) {
 			block_io2_probe(handles[i], bio);
+		}
+	}
+	/* the DSU store: listed among the partitions, before the units */
+	block_dsu_part = -1;
+	if (block_shared.parts + nunits < BLOCK_MAX_PARTS) {
+		int writable = 0;
+
+		if (dsu_store_open(&block_shared.part[block_shared.parts], block_write_requested, &writable)) {
+			block_dsu_part = (int)block_shared.parts;
+			if (writable) {
+				block_write_part = block_dsu_part;
+			}
+			block_bios[block_shared.parts++] = NULL;        /* dsu_store_io, not a BlockIo of its own */
 		}
 	}
 	for (uint64_t u = 0; u < nunits; u++) {
@@ -536,7 +496,7 @@ block_start(void)
 	block_writes = block_writes_refused = block_write_bytes = 0;
 	if (block_write_part >= 0) {
 		block_shared.write_part_plus_one = (uint32_t)block_write_part + 1;
-		block_shared.write_first = BLOCK_WRITE_FIRST;
+		block_shared.write_first = 0;   /* the whole store */
 	}
 	block_shared.magic = BLOCK_MAGIC;
 	block_shared.version = BLOCK_VERSION;
@@ -663,8 +623,8 @@ block_poll(void)
 			s = 0x800000000000000FULL;      /* EFI_ACCESS_DENIED */
 			bytes = 0;
 		} else if (op == BLOCK_OP_WRITE) {
-			if (block_write_part < 0 || part != (uint32_t)block_write_part || lba < BLOCK_WRITE_FIRST) {
-				/* not darwin, or not past what the build writes from the computer: never */
+			if (block_write_part < 0 || part != (uint32_t)block_write_part) {
+				/* not the store: never */
 				if (block_writes_refused++ < 8) {
 					print("ufs: a write of %d blocks from %d of %s: REFUSED\n", count, lba,
 					    block_shared.part[part].name);
@@ -683,14 +643,13 @@ block_poll(void)
 				flush_dcache((uint64_t)(uintptr_t)block_buffer,
 				    (uint64_t)(uintptr_t)block_buffer + bytes);
 				want = ufs_crc32(block_buffer, bytes);
-				s = bio->write_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
+				s = dsu_store_io(1, lba, bytes, block_buffer);
 				if (!EFI_ERROR(s)) {
-					bio->flush_blocks(bio);
-					s = bio->read_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
+					s = dsu_store_io(0, lba, bytes, block_buffer);
 					flush_dcache((uint64_t)(uintptr_t)block_buffer,
 					    (uint64_t)(uintptr_t)block_buffer + bytes);
 					if (!EFI_ERROR(s) && ufs_crc32(block_buffer, bytes) != want) {
-						print("ufs: %d blocks from %d of darwin read back DIFFERENT\n",
+						print("ufs: %d blocks from %d of dsu_store read back DIFFERENT\n",
 						    count, lba);
 						s = 0x800000000000000AULL;      /* EFI_VOLUME_CORRUPTED */
 					}
@@ -701,7 +660,8 @@ block_poll(void)
 				}
 			}
 		} else if (op == BLOCK_OP_READ) {
-			s = bio->read_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
+			s = (int)part == block_dsu_part ? dsu_store_io(0, lba, bytes, block_buffer) :
+			    bio->read_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
 			/* what the controller wrote is in memory; drop whatever this core held of the buffer */
 			flush_dcache((uint64_t)(uintptr_t)block_buffer, (uint64_t)(uintptr_t)block_buffer + bytes);
 		} else {

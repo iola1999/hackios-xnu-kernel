@@ -17,7 +17,9 @@
  * "oem dsu crc OFFSET LENGTH"  CRC-32 (zlib's) of that part of the resident image, for the host to
  *                              compare with its own copy before it boots a kernel on it; the host
  *                              reads it with "getvar dsu-crc" (fastboot shows no text of an oem OKAY)
- * Nothing here writes to the storage. Ported from hakios-arm64e-dada's loader (APSL 2.0).
+ * The commands write nothing to the storage. The one write this port makes there goes to the last
+ * part of the same slot, through the kernel's block service (dsu_store, at the end of this file).
+ * Ported from hakios-arm64e-dada's loader (APSL 2.0).
  */
 #define LP_GEOMETRY_MAGIC  0x616c4467u
 #define LP_HEADER_MAGIC    0x414c5030u
@@ -252,5 +254,167 @@ dsu_command(const char *cmd)
 		}
 		fb_reply("OKAY", "");
 	}
+	return 1;
+}
+
+/* ------------------------------------------------------------------------ */
+/* dsu_store: where /private/var is kept between boots                      */
+
+/*
+ * tools/k90auto/dsu.py pads the system image with zeros to a 16 GiB slot, so the slot's tail is
+ * this port's own: the store is its last 4 GiB, two slots of userland/src/var_store.c (2 GiB each,
+ * a header at the start of each). The block service lists it as the partition "dsu_store", in
+ * blocks of userdata's size, and the kernel sees /dev/rufs_dsu_store (bsd/dev/redwood_ufs.c).
+ *
+ * A write lands in userdata, where a wrong sector is Android's data and cannot be undone. So the
+ * store is listed only when the DSU file found through lp_metadata is the one holding this run's
+ * system image -- its first 64 KB are the APFS container this loader is about to hand over -- and
+ * it takes writes only if besides each var_store header block holds zeros or a header. A
+ * discarded DSU leaves an old lp_metadata in /metadata that dsu_find still finds; its extents are
+ * then free space or another file of Android's, which fails one of the two checks.
+ */
+#define DSU_STORE_AT       (12ULL << 30)               /* past the system image (5.3 GB now) */
+#define DSU_STORE_BYTES    (4ULL << 30)
+#define DSU_STORE_SLOT     (2ULL << 30)                /* var_store.c SLOT_BYTES */
+#define DSU_HEAD_CHECK     65536u
+
+static efi_block_io *dsu_store_bio;
+static struct {
+	uint64_t sector, count;
+} dsu_store_extent[DSU_MAX_EXTENTS];
+static unsigned dsu_store_extents;
+
+/* bytes at..at + len of the slot (whole blocks), read into or written from buf */
+static efi_status
+dsu_slot_io(int write, uint64_t at, uint64_t len, uint8_t *buf)
+{
+	efi_block_io *bio = dsu_store_bio;
+	uint64_t bs = bio->media->block_size;
+
+	for (unsigned x = 0; x < dsu_store_extents && len > 0; x++) {
+		uint64_t extent = dsu_store_extent[x].count * 512, n, lba;
+		efi_status s;
+
+		if (at >= extent) {
+			at -= extent;
+			continue;
+		}
+		n = extent - at < len ? extent - at : len;
+		lba = (dsu_store_extent[x].sector * 512 + at) / bs;
+		s = write ? bio->write_blocks(bio, bio->media->media_id, lba, n, buf) :
+		    bio->read_blocks(bio, bio->media->media_id, lba, n, buf);
+		if (EFI_ERROR(s)) {
+			return s;
+		}
+		buf += n;
+		len -= n;
+		at = 0;
+	}
+	return len == 0 ? 0 : 0x8000000000000002ULL;       /* EFI_INVALID_PARAMETER: past the slot */
+}
+
+/* the store's blocks from lba on, for the block service (which has bounded lba and bytes) */
+static efi_status
+dsu_store_io(int write, uint64_t lba, uint64_t bytes, uint8_t *buf)
+{
+	efi_status s;
+
+	if (dsu_store_bio == NULL) {
+		return 0x8000000000000002ULL;
+	}
+	s = dsu_slot_io(write, DSU_STORE_AT + lba * dsu_store_bio->media->block_size, bytes, buf);
+	if (write && !EFI_ERROR(s)) {
+		dsu_store_bio->flush_blocks(dsu_store_bio);
+	}
+	return s;
+}
+
+static int
+dsu_block_is_zero_or_head(const uint8_t *p, uint64_t bs)
+{
+	static const char magic[8] = "RDWVAR\0";
+
+	if (memcmp(p, magic, sizeof(magic)) == 0) {
+		return 1;
+	}
+	for (uint64_t i = 0; i < bs; i++) {
+		if (p[i] != 0) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+/* List the store at bp if the DSU slot checks out; *writable when writes may go there too. */
+static int
+dsu_store_open(struct loader_block_part *bp, int want_write, int *writable)
+{
+	static const char name[] = "dsu_store";
+	const uint8_t *image = (const uint8_t *)(win_base + RESIDENT_RD_OFFSET);
+	efi_block_io *data;
+	uint64_t bs;
+	const char *why = NULL;
+
+	*writable = 0;
+	dsu_store_bio = NULL;
+	if (!dsu_find(&data)) {
+		print("dsu_store: no DSU slot: not listed\n");
+		return 0;
+	}
+	bs = data->media->block_size;
+	dsu_store_bio = data;
+	dsu_store_extents = dsu_extents;
+	for (unsigned x = 0; x < dsu_extents; x++) {
+		dsu_store_extent[x].sector = dsu_extent[x].sector;
+		dsu_store_extent[x].count = dsu_extent[x].count;
+		if (bs == 0 || (dsu_extent[x].sector * 512) % bs || (dsu_extent[x].count * 512) % bs) {
+			why = "an extent is not block aligned";
+		}
+	}
+	if (why == NULL && (bs > DSU_HEAD_CHECK || DSU_STORE_AT % bs || DSU_STORE_SLOT % bs)) {
+		why = "userdata's blocks do not divide the store";
+	} else if (why == NULL && dsu_bytes < DSU_STORE_AT + DSU_STORE_BYTES) {
+		why = "the slot is smaller than 16 GiB";
+	} else if (why == NULL && (resident_rd_size < DSU_HEAD_CHECK || resident_rd_size > DSU_STORE_AT)) {
+		why = "this run's system image is missing or reaches into the store";
+	} else if (why == NULL && EFI_ERROR(dsu_slot_io(0, 0, DSU_HEAD_CHECK, ufs_buffer))) {
+		why = "the slot's first blocks do not read";
+	} else if (why == NULL && memcmp(ufs_buffer + 32, "NXSB", 4) != 0) {
+		why = "the slot does not begin with an APFS container";
+	} else if (why == NULL && memcmp(ufs_buffer, image, DSU_HEAD_CHECK) != 0) {
+		why = "the slot does not begin with this run's system image";
+	}
+	if (why != NULL) {
+		print("dsu_store: not listed: %s\n", why);
+		dsu_store_bio = NULL;
+		return 0;
+	}
+	memset(bp, 0, sizeof(*bp));
+	memcpy(bp->name, name, sizeof(name));
+	bp->block_size = (uint32_t)bs;
+	bp->blocks = DSU_STORE_BYTES / bs;
+	bp->unit = 0xffff;
+	bp->lun = 0xff;
+	print("dsu_store: %d MB from %d MB of the DSU slot, %d blocks of %d\n", DSU_STORE_BYTES >> 20,
+	    DSU_STORE_AT >> 20, bp->blocks, bs);
+	if (!want_write) {
+		return 1;
+	}
+	for (uint64_t slot = 0; slot < DSU_STORE_BYTES / DSU_STORE_SLOT && why == NULL; slot++) {
+		if (EFI_ERROR(dsu_slot_io(0, DSU_STORE_AT + slot * DSU_STORE_SLOT, bs, ufs_buffer))) {
+			why = "a header block does not read";
+		} else if (!dsu_block_is_zero_or_head(ufs_buffer, bs)) {
+			why = "a header block holds something else than zeros or a header";
+		}
+	}
+	if (why == NULL && data->media->read_only) {
+		why = "UEFI gives userdata out read only";
+	}
+	if (why != NULL) {
+		print("dsu_store: read only this run: %s\n", why);
+		return 1;
+	}
+	*writable = 1;
+	print("dsu_store: takes writes this run\n");
 	return 1;
 }

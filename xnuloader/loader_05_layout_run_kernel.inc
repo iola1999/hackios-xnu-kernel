@@ -1023,7 +1023,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	 * memory and devices release (LC-RETURN block, same ruling for both run kinds) */
 	lc_after_return(ran_other_core, cpu_mpidr, cpu_count);
 	if (block_write_requested) {
-		print("ufs: %d writes into darwin, %d bytes, read back the same; %d refused\n", block_writes,
+		print("ufs: %d writes into dsu_store, %d bytes, read back the same; %d refused\n", block_writes,
 		    block_write_bytes, block_writes_refused);
 	}
 	lc_after_return_collect(kernel_live, slide, checkpoint);
