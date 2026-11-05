@@ -25,5 +25,8 @@ for a in "$@"; do
     *) args+=("$a");;
   esac
 done
-exec /usr/bin/$drv -include "$HB/../../hostinc/xnu_clang_compat.h" -target arm64-apple-ios${XNU_SDK_VERSION:-16.5} --ld-path="$HB/ld64" \
+# setup.sh links the cctools ld64 here on Linux; on macOS Xcode's ld is that linker
+ld="$HB/ld64"
+[ -e "$ld" ] || [ "$(uname -s)" != Darwin ] || ld=/usr/bin/ld
+exec /usr/bin/$drv -include "$HB/../../hostinc/xnu_clang_compat.h" -target arm64-apple-ios${XNU_SDK_VERSION:-16.5} --ld-path="$ld" \
   -w "${extra[@]}" "${args[@]}"
