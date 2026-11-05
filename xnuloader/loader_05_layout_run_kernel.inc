@@ -345,6 +345,10 @@ lc_after_return_collect(const struct kernel_live *live, uint64_t slide, uint64_t
 }
 /* LC-RETURN-END */
 
+static void usb_command_loop(void);
+static int usb_start(void);
+static void ui_stage(const char *word);
+
 static int
 run_kernel(int have_checkpoint, uint64_t checkpoint)
 {
@@ -354,7 +358,14 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	struct payload_info pi;
 
 	if (!parse_payload(&pi, 1) || pi.kernel == NULL) {
-		print("no kernel in payload\n");
+		print("no kernel in payload: entering Fastboot debug mode\n");
+		ui_stage("NO KERNEL - FASTBOOT MODE");
+		if (usb_start()) {
+			usb_command_loop();
+		}
+		for (;;) {
+			__asm__ volatile("wfe");
+		}
 		return 0;
 	}
 	if (!have_checkpoint) {
@@ -503,7 +514,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	if (ufs_requested >= 2) {
 		hc_init();              /* (ufs_native=: UEFI's transfer list kept, before anything reads) */
 	}
-	if (ufs_requested >= 1) {
+	if (ufs_requested == 1) {
 		ufs_survey();
 	}
 	if (ufs_requested >= 2) {

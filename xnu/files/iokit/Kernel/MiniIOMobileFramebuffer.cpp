@@ -583,7 +583,7 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	int32_t sx = src[0], sy = src[1], sw = src[2], sh = src[3];
 	int32_t dx = dst[0], dy = dst[1], dw = dst[2], dh = dst[3];
 	int32_t px0, py0, px1, py1, cx0, cx1;
-	bool filter = gFilter == 1 || (gFilter == 2 && fSettling);
+	bool filter = gFilter == 1 || (gFilter == 2 && (fSettling || fFilterFrame));
 	RowJob job;
 
 	if (sw <= 0 || sh <= 0) {
@@ -662,7 +662,7 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 		fStatUnchanged++;
 		return;
 	}
-	fDrewNearest = fDrewNearest || (gFilter == 2 && !fSettling);
+	fDrewNearest = fDrewNearest || (gFilter == 2 && !fSettling && !fFilterFrame);
 	flip_band(&job.by0, &job.by1, job.py0, job.py1);
 	fStatBandRows += (uint64_t) (job.by1 - job.by0);
 	if (fThreads <= 1 || fDiff || fHelpersStarted + 1 < fThreads) {
@@ -935,9 +935,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 		if (gFilter == 2) {
 			absolutetime_to_nanoseconds(fStatSettleTime, &beat);
-			IOLog("MiniIOMobileFramebuffer: %u frames drawn again filtered, %llu us each\n", fStatSettled,
-			    fStatSettled ? beat / fStatSettled / NSEC_PER_USEC : 0);
-			fStatSettled = 0;
+			IOLog("MiniIOMobileFramebuffer: %u frames drawn again filtered, %llu us each; %u reused\n", fStatSettled,
+			    fStatSettled ? beat / fStatSettled / NSEC_PER_USEC : 0, fStatSettleReused);
+			fStatSettled = 0; fStatSettleReused = 0;
 			fStatSettleTime = 0;
 		}
 		fStatUnchanged = fStatUnhashed = 0;

@@ -613,6 +613,9 @@ fb_command(char *cmd)
 		} else if (starts_with(cmd, "oem push")) {
 			download_to_inbox = inbox_live() != NULL;
 			fb_reply(download_to_inbox ? "OKAY" : "FAIL", download_to_inbox ? "" : "no kernel with an inbox is running");
+		} else if (str_eq(cmd, "oem recovery")) {
+			const char *err = slot_unlock_held_recovery();
+			fb_reply(err == NULL ? "OKAY" : "FAIL", err == NULL ? "" : err);
 		} else if (lc_cmd_denied(kernel_resources_held, firmware_fault, live, cmd)) {
 			fb_reply("FAIL", live ? "a kernel is running (oem stop ends it)"
 			    : "a kernel may still hold memory or devices: reboot to start over");
@@ -642,6 +645,16 @@ fb_command(char *cmd)
 				fb_reply("OKAY", last_result);
 			} else if (str_eq(var, "watchdog")) {
 				fb_reply("OKAY", wdt_armed ? "armed" : "off");
+			} else if (str_eq(var, "slot-retry-count:a") || str_eq(var, "slot-retry-count:b")) {
+				fb_reply("OKAY", "7");
+			} else if (str_eq(var, "slot-successful:a") || str_eq(var, "slot-successful:b")) {
+				fb_reply("OKAY", "yes");
+			} else if (str_eq(var, "slot-unbootable:a") || str_eq(var, "slot-unbootable:b")) {
+				fb_reply("OKAY", "no");
+			} else if (str_eq(var, "current-slot")) {
+				fb_reply("OKAY", "a");
+			} else if (str_eq(var, "has-slot:boot")) {
+				fb_reply("OKAY", "yes");
 			} else if (str_eq(var, "screen") && SCREEN.base != 0) {
 				/* width height bytes-per-row */
 				uint32_t mark = log_len;
@@ -823,6 +836,9 @@ fb_command(char *cmd)
 				ui_stage("BOOT FAILED");
 			} else {
 				UI.ready = 0;   /* the panel keeps the kernel's last frame for oem screenshot */
+				if (recovery_pending_after_return) {
+					(void)slot_unlock_held_recovery();
+				}
 			}
 		} else if (starts_with(cmd, "oem hang")) {
 			/* the watchdog's reset, from here: with memory and devices held too (a host cold reset),
@@ -851,6 +867,13 @@ fb_command(char *cmd)
 			/* the only writable storage check, and it puts back what it moved (review F09) */
 			fb_reply("OKAY", "");
 			probe_boot_a();
+		} else if (str_eq(cmd, "flash:boot_a") || str_eq(cmd, "oem flash_boot")) {
+			const char *err = slot_flash_boot_image(payload_bytes);
+			fb_reply(err == NULL ? "OKAY" : "FAIL", err == NULL ? "" : err);
+		} else if (str_eq(cmd, "oem android")) {
+			slot_set_active_other();
+			fb_reply("OKAY", "");
+			reboot();
 		} else if (starts_with(cmd, "oem log")) {
 			if (running_live != NULL) {
 				compose_live_log(running_live, running_slide);
@@ -976,6 +999,7 @@ usb_command_loop(void)
 		if (!usb_connected || firmware_fault || usb_out_lost || usb_in_lost) {
 			ramdisk_fail();
 		}
+		boot_fallback_check();
 		if (!usb_connected) {
 			/* the link wait ends on a cable event: Connected returns so this loop submits
 			 * the first OUT; a disconnect just keeps waiting for the cable to come up */
@@ -1134,17 +1158,38 @@ efi_main(efi_handle image, efi_system_table *st)
 
 	install_exception_hook();
 	wdt_arm();
+	screen_quiet = 1;
+	ui_init();
 
 	int have_payload = parse_payload(&pi, 0);
-	if (have_payload && pi.usb_mode && usb_start()) {
-		flush_log();
-		inspect_storage(); /* read-only since review F09; the writes live behind "oem probe" */
-		usb_command_loop();
+	block_start();
+	inspect_storage();
+	slot_detect();
+	/* Start USB peripheral before the boot menu so host tools can interrupt or attach at any time. */
+	(void)usb_start();
+	int menu_choice = ui_boot_menu();
+	if (menu_choice == MENU_CHOICE_ANDROID) {
+		slot_set_active_other();
+		reboot();
+	} else if (menu_choice == MENU_CHOICE_FASTBOOT) {
+		if (USB != NULL || usb_start()) {
+			flush_log();
+			usb_command_loop();
+		}
+	} else {
+		slot_maintain_current();
 	}
 
-	/* One-shot mode: run the kernel that came with the image, then reset. */
+	/* One-shot mode: run the kernel that came with the image, then fall back to Fastboot if it returns. */
 	if (have_payload) {
 		run_kernel(0, 0);
+	}
+	boot_fallback_enter();
+	if (USB != NULL || usb_start()) {
+		usb_command_loop();
+	}
+	for (;;) {
+		__asm__ volatile("wfe");
 	}
 	reboot();
 	return 0;

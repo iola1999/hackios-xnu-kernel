@@ -5,4 +5,6 @@ set -e
 cd "$(dirname "$0")"
 clang --target=aarch64-linux-gnu -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -static \
 	-fuse-ld=lld -O1 -Wall -Wl,-e,_start -o f2fs-resize f2fs-resize.c
-ls -la f2fs-resize
+clang --target=aarch64-linux-gnu -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -static \
+	-fuse-ld=lld -O1 -Wall -Wl,-e,_start -o blkpg-tool blkpg-tool.c
+ls -la f2fs-resize blkpg-tool

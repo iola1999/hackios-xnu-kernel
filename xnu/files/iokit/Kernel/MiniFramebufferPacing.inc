@@ -72,6 +72,13 @@ panel_thread_start(thread_continue_t continuation, void * parameter, thread_t * 
  * being drawn into by CoreAnimation again, for the length of that one drawing.
  */
 #define SETTLE_MS       40
+#define FAST_FRAMES     2
+
+static unsigned fFastFrames = 0;
+static bool fFilterFrame = false;
+static uint32_t fStatSettleReused = 0;
+static uint32_t shownDrawn[SWAP_LAYERS] = { 0 };
+static uint64_t lastFrame = 0;
 
 void
 IOMobileFramebuffer::presenterMain(void * self, wait_result_t result __unused)
@@ -97,6 +104,9 @@ IOMobileFramebuffer::presenter(void)
 	MiniIOSurface * surfaces[SWAP_LAYERS] = { NULL };
 	bool unsettled = false;                 /* the panel shows rows drawn nearest neighbour; `surfaces` are the last frame's */
 	AbsoluteTime deadline = 0;
+	uint64_t settleTicks;
+
+	nanoseconds_to_absolutetime(SETTLE_MS * NSEC_PER_MSEC, &settleTicks);
 
 	for (;;) {
 		IOLockLock(fSwapLock);
@@ -106,7 +116,15 @@ IOMobileFramebuffer::presenter(void)
 			} else if (IOLockSleepDeadline(fSwapLock, fSwap, deadline, THREAD_UNINT) == THREAD_TIMED_OUT &&
 			    fSwapsWaiting == 0) {
 				IOLockUnlock(fSwapLock);
-				settle(swap, surfaces);
+				bool reused = false;
+				for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+					reused = reused || (surfaces[layer] != NULL && surfaces[layer]->drawn != shownDrawn[layer]);
+				}
+				if (reused) {
+					fStatSettleReused++;
+				} else {
+					settle(swap, surfaces);
+				}
 				drop_surfaces(surfaces);
 				unsettled = false;
 				IOLockLock(fSwapLock);
@@ -116,10 +134,20 @@ IOMobileFramebuffer::presenter(void)
 		memcpy(swap, fSwap[fSwapFirst], SWAP_SIZE);
 		memcpy(surfaces, fSwapSurfaces[fSwapFirst], sizeof(surfaces));
 		IOLockUnlock(fSwapLock);
-		fDrewNearest = false;
-		show(swap, surfaces);
+		{
+			uint64_t now = mach_absolute_time();
+
+			fFastFrames = (lastFrame != 0 && now - lastFrame <= settleTicks) ? fFastFrames + 1 : 0;
+			fFilterFrame = fFastFrames < FAST_FRAMES;
+			for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+				shownDrawn[layer] = surfaces[layer] != NULL ? surfaces[layer]->drawn : 0;
+			}
+			fDrewNearest = false;
+			show(swap, surfaces);
+			lastFrame = mach_absolute_time();
+		}
 		/* (a frame that drew nothing leaves the rows of the one before, so an unsettled panel stays so) */
-		unsettled = gFilter == 2 && (unsettled || fDrewNearest);
+		unsettled = gFilter == 2 && !fFilterFrame && (unsettled || fDrewNearest);
 		if (unsettled) {
 			clock_interval_to_deadline(SETTLE_MS, kMillisecondScale, &deadline);
 		} else {
@@ -128,6 +156,7 @@ IOMobileFramebuffer::presenter(void)
 		MiniIOSurfaceClearKept();               /* (the next frame is some milliseconds away) */
 	}
 }
+
 
 /*
  * The frame on the panel once more, filtered: the same layers from the same surfaces, every row (the row

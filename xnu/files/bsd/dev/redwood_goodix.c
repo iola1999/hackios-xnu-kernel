@@ -305,6 +305,18 @@ goodix_report(const uint8_t *touches, uint32_t count)
 	}
 }
 
+static bool
+goodix_touching(void)
+{
+	for (uint32_t i = 0; i < GOODIX_MAX_TOUCHES; i++) {
+		if (contact[i].down) {
+			return true;
+		}
+	}
+	return false;
+}
+
+
 /* Read the report if there is one, and tell the chip it has been read. */
 static void
 goodix_poll(void)
@@ -394,6 +406,16 @@ chip_poll(void)
 		goodix_poll();
 	}
 }
+
+static bool
+chip_touching(void)
+{
+	if (touch_chip == TOUCH_FOCALTECH) {
+		return focaltech_touching();
+	}
+	return goodix_touching();
+}
+
 
 /* ---- all of it together ---------------------------------------------------------------------------- */
 
@@ -563,7 +585,10 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 	if (poll_us < 250 || poll_us > 100000) {
 		poll_us = 8000;
 	}
-	idle_looks = 80000 / poll_us;   /* a report read every 80 ms even with the line high, in case it is missed */
+	idle_looks = 16000 / poll_us;   /* a report read every 16 ms even with the line high, in case it is missed */
+	if (idle_looks == 0) {
+		idle_looks = 1;
+	}
 
 	tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
 	gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
@@ -604,8 +629,10 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 		uint64_t looked = micros_now(), read_at;
 
 		/* the interrupt line is low while a report waits, or an edge was latched since the last look;
-		 * look anyway every 80 ms in case both are missed */
-		bool waiting = !gpio_get(PIN_INT);
+		 * or a finger is down on the glass: poll every round unconditionally so liftoff is caught at once.
+		 * look anyway every 16 ms in case edges are missed. */
+		bool touching = chip_touching();
+		bool waiting = touching || !gpio_get(PIN_INT);
 
 		if (int_latched && (rd(GPIO_INTR_STATUS(PIN_INT)) & 1)) {
 			wr(GPIO_INTR_STATUS(PIN_INT), 0);       /* before the read, so an edge during it is kept */

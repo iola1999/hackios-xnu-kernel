@@ -96,9 +96,8 @@ dsu_parse(const uint8_t *p, uint64_t room, uint64_t userdata_sectors)
 	return 0;
 }
 
-/* system_gsi's extents; 1 if every copy of the metadata found agrees (a rename can leave an older one) */
 static int
-dsu_find(efi_block_io **userdata)
+dsu_find_gsi(efi_block_io **userdata)
 {
 	static const char16 meta_name[] = u"metadata", data_name[] = u"userdata";
 	efi_block_io *meta = find_partition_named(meta_name, sizeof(meta_name) / sizeof(meta_name[0]));
@@ -143,6 +142,25 @@ dsu_find(efi_block_io **userdata)
 	}
 	*userdata = data;
 	return 1;
+}
+
+/* system_gsi's extents; 1 if every copy of the metadata found agrees (a rename can leave an older one) */
+static int
+dsu_find(efi_block_io **userdata)
+{
+	static const char16 darwin_name[] = u"darwin";
+	efi_block_io *darwin = find_partition_named(darwin_name, sizeof(darwin_name) / sizeof(darwin_name[0]));
+	if (darwin != NULL) {
+		uint64_t bytes = (darwin->media->last_block + 1) * darwin->media->block_size;
+		dsu_extents = 1;
+		dsu_extent[0].sector = 0;
+		dsu_extent[0].count = bytes / 512;
+		dsu_bytes = bytes;
+		*userdata = darwin;
+		print("dsu: darwin partition: %d bytes in 1 extent\n", dsu_bytes);
+		return 1;
+	}
+	return dsu_find_gsi(userdata);
 }
 
 /* zlib's CRC-32 through the ARMv8 CRC32 instructions (the same reflected 0xedb88320 polynomial) */
@@ -285,6 +303,7 @@ dsu_command(const char *cmd)
 #define DSU_HEAD_CHECK     65536u
 
 static efi_block_io *dsu_store_bio;
+static uint64_t dsu_store_at = DSU_STORE_AT;
 static struct {
 	uint64_t sector, count;
 } dsu_store_extent[DSU_MAX_EXTENTS];
@@ -328,7 +347,7 @@ dsu_store_io(int write, uint64_t lba, uint64_t bytes, uint8_t *buf)
 	if (dsu_store_bio == NULL) {
 		return 0x8000000000000002ULL;
 	}
-	s = dsu_slot_io(write, DSU_STORE_AT + lba * dsu_store_bio->media->block_size, bytes, buf);
+	s = dsu_slot_io(write, dsu_store_at + lba * dsu_store_bio->media->block_size, bytes, buf);
 	if (write && !EFI_ERROR(s)) {
 		dsu_store_bio->flush_blocks(dsu_store_bio);
 	}
@@ -356,39 +375,58 @@ static int
 dsu_store_open(struct loader_block_part *bp, int want_write, int *writable)
 {
 	static const char name[] = "dsu_store";
+	static const char16 darwin_var_name[] = u"darwin_var";
 	const uint8_t *image = (const uint8_t *)(win_base + RESIDENT_RD_OFFSET);
-	efi_block_io *data;
-	uint64_t bs;
+	efi_block_io *data = NULL;
+	uint64_t bs = 0;
 	const char *why = NULL;
 
 	*writable = 0;
 	dsu_store_bio = NULL;
-	if (!dsu_find(&data)) {
-		print("dsu_store: no DSU slot: not listed\n");
-		return 0;
-	}
-	bs = data->media->block_size;
-	dsu_store_bio = data;
-	dsu_store_extents = dsu_extents;
-	for (unsigned x = 0; x < dsu_extents; x++) {
-		dsu_store_extent[x].sector = dsu_extent[x].sector;
-		dsu_store_extent[x].count = dsu_extent[x].count;
-		if (bs == 0 || (dsu_extent[x].sector * 512) % bs || (dsu_extent[x].count * 512) % bs) {
-			why = "an extent is not block aligned";
+	dsu_store_at = DSU_STORE_AT;
+	if (dsu_find_gsi(&data)) {
+		bs = data->media->block_size;
+		dsu_store_bio = data;
+		dsu_store_extents = dsu_extents;
+		for (unsigned x = 0; x < dsu_extents; x++) {
+			dsu_store_extent[x].sector = dsu_extent[x].sector;
+			dsu_store_extent[x].count = dsu_extent[x].count;
+			if (bs == 0 || (dsu_extent[x].sector * 512) % bs || (dsu_extent[x].count * 512) % bs) {
+				why = "an extent is not block aligned";
+			}
 		}
+		if (why == NULL && (bs > DSU_HEAD_CHECK || DSU_STORE_AT % bs || DSU_STORE_SLOT % bs)) {
+			why = "userdata's blocks do not divide the store";
+		} else if (why == NULL && dsu_bytes < DSU_STORE_AT + DSU_STORE_BYTES) {
+			why = "the slot is smaller than 16 GiB";
+		} else if (why == NULL && (resident_rd_size < DSU_HEAD_CHECK || resident_rd_size > DSU_STORE_AT)) {
+			why = "this run's system image is missing or reaches into the store";
+		} else if (why == NULL && EFI_ERROR(dsu_slot_io(0, 0, DSU_HEAD_CHECK, ufs_buffer))) {
+			why = "the slot's first blocks do not read";
+		} else if (why == NULL && memcmp(ufs_buffer + 32, "NXSB", 4) != 0) {
+			why = "the slot does not begin with an APFS container";
+		} else if (why == NULL && memcmp(ufs_buffer, image, DSU_HEAD_CHECK) != 0) {
+			why = "the slot does not begin with this run's system image";
+		}
+	} else {
+		why = "no DSU slot";
 	}
-	if (why == NULL && (bs > DSU_HEAD_CHECK || DSU_STORE_AT % bs || DSU_STORE_SLOT % bs)) {
-		why = "userdata's blocks do not divide the store";
-	} else if (why == NULL && dsu_bytes < DSU_STORE_AT + DSU_STORE_BYTES) {
-		why = "the slot is smaller than 16 GiB";
-	} else if (why == NULL && (resident_rd_size < DSU_HEAD_CHECK || resident_rd_size > DSU_STORE_AT)) {
-		why = "this run's system image is missing or reaches into the store";
-	} else if (why == NULL && EFI_ERROR(dsu_slot_io(0, 0, DSU_HEAD_CHECK, ufs_buffer))) {
-		why = "the slot's first blocks do not read";
-	} else if (why == NULL && memcmp(ufs_buffer + 32, "NXSB", 4) != 0) {
-		why = "the slot does not begin with an APFS container";
-	} else if (why == NULL && memcmp(ufs_buffer, image, DSU_HEAD_CHECK) != 0) {
-		why = "the slot does not begin with this run's system image";
+	if (why != NULL) {
+		efi_block_io *dvar = find_partition_named(darwin_var_name,
+		    sizeof(darwin_var_name) / sizeof(darwin_var_name[0]));
+		if (dvar != NULL) {
+			uint64_t vbytes = (dvar->media->last_block + 1) * dvar->media->block_size;
+			bs = dvar->media->block_size;
+			if (bs != 0 && bs <= DSU_HEAD_CHECK && DSU_STORE_SLOT % bs == 0 && vbytes >= DSU_STORE_BYTES) {
+				data = dvar;
+				dsu_store_bio = dvar;
+				dsu_store_at = 0;
+				dsu_store_extents = 1;
+				dsu_store_extent[0].sector = 0;
+				dsu_store_extent[0].count = vbytes / 512;
+				why = NULL;
+			}
+		}
 	}
 	if (why != NULL) {
 		print("dsu_store: not listed: %s\n", why);
@@ -402,12 +440,12 @@ dsu_store_open(struct loader_block_part *bp, int want_write, int *writable)
 	bp->unit = 0xffff;
 	bp->lun = 0xff;
 	print("dsu_store: %d MB from %d MB of the DSU slot, %d blocks of %d\n", DSU_STORE_BYTES >> 20,
-	    DSU_STORE_AT >> 20, bp->blocks, bs);
+	    dsu_store_at >> 20, bp->blocks, bs);
 	if (!want_write) {
 		return 1;
 	}
 	for (uint64_t slot = 0; slot < DSU_STORE_BYTES / DSU_STORE_SLOT && why == NULL; slot++) {
-		if (EFI_ERROR(dsu_slot_io(0, DSU_STORE_AT + slot * DSU_STORE_SLOT, bs, ufs_buffer))) {
+		if (EFI_ERROR(dsu_slot_io(0, dsu_store_at + slot * DSU_STORE_SLOT, bs, ufs_buffer))) {
 			why = "a header block does not read";
 		} else if (!dsu_block_is_zero_or_head(ufs_buffer, bs)) {
 			why = "a header block holds something else than zeros or a header";

@@ -643,14 +643,25 @@ block_poll(void)
 				flush_dcache((uint64_t)(uintptr_t)block_buffer,
 				    (uint64_t)(uintptr_t)block_buffer + bytes);
 				want = ufs_crc32(block_buffer, bytes);
-				s = dsu_store_io(1, lba, bytes, block_buffer);
+				if ((int)part == block_dsu_part) {
+					s = dsu_store_io(1, lba, bytes, block_buffer);
+				} else if (bio != NULL) {
+					s = bio->write_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
+					if (!EFI_ERROR(s)) {
+						bio->flush_blocks(bio);
+					}
+				} else {
+					s = 0x800000000000000FULL;
+				}
 				if (!EFI_ERROR(s)) {
-					s = dsu_store_io(0, lba, bytes, block_buffer);
+					s = (int)part == block_dsu_part ?
+					    dsu_store_io(0, lba, bytes, block_buffer) :
+					    bio->read_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
 					flush_dcache((uint64_t)(uintptr_t)block_buffer,
 					    (uint64_t)(uintptr_t)block_buffer + bytes);
 					if (!EFI_ERROR(s) && ufs_crc32(block_buffer, bytes) != want) {
-						print("ufs: %d blocks from %d of dsu_store read back DIFFERENT\n",
-						    count, lba);
+						print("ufs: %d blocks from %d of %s read back DIFFERENT\n",
+						    count, lba, block_shared.part[part].name);
 						s = 0x800000000000000AULL;      /* EFI_VOLUME_CORRUPTED */
 					}
 				}

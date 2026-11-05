@@ -399,6 +399,22 @@ focaltech_poll(void)
 		}
 		return;
 	}
+	/* (nothing to report: what the vendor's driver takes for a report that is not one; a finger would seem to have lifted) */
+	if (report[1] == 0xff && report[2] == 0xff && report[3] == 0xff) {
+		return;
+	}
 	seen.reports++;
 	focaltech_report(report);
 }
+
+static bool
+focaltech_touching(void)
+{
+	for (uint32_t i = 0; i < FOCALTECH_MAX_TOUCHES; i++) {
+		if (focaltech_contact[i].down) {
+			return true;
+		}
+	}
+	return false;
+}
+

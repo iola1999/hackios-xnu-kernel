@@ -52,6 +52,8 @@ __pycache__/
 !/xnuloader/platform_private.h
 !/xnuloader/mkidentity.py
 !/xnuloader/mkpayload.py
+!/xnuloader/mkstandalone.py
+!/xnuloader/test_boot_safety.py
 
 /qemu/*
 !/qemu/*.sh
@@ -86,6 +88,7 @@ __pycache__/
 !/xnu-deps/build/lzbitmap/libzbitmap.c
 !/xnu-deps/build/lzbitmap/libzbitmap.h
 /tools/android/f2fs-resize
+/tools/android/blkpg-tool
 
 # Local diagnostics remain outside source control.
 /docs/progress/evidence/

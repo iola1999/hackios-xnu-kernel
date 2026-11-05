@@ -419,7 +419,7 @@ lc_blocked_cmd(const char *cmd)
 {
 	static const char *const blocked[] = { "oem ramdisk", "download:", "oem run", "oem selftest",
 		"oem recording", "oem sound", "oem clearscreen", "oem memmap", "oem probe",
-		"oem logwrite", "oem dsu" };
+		"oem logwrite", "oem dsu", "flash:", "oem flash_boot", "oem android" };
 
 	for (unsigned i = 0; i < sizeof(blocked) / sizeof(blocked[0]); i++) {
 		if (lc_starts(cmd, blocked[i])) {
@@ -675,10 +675,14 @@ flush_log(void)
  * 2.4 GB iOS system volume therefore needs neither the boot image nor a kernel storage driver.
  * EDK2 BlockIO reads work on this phone (writes do not, which this path never needs).
  */
+static void wdt_pet(void);
+static void ui_stage(const char *word);
+static void ui_progress(uint64_t done, uint64_t total);
+
 static int
 rdfile_load(const char *part, uint64_t off, uint64_t size, uint64_t dst)
 {
-	static uint8_t bounce[262144];   /* some UFS BlockIO drivers cap single transfers; 256 KiB is safe */
+	const uint64_t max_chunk = 8u << 20;
 	char16 wname[40];
 	unsigned n;
 
@@ -697,25 +701,32 @@ rdfile_load(const char *part, uint64_t off, uint64_t size, uint64_t dst)
 	uint64_t start = off == ~0ull ? total - size : off;
 
 	print("rdfile: %s bs=%d total=%x start=%x size=%x\n", part, (uint64_t)bs, total, start, size);
-	if (size == 0 || (start % bs) != 0 || start + size > total) {
+	if (size == 0 || bs == 0 || (start % bs) != 0 || start + size > total) {
 		print("rdfile: bad range\n");
 		return 0;
 	}
-	memset((void *)dst, 0, size); /* image holes must read as zeroes, as QEMU's sparse file gives */
+	uint64_t t0 = READ_SYSREG(CNTVCT_EL0);
+	ui_stage("READING SYSTEM FROM STORAGE");
 	for (uint64_t done = 0; done < size; ) {
-		uint64_t chunk = size - done < sizeof(bounce) ? size - done : sizeof(bounce);
+		uint64_t chunk = size - done < max_chunk ? size - done : max_chunk;
+		chunk = (chunk + bs - 1) / bs * bs;
 
-		efi_status s = bio->read_blocks(bio, bio->media->media_id, (start + done) / bs, chunk, bounce);
+		efi_status s = bio->read_blocks(bio, bio->media->media_id, (start + done) / bs,
+		    chunk, (void *)(uintptr_t)(dst + done));
 		if (EFI_ERROR(s)) {
 			print("rdfile: read status %x at %x\n", s, done);
 			return 0;
 		}
-		memcpy((void *)(dst + done), bounce, (size_t)chunk);
 		done += chunk;
-		if ((done >> 20) % 256 == 0) {
-			print("rdfile: %x / %x\n", done, size);
+		ui_progress(done < size ? done : size, size);
+		wdt_pet();
+		if ((done >> 20) % 512 == 0 || done >= size) {
+			print("rdfile: %x / %x\n", done < size ? done : size, size);
 		}
 	}
+	print("rdfile: %d bytes read in %d ms\n", size,
+	    (READ_SYSREG(CNTVCT_EL0) - t0) / (READ_SYSREG(CNTFRQ_EL0) / 1000));
+	ui_stage("SYSTEM READY");
 	return 1;
 }
 

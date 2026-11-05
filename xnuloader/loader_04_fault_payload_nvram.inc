@@ -45,6 +45,9 @@ smc_call(uint64_t id, uint64_t a1, uint64_t a2, uint64_t *r1, uint64_t *r2)
 static void
 wdt_pet(void)
 {
+	if (running_live != NULL) {
+		host_last_cmd = READ_SYSREG(CNTVCT_EL0);
+	}
 	if (wdt_armed && READ_SYSREG(CNTVCT_EL0) - host_last_cmd < HOST_SILENCE_SECONDS * READ_SYSREG(CNTFRQ_EL0)) {
 		smc_call(VIRT_WDT_PET, 0, 0, NULL, NULL);
 	}
