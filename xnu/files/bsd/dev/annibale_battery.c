@@ -20,10 +20,12 @@ extern kern_return_t thread_terminate(thread_t);
 #define SCL 1
 #define OUTPUT (1u << 9)
 #define GAUGE_ADDRESS 0x55
-#define CHARGE_FLOW_UA 50000    /* 50 mA */
+#define CHARGE_FLOW_UA 50000        /* 50 mA */
+#define DISCONNECT_FLOW_UA (-250000) /* -250 mA */
 static vm_offset_t pins;
 static uint32_t saved_cfg[2], saved_io[2], input_cfg[2];
 static bool bus_ok;
+static bool last_external = false;
 
 static uint32_t
 rd(unsigned pin, unsigned offset)
@@ -180,8 +182,20 @@ sample(void)
 	 * a charger that holds a full battery shows as plugged in and not charging (status 3), which
 	 * RedwoodBattery reports as charging, as an iPhone shows it. A supply weaker than the phone's
 	 * draw (a computer's USB port) still reads as discharging. */
-	state.status = state.current_ua > CHARGE_FLOW_UA ? 1 : state.current_ua < -CHARGE_FLOW_UA ? 2 : 3;
-	state.external = state.current_ua >= -CHARGE_FLOW_UA;
+	/* Hysteresis window [-250 mA, +50 mA] to eliminate toggling around 0 mA:
+	 * > +50 mA: battery is actively charging from external power
+	 * < -250 mA: battery is actively discharging, external power disconnected
+	 * [-250 mA, +50 mA]: maintain current external state */
+	if (state.current_ua > CHARGE_FLOW_UA) {
+		last_external = true;
+		state.status = 1;
+	} else if (state.current_ua < DISCONNECT_FLOW_UA) {
+		last_external = false;
+		state.status = 2;
+	} else {
+		state.status = last_external ? 3 : 2;
+	}
+	state.external = last_external;
 	state.charge_uah = values[4] * 1000;
 	state.full_uah = values[5] * 1000;
 	state.design_uah = values[6] * 1000;
@@ -194,17 +208,51 @@ sample(void)
 }
 
 static void
+bus_reinit(void)
+{
+	for (unsigned pin = 0; pin < 2; pin++) {
+		saved_cfg[pin] = rd(pin, 0);
+		saved_io[pin] = rd(pin, 4) & 2;
+		input_cfg[pin] = (saved_cfg[pin] & ~(0x3fu | OUTPUT)) | 3;
+		wr(pin, 0, input_cfg[pin]);
+		wr(pin, 4, 0);
+	}
+	line(SDA, true);
+	for (unsigned i = 0; i < 9; i++) {
+		line(SCL, false);
+		pause_bus();
+		line(SCL, true);
+		pause_bus();
+		if (rd(SDA, 4) & 1) {
+			break;
+		}
+	}
+	stop();
+	for (unsigned pin = 0; pin < 2; pin++) {
+		wr(pin, 4, saved_io[pin]);
+		wr(pin, 0, saved_cfg[pin]);
+	}
+	delay_for_interval(100, NSEC_PER_MSEC);
+}
+
+static void
 battery_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	printf("battery: BQ27Z561 on GPIO52/53, address %#x; reading standard commands\n", GAUGE_ADDRESS);
 	pins = ml_io_map(0x0f134000UL, 0x2000);
 	if (pins) {
-		for (unsigned failures = 0; failures < 3;) {
-			failures = sample() ? 0 : failures + 1;
+		for (;;) {
+			if (!sample()) {
+				bus_reinit();
+				if (sample()) {
+					delay_for_interval(5000, NSEC_PER_MSEC);
+					continue;
+				}
+			}
 			delay_for_interval(5000, NSEC_PER_MSEC);
 		}
 	}
-	printf("battery: BQ27Z561 polling stopped\n");
+	printf("battery: failed to map pins\n");
 	thread_terminate(current_thread());
 }
 

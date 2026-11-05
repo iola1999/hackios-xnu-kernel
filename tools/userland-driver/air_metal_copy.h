@@ -89,6 +89,7 @@ struct rwa_linked_function {
 struct rwa_texture *rwa_texture_view(struct rwa_texture *texture, unsigned mtl_format,
                                      unsigned first_level, unsigned num_levels,
                                      char *why, size_t why_size);
+void rwa_texture_set_swizzle(struct rwa_texture *texture, uint8_t r, uint8_t g, uint8_t b, uint8_t a);
 
 #ifdef __cplusplus
 }

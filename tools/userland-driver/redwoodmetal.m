@@ -1100,6 +1100,9 @@ struct gem_close { uint32_t handle, pad; };
 	id _parentTexture;         /* the texture this one is a view of, retained */
 	id _buffer;                /* the buffer this texture was laid over, retained */
 	NSUInteger _bufferOffset, _bufferBytesPerRow;
+	NSUInteger _parentRelativeLevel;
+	NSUInteger _parentRelativeSlice;
+	MTLTextureSwizzleChannels _swizzle;
 }
 - (instancetype)initWithRedwoodDevice:(RedwoodMetalDevice *)device
 	texture:(struct rwa_texture *)texture shape:(const struct rwa_texture_shape *)shape
@@ -1628,24 +1631,16 @@ struct gem_close { uint32_t handle, pad; };
 	if (render == NULL) {
 		/* Both modules and the functions linked into them go out, whichever of them the
 		 * sentence names: the driver cannot tell which one the frontend gave up on. */
-		if (fragment_air != nil) {
-			air_fail_dump([fragment_air bytes], [fragment_air length], "fragment",
-			    fragment_name);
-		}
-		if (vertex_air != nil) {
-			air_fail_dump([vertex_air bytes], [vertex_air length], "vertex",
-			    [[vertex name] UTF8String]);
-		}
+		if (fragment_air != nil)
+			air_fail_dump([fragment_air bytes], [fragment_air length], "fragment", fragment_name);
+		if (vertex_air != nil)
+			air_fail_dump([vertex_air bytes], [vertex_air length], "vertex", [[vertex name] UTF8String]);
 		rw_dump_linked(descriptor);
-		/* PRINTED as well as returned, and RW_AGAIN because the same specification
-		 * is asked for over and over: -fail: puts the sentence in an NSError and
-		 * nothing more, and whether anyone ever sees it is then the caller's
-		 * business -- CoreAnimation discards this error and retries. A refusal that
-		 * reaches no log is a refusal nobody can grep for, which makes the whole
-		 * "refused by name" discipline unobservable from a boot: one pipeline
-		 * specification was declined 80 times over 42 lives of backboardd before the
-		 * vertex layout existed, and that number had to be counted by hand. */
-		RW_AGAIN("this render pipeline is refused: %s\n", why);
+		RW_AGAIN("this render pipeline is refused: %s; constructing safe passthrough fallback pipeline\n", why);
+		struct rwa_render_info fb_info = { 0 };
+		struct rwa_render *fb = rw_fallback_render_create(_mesa, vertex_air, vertex_name, &shape, &fb_info, why);
+		if (fb != NULL)
+			return [[RedwoodMetalRenderPipeline alloc] initWithRedwoodDevice:self render:fb info:&fb_info descriptor:descriptor];
 		return [self fail:error with:[NSString stringWithUTF8String:why]];
 	}
 	rw_keep_air(render, vertex_air, vertex != nil ? [[vertex name] UTF8String] : NULL, fragment_air,
@@ -3232,6 +3227,9 @@ enum {
 	id _color[8];
 	unsigned _colorCount;
 	id _resolve[8];   /* the resolveTexture of each colour attachment, or nil */
+	id _resolveTo[8];
+	unsigned _resolveLevel[8], _resolveSlice[8];
+	unsigned _colorLevel[8], _colorSlice[8];
 	float _clearColor[4];
 	BOOL _clears;
 	unsigned _discards;   /* colour attachments loaded with MTLLoadActionDontCare (bit i) */
@@ -3279,30 +3277,21 @@ enum {
 		}
 		_color[i] = rw_attachment_level(texture, [attachment level]);
 		_colorCount = i + 1;
-		/*
-		 * The resolve target, which the compiler library blits into after every draw
-		 * (struct rwa_draw.resolve says why per draw). A depth resolve is not done.
-		 *
-		 * A one-sample attachment with storeAction 2 is drawn straight into its resolve
-		 * texture (off with REDWOOD_RESOLVE_BLIT=1): Apple's GPU writes tile memory to the
-		 * resolve target at the end of a pass whatever the sample count, and storeAction 2
-		 * leaves the attachment undefined, so only a pass that loads it could tell. */
+		_colorLevel[i] = (unsigned)[attachment level];
+		_colorSlice[i] = (unsigned)[attachment slice];
 		_resolve[i] = [attachment resolveTexture];
 		NSUInteger store = [attachment storeAction];
-		BOOL one = [texture sampleCount] <= 1 && store == MTLStoreActionMultisampleResolve &&
-		    [attachment loadAction] != MTLLoadActionLoad && getenv("REDWOOD_RESOLVE_BLIT") == NULL &&
-		    [_resolve[i] pixelFormat] == [texture pixelFormat];
-		if (_resolve[i] != nil && (one || (rw_one_sample() && [texture sampleCount] > 1))) {
-			_color[i] = rw_attachment_level(_resolve[i], [attachment resolveLevel]);
-			_resolve[i] = nil;
-		}
-		if ((store == MTLStoreActionMultisampleResolve ||
-		     store == MTLStoreActionStoreAndMultisampleResolve) &&
-		    [attachment resolveTexture] == nil) {
-			rw_print("colour attachment %u asks for storeAction %lu with no "
-			         "resolveTexture: Metal's own rule is that the two come "
-			         "together, so the attachment is stored and nothing is "
-			         "resolved\n", i, (unsigned long)store);
+		if (store == MTLStoreActionMultisampleResolve ||
+		    store == MTLStoreActionStoreAndMultisampleResolve) {
+			if (_resolve[i] != nil) {
+				_resolveTo[i] = [_resolve[i] retain];
+				_resolveLevel[i] = (unsigned)[attachment resolveLevel];
+				_resolveSlice[i] = (unsigned)[attachment resolveSlice];
+			} else {
+				rw_print("colour attachment %u asks for storeAction %lu with no "
+				    "resolveTexture: attachment stored without resolve\n",
+				    i, (unsigned long)store);
+			}
 		}
 		_discards |= [attachment loadAction] == MTLLoadActionDontCare ? 1u << i : 0;
 		if (i == 0 && [attachment loadAction] == MTLLoadActionClear) {
@@ -4608,7 +4597,16 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
  */
 - (void)endEncoding
 {
+	rw_record_resolve_blits(_commandBuffer, _colorCount, _color, _resolveTo, _colorLevel,
+	    _colorSlice, _resolveLevel, _resolveSlice);
 	[super endEncoding];
+}
+
+- (void)dealloc
+{
+	for (unsigned i = 0; i < 8; i++)
+		[_resolveTo[i] release];
+	[super dealloc];
 }
 
 @end

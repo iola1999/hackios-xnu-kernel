@@ -11,6 +11,7 @@ static struct {
 	__typeof__(&rwa_buffer_textures_refresh) buffer_textures_refresh;
 	__typeof__(&rwa_buffer_textures_writeback) buffer_textures_writeback;
 	__typeof__(&rwa_texture_view) texture_view;
+	__typeof__(&rwa_texture_set_swizzle) texture_set_swizzle;
 	__typeof__(&rwa_texture_thumbnail) texture_thumbnail;
 	__typeof__(&rwa_buffer_set_mirror) buffer_set_mirror;
 	__typeof__(&rwa_buffer_from_memory) buffer_from_memory;
@@ -105,6 +106,7 @@ mesa_available(void)
 	*(void **)&mesa.buffer_textures_writeback = dlsym(mesa.handle,
 							  "rwa_buffer_textures_writeback");
 	*(void **)&mesa.texture_view = dlsym(mesa.handle, "rwa_texture_view");
+	*(void **)&mesa.texture_set_swizzle = dlsym(mesa.handle, "rwa_texture_set_swizzle");
 	*(void **)&mesa.texture_thumbnail = dlsym(mesa.handle, "rwa_texture_thumbnail");
 	*(void **)&mesa.buffer_set_mirror = dlsym(mesa.handle, "rwa_buffer_set_mirror");
 	*(void **)&mesa.buffer_from_memory = dlsym(mesa.handle, "rwa_buffer_from_memory");

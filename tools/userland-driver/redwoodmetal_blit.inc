@@ -274,3 +274,40 @@ protocol_declares(const char *name, SEL selector, struct objc_method_description
 	_commandBuffer = nil;
 }
 @end
+
+static void
+rw_record_resolve_blits(RedwoodMetalCommandBuffer *cb, unsigned colorCount, id color[8],
+    id resolveTo[8], const unsigned colorLevel[8], const unsigned colorSlice[8],
+    const unsigned resolveLevel[8], const unsigned resolveSlice[8])
+{
+	for (unsigned i = 0; i < colorCount && i < 8; i++) {
+		id from = color[i], to = resolveTo[i];
+		if (from == nil || to == nil) {
+			[resolveTo[i] release];
+			resolveTo[i] = nil;
+			continue;
+		}
+		RedwoodMetalWork *w = [[RedwoodMetalWork alloc] init];
+		unsigned fw = (unsigned)MAX([(id<MTLTexture>)from width], 1ul);
+		unsigned fh = (unsigned)MAX([(id<MTLTexture>)from height], 1ul);
+		unsigned tw = (unsigned)MAX([(id<MTLTexture>)to width] >> resolveLevel[i], 1ul);
+		unsigned th = (unsigned)MAX([(id<MTLTexture>)to height] >> resolveLevel[i], 1ul);
+		BOOL hasParent = [from respondsToSelector:@selector(parentTexture)] && [from parentTexture] != nil;
+
+		w->copyKind = RW_BLIT_TEXTURE;
+		w->textureCount = 2;
+		w->textures[0] = from;
+		w->textures[1] = to;
+		w->copyLevels[0] = hasParent ? 0 : colorLevel[i];
+		w->copyLevels[1] = resolveLevel[i];
+		w->copySlices[0] = hasParent ? 0 : colorSlice[i];
+		w->copySlices[1] = resolveSlice[i];
+		w->copySize[0] = MIN(fw, tw);
+		w->copySize[1] = MIN(fh, th);
+		w->copySize[2] = 1;
+		[cb recordWork:w];
+		[w release];
+		[resolveTo[i] release];
+		resolveTo[i] = nil;
+	}
+}

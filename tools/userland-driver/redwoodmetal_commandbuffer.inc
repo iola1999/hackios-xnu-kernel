@@ -506,6 +506,7 @@ static pthread_mutex_t rw_commit_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 	unsigned work_index = 0;
 
 	rw_thumb_commit(_work, commit_count);
+	rw_audit_commit_begin(_work, commit_count);
 	for (RedwoodMetalWork *work in _work) {
 		uint64_t work_began = mach_absolute_time();
 
@@ -547,6 +548,7 @@ static pthread_mutex_t rw_commit_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 			if (![self runDraw:work why:why size:sizeof(why)]) {
 				goto done;
 			}
+			rw_audit_render_work(work, commit_count, work_index);
 			rw_work_time(RW_WORK_DRAW, work_began);
 			if (rw_sync_draws() && ![self syncDraw:work index:work_index why:why
 							  size:sizeof(why)]) {
@@ -664,6 +666,7 @@ static pthread_mutex_t rw_commit_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 		}
 	}
 done:
+	rw_audit_commit_end(commit_count);
 	/* The draws this buffer recorded are all in the library's batch by now -- a draw no
 	 * longer waits for the GPU (rwa_render_draw) -- and this hands them over.
 	 *
@@ -1182,6 +1185,5 @@ done:
 		"nothing this driver allocates is volatile; the report is noted and the "
 		"buffer is not failed\n");
 }
-
 
 @end

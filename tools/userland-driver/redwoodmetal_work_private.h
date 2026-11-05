@@ -11,6 +11,8 @@
 enum RWCopyKind { RW_COPY_NONE, RW_COPY_BUFFER, RW_COPY_TEXTURE, RW_COPY_MIPMAP,
                    RW_COPY_BUFFER_TEXTURE, RW_COPY_ERROR };
 
+#define RW_BLIT_TEXTURE RW_COPY_TEXTURE
+
 @interface RedwoodMetalWork : NSObject {
 @private
 	BOOL _ownsResources;

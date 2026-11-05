@@ -147,8 +147,8 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 - (BOOL)isFramebufferOnly          { return NO; }
 - (BOOL)allowGPUOptimizedContents  { return NO; }
 - (id)parentTexture                { return _parentTexture; }
-- (NSUInteger)parentRelativeLevel  { return 0; }
-- (NSUInteger)parentRelativeSlice  { return 0; }
+- (NSUInteger)parentRelativeLevel  { return _parentRelativeLevel; }
+- (NSUInteger)parentRelativeSlice  { return _parentRelativeSlice; }
 - (id)buffer                       { return _buffer; }
 - (NSUInteger)bufferOffset         { return _bufferOffset; }
 - (NSUInteger)bufferBytesPerRow    { return _bufferBytesPerRow; }
@@ -277,37 +277,65 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 /* A view of a texture is another texture over the same resource (rwa_texture_view), read
  * and rendered in its own format, over a run of the texture's levels. It keeps the texture it
  * came from, which -parentTexture answers. */
-- (id)redwoodViewWithPixelFormat:(NSUInteger)format levels:(NSRange)levels
+- (id)redwoodViewWithPixelFormat:(NSUInteger)format
+			  levels:(NSRange)levels
+			  slices:(NSRange)slices
+			    type:(NSUInteger)type
+			 swizzle:(MTLTextureSwizzleChannels)swizzle
 {
 	char why[256] = { 0 };
 	struct rwa_texture_shape shape = _shape;
 	struct rwa_texture *view;
 	RedwoodMetalTexture *texture;
 	unsigned first = (unsigned)levels.location;
+	unsigned num_levels = (unsigned)levels.length;
 
 	if (mesa.texture_view == NULL) {
 		RW_ONCE("this compiler library has no rwa_texture_view; a texture view is nil\n");
 		return nil;
 	}
-	view = mesa.texture_view(_texture, (unsigned)format, first, (unsigned)levels.length, why,
+	view = mesa.texture_view(_texture, (unsigned)format, first, num_levels, why,
 				 sizeof(why));
 	if (view == NULL) {
 		rw_print("texture view: %s\n", why);
 		return nil;
 	}
+	if (mesa.texture_set_swizzle != NULL &&
+	    (swizzle.red || swizzle.green || swizzle.blue || swizzle.alpha)) {
+		mesa.texture_set_swizzle(view, (uint8_t)swizzle.red, (uint8_t)swizzle.green,
+					 (uint8_t)swizzle.blue, (uint8_t)swizzle.alpha);
+	}
 	shape.pixel_format = (unsigned)format;
+	shape.type = (unsigned)type;
 	shape.width = MAX(shape.width >> first, 1u);
 	if (shape.height)
 		shape.height = MAX(shape.height >> first, 1u);
 	if (shape.depth)
 		shape.depth = MAX(shape.depth >> first, 1u);
-	shape.mip_levels = (unsigned)levels.length;
+	shape.mip_levels = num_levels;
+	shape.array_length = (type == MTLTextureType2DArray || type == MTLTextureTypeCubeArray)
+				? (unsigned)slices.length : 1;
 	texture = [[RedwoodMetalTexture alloc] initWithRedwoodDevice:_owner texture:view
 							       shape:&shape iosurface:NULL plane:0];
 	if (texture != nil) {
 		texture->_parentTexture = [self retain];
+		texture->_parentRelativeLevel = levels.location;
+		texture->_parentRelativeSlice = slices.location;
+		texture->_swizzle = swizzle;
 	}
 	return texture;
+}
+
+- (id)redwoodViewWithPixelFormat:(NSUInteger)format levels:(NSRange)levels
+{
+	NSUInteger layers = _shape.type == MTLTextureTypeCube || _shape.type == MTLTextureTypeCubeArray
+				? 6 * MAX(_shape.array_length, 1) : MAX(_shape.array_length, 1);
+	return [self redwoodViewWithPixelFormat:format levels:levels slices:NSMakeRange(0, layers)
+					   type:_shape.type
+					swizzle:MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed,
+									     MTLTextureSwizzleGreen,
+									     MTLTextureSwizzleBlue,
+									     MTLTextureSwizzleAlpha)];
 }
 
 - (id)newTextureViewWithPixelFormat:(NSUInteger)format
@@ -318,42 +346,63 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 
 /*
  * THE REST OF WHAT <MTLTexture>, <MTLTextureSPI>, <MTLResource> AND <MTLResourceSPI>
- * REQUIRE: 27 methods with no answer anywhere in this chain before this section. The same
- * three kinds as everywhere else -- served, true by construction, or refused out loud.
- *
- * A view over part of the slices, or as another type, is refused out loud: rwa_texture_view
- * covers every slice, and a view over fewer would read the wrong ones.
+ * REQUIRE: 27 methods with no answer anywhere in this chain before this section.
  */
-- (id)newTextureViewWithPixelFormat:(NSUInteger)format
-			textureType:(NSUInteger)type
-			     levels:(NSRange)levels
-			     slices:(NSRange)slices
-{
-	NSUInteger layers = _shape.type == MTLTextureTypeCube || _shape.type == MTLTextureTypeCubeArray
-				? 6 * MAX(_shape.array_length, 1) : MAX(_shape.array_length, 1);
-
-	if (type == _shape.type && slices.location == 0 && slices.length == layers) {
-		return [self redwoodViewWithPixelFormat:format levels:levels];
-	}
-	rw_print("texture view: type %lu levels %lu+%lu slices %lu+%lu of a type %u texture "
-		 "of %u levels and %lu slices; only a view of every slice, of the same type, "
-		 "is made\n",
-		 (unsigned long)type, (unsigned long)levels.location,
-		 (unsigned long)levels.length, (unsigned long)slices.location,
-		 (unsigned long)slices.length, _shape.type, _shape.mip_levels,
-		 (unsigned long)layers);
-	return nil;
-}
 - (id)newTextureViewWithPixelFormat:(NSUInteger)format
 			textureType:(NSUInteger)type
 			     levels:(NSRange)levels
 			     slices:(NSRange)slices
 			    swizzle:(MTLTextureSwizzleChannels)swizzle
 {
-	(void)swizzle;
-	return [self newTextureViewWithPixelFormat:format textureType:type levels:levels
-					    slices:slices];
+	NSUInteger layers = _shape.type == MTLTextureTypeCube || _shape.type == MTLTextureTypeCubeArray
+				? 6 * MAX(_shape.array_length, 1) : MAX(_shape.array_length, 1);
+
+	BOOL type_ok = (type == _shape.type) ||
+		(type == MTLTextureType2D && _shape.type == MTLTextureType2DArray) ||
+		(type == MTLTextureType2DArray && _shape.type == MTLTextureType2D) ||
+		(type == MTLTextureTypeCube && _shape.type == MTLTextureTypeCubeArray) ||
+		(type == MTLTextureTypeCubeArray && _shape.type == MTLTextureTypeCube);
+
+	if (!type_ok) {
+		rw_print("texture view: requested type %lu incompatible with texture type %u\n",
+			 (unsigned long)type, _shape.type);
+		return nil;
+	}
+
+	if (slices.location >= layers) {
+		rw_print("texture view: slice location %lu >= total slices %lu\n",
+			 (unsigned long)slices.location, (unsigned long)layers);
+		return nil;
+	}
+	NSUInteger valid_slices = MIN(MAX(slices.length, 1), layers - slices.location);
+	NSRange eff_slices = NSMakeRange(slices.location, valid_slices);
+
+	NSUInteger max_mips = MAX(_shape.mip_levels, 1);
+	if (levels.location >= max_mips) {
+		rw_print("texture view: level location %lu >= mip levels %lu\n",
+			 (unsigned long)levels.location, (unsigned long)max_mips);
+		return nil;
+	}
+	NSUInteger valid_levels = MIN(MAX(levels.length, 1), max_mips - levels.location);
+	NSRange eff_levels = NSMakeRange(levels.location, valid_levels);
+
+	return [self redwoodViewWithPixelFormat:format levels:eff_levels slices:eff_slices
+					   type:type swizzle:swizzle];
 }
+
+- (id)newTextureViewWithPixelFormat:(NSUInteger)format
+			textureType:(NSUInteger)type
+			     levels:(NSRange)levels
+			     slices:(NSRange)slices
+{
+	return [self newTextureViewWithPixelFormat:format textureType:type levels:levels
+					    slices:slices
+					   swizzle:MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed,
+										MTLTextureSwizzleGreen,
+										MTLTextureSwizzleBlue,
+										MTLTextureSwizzleAlpha)];
+}
+
 - (id)newSharedTextureHandle { return nil; }   /* nothing here is shared between processes */
 
 /* Served out of the shape this texture was made with, which is the only place that
@@ -362,15 +411,20 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 {
 	return _shape.type == MTLTextureTypeCube || _shape.type == MTLTextureTypeCubeArray ? 6 : 1;
 }
-/* The identity swizzle, and it is the truth rather than a default: a texture of this driver
- * is made from a descriptor's format alone and nothing reorders its channels, so red reads
- * as red. MTLTextureSwizzleChannelsDefault is that same quadruple. */
+
 - (MTLTextureSwizzleChannels)swizzle
 {
+	if (_swizzle.red != 0 || _swizzle.green != 0 || _swizzle.blue != 0 || _swizzle.alpha != 0)
+		return _swizzle;
 	return MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen,
 					     MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha);
 }
-- (unsigned int)swizzleKey { return 0; }   /* the key of "nothing is swizzled" */
+
+- (unsigned int)swizzleKey
+{
+	MTLTextureSwizzleChannels s = [self swizzle];
+	return (unsigned int)(s.red | (s.green << 8) | (s.blue << 16) | (s.alpha << 24));
+}
 /* Nothing here is a view, so every texture is its own root, and nil is what Apple's own
  * resource answers for one that was allocated rather than derived. */
 - (id)rootResource { return nil; }
@@ -698,6 +752,11 @@ static id
 rw_attachment_level(id texture, NSUInteger level)
 {
 	if (texture == nil || level == 0)
+		return texture;
+	NSUInteger mips = [texture mipmapLevelCount];
+	if (mips > 0 && level >= mips)
+		level = mips - 1;
+	if (level == 0)
 		return texture;
 	id view = [texture newTextureViewWithPixelFormat:[texture pixelFormat]
 					    textureType:[texture textureType]

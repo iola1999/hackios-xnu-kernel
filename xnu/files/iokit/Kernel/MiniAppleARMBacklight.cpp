@@ -227,6 +227,8 @@ bl_log_later(thread_call_param_t, thread_call_param_t)
 static void
 bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 {
+	static uint64_t last_v = kBLValueMax;
+	static uint64_t last_millinits = kBLMilliNitsMax;
 	OSNumber * nits = OSDynamicCast(OSNumber, dict->getObject(nits_key));
 	OSNumber * value = value_key != NULL ? OSDynamicCast(OSNumber, dict->getObject(value_key)) : NULL;
 	uint64_t v, millinits;
@@ -241,15 +243,43 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 	used = list_keys(bl.line, sizeof(bl.line), used < sizeof(bl.line) ? used : sizeof(bl.line), dict);
 	if (nits != NULL) {
 		uint64_t n16 = nits->unsigned64BitValue();
+		int64_t s16 = (int64_t) n16;
 
-		/* (the bound only keeps the multiplication in 64 bits) */
-		millinits = (n16 < (uint64_t) kBLMilliNitsMax << 16 ? n16 : (uint64_t) kBLMilliNitsMax << 16) * 1000 >> 16;
-		millinits = millinits < kBLMilliNitsMin ? kBLMilliNitsMin : millinits > kBLMilliNitsMax ? kBLMilliNitsMax : millinits;
-		v = kBLValueMin + (millinits - kBLMilliNitsMin) * (kBLValueMax - kBLValueMin) / (kBLMilliNitsMax - kBLMilliNitsMin);
+		if (s16 <= 0) {
+			snprintf(bl.line + used, sizeof(bl.line) - used,
+			    "; discarded non-positive level %lld, keeping %llu.%03llu nits",
+			    (long long) s16, last_millinits / 1000, last_millinits % 1000);
+			bl_log();
+			return;
+		}
+
+		if (n16 >= 65536) {
+			/* Standard 16.16 fixed-point nits (>= 1.0 nit) */
+			millinits = (n16 < (uint64_t) kBLMilliNitsMax << 16 ? n16 : (uint64_t) kBLMilliNitsMax << 16) * 1000 >> 16;
+			millinits = millinits < kBLMilliNitsMin ? kBLMilliNitsMin : millinits > kBLMilliNitsMax ? kBLMilliNitsMax : millinits;
+			v = kBLValueMin + (millinits - kBLMilliNitsMin) * (kBLValueMax - kBLValueMin) / (kBLMilliNitsMax - kBLMilliNitsMin);
+			last_v = v;
+			last_millinits = millinits;
+		} else if (n16 >= 1 && n16 <= kBLLevelFull) {
+			/* Integer step in 1..1024, map linearly to [kBLMilliNitsMin, kBLMilliNitsMax] */
+			millinits = kBLMilliNitsMin + (n16 - 1) * (kBLMilliNitsMax - kBLMilliNitsMin) / (kBLLevelFull - 1);
+			v = kBLValueMin + (millinits - kBLMilliNitsMin) * (kBLValueMax - kBLValueMin) / (kBLMilliNitsMax - kBLMilliNitsMin);
+			last_v = v;
+			last_millinits = millinits;
+		} else {
+			/* Invalid transient (> 1024 and < 65536): discard and keep previous stable brightness */
+			snprintf(bl.line + used, sizeof(bl.line) - used,
+			    "; discarded invalid transient %llu, keeping %llu.%03llu nits",
+			    n16, last_millinits / 1000, last_millinits % 1000);
+			bl_log();
+			return;
+		}
 	} else if (value != NULL) {
 		v = value->unsigned64BitValue();
 		v = v < kBLValueMin ? kBLValueMin : v > kBLValueMax ? kBLValueMax : v;
 		millinits = kBLMilliNitsMin + (v - kBLValueMin) * (kBLMilliNitsMax - kBLMilliNitsMin) / (kBLValueMax - kBLValueMin);
+		last_v = v;
+		last_millinits = millinits;
 	} else {
 		snprintf(bl.line + used, sizeof(bl.line) - used, "; nothing taken");
 		bl_log();

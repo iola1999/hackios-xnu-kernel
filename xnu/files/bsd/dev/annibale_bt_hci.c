@@ -40,6 +40,9 @@ extern kern_return_t thread_terminate(thread_t thread);
 #define OP_LE_SCAN_PARAMETERS   0x200b
 #define OP_LE_SCAN_ENABLE       0x200c
 #define OP_QCA_LOGGING          0xfc17
+#define OP_QCA_SET_BAUDRATE     0xfc48
+#define QCA_BAUDRATE_115200     0x00
+#define QCA_BAUDRATE_3000000    0x0e
 
 /* Qualcomm's EDL commands, all behind opcode 0xfc00; WCN3991 and later answer with Command Complete, whose return
  * parameters (ev[6] on) are cresp (0 = done) and the request type again */
@@ -505,6 +508,39 @@ rom_answers(void)
 	return false;
 }
 
+/*
+ * Switch the HCI UART transport baud rate via Qualcomm vendor command 0xFC48.
+ * Parameter is 1 byte: 0x0E for 3,000,000 baud (3 Mbaud), 0x00 for 115,200 baud.
+ * The chip returns Command Complete at current baud, then switches its UART.
+ * The host pauses 10 ms for line settle, then switches SE14 S6 RCG clock to 48 MHz (divider 1).
+ */
+bool
+annibale_bt_hci_set_baudrate(uint32_t baud)
+{
+	uint8_t param = (baud == 3000000u) ? QCA_BAUDRATE_3000000 : QCA_BAUDRATE_115200;
+	uint8_t ev[32];
+	uint32_t n;
+
+	bt_say("bt: baud transition: sending vendor command 0xFC48 (param %#x for %u baud)\n", param, baud);
+	n = hci_cmd(OP_QCA_SET_BAUDRATE, &param, 1, ev, sizeof(ev), 1000);
+	if (!hci_ok(ev, n, 7)) {
+		bt_say("bt: stop: 0xFC48 refused or timed out (%u bytes, status %#x)\n", n, n >= 7 ? ev[6] : 0xff);
+		if (n) {
+			annibale_bt_hex("0xFC48 answer", ev, n);
+		}
+		return false;
+	}
+	bt_say("bt: chip accepted 0xFC48, settling before host UART switch\n");
+	ms(10);
+	if (!annibale_bt_uart_set_baud(baud)) {
+		bt_say("bt: stop: host UART baud switch to %u failed\n", baud);
+		return false;
+	}
+	ms(10);
+	bt_say("bt: baud transition to %u completed successfully\n", baud);
+	return true;
+}
+
 static void
 bring_up(uint32_t steps)
 {
@@ -559,6 +595,12 @@ bring_up(uint32_t steps)
 		    ev[10], ev[13] | ev[14] << 8, manufacturer, manufacturer == 0x1d ? " (Qualcomm)" : "");
 	} else {
 		bt_say("bt: version: Read_Local_Version failed (%u bytes)\n", n);
+	}
+	{
+		uint32_t target_baud = 0;
+		if (PE_parse_boot_argn("bt_baud", &target_baud, sizeof(target_baud)) && target_baud == 3000000u) {
+			(void)annibale_bt_hci_set_baudrate(3000000u);
+		}
 	}
 	if (steps >= 4) {
 		annibale_bt_ios_serve(addr);

@@ -6,6 +6,9 @@
  */
 #include <mach/mach.h>
 #include <pthread.h>
+#include <notify.h>
+#include <dispatch/dispatch.h>
+#include <stdatomic.h>
 #include "redwoodmetal_work_private.h"
 
 /*
@@ -590,3 +593,138 @@ rw_dump_pipeline_air(MTLRenderPipelineDescriptor *descriptor)
 	for (id function in [linked functions])
 		rw_dump_air(function, [[descriptor fragmentFunction] name]);
 }
+
+/*
+ * Single-frame Render Pass Audit.
+ * Triggered via REDWOOD_AUDIT_FRAME (e.g. "1", "all", or commit number)
+ * or via Darwin notification "com.redwood.audit.pass".
+ * Audits attachments, pixel formats, dimensions, sample counts, memory type, load/store actions,
+ * and checks for pure black store actions.
+ */
+static _Atomic int rw_audit_wanted_frame = -1;
+static _Atomic bool rw_audit_active = false;
+
+static void
+rw_audit_setup_notify(void)
+{
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		int token;
+		notify_register_dispatch("com.redwood.audit.pass", &token, dispatch_get_main_queue(), ^(int t) {
+			(void)t;
+			atomic_store_explicit(&rw_audit_active, true, memory_order_release);
+			rw_print("audit: single-frame pass audit requested via notification\n");
+		});
+	});
+}
+
+static bool
+rw_audit_frame_active(unsigned commit)
+{
+	rw_audit_setup_notify();
+	int wanted = atomic_load_explicit(&rw_audit_wanted_frame, memory_order_acquire);
+	if (wanted < 0) {
+		const char *env = getenv("REDWOOD_AUDIT_FRAME");
+		int parsed = -2;
+		if (env != NULL) {
+			if (strcmp(env, "all") == 0)
+				parsed = 0;
+			else
+				parsed = atoi(env);
+		}
+		int expected = wanted;
+		atomic_compare_exchange_strong_explicit(&rw_audit_wanted_frame, &expected, parsed,
+							memory_order_acq_rel, memory_order_acquire);
+		wanted = atomic_load_explicit(&rw_audit_wanted_frame, memory_order_acquire);
+	}
+	if (wanted >= 0) {
+		if (wanted == 0 || commit == (unsigned)wanted)
+			return true;
+	}
+	return atomic_load_explicit(&rw_audit_active, memory_order_acquire);
+}
+
+static void
+rw_audit_commit_begin(NSArray *works, unsigned commit)
+{
+	if (!rw_audit_frame_active(commit))
+		return;
+	rw_print("audit-pass begin: commit %u total_works %lu\n", commit, (unsigned long)[works count]);
+}
+
+static void
+rw_audit_render_work(RedwoodMetalWork *work, unsigned commit, unsigned index)
+{
+	if (!rw_audit_frame_active(commit) || work == nil || work->render == nil)
+		return;
+
+	void *pipeline_render = ((void *(*)(id, SEL))objc_msgSend)(work->render, sel_registerName("render"));
+	rw_print("audit-pass work %u: pipeline %p prim %u vert %u+%u\n",
+	    index, pipeline_render, work->primitive, work->vertexStart, work->vertexCount);
+
+	for (unsigned i = 0; i < work->colorCount; i++) {
+		id tex = work->color[i];
+		if (tex == nil)
+			continue;
+		BOOL is_surface = [(id<MTLTexture>)tex iosurface] != NULL;
+		BOOL is_clear = work->clears;
+		BOOL is_discard = (work->discards & (1u << i)) != 0;
+		const char *load_str = is_clear ? "clear" : is_discard ? "dontCare" : "load";
+		const char *store_str = work->resolve[i] != nil ? "resolve" : "store";
+
+		rw_print("audit-pass color %u: %lux%lu format %lu s%lu mem=%s load=%s store=%s%s\n",
+		    i,
+		    (unsigned long)[(id<MTLTexture>)tex width],
+		    (unsigned long)[(id<MTLTexture>)tex height],
+		    (unsigned long)[(id<MTLTexture>)tex pixelFormat],
+		    (unsigned long)[(id<MTLTexture>)tex sampleCount],
+		    is_surface ? "surface" : "own",
+		    load_str, store_str,
+		    is_clear ? " [cleared]" : "");
+
+		if (mesa.texture_thumbnail != NULL) {
+			uint8_t sample_rgba[16 * 16 * 4];
+			SEL mt_sel = sel_registerName("mesaTexture");
+			struct rwa_texture *mt = [tex respondsToSelector:mt_sel]
+			    ? ((struct rwa_texture *(*)(id, SEL))objc_msgSend)(tex, mt_sel) : NULL;
+			if (mt != NULL && mesa.texture_thumbnail(mt, 16, 16, sample_rgba) == 0) {
+				bool all_black = true;
+				for (int p = 0; p < 16 * 16; p++) {
+					if (sample_rgba[p * 4 + 0] > 2 ||
+					    sample_rgba[p * 4 + 1] > 2 ||
+					    sample_rgba[p * 4 + 2] > 2) {
+						all_black = false;
+						break;
+					}
+				}
+				if (all_black) {
+					rw_print("audit-warn: pass %u work %u color %u drew pure black (size %lux%lu, format %lu)\n",
+					    commit, index, i,
+					    (unsigned long)[(id<MTLTexture>)tex width],
+					    (unsigned long)[(id<MTLTexture>)tex height],
+					    (unsigned long)[(id<MTLTexture>)tex pixelFormat]);
+				}
+			}
+		}
+	}
+
+	if (work->depth != nil) {
+		id dtex = work->depth;
+		rw_print("audit-pass depth: %lux%lu format %lu load=%s%s\n",
+		    (unsigned long)[(id<MTLTexture>)dtex width],
+		    (unsigned long)[(id<MTLTexture>)dtex height],
+		    (unsigned long)[(id<MTLTexture>)dtex pixelFormat],
+		    work->clearsDepth ? "clear" : "load",
+		    work->clearsStencil ? " stencil_clear" : "");
+	}
+}
+
+static void
+rw_audit_commit_end(unsigned commit)
+{
+	if (!rw_audit_frame_active(commit))
+		return;
+	rw_print("audit-pass end: commit %u\n", commit);
+	atomic_store_explicit(&rw_audit_active, false, memory_order_release);
+}
+

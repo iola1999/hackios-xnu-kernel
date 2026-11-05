@@ -111,8 +111,15 @@ static const uint32_t s6_parent_hz[8] = { 19200000, 600000000, 0, 0, 0, 0, 30000
 
 static vm_offset_t gcc, tlmm, se;
 static uint32_t se_hz, se_clock_select;
+static uint32_t current_baud = BT_BAUD;
 static uint8_t rx_buf[4096];
 static uint32_t rx_len;
+
+uint32_t
+annibale_bt_uart_get_baud(void)
+{
+	return current_baud;
+}
 
 static void
 us(uint32_t n)
@@ -339,6 +346,93 @@ annibale_bt_uart_config(uint32_t oversampling)
 	rx_len = 0;
 	bt_say("bt: uart: %u 8N1 RTS/CTS, oversampling %u, divider %u of %u Hz, RX FIFO %u words\n", BT_BAUD,
 	    oversampling, divider, se_hz, rx_depth);
+	return true;
+}
+
+bool
+annibale_bt_uart_set_baud(uint32_t baud)
+{
+	vm_offset_t r = gcc + GCC_QUP2_S6_RCG;
+	uint32_t oversampling = 16;
+	uint32_t divider, rx_depth;
+
+	if (baud != 115200u && baud != 3000000u) {
+		bt_say("bt: stop: uart: unsupported baud %u (supported: 115200, 3000000)\n", baud);
+		return false;
+	}
+	if (rd(r + RCG_DFSR) & 1) {
+		se_hz = 0;
+		for (uint32_t level = 0; level < 8; level++) {
+			uint32_t hz = rcg_hz(rd(r + RCG_PERF_CFG(level)), rd(r + RCG_PERF_M(level)), rd(r + RCG_PERF_N(level)));
+
+			if (hz != 0 && hz % (baud * oversampling) == 0 && (se_hz == 0 || hz < se_hz)) {
+				se_hz = hz;
+				se_clock_select = level;
+			}
+		}
+		if (se_hz == 0) {
+			bt_say("bt: stop: clock: no DFS preset rate divides into %u x 16\n", baud);
+			return false;
+		}
+		bt_say("bt: clock: s6 DFS preset %u selected for %u baud (%u Hz)\n", se_clock_select, baud, se_hz);
+	} else if (baud == 3000000u) {
+		/*
+		 * 3 Mbaud transition:
+		 * S6 parent GPLL0 even is 300,000,000 Hz.
+		 * 3,000,000 * 16 = 48,000,000 Hz (48 MHz).
+		 * M / N = 48 / 300 = 4 / 25.
+		 */
+		uint32_t m = 4, n = 25, d = 2 * (n - m), mask = 0xffff;
+
+		wr(r + 8, m & mask);
+		wr(r + 0xc, ~(n - m) & mask);
+		wr(r + 0x10, ~d & mask);
+		wr(r + 4, (rd(r + 4) & (1u << 20)) | 1u | 6u << 8 | 2u << 12);
+		wr(r, rd(r) | 1);
+		for (int i = 0; i < 1000 && (rd(r) & 1); i++) {
+			us(1);
+		}
+		se_hz = rcg_hz(rd(r + 4), rd(r + 8), rd(r + 0xc));
+		se_clock_select = 0;
+		bt_say("bt: clock: s6 switched to 3 Mbaud RCG (%u Hz, update %s)\n", se_hz,
+		    (rd(r) & 1) ? "PENDING" : "taken");
+	} else {
+		/* 115200 baud: GPLL0 even through M/N 384/15625 = 7.3728 MHz */
+		uint32_t m = 384, n = 15625, d = n, mask = 0xffff;
+
+		wr(r + 8, m & mask);
+		wr(r + 0xc, ~(n - m) & mask);
+		d = d < m ? m : d > 2 * (n - m) ? 2 * (n - m) : d;
+		wr(r + 0x10, ~d & mask);
+		wr(r + 4, (rd(r + 4) & (1u << 20)) | 1u | 6u << 8 | 2u << 12);
+		wr(r, rd(r) | 1);
+		for (int i = 0; i < 1000 && (rd(r) & 1); i++) {
+			us(1);
+		}
+		se_hz = rcg_hz(rd(r + 4), rd(r + 8), rd(r + 0xc));
+		se_clock_select = 0;
+		bt_say("bt: clock: s6 switched to 115200 baud RCG (%u Hz, update %s)\n", se_hz,
+		    (rd(r) & 1) ? "PENDING" : "taken");
+	}
+
+	if ((rd(r) & 1) || se_hz == 0 || se_hz % (baud * oversampling) != 0) {
+		bt_say("bt: stop: clock: s6 rate %u Hz cannot divide into %u x 16\n", se_hz, baud);
+		return false;
+	}
+
+	divider = se_hz / (baud * oversampling);
+	rx_depth = rd(se + SE_HW_PARAM_1) >> 16 & 0x3f;
+	rx_depth = rx_depth ? rx_depth : 16;
+
+	stop_command(SE_GENI_M_CMD_CTRL, GENI_M_ACTIVE);
+	stop_command(SE_GENI_S_CMD_CTRL, GENI_S_ACTIVE);
+
+	wr(se + SE_GENI_CLK_SEL, se_clock_select);
+	wr(se + SE_GENI_M_CLK_CFG, divider << 4 | 1);
+	wr(se + SE_GENI_S_CLK_CFG, divider << 4 | 1);
+	wr(se + SE_GENI_S_CMD0, UART_START_READ << OPCODE_SHIFT);
+	current_baud = baud;
+	bt_say("bt: uart: baud switched to %u, divider %u of %u Hz, RX FIFO %u words\n", baud, divider, se_hz, rx_depth);
 	return true;
 }
 

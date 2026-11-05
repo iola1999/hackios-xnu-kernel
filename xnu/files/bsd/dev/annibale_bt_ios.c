@@ -575,6 +575,15 @@ bt_ios_take(uint8_t *p, uint32_t most)
 				said_adv++;
 				bt_say("bt: LE advertising report to bluetoothd (%02x:%02x:%02x:xx:xx:xx, %u bytes)\n",
 				    p[i + 11], p[i + 10], p[i + 9], p[i + 2]);
+			} else if (p[i] == 0x04 && p[i + 1] == 0x3e && (p[i + 3] == 0x01 || p[i + 3] == 0x0a)) {
+				bt_say("bt: LE connection established with peripheral (subevent %#x, handle %#x)\n",
+				    p[i + 3], p[i + 4] | p[i + 5] << 8);
+			} else if (p[i] == 0x02 && i + 5 <= n) {
+				static uint32_t said_acl;
+				if (said_acl++ < 20) {
+					bt_say("bt: ACL data packet (handle %#x, length %u)\n",
+					    (p[i + 1] | p[i + 2] << 8) & 0x0fff, p[i + 3] | p[i + 4] << 8);
+				}
 			}
 		}
 	}
@@ -709,6 +718,12 @@ bt_answer_vendor(const uint8_t *packet, uint32_t n)
 	wakeup(&bt_ring_in);
 	lck_mtx_unlock(bt_ring_lock);
 	selwakeup(&bt_sel);
+	if (packet[1] == 0x48 && packet[2] == 0xfc) {
+		uint32_t req_baud = (n > 4 && packet[4] == 0x0e) ? 3000000u : 115200u;
+		bt_say("bt: iOS requested baud rate switch via 0xFC48: %u baud (param %#x)\n",
+		    req_baud, n > 4 ? packet[4] : 0);
+		(void)annibale_bt_uart_set_baud(req_baud);
+	}
 	if (bt_vsc_answered++ < 120) {
 		bt_say("bt: iOS's command %#06x (%u bytes of parameters) answered here, not sent\n",
 		    packet[1] | packet[2] << 8, packet[3]);
