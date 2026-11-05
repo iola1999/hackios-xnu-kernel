@@ -6,7 +6,8 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 DRIVER = ROOT / "xnu/files/bsd/dev/adreno8_zap.c"
-FIRMWARE = ROOT.parent / "hackios-xnu-userland/firmware-gen8/gen80000_zap.mbn"
+# The device's own zap image, pulled from /odm/firmware as hackios-xnu-userland/firmware-gen8/README.md says.
+FIRMWARE = ROOT / "fw-gpu/gen80000_zap.mbn"
 production = DRIVER.read_text().replace('#include "adreno8_private.h"', "")
 stub = r'''
 #include <assert.h>

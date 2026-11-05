@@ -608,7 +608,9 @@ def static_tests(tmp, objs):
 
 def main():
     tmp = tempfile.mkdtemp(prefix='bootshim-contract-')
-    baseline_src = git('-C', ROOT / 'Mu-Silicium', 'show', 'HEAD:BootShim/BootShim.S')
+    # Mu-Silicium's k90-port already carries the patch; the patch applies to the upstream import it forked from.
+    upstream = git('-C', ROOT / 'Mu-Silicium', 'merge-base', 'HEAD', 'origin/main').decode().strip()
+    baseline_src = git('-C', ROOT / 'Mu-Silicium', 'show', f'{upstream}:BootShim/BootShim.S')
     work = Path(tempfile.mkdtemp(dir=tmp))
     (work / 'BootShim').mkdir()
     (work / 'BootShim/BootShim.S').write_bytes(baseline_src)

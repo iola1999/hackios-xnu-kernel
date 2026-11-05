@@ -318,6 +318,8 @@ if __name__ == "__main__":
             (ROOT / "xnu/files/bsd/dev/adreno8_memory_private.h").read_text())
         (target / "adreno8_smmu_private.h").write_text(
             (ROOT / "xnu/files/bsd/dev/adreno8_smmu_private.h").read_text())
+        (target / "adreno8_bo_private.h").write_text(
+            (ROOT / "xnu/files/bsd/dev/adreno8_bo_private.h").read_text())
         (target / "adreno8_smmu.c").write_text(fixture["driver"])
         (target / "check.c").write_text('#include "adreno8_smmu.c"\n' + setup + tests)
         for page_size in (4096, 16384):

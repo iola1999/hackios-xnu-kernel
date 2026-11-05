@@ -51,6 +51,7 @@ typedef size_t vm_size_t;
 static int kernel_map;
 static unsigned adreno8_step;
 static bool adreno8_gpu_stall;
+static bool adreno8_gpu_coherent;
 static bool adreno8_direct_ring;
 static bool bootarg_present;
 static uint32_t bootarg_value;
@@ -97,6 +98,8 @@ static void absolutetime_to_nanoseconds(uint64_t time, uint64_t *ns) { *ns = tim
 #define NSEC_PER_SEC 1000000000ull
 #define NSEC_PER_MSEC 1000000ull
 static bool adreno8_quiet;
+/* adreno8_bo.c names faulting BOs; tests that compile it remove this no-op. */
+void adreno8_bo_describe_fault(uint32_t fault) {}
 static void adreno8_space_off(struct adreno8_gpu_space *, uint32_t);
 static bool adreno8_space_faulted(struct adreno8_gpu_space *);
 static uint32_t regs[0x40000 / 4];
@@ -788,6 +791,7 @@ if __name__ == "__main__":
         (target / "adreno8_private.h").write_text(stub)
         (target / "adreno8_memory_private.h").write_text((ROOT / "xnu/files/bsd/dev/adreno8_memory_private.h").read_text())
         (target / "adreno8_smmu_private.h").write_text((ROOT / "xnu/files/bsd/dev/adreno8_smmu_private.h").read_text())
+        (target / "adreno8_bo_private.h").write_text((ROOT / "xnu/files/bsd/dev/adreno8_bo_private.h").read_text())
         (target / "adreno8_smmu.c").write_text(driver)
         (target / "check.c").write_text('#include "adreno8_smmu.c"\n' + tests)
         for page_size in (4096, 16384):

@@ -24,7 +24,7 @@ against throwaway git fixtures only -- never against the working overlay:
 
 The fixture HEAD is a fresh hash, so the two HEAD-at-BASE cases rewrite the
 fixture BASE to that hash; the fixture never touches the real uefi/ files.
-The contrast runs use the pre-preflight export.sh from kernel git HEAD, or
+The contrast runs use the pre-preflight export.sh from kernel commit 4ab189d, or
 $XNU_UEFI_EXPORT_OLD when there is no git (frozen snapshots); without either
 the two contrast cases are skipped and reported.
 Usage: python3 tools/test-uefi-export.py"""
@@ -38,6 +38,9 @@ import tempfile
 KERNEL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXPORT = os.path.join(KERNEL, "uefi", "export.sh")
 BASE_SHA = "e51cd877e31c8fbb322032dc4cb6715e83d25ad3"
+# export.sh before the preflight: the upstream open-source release. Reading HEAD's copy stopped
+# being a contrast once the preflight was committed.
+OLD_EXPORT_COMMIT = "4ab189d"
 
 PORT_FILES = [
     "Platforms/Xiaomi/redwoodPkg/redwoodPkg.dec",
@@ -110,9 +113,10 @@ def run_export(uefi):
 
 
 def old_export_text():
-    """The pre-preflight export.sh from kernel git HEAD, for contrast runs that
-    show the old script silently losing the same inputs the guard refuses;
-    $XNU_UEFI_EXPORT_OLD points at a copy for frozen snapshots without git."""
+    """The pre-preflight export.sh (OLD_EXPORT_COMMIT, the upstream release the
+    preflight was added on top of), for contrast runs that show the old script
+    silently losing the same inputs the guard refuses; $XNU_UEFI_EXPORT_OLD
+    points at a copy for frozen snapshots without git."""
     src = os.environ.get("XNU_UEFI_EXPORT_OLD")
     if src:
         try:
@@ -120,7 +124,8 @@ def old_export_text():
                 return f.read().decode()
         except OSError as exc:
             sys.exit("cannot read XNU_UEFI_EXPORT_OLD=%s: %s" % (src, exc))
-    r = subprocess.run(["git", "-C", KERNEL, "show", "HEAD:uefi/export.sh"], capture_output=True, text=True)
+    r = subprocess.run(["git", "-C", KERNEL, "show", OLD_EXPORT_COMMIT + ":uefi/export.sh"],
+                       capture_output=True, text=True)
     return r.stdout if r.returncode == 0 else None
 
 
@@ -189,7 +194,7 @@ def main():
     # the pre-preflight script, for the two contrast runs below
     old = old_export_text()
     if old is None:
-        print("SKIP old_script_contrast (kernel git HEAD unreachable and XNU_UEFI_EXPORT_OLD unset)")
+        print("SKIP old_script_contrast (kernel commit %s unreachable and XNU_UEFI_EXPORT_OLD unset)" % OLD_EXPORT_COMMIT)
 
     # apply.sh shape with the upstream edit staged: git diff would leave it out
     # of the patch, so the guard refuses with the overlay byte-identical

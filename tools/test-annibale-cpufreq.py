@@ -77,6 +77,9 @@ static kern_return_t kernel_thread_start(thread_continue_t f, void *arg, thread_
 static void thread_wakeup(event_t e) { (void)e; wakeups++; }
 static wait_result_t assert_wait_timeout(event_t e, int i, uint32_t interval, uint64_t scale) { (void)e; (void)i; assert(interval * scale == 50000000ULL); return 0; }
 static bool ml_cpu_idle_time(int cpu, uint64_t *idle) { *idle = idle_ns[cpu]; return true; }
+/* redwood_threads.c's freeze watchdog runs from this thread's tick; it has no part in the governor. */
+static uint64_t redwood_touch_last(void) { return 0; }
+static void redwood_freeze_check(uint64_t touched) { (void)touched; }
 static bool PE_parse_boot_argn(const char *name, void *value, int size)
 {
     (void)size;
@@ -254,19 +257,24 @@ int main(void)
     run(9); assert(sets == 6);
     run(2); assert(sets == 7 && set_key[6] == 0);
 
-    /* 70 C: slowest at once, busy or not; 65 C: stays; under 60 C: up again */
+    /* 70 C: a level down each tick, busy or not; 75 C: slowest at once; 65 C: held; under 65 C: a level up every 4 ticks */
     busy_now = 1000;
     run(6); assert(now_mhz() == 3072);
     temp_now = 700;
+    run(1); assert(now_mhz() == 2841 && perf_domain[1].hot && perf_domain[1].hot_entries == 1);
+    run(1); assert(now_mhz() == 2649);
+    temp_now = 750;
     run(1); assert(now_mhz() == 1017 && perf_domain[1].hot && perf_domain[1].hot_entries == 1);
     temp_now = 650;
-    run(5); assert(now_mhz() == 1017);
-    temp_now = 599;
-    run(1); assert(now_mhz() == 1401 && !perf_domain[1].hot);
+    run(5); assert(now_mhz() == 1017 && !perf_domain[1].hot);
+    temp_now = 649;
+    run(3); assert(now_mhz() == 1017);
+    run(1); assert(now_mhz() == 1209);
+    run(32); assert(now_mhz() == 3072);
 
     /* no reading of its own: the last one stands in for TSENS_STALE_MS, then the domain goes to its slowest */
     temp_now = -2000;
-    run(1); assert(now_mhz() == 1958 && !perf_domain[1].hot);           /* (50 ms after the last 59.9 C) */
+    run(1); assert(now_mhz() == 3072 && !perf_domain[1].hot);           /* (50 ms after the last 64.9 C) */
     run(2); assert(now_mhz() == 3072 && !perf_domain[1].hot);           /* (100, 150 ms: it still stands in) */
     run(3); assert(now_mhz() == 1017 && perf_domain[1].hot && perf_domain[1].hot_by_no_reading == 1);
 
@@ -319,12 +327,13 @@ int main(void)
     /* a hot sensor whose valid bit drops out: its reading still holds the cap for TSENS_STALE_MS */
     reset(1);
     annibale_cpufreq_init();
-    temp_now = 450; busy_now = 1000; own[1][1] = own[1][2] = 720;       /* (two of cluster 1's sensors) */
+    temp_now = 450; busy_now = 1000; own[1][1] = own[1][2] = 750;       /* (two of cluster 1's sensors) */
     run(1); assert(now_mhz() == 1017 && perf_domain[1].hot && perf_domain[1].hot_by_temp == 1);
     blank[1] = 1u << 1 | 1u << 2;
-    run(1); assert(now_mhz() == 1017 && perf_domain[1].hot && perf_domain[1].hottest == 720);
+    run(1); assert(now_mhz() == 1017 && perf_domain[1].hot && perf_domain[1].hottest == 750);
     run(2); assert(now_mhz() == 1017 && perf_domain[1].hot && perf_domain[1].hot_entries == 1);
-    run(4); assert(!perf_domain[1].hot && now_mhz() >= 1401);           /* (out of date: the 45.0 C decides) */
+    run(4); assert(!perf_domain[1].hot && now_mhz() == 1017);           /* (out of date: the 45.0 C decides) */
+    run(1); assert(now_mhz() == 1209);                                  /* (a level up after 4 ticks under 65 C) */
 
     /* a valid bit that flaps: the set of sensors with a reading of their own changes, the level does not */
     reset(1);
@@ -345,12 +354,12 @@ int main(void)
     run(50);
     assert(sets == 0 && wakeups == 0);
 
-    /* cpufreq=3: the ceiling at once, the slowest when hot */
+    /* cpufreq=3: the ceiling at once, under the same thermal limit */
     reset(3);
     annibale_cpufreq_init();
     run(1); assert(sets == 1 && now_mhz() == 3072);
     temp_now = 720;
-    run(1); assert(now_mhz() == 1017);
+    run(1); assert(now_mhz() == 2841);
 
     /* cpufreq_mhz=2000: ceiling 1958 MHz and the boost no higher; cpufreq_mhz=0: the sustained frequency */
     reset(1);

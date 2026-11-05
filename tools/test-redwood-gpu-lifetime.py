@@ -39,7 +39,8 @@ enum { kIOReturnSuccess, kIOReturnBadArgument, kIOReturnNoMemory,
        kIOReturnNotReady, kIOReturnNotFound, kIOReturnUnsupported,
        kIOReturnVMError, kIOReturnTimeout };
 enum { kIOMemoryMapperNone, kIODirectionInOut = 1,
-       kIOMemoryKernelUserShared = 2, kIOMapWriteCombineCache = 4 };
+       kIOMemoryKernelUserShared = 2, kIOMapWriteCombineCache = 4, kIODirectionOut = 8 };
+constexpr IOReturn KERN_PROTECTION_FAILURE = 100;
 #ifndef HOST_PAGE_SIZE
 #define HOST_PAGE_SIZE 16384
 #endif
@@ -55,6 +56,7 @@ static void delay_for_interval(uint64_t n, uint64_t unit) { now += n * unit; }
 static uint64_t round_page_64(uint64_t n) { return (n + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1); }
 static void IOLog(const char *, ...) {}
 static void redwood_tl(const char *, ...) {}
+static void proc_selfname(char *name, int size) { snprintf(name, size, "test"); }
 static int copyin(user_addr_t from, void *to, size_t size) {
     memcpy(to, reinterpret_cast<void *>(from), size); return 0;
 }
@@ -85,6 +87,9 @@ public:
         if (--refs == 0) { freed = true; if (parent) parent->release(); }
     }
     uint64_t getLength() const { assert(!freed); return size; }
+    /* memoryBuffer() wires program memory only with gpu_coherent=1, which no case sets */
+    static IOMemoryDescriptor *withAddressRange(uint64_t, uint64_t, int, task_t) { abort(); }
+    IOReturn prepare() { abort(); }
     void *getBytesNoCopy() { assert(!freed); return bytes; }
     addr64_t getPhysicalSegment(uint64_t from, IOByteCount *length, int) {
         assert(!freed && from < size);
@@ -171,6 +176,8 @@ static void redwood_gpu_worked(uint64_t *time, uint32_t *count, uint32_t by[7]) 
 }
 static void redwood_gpu_space(uint64_t *, uint32_t *, uint64_t *, unsigned *, unsigned *, uint64_t *, uint32_t *) {}
 static void redwood_gpu_speed(uint32_t *mhz, uint32_t *changes) { *mhz = *changes = 0; }
+static uint32_t redwood_gpu_irqs() { return 0; }
+static void redwood_gpu_pause(uint32_t, uint32_t poll_us, uint32_t) { delay_for_interval(poll_us, NSEC_PER_USEC); }
 '''
 
 
@@ -365,7 +372,7 @@ def unit(source, memory):
     records = source[source.index("struct gpu_buffer {") : source.index("class RedwoodGPUUserClient :")]
     fields = source[source.index("\ttask_t                  fTask;") : source.index("\npublic:\n\tvirtual bool initWithTask")]
     return (PRELUDE + uapi + "\nstatic IOLock lock; static IOLock *gGPULock = &lock;\n"
-            "static bool gGPUReported, gGPUCached;\n" + stats + records
+            "static bool gGPUReported, gGPUCached, gGPUCoherent;\n" + stats + "\nstatic uint32_t gGPUIrqsSeen;\n" + records
             + "\nstruct RedwoodGPUUserClient : IOUserClient {\n" + fields
             + "\nIOReturn clientClose(); void free();\n};\n"
             + function(source, "gpuWait") + function(source, "MiniIOSurfaceDrawn")
@@ -438,7 +445,7 @@ def main():
         execute(LEGACY_MODEL + legacy_functions + LEGACY_CASES.replace("redwood_gpu_", "legacy_gpu_"), folder, "legacy")
         if args.mutations:
             changes = [
-                ("release_stopped", memory, "gGPUReported || !redwood_gpu_ready() || (b->fence", "gGPUReported || (b->fence", False),
+                ("release_stopped", memory, "busy = gGPUReported || !redwood_gpu_ready() || (last", "busy = gGPUReported || (last", False),
                 ("ignore_unmap", memory, "!redwood_gpu_unmap(address, size)", "(redwood_gpu_unmap(address, size), false)", False),
                 ("partial_release", memory, "\n\t\t\tmemory->retain();", "\n\t\t\t/* removed retain */", False),
                 ("reuse_failed_kept", memory, "if (!gpuReleaseMapping(k->address, k->size))", "if ((gpuReleaseMapping(k->address, k->size), false))", False),

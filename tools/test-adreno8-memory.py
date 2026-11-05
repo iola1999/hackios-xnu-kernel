@@ -470,7 +470,8 @@ int main(int argc, char **argv) {
 with tempfile.TemporaryDirectory(prefix="adreno8-memory-") as directory:
     target = Path(directory)
     (target / "adreno8_private.h").write_text(stub)
-    for name in ("adreno8_smmu_private.h", "adreno8_memory_private.h", "adreno8_hwsched_private.h", "adreno8_secure_private.h"):
+    for name in ("adreno8_smmu_private.h", "adreno8_memory_private.h", "adreno8_hwsched_private.h", "adreno8_secure_private.h",
+                 "adreno8_bo_private.h"):
         (target / name).write_text((ROOT / "xnu/files/bsd/dev" / name).read_text())
     (target / "adreno8_smmu.c").write_text(fixture["driver"])
     (target / "adreno8_memory.c").write_text(driver)

@@ -130,6 +130,34 @@ static bool adreno8_gpu_faulted(void) { return false; }
 void adreno8_hwsched_memory_failed(void) { memory_failures++; }
 static void adreno8_gmu_post_mortem(void) { failures++; }
 static bool adreno8_hwsched_request(const uint32_t *request, uint32_t words, uint32_t *reply, uint32_t *reply_words) { return false; }
+/* The transport's gpu_tl lines and GMU interrupt: gpu_tl stays off and no case attaches the interrupt. */
+typedef int kern_return_t;
+typedef void *event_t;
+#define NSEC_PER_USEC 1000ull
+#define THREAD_UNINT 0
+#define THREAD_AWAKENED 0
+#define THREAD_CONTINUE_NULL 0
+#define GMU_ALWAYS_ON_HI 0x1000
+#define GMU_ALWAYS_ON_LO 0x1004
+#define GMU_GMU2HOST_MASK 0x1008
+static void redwood_tl(const char *format, ...) __printflike(1, 2);
+static void redwood_tl(const char *format, ...) { (void)format; assert(false); }
+static kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *, uint32_t), void *context) {
+    (void)intid; (void)edge; (void)handler; (void)context; assert(false); return 1;
+}
+static void gic_v3_spi_mask(uint32_t intid) { (void)intid; assert(false); }
+static void thread_wakeup(event_t event) { (void)event; assert(false); }
+static void delay_for_interval(uint32_t count, uint64_t unit) { (void)count; (void)unit; assert(false); }
+static void assert_wait_timeout(event_t event, int interruptible, uint32_t count, uint64_t unit) {
+    (void)event; (void)interruptible; (void)count; (void)unit; assert(false);
+}
+static void *current_thread(void) { assert(false); return NULL; }
+static void clear_wait(void *thread, int result) { (void)thread; (void)result; assert(false); }
+static void thread_block(int continuation) { (void)continuation; assert(false); }
+#define KERN_SUCCESS 0
+#define NSEC_PER_MSEC 1000000ull
+static bool PE_parse_boot_argn(const char *name, void *out, int size) { return false; }
+void adreno8_gpu_hang_dump(void) {}
 ''' + FUNCTIONS + r'''
 static void reset(unsigned test) {
     memset(command, 0, sizeof(command)); memset(response, 0, sizeof(response));
@@ -251,6 +279,7 @@ VOTE_FUNCTIONS = cx[cx.index("bool\nadreno8_arc_vote("):cx.index("static bool\na
 RPMH_DEFINE = re.search(r"^#define RPMH_LEVELS\s+\d+", private, re.M).group()
 STAGE_SOURCE = r'''
 #include <assert.h>
+#include <sys/param.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -349,7 +378,7 @@ int main(void) {
     assert(adreno8_dep_vote(128,&dependency) && dependency==0xffffc3ffu);
     assert(adreno8_dep_vote(448,&dependency) && dependency==0xffffc9ffu);
     assert(!adreno8_dep_vote(480,&dependency));
-    assert(sizeof(adreno8_boot_speeds) / sizeof(adreno8_boot_speeds[0]) == 3);
+    assert(sizeof(adreno8_boot_speeds) / sizeof(adreno8_boot_speeds[0]) == 14);
     assert(adreno8_boot_speeds[0].hz == 160000000 && adreno8_boot_speeds[0].level == 50 && adreno8_boot_speeds[0].bus == 2);
     assert(adreno8_boot_speeds[1].hz == 222000000 && adreno8_boot_speeds[1].level == 52 && adreno8_boot_speeds[1].bus == 2);
     assert(adreno8_boot_speeds[2].hz == 342000000 && adreno8_boot_speeds[2].level == 56 && adreno8_boot_speeds[2].bus == 3);
@@ -422,10 +451,12 @@ int main(void) {
     send_count = 0; fail_id = 30; adreno8_reset_required = false;
     assert(!adreno8_step_gx_power() && adreno8_reset_required);
     /*
-     * The speed tick, every 100 ms at most: 342 MHz from 20% of the time busy at 160 MHz or a touch in the last
-     * 300 ms, back to 160 after 500 ms under 10%, and 160 at 70 C or without a reading until below 60 C.
+     * The speed tick, every 100 ms at most, with adreno8_floor=1 adreno8_touch_ms=300: 342 MHz from 20% of the time
+     * busy at 160 MHz or a touch in the last 300 ms, back to 160 after 500 ms under 10%; a thermal limit one speed
+     * down each tick at 70 C, one up every 2 ticks below 60 C, and 160 at once without a reading.
      * 384000 always-on ticks are 20 ms, 20% of a 100 ms tick at 160 MHz.
      */
+    adreno8_speed_floor = 1; adreno8_touch_ms = 300;
     for (unsigned i = 0; i < 4; i++) { adreno8_gx_hz[i] = i ? adreno8_boot_speeds[i - 1].hz : 0; }
     adreno8_gx_count = 4; adreno8_hfi_tables_sent = true; adreno8_reset_required = true; fail_id = 0;
     adreno8_speed_asked = 1; send_count = 0; adreno8_retired_total = 1000000; adreno8_speed_tick(); assert(send_count == 0);
@@ -449,16 +480,24 @@ int main(void) {
     clock_now += 100000000; touched_at = clock_now - 299999999; adreno8_speed_tick();
     assert(send_count == 3 && sent[2][1] == 3);
     clock_now += 100000000; hot = 700; adreno8_speed_tick();
-    assert(send_count == 4 && sent[3][1] == 1);
-    clock_now += 100000000; hot = 650; touched_at = clock_now; adreno8_speed_tick(); assert(send_count == 4);
-    clock_now += 100000000; hot = 599; touched_at = clock_now; adreno8_speed_tick();
-    assert(send_count == 5 && sent[4][1] == 3);
+    assert(send_count == 4 && sent[3][1] == 2);
+    clock_now += 100000000; adreno8_speed_tick();
+    assert(send_count == 5 && sent[4][1] == 1);
+    clock_now += 100000000; hot = 650; touched_at = clock_now; adreno8_speed_tick(); assert(send_count == 5);
+    clock_now += 100000000; hot = 599; touched_at = clock_now; adreno8_speed_tick(); assert(send_count == 5);
+    clock_now += 100000000; touched_at = clock_now; adreno8_speed_tick();
+    assert(send_count == 6 && sent[5][1] == 2);
+    clock_now += 100000000; touched_at = clock_now; adreno8_speed_tick(); assert(send_count == 6);
+    clock_now += 100000000; touched_at = clock_now; adreno8_speed_tick();
+    assert(send_count == 7 && sent[6][1] == 3);
     send_count = 0; clock_now += 100000000; hot_read = false; adreno8_speed_tick();
     assert(send_count == 1 && sent[0][1] == 1);
     send_count = 0; clock_now += 100000000; hot_read = true; hot = 400; touched_at = clock_now; fail_id = 30;
-    adreno8_speed_tick(); assert(send_count == 1 && adreno8_speed_asked == 1);
+    adreno8_speed_tick(); assert(send_count == 0);
+    clock_now += 100000000; touched_at = clock_now; adreno8_speed_tick();
+    assert(send_count == 1 && adreno8_speed_asked == 1);
     clock_now += 100000000; fail_id = 0; adreno8_speed_tick(); assert(send_count == 1);
-    { uint32_t mhz, changes; adreno8_speed_state(&mhz, &changes); assert(mhz == 160 && changes == 6); }
+    { uint32_t mhz, changes; adreno8_speed_state(&mhz, &changes); assert(mhz == 160 && changes == 8); }
     puts("HFI version, perf/BW payloads, ACV threshold, AB=0, minimum DCVS and the load, touch and temperature speed rules: PASS");
 }
 '''
@@ -504,8 +543,8 @@ speed_mutations = [
     ("20% busy kept slow", "permille >= SPEED_UP_PERMILLE", "permille > SPEED_UP_PERMILLE"),
     ("down at once when light", "light >= SPEED_DOWN_NS", "light >= 0"),
     ("medium load counted as light", "\t} else {\n\t\tadreno8_speed_light_since = 0;\n\t}", "\t}"),
-    ("touch ignored", "touch_age < SPEED_TOUCH_NS", "touch_age < 0"),
-    ("missing reading kept at speed", "if (!reading || tenths", "if (tenths"),
+    ("touch ignored", "touch_age < (uint64_t)adreno8_touch_ms * 1000000", "touch_age < 0"),
+    ("missing reading kept at speed", "if (!annibale_gpu_temperature(&tenths) ||", "if ((annibale_gpu_temperature(&tenths), false) ||"),
     ("speed vote without rate limit", "since < SPEED_TICK_NS", "since < 0"),
     ("bus row of the slowest speed", "adreno8_speeds[want - 1].bus", "adreno8_speeds[0].bus"),
 ]

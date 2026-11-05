@@ -56,7 +56,35 @@ static void adreno8_announce(const char *format, ...) { (void)format; }
 static void adreno8_settle(void) {}
 static uint64_t mach_absolute_time(void) { return clock_ns; }
 static void absolutetime_to_nanoseconds(uint64_t value, uint64_t *out) { *out = value; }
+/* The transport's gpu_tl lines and GMU interrupt: gpu_tl stays off and no case attaches the interrupt. */
+typedef int kern_return_t;
+typedef void *event_t;
+#define NSEC_PER_USEC 1000ull
+#define THREAD_UNINT 0
+#define THREAD_AWAKENED 0
+#define THREAD_CONTINUE_NULL 0
+#define GMU_ALWAYS_ON_HI 0x1000
+#define GMU_ALWAYS_ON_LO 0x1004
+#define GMU_GMU2HOST_MASK 0x1008
+static void redwood_tl(const char *format, ...) __printflike(1, 2);
+static void redwood_tl(const char *format, ...) { (void)format; assert(false); }
+static kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *, uint32_t), void *context) {
+    (void)intid; (void)edge; (void)handler; (void)context; assert(false); return 1;
+}
+static void gic_v3_spi_mask(uint32_t intid) { (void)intid; assert(false); }
+static void thread_wakeup(event_t event) { (void)event; assert(false); }
+static void delay_for_interval(uint32_t count, uint64_t unit) { (void)count; (void)unit; assert(false); }
+static void assert_wait_timeout(event_t event, int interruptible, uint32_t count, uint64_t unit) {
+    (void)event; (void)interruptible; (void)count; (void)unit; assert(false);
+}
+static void *current_thread(void) { assert(false); return NULL; }
+static void clear_wait(void *thread, int result) { (void)thread; (void)result; assert(false); }
+static void thread_block(int continuation) { (void)continuation; assert(false); }
+#define KERN_SUCCESS 0
+#define NSEC_PER_MSEC 1000000ull
+static bool PE_parse_boot_argn(const char *name, void *out, int size) { (void)name; (void)out; (void)size; return false; }
 bool adreno8_gpu_faulted(void) { return hardware_fault; }
+void adreno8_gpu_hang_dump(void) {}
 static void adreno8_gmu_post_mortem(void) { snapshots++; }
 void adreno8_hwsched_memory_failed(void) { failures++; closed = true; }
 bool adreno8_hwsched_ready(void) { return !closed; }
@@ -301,7 +329,7 @@ int main(void) {
     assert(last_packet_words == 11 && last_packet[0] >> 20 == 0 && adreno8_context_done(1));
 
     reset(NORMAL); prepare_ib(); q = (uint32_t *)context_queue_view; q[5] = 12;
-    assert(submit() == 0 && dispatches == 0 && context_state == CONTEXT_FAILED && closed && clock_ns >= 200000000ULL);
+    assert(submit() == 0 && dispatches == 0 && context_state == CONTEXT_FAILED && closed && clock_ns >= 2000000000ULL);
     assert(q[6] == 0 && allocation_count == 4);
     reset(NORMAL); prepare_ib(); q = (uint32_t *)context_queue_view; q[5] = 3;
     assert(submit() == 0 && dispatches == 0 && context_state == CONTEXT_FAILED);
@@ -313,7 +341,7 @@ int main(void) {
     reset(NORMAL);
     assert(adreno8_context_submit(addresses, lengths, 83) == 0 && allocation_count == 0 && command_count == 0);
 
-    reset(RETIRE_ONLY); assert(!adreno8_context_test() && dispatches == 1 && clock_ns == 200000000ULL);
+    reset(RETIRE_ONLY); assert(!adreno8_context_test() && dispatches == 1 && clock_ns == 2000000000ULL);
     assert(allocation_count == 4 && closed && context_last == 1 && !adreno8_context_done(1));
     assert(!adreno8_context_prepare() && !adreno8_context_close() && command_count == 2);
     reset(BAD_ACK); assert(!adreno8_context_test() && command_count == 1 && clock_ns == 1000000000ULL);

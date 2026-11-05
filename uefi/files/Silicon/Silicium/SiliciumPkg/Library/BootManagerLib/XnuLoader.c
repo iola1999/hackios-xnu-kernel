@@ -5,8 +5,9 @@
   (see XnuLoader.h) to a fixed reserved address; if it carries "loader.efi",
   the image is started straight from memory so the loader can be iterated on
   without rebuilding this firmware. XnuLoaderMain does not return: a missing,
-  invalid or returned-from payload ends in a cold reset, with no console or
-  storage call before it, so the device boots again without a key press.
+  invalid or returned-from payload ends in a PSCI SYSTEM_RESET, with no
+  console, storage or firmware call before it, so the device boots again
+  without a key press.
 
   SPDX-License-Identifier: BSD-2-Clause-Patent
 **/
@@ -15,7 +16,8 @@
 
 #include <Library/BaseLib.h>
 #include <Library/UefiBootServicesTableLib.h>
-#include <Library/UefiRuntimeServicesTableLib.h>
+#include <Library/ArmMonitorLib.h>
+#include <IndustryStandard/ArmStdSmc.h>
 
 #include "XnuLoader.h"
 
@@ -29,14 +31,22 @@ XnuTerminalReset (
   VOID
   )
 {
+  ARM_MONITOR_ARGS  Args = { 0 };
+
   //
-  // Nothing is written to storage before the reset: the loader image is on a
-  // boot partition (boot_a on annibale), and a log written there would damage
-  // the image the next boot reads. ResetSystem does not return when the reset
-  // is taken; if it does, this CPU stops with interrupts masked and only a
-  // long press of the power key brings the device back.
+  // PSCI SYSTEM_RESET straight to the secure monitor, the call the resident
+  // loader's own reset makes. The firmware's reset service runs the reset
+  // notification callbacks first: on annibale (2026-11-05) that path brought
+  // the phone back after 5 min 26 s, this call after 34 s. Nothing is written
+  // to storage before the reset: the loader image is on a boot partition
+  // (boot_a), and a log written there would damage the image the next boot
+  // reads.
+  // SYSTEM_RESET does not return when the reset is taken; if it does, this CPU
+  // stops with interrupts masked and only a long press of the power key brings
+  // the device back.
   //
-  gRT->ResetSystem (EfiResetCold, EFI_SUCCESS, 0, NULL);
+  Args.Arg0 = ARM_SMC_ID_PSCI_SYSTEM_RESET;
+  ArmMonitorCall (&Args);
 
   __asm__ volatile ("msr daifset, #0xf" ::: "memory");
 

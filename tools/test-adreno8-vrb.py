@@ -191,7 +191,8 @@ variants = {
 with tempfile.TemporaryDirectory(prefix="adreno8-vrb-") as directory:
     target = Path(directory)
     (target / "adreno8_private.h").write_text(stub)
-    for name in ("adreno8_smmu_private.h", "adreno8_memory_private.h", "adreno8_hwsched_private.h", "adreno8_secure_private.h"):
+    for name in ("adreno8_smmu_private.h", "adreno8_memory_private.h", "adreno8_hwsched_private.h", "adreno8_secure_private.h",
+                 "adreno8_bo_private.h"):
         (target / name).write_text((DEV / name).read_text())
     (target / "adreno8_smmu.c").write_text(fixture["driver"])
     for name, body in variants.items():

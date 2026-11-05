@@ -299,7 +299,7 @@ variants["before-layout"] = production.replace("\tif (!adreno8_smmu_layout()) {"
 with tempfile.TemporaryDirectory(prefix="adreno8-early-tlb-") as directory:
     target = Path(directory)
     (target / "adreno8_private.h").write_text(stub)
-    for name in ("adreno8_memory_private.h", "adreno8_smmu_private.h"):
+    for name in ("adreno8_memory_private.h", "adreno8_smmu_private.h", "adreno8_bo_private.h"):
         (target / name).write_text((DEV / name).read_text())
     (target / "check.c").write_text('#include "adreno8_smmu.c"\n#undef printf\n' + setup + cases)
     for label, content in [("production", production)] + list(variants.items()):

@@ -5,9 +5,9 @@ The real XnuLoader.c and XnuLoader.h are compiled and run: only the #include
 lines are dropped and the block between the XNU-TERM markers is replaced by a
 stand-in that records the event and longjmps, so a host process can observe
 what the production control flow did. Everything between the markers is
-checked before the swap (one cold ResetSystem, then the DAIF mask and the
-self-loop, no Boot Services call), and the swap itself must find the markers
-exactly once. Outside the block, payload, Boot Services and Runtime Services
+checked before the swap (one PSCI SYSTEM_RESET through ArmMonitorCall, then
+the DAIF mask and the self-loop, no Boot or Runtime Services call), and the
+swap itself must find the markers exactly once. Outside the block, payload, Boot Services and Runtime Services
 are host stubs that record every call in order; LocateHandleBuffer,
 HandleProtocol, GetMemoryMap, LocateProtocol, SetWatchdogTimer, ResetSystem,
 SetVariable, GetTime, AsciiVSPrint and the allocators count as forbidden, so
@@ -24,7 +24,7 @@ magic check, the size cap, the 16-byte entry padding or stepping by a fixed 24
 bytes must each break the scenario suite, dropping the header subtraction from
 the size cap must accept an over-by-one body, and retargeting the magic macro
 in the header must reject the independent wire bytes. The terminal body
-itself (the ResetSystem call and the fallback loop) only gets the text checks
+itself (the PSCI call and the fallback loop) only gets the text checks
 above; the host run carries no firmware or hardware semantics.
 
 The Mu-Silicium root under test is optional argv[1] or $MU_SILICIUM_ROOT and
@@ -378,11 +378,11 @@ def assemble(c_source, header_source, terminal, main_returned_mutation=False, lo
     body = "\n".join(l for l in c_source.splitlines() if not l.startswith("#include"))
     beg, end = body.index(BEG), body.index(END) + len(END)
     block = body[beg:end]
-    for probe in ("gRT->ResetSystem (EfiResetCold, ", "daifset", "for (;;)"):
+    for probe in ("Args.Arg0 = ARM_SMC_ID_PSCI_SYSTEM_RESET;", "ArmMonitorCall (&Args);", "daifset", "for (;;)"):
         assert probe in block, "terminal block lost %s" % probe
-    assert block.count("->ResetSystem") == 1, "terminal block resets more than once"
-    assert block.index("->ResetSystem") < block.index("msr daifset"), "terminal block masks before the reset"
-    for absent in ("gBS->", "SetVariable", "CpuDeadLoop"):
+    assert block.count("ArmMonitorCall") == 1, "terminal block calls the monitor more than once"
+    assert block.index("ArmMonitorCall") < block.index("msr daifset"), "terminal block masks before the reset"
+    for absent in ("gBS->", "gRT->", "SetVariable", "CpuDeadLoop"):
         assert absent not in block, "terminal block calls %s" % absent
     if parse_mutation:
         old, new, _ = {**PARSE_MUTATIONS, **BOUNDARY_MUTATIONS}[parse_mutation]
@@ -455,22 +455,23 @@ def main():
     header_source = tree_bytes("XnuLoader.h").decode()
     inf = tree_bytes("BootManagerLib.inf").decode()
 
-    # wiring: no diagnostics tail, and Runtime Services appear only in the
-    # terminal block, as one cold reset
+    # wiring: no diagnostics tail, no Runtime Services at all (gRT->ResetSystem runs the
+    # reset notification callbacks first), and the monitor is called only in the terminal block
     ck(c_source.count(BEG) == 1 and c_source.count(END) == 1, "terminal_markers_once")
-    for gone in ("FlushLog", "FindPartition", "SetVariable", "BlockIo", "PartitionInfo",
-                 "AllocateZeroPool", "AsciiVSPrint", "GetTime", "LOG_SIZE", "mLog", "wfi", "wfe"):
+    for gone in ("FlushLog", "FindPartition", "ResetSystem", "SetVariable", "BlockIo", "PartitionInfo",
+                 "AllocateZeroPool", "AsciiVSPrint", "GetTime", "gRT", "LOG_SIZE", "mLog", "wfi", "wfe"):
         ck(gone not in c_source, "%s_removed" % gone)
     if c_source.count(BEG) == 1 and c_source.count(END) == 1:
         block = c_source[c_source.index(BEG):c_source.index(END)]
         outside = c_source.replace(block, "")
-        ck("gRT" not in outside and "ResetSystem" not in outside, "runtime_services_only_in_terminal")
-        ck(block.count("gRT->ResetSystem (EfiResetCold, ") == 1, "terminal_resets_cold_once")
+        ck("ArmMonitorCall" not in outside, "monitor_call_only_in_terminal")
+        ck(block.count("ARM_SMC_ID_PSCI_SYSTEM_RESET") == 1, "terminal_psci_reset_once")
     ck(c_source.count("XnuTerminalReset") == 2, "one_terminal_definition_and_call")
     ck(c_source.count("StartPayloadLoader") == 2, "one_loader_definition_and_call")
     ck("XNU_LOG_PARTITION" not in header_source and "XNU_MARKER_MAGIC" not in header_source, "header_diagnostics_gone")
     ck("__attribute__((noreturn))\nVOID\nXnuLoaderMain ();" in header_source, "header_declares_noreturn")
     ck("gEfiBlockIoProtocolGuid" not in inf and "gEfiPartitionInfoProtocolGuid" not in inf, "inf_protocols_gone")
+    ck("ArmMonitorLib" in inf and "ArmPkg/ArmPkg.dec" in inf, "inf_has_arm_monitor")
     for keep in ("UefiRuntimeServicesTableLib", "PrintLib", "MemoryAllocationLib"):   # other library users
         ck(keep in inf, "inf_keeps_%s" % keep.lower())
 

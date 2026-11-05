@@ -85,6 +85,31 @@ static uint64_t clock_ns;
 #define GMU_GMU2HOST_CLR 8
 #define GMU_FW_INIT_RESULT 12
 #define GMU_FW_FAILED 0xe00
+void adreno8_gpu_hang_dump(void) {}
+/* The transport's gpu_tl lines and GMU interrupt: gpu_tl stays off and no case attaches the interrupt. */
+typedef int kern_return_t;
+typedef void *event_t;
+#define NSEC_PER_USEC 1000ull
+#define THREAD_UNINT 0
+#define THREAD_AWAKENED 0
+#define THREAD_CONTINUE_NULL 0
+#define GMU_ALWAYS_ON_HI 0x1000
+#define GMU_ALWAYS_ON_LO 0x1004
+#define GMU_GMU2HOST_MASK 0x1008
+static void redwood_tl(const char *format, ...) __printflike(1, 2);
+static void redwood_tl(const char *format, ...) { (void)format; assert(false); }
+static kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *, uint32_t), void *context) {
+    (void)intid; (void)edge; (void)handler; (void)context; assert(false); return 1;
+}
+static void gic_v3_spi_mask(uint32_t intid) { (void)intid; assert(false); }
+static void thread_wakeup(event_t event) { (void)event; assert(false); }
+static void delay_for_interval(uint32_t count, uint64_t unit) { (void)count; (void)unit; assert(false); }
+static void assert_wait_timeout(event_t event, int interruptible, uint32_t count, uint64_t unit) {
+    (void)event; (void)interruptible; (void)count; (void)unit; assert(false);
+}
+static void *current_thread(void) { assert(false); return NULL; }
+static void clear_wait(void *thread, int result) { (void)thread; (void)result; assert(false); }
+static void thread_block(int continuation) { (void)continuation; assert(false); }
 static uint32_t header(unsigned id, unsigned words, unsigned type, unsigned seq) {
     return id | (words << 8) | (type << 16) | (seq << 20);
 }
@@ -316,7 +341,7 @@ if __name__ == "__main__":
         target = Path(directory)
         (target / "adreno8_private.h").write_text(stub)
         for name in ("adreno8_smmu_private.h", "adreno8_memory_private.h", "adreno8_hwsched_private.h",
-                     "adreno8_secure_private.h", "adreno8_wire_private.h"):
+                     "adreno8_secure_private.h", "adreno8_wire_private.h", "adreno8_bo_private.h"):
             (target / name).write_text((DEV / name).read_text())
         (target / "adreno8_smmu.c").write_text(fixture["driver"])
         (target / "adreno8_memory.c").write_text(driver)

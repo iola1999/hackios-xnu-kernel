@@ -35,7 +35,7 @@ typedef struct {
 
 //
 // Starts loader.efi from the payload region. Does not return: every outcome
-// ends in the cold reset defined in XnuLoader.c.
+// ends in the PSCI SYSTEM_RESET defined in XnuLoader.c.
 //
 __attribute__((noreturn))
 VOID

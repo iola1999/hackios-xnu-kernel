@@ -33,6 +33,9 @@ void adreno8_speed_state(uint32_t *mhz, uint32_t *changes);
 static void adreno8_to_memory(vm_offset_t address, uint64_t size) {
     assert((address == 0x1000 && size == 4096) || (!address && !size)); cache_calls++;
 }
+#define NSEC_PER_USEC 1000ull
+static void delay_for_interval(uint32_t interval, uint64_t unit) { (void)interval; (void)unit; }
+static void adreno8_sleep_us(uint32_t us) { (void)us; }
 #endif
 '''
 
@@ -52,6 +55,12 @@ uint32_t adreno8_context_submit(const uint64_t *addresses, const uint32_t *words
 }
 bool adreno8_context_done(uint32_t fence) { assert(bo_open && fence == 17); return true; }
 uint32_t adreno8_context_last(void) { return 17; }
+uint32_t adreno8_context_retired(void) { return 17; }
+void adreno8_gpu_hang_dump(void) {}
+bool adreno8_hfi_poll(void) { return false; }
+void adreno8_hfi_irq_attach(void) {}
+uint32_t adreno8_hfi_irq_count(void) { return 0; }
+void adreno8_hfi_irq_pause(uint32_t seen, uint32_t poll_us, uint32_t longest_us) { (void)seen; (void)poll_us; (void)longest_us; }
 bool adreno8_context_close(void) { assert(bo_open); close_calls++; return true; }
 bool adreno8_gpu_faulted(void) { return !bo_open; }
 void adreno8_speed_tick(void) { assert(bo_open); speed_ticks++; }
@@ -147,7 +156,7 @@ static void IOLockFree(IOLock *p) { assert(p && !p->depth); lock_frees++; delete
 static void IOLockLock(IOLock *p) { assert(p && p->depth++==0); }
 static void IOLockUnlock(IOLock *p) { assert(p && p->depth--==1); }
 static IOLock *gGPULock;
-static bool gGPUCached;
+static bool gGPUCached, gGPUCoherent;
 static void IOLog(const char *, ...) {}
 static bool PE_parse_boot_argn(const char *, void *v, unsigned) { *(uint32_t *)v=cached_arg; return true; }
 struct IOService {

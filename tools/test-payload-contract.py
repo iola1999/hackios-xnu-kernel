@@ -86,7 +86,8 @@ def main():
     dl_body = dl[len('} else if (starts_with(cmd, "download:")) {'):-len('} else if (starts_with(cmd, "upload"))')]
 
     macros = "\n".join(line for line in src.splitlines() if re.match(
-        r"#define (PAYLOAD_MAGIC|PAYLOAD_CONTAINER_MAX|PAYLOAD_RESERVE_SIZE|RESIDENT_RD_OFFSET|RESIDENT_RD_RESERVE|USB_CHUNK)\b", line))
+        r"#define (PAYLOAD_MAGIC|PAYLOAD_CONTAINER_MAX|PAYLOAD_RESERVE_SIZE|RESIDENT_RD_OFFSET|RESIDENT_RD_RESERVE|USB_CHUNK"
+        r"|BASE_ALIGN|MAX_MEM_SIZE_LIMIT)\b", line))
     prelude = """#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -103,8 +104,16 @@ static int download_to_ramdisk;
 static uint8_t usb_rx_buf[USB_CHUNK];
 static const uint8_t *rx_src;
 static uint64_t rx_left, rx_chunk;
-static int64_t usb_rx(uint8_t *buf, uint64_t len)
+/* the streamed ramdisk session (tools/test-loader-ramdisk.py) and the panel status stay out of these scenarios */
+static struct { uint64_t total, received; } ramdisk_transfer;
+static int ramdisk_pending(void) { return 0; }
+static int ramdisk_block_size(const char *text, uint64_t *size) { (void)text; (void)size; abort(); }
+static void ramdisk_block_done(uint64_t wanted, uint64_t received) { (void)wanted; (void)received; abort(); }
+static void ui_stage(const char *word) { (void)word; }
+static void ui_progress(uint64_t done, uint64_t total) { (void)done; (void)total; }
+static int64_t usb_rx(uint8_t *buf, uint64_t len, int command)
 {
+	(void)command;
 	uint64_t n = len < rx_left ? len : rx_left;
 	if (n > rx_chunk) {
 		n = rx_chunk;

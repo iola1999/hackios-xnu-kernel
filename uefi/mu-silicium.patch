@@ -689,10 +689,10 @@ index 9b18ddb..f5bff32 100644
 +  DeviceBootManagerBdsEntry ();
 +}
 diff --git a/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManagerLib.inf b/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManagerLib.inf
-index 2310dc6..c3fb7f7 100644
+index 2310dc6..de6e1c9 100644
 --- a/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManagerLib.inf
 +++ b/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManagerLib.inf
-@@ -1,50 +1,53 @@
+@@ -1,50 +1,55 @@
 -##
 -#  Copyright (C) Microsoft Corporation. All rights reserved.
 -#  SPDX-License-Identifier: BSD-2-Clause-Patent
@@ -764,6 +764,7 @@ index 2310dc6..c3fb7f7 100644
 +
 +[Packages]
 +  MdePkg/MdePkg.dec
++  ArmPkg/ArmPkg.dec
 +  PcBdsPkg/PcBdsPkg.dec
 +  MsCorePkg/MsCorePkg.dec
 +  MsGraphicsPkg/MsGraphicsPkg.dec
@@ -785,6 +786,7 @@ index 2310dc6..c3fb7f7 100644
 +  PrintLib
 +  BaseLib
 +  BaseMemoryLib
++  ArmMonitorLib
 +
 +[Pcd]
 +  gEfiMdePkgTokenSpaceGuid.PcdPlatformBootTimeOut

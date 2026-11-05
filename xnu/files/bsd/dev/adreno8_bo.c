@@ -197,7 +197,8 @@ adreno8_bo_reserve(uint64_t size)
 	uint32_t address, from = bo_free_from;
 	uint64_t span = size + SMMU_GRANULE;   /* the BO and its guard page */
 	if (!adreno8_bo_ready()) return 0;
-	if (!bo_range(ADRENO8_GPU_IOVA_START, span) ||
+	/* size 0 has to be refused here: its span is the guard page alone, which bo_range accepts */
+	if (!size || !bo_range(ADRENO8_GPU_IOVA_START, span) ||
 	    (!adreno8_space_find_range(&adreno8_gpu_space, from, ADRENO8_GPU_IOVA_END, (uint32_t)span, SMMU_GRANULE, &address) &&
 	    (from == ADRENO8_GPU_IOVA_START || !adreno8_space_find_range(&adreno8_gpu_space, ADRENO8_GPU_IOVA_START,
 	    ADRENO8_GPU_IOVA_END, (uint32_t)span, SMMU_GRANULE, &address)))) {
