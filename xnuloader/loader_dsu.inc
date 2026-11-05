@@ -23,7 +23,8 @@
  */
 #define LP_GEOMETRY_MAGIC  0x616c4467u
 #define LP_HEADER_MAGIC    0x414c5030u
-#define DSU_MAX_EXTENTS    64
+/* a fresh 16 GiB DSU file on a used userdata had 166 extents (2026-11-05); 64 refused it */
+#define DSU_MAX_EXTENTS    1024
 #define DSU_READ_BYTES     (8u << 20)
 
 static struct {
@@ -69,7 +70,12 @@ dsu_parse(const uint8_t *p, uint64_t room, uint64_t userdata_sectors)
 		}
 		first = *(const uint32_t *)(e + 40);
 		n = *(const uint32_t *)(e + 44);
-		if (n == 0 || n > DSU_MAX_EXTENTS || (uint64_t)first + n > en) {
+		if (n > DSU_MAX_EXTENTS) {
+			print("dsu: system_gsi has %d extents, more than the %d this loader keeps\n", (uint64_t)n,
+			    (uint64_t)DSU_MAX_EXTENTS);
+			return 0;
+		}
+		if (n == 0 || (uint64_t)first + n > en) {
 			return 0;
 		}
 		for (uint32_t x = 0; x < n; x++) {

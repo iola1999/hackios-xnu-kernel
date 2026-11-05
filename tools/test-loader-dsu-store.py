@@ -49,7 +49,7 @@ typedef struct efi_block_io {
 	efi_status (EFIAPI *flush_blocks)(struct efi_block_io *);
 } efi_block_io;
 struct loader_block_part { char name[36]; uint32_t block_size; uint64_t blocks, start_lba; uint16_t unit; uint8_t lun, flags; uint32_t reserved; };
-#define DSU_MAX_EXTENTS 64
+#define DSU_MAX_EXTENTS 1024
 static struct { uint64_t sector, count; } dsu_extent[DSU_MAX_EXTENTS];
 static unsigned dsu_extents;
 static uint64_t dsu_bytes;
