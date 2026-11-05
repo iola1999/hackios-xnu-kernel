@@ -262,9 +262,10 @@ lx_os_radio_address(unsigned char *address)
 }
 
 int
-lx_os_network(unsigned char *name, unsigned *name_length, unsigned char *passphrase, unsigned *passphrase_length)
+lx_os_network(__unused unsigned char *name, __unused unsigned *name_length, __unused unsigned char *passphrase,
+    __unused unsigned *passphrase_length)
 {
-	return redwood_wifi_network(name, name_length, passphrase, passphrase_length);
+	return 0;
 }
 
 /* ---- frames: the radio as the link behind en0 (sys/redwood_net.h) ------------------------------------ */

@@ -80,14 +80,13 @@
  *
  * wifi=1 is all of it for whoever uses the phone: the steps that are needed (not the ones that
  * only look), ath11k as step 15 for real, its station given to the rest of the kernel to ask
- * (sys/redwood_sta.h: iOS's Wi-Fi side does, through bsd/dev/redwood_apple80211.c), the network
- * of fw/network joined if the small image has that file, and everything left running while the
- * system does -- on a thread of its own, so that the system's start does not wait for it, and
- * without a word in the log but the outcome (what the steps say is kept, and shown if the radio
- * does not come up). Without the radio's firmware in the small image it says so in a line and
- * does nothing. (wifi_loud=1 with it: nothing is kept back, for looking into a start that goes
- * wrong.) The rest of this comment is about the steps one by one, wifi_step=N, which is how
- * all this was found out.
+ * (sys/redwood_sta.h: iOS's Wi-Fi side does, through bsd/dev/redwood_apple80211.c), and
+ * everything left running while the system does -- on a thread of its own, so that the system's
+ * start does not wait for it, and without a word in the log but the outcome (what the steps say
+ * is kept, and shown if the radio does not come up). Without the radio's firmware in the small
+ * image it says so in a line and does nothing. (wifi_loud=1 with it: nothing is kept back, for
+ * looking into a start that goes wrong.) The rest of this comment is about the steps one by one,
+ * wifi_step=N, which is how all this was found out.
  *
  * More boot-args, for wifi_step=N:
  *   wifi_new=K         steps K and later have not been seen to work (default: the last one)
@@ -122,13 +121,8 @@
  *                      made and the radio scans, listening only; what it heard goes to the log
  *                      (other people's networks by name and address: the log is not for
  *                      passing on)
- *   wifi_join=1        with wifi_lx=2: the station joins the network named in fw/network of
- *                      the small image (redwood_wifi_network() below) and the driver stays
- *                      up as the link behind en0; with wifi_keep=1 while the system runs,
- *                      else until the steps are over (wifi_hold=S: S seconds longer)
  *   wifi_station=1     with wifi_lx=2: the driver stays up and its station is the kernel's to
  *                      ask (sys/redwood_sta.h); nothing is joined by the driver itself
- *   wifi_file=0        with wifi=1: the network of fw/network is not joined at the start
  *   wifi_irq=1         the radio's interrupts (MSI through its SMMU context to the GIC) instead
  *                      of looking at its rings every millisecond (lx_bus.c); wifi=1 stands for it
  *   wifi_ba=1          block ack: the access point's requests to send aggregates are answered
@@ -3697,49 +3691,6 @@ redwood_wifi_radio_address(uint8_t *address)
 	return good;
 }
 
-/*
- * The network the radio is to join: the file "network" among the firmware in the small image,
- * the name on its first line, the passphrase on its second (userland/build.sh takes it from
- * fw-wifi/network, which is in no repository). Not a boot argument: those are echoed by the
- * loader and printed with a panic. The log says how long the two are, and nothing else of them.
- */
-bool
-redwood_wifi_network(uint8_t *name, unsigned *name_length, uint8_t *passphrase, unsigned *passphrase_length)
-{
-	uint64_t size = 0;
-	const uint8_t *file = image_file("network", &size), *end = file + size, *line = file;
-	unsigned lengths[2] = { 0, 0 }, sizes[2] = { *name_length, *passphrase_length };
-	uint8_t *where[2] = { name, passphrase };
-
-	if (file == NULL) {
-		printf("wifi: %u: which network to join: none was given (fw/network of the small image)\n", step);
-		return false;
-	}
-	for (unsigned n = 0; n < 2 && line < end; n++) {
-		const uint8_t *stop = line;
-
-		while (stop < end && *stop != '\n') {
-			stop++;
-		}
-		lengths[n] = (unsigned)(stop - line) - (stop > line && stop[-1] == '\r' ? 1 : 0);
-		if (lengths[n] > sizes[n]) {
-			lengths[n] = 0;
-		} else {
-			memcpy(where[n], line, lengths[n]);
-		}
-		line = stop + 1;
-	}
-	printf("wifi: %u: which network to join: a name of %u bytes and a passphrase of %u bytes were given%s\n", step,
-	    lengths[0], lengths[1], lengths[0] == 0 || lengths[1] < 8 || lengths[1] > 63 ? ": NOT A NAME OF 1 TO 32 BYTES AND A "
-	    "PASSPHRASE OF 8 TO 63" : "");
-	if (lengths[0] == 0 || lengths[1] < 8 || lengths[1] > 63) {
-		return false;
-	}
-	*name_length = lengths[0];
-	*passphrase_length = lengths[1];
-	return true;
-}
-
 /* ---- all of it together ---------------------------------------------------------------------------- */
 
 static bool(*const steps[])(void) = {
@@ -3815,56 +3766,6 @@ steps_over(uint32_t done)
 }
 
 /*
- * The network of the file, joined the way anybody joins one: by asking the station. iOS's Wi-Fi
- * side may ask for another later, or for none.
- */
-static void
-join_given(uint64_t began)
-{
-	static struct redwood_sta_join what;
-	struct redwood_sta_state *state;
-	unsigned name_length = sizeof(what.ssid), passphrase_length = sizeof(what.passphrase);
-	uint64_t size = 0;
-	uint32_t given = 1;
-	int error;
-
-	if (image_file("network", &size) == NULL) {
-		tell("wifi: no network to join was given (fw-wifi/network, see the README): the radio waits to be asked\n");
-		return;
-	}
-	if (PE_parse_boot_argn("wifi_file", &given, sizeof(given)) && given == 0) {
-		tell("wifi: the network of the file is not joined at the start (wifi_file=0): the radio waits to be asked\n");
-		return;
-	}
-	bzero(&what, sizeof(what));
-	if (!redwood_wifi_network(what.ssid, &name_length, what.passphrase, &passphrase_length)) {
-		tell("wifi: the network given in fw/network is not a name and a passphrase: nothing is joined\n");
-		return;
-	}
-	what.ssid_length = (uint8_t)name_length;
-	what.passphrase_length = (uint8_t)passphrase_length;
-	what.security = REDWOOD_STA_WPA2_PSK;
-	error = redwood_sta_ask_join_standing(&what);
-	bzero(&what, sizeof(what));
-	for (unsigned waited = 0; error == 0 && redwood_sta_busy() && waited < 300; waited++) {
-		sleep_ms(100);
-	}
-	if ((state = kalloc_data(sizeof(*state), Z_WAITOK)) == NULL) {
-		return;
-	}
-	redwood_sta_state(state);
-	if (state->phase == REDWOOD_STA_JOINED) {
-		tell("wifi: THE NETWORK OF THE FILE IS JOINED, %llu.%llu s after the kernel began on the radio\n", (now_us() - began) /
-		    1000000, (now_us() - began) / 100000 % 10);
-	} else {
-		tell("wifi: THE NETWORK OF THE FILE IS NOT JOINED (%d, %d): the radio waits to be asked. The last of what was said:\n",
-		    error, state->last_error);
-		say_kept();
-	}
-	kfree_data(state, sizeof(*state));
-}
-
-/*
  * wifi=1: the whole of it on a thread of its own, so that the system starts meanwhile (the
  * firmware's calibration alone takes seven seconds). The steps that only look are left out.
  */
@@ -3896,7 +3797,6 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 	if (failed == 0) {
 		tell("wifi: THE RADIO IS UP, %llu.%llu s after the kernel began on it\n", (now_us() - began) / 1000000,
 		    (now_us() - began) / 100000 % 10);
-		join_given(began);
 	} else {
 		tell("wifi: THE RADIO DID NOT COME UP: step %u failed, %llu s in. The last of what was said on the way:\n", failed,
 		    (now_us() - began) / 1000000);
