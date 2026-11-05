@@ -95,6 +95,8 @@ DRIVER="core hal wmi mac reg htc qmi dp dp_tx dp_rx dp_htt dp_peer ce peer dbrin
 	wifi7/dp wifi7/dp_mon wifi7/hal wifi7/hal_qcn9274 wifi7/hal_wcn7850 wifi7/hal_qcc2072"
 CC="clang -target arm64-apple-ios16.5"
 LD=$ROOT/xnu-deps/host/bin/ld64
+# xnu-deps/setup.sh links the cctools ld64 there on Linux; on macOS Xcode's ld is that linker
+[ -e "$LD" ] || [ "$(uname -s)" != Darwin ] || LD=/usr/bin/ld
 CFLAGS="-mkernel -mgeneral-regs-only -fno-builtin -fno-common -ffreestanding -fno-strict-aliasing
 	-funsigned-char -nostdinc -std=gnu17 -O2 -g -w -ferror-limit=0
 	-D__FreeBSD__=15 -D_KERNEL -DKLD_MODULE -DHAVE_KERNEL_OPTION_HEADERS -include opt_global.h

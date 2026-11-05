@@ -26,9 +26,11 @@ xnu26/apply.sh                                # 取上游源码，应用 xnu26/p
 xnu26/deps-macos.sh --stage1                  # 依赖源码与 SDK
 xnu26/build-macos.sh exporthdrs installhdrs   # 导出内核头文件
 xnu26/deps-macos.sh --stage2                  # 用内核头文件编 libfirehose_kernel.a、libpthread_kext.a
+tools/mk-ath12k.sh                            # Wi-Fi 驱动 ath12k，build-macos.sh 发现 out/ath12k.o 时链接进内核
 xnu26/build-macos.sh                          # 构建内核
 ```
 
+- 产物是 `xnu-src/xnu-12377.121.6/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837`。在顶层工作区执行 `python3 tools/k90auto/register-kernel.py 12377-local` 登记后，`tools/k90auto/cycle.py --kernel 12377-local` 用它启动。
 - `xnu26/apply.sh` 在构建树已存在时直接退出；构建树里的修改用 `xnu26/export.sh` 导回仓库。
 - 真机轮次实际用的构建命令记在每轮 `kernel.json` 的 `build.command`，增量构建的做法见顶层 [k90auto 说明](https://github.com/iola1999/hackios-redmi-k90-annibale/blob/main/tools/k90auto/README.md)。
 - loader：`EXTRA_CFLAGS=-DDIRECT_PHONE_PLAT xnuloader/build.sh`，产物是 `xnuloader/loader-phone.efi`。
