@@ -29,6 +29,9 @@ bool mhi_pcie_ipcr(void);
 void *mhi_pcie_dma_alloc(uint64_t bytes, uint64_t *pa);
 void mhi_pcie_wlfw(void);
 void mhi_pcie_wake(void);
+/* boot-arg bt=N: the chip's Bluetooth half over SE14 in a thread of its own (annibale_bt_hci.c), once powered */
+void annibale_bt_start(void);
+void annibale_bt_ios_early(void);
 
 /* step 10: the card for the Wi-Fi driver (redwood_lx.c), set up by mhi_pcie.c when pcie=10 starts it */
 bool mhi_pcie_radio(void);                                      /* the driver runs on the card */

@@ -3172,23 +3172,26 @@ static bool(*const steps[])(void) = {
  * The SoC's temperature sensors report by themselves, in a block that is always on (Linux's
  * tsens-v2.c): a status word a sensor, the last reading in its low 12 bits, signed, in tenths of a
  * degree, and bit 21 when there is one. On SM8750 the GPU's group is at 0xc22a000, sensors 1 to 8
- * (stock thermal-zones gpuss-*, the same group annibale_cpufreq.c's tsens_groups reads); this
- * reads its first two. Read, never written: once a minute while the GPU is
- * kept, for the line beside the kernel's line about memory (osfmk/arm64/loader_return.c). A
- * sensor caught between two readings has none for a moment and is asked again; one that still
- * has none is put down as -273.0.
+ * (stock thermal-zones gpuss-*, the same group annibale_cpufreq.c's tsens_groups reads); this reads
+ * its first two once a minute while the GPU is kept, beside the memory line (loader_return.c).
  */
 static struct block tsens = { "tsens-gpu", 0x0c22a000, 0x200 };
 #define TSENS_STATUS(sensor)    (0xa0 + 4 * (sensor))
 #define TSENS_VALID             (1u << 21)
+extern bool adreno8_gpu8_keep;
+extern void adreno8_speed_state(uint32_t *mhz, uint32_t *changes);
 
 void
 redwood_adreno_minute(void)
 {
+	uint32_t mhz = core_khz / 1000, changes = 0;
 	int32_t tenths[2];
 
-	if (!gpu_kept) {
+	if (!gpu_kept && !adreno8_gpu8_keep) {
 		return;
+	}
+	if (adreno8_gpu8_keep) {
+		adreno8_speed_state(&mhz, &changes);
 	}
 	need(&tsens);
 	for (unsigned i = 0; i < 2; i++) {
@@ -3203,7 +3206,7 @@ redwood_adreno_minute(void)
 	}
 	printf("adreno: the GPU's sensors read %d.%d and %d.%d degrees; its clock is set to %u MHz\n", tenths[0] / 10,
 	    tenths[0] % 10 < 0 ? -(tenths[0] % 10) : tenths[0] % 10, tenths[1] / 10,
-	    tenths[1] % 10 < 0 ? -(tenths[1] % 10) : tenths[1] % 10, core_khz / 1000);
+	    tenths[1] % 10 < 0 ? -(tenths[1] % 10) : tenths[1] % 10, mhz);
 }
 
 /* ---- beside the steps: what the firmware left the display doing (boot-arg display_probe=1) ---------------- */
@@ -3212,14 +3215,10 @@ redwood_adreno_minute(void)
  * The panel is a DSI video panel (dt: qcom,mdss_dsi_m20_36_02_0a_dsc_vid: 1080 x 2400 at 120
  * frames a second, 2432 lines with the porches; or at 60 with a longer vertical front porch):
  * the display controller sends it the framebuffer over and over at the rate of its timing
- * registers, which nobody has touched since the firmware. This reads them. Each read is behind
- * a check that what it reads has its clock: the bus clock of the display's clock controller (by
- * GCC, which answers always; the firmware leaves it off, Linux keeps it on always, and so it is
- * turned on here: one write), in that controller the display block's power switch and the bus
- * clock of its registers (the firmware set the panel going and took that clock away again; it
- * is turned on here: the other write, and the last), then the timing of the interface the panel
- * hangs on (Linux's dpu_hw_intf.c has the registers' meaning) and its two counters, read twice a
- * known time apart: how many frames a second the panel is really sent. Neither clock is turned
+ * registers. Each read is behind a check that what it reads has its clock: the bus clock of the
+ * display's clock controller (by GCC), in that controller the display block's power switch and
+ * the bus clock of its registers, then the timing of the interface the panel hangs on (Linux's
+ * dpu_hw_intf.c) and its two counters, read twice a known time apart. Neither clock is turned
  * off again. Every access is announced and waited for (adreno_pause), as in the newest step.
  *
  * Seen: 476 clocks a line (360 of them picture: the panel takes it compressed three to one),

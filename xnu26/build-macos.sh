@@ -39,10 +39,96 @@ if [ -d BUILD/obj ] && [ "$(cat BUILD/obj/redwood-objects 2>/dev/null)" != "$now
   echo "$now" > BUILD/obj/redwood-objects
 fi
 
+# Strip outer -j/--jobs flags: makedefs/MakeInc.cmd sets MAKEJOBS=--jobs=$(hw.ncpu) on sub-makes,
+# and passing -jN to the outer make resets the jobserver and multiplies parallel clang processes.
+make_args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+  -j | --jobs) shift 2 ;;
+  -j* | --jobs=*) shift ;;
+  *) make_args+=("$1"); shift ;;
+  esac
+done
+
+# Preserve incremental builds when conf/files* changes in an already-built tree:
+# Every */conf/Makefile.template has `${OBJS}: $(firstword $(MAKEFILE_LIST))`, which makes all
+# .o/.cpo files in a subsystem depend on the generated Makefile. If doconf updates Makefile with
+# the current timestamp, every object in that subsystem recompiles; if Makefile is touched older
+# than BUILD/obj/SETUP/config or DOCONFDEPS, make re-runs doconf across all subsystems.
+# Run doconf for any subsystem whose conf/files* is newer than its generated Makefile, then place
+# DOCONFDEPS at t_base and Makefile at t_base + 1 (strictly after SETUP/config and strictly before
+# existing .o/.cpo files).
+if [ -d "BUILD/obj/SETUP/config" ]; then
+  python3 - "$SRC" "${MACHINE:-BCM2837}" "${KERNEL_CONFIG:-DEVELOPMENT}" <<'PY' || exit $?
+import glob, os, subprocess, sys
+
+src, machine, kconf = sys.argv[1], sys.argv[2], sys.argv[3]
+arch_lc = "arm64"
+mach_lc = machine.lower()
+objroot = os.path.join(src, "BUILD/obj")
+variant_dir = os.path.join(objroot, f"{kconf}_ARM64_{machine}")
+setup_cfg = os.path.join(objroot, "SETUP/config")
+doconf = os.path.join(src, "SETUP/config/doconf")
+if not os.path.isdir(variant_dir) or not os.path.exists(doconf):
+    sys.exit(0)
+
+t_base = int(max(os.path.getmtime(setup_cfg), os.path.getmtime(doconf))) + 1
+subsystems = ["osfmk", "bsd", "iokit", "libkern", "pexpert", "security", "san"]
+master_dir = os.path.join(src, "config")
+master_deps = [
+    os.path.join(master_dir, f)
+    for f in ("MASTER", f"MASTER.{arch_lc}", f"MASTER.{arch_lc}.{mach_lc}")
+    if os.path.exists(os.path.join(master_dir, f))
+]
+
+for sub in subsystems:
+    bdir = os.path.join(variant_dir, sub, kconf)
+    mk = os.path.join(bdir, "Makefile")
+    if not os.path.isfile(mk):
+        continue
+    for tmp in glob.glob(os.path.join(bdir, "*.tmp")):
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    objs = glob.glob(os.path.join(bdir, "*.o")) + glob.glob(os.path.join(bdir, "*.cpo"))
+    if not objs:
+        continue
+    conf_dir = os.path.join(src, sub, "conf")
+    sub_deps = master_deps + [
+        os.path.join(conf_dir, f)
+        for f in ("Makefile.template", f"Makefile.{arch_lc}", "files", f"files.{arch_lc}")
+        if os.path.exists(os.path.join(conf_dir, f))
+    ]
+    mk_mtime = os.path.getmtime(mk)
+    if any(os.path.getmtime(d) > mk_mtime for d in sub_deps):
+        env = os.environ.copy()
+        env["SRCROOT"] = src
+        env["OBJROOT"] = objroot
+        env["SOURCE"] = conf_dir + "/"
+        subprocess.check_call(
+            [
+                doconf, "-c", "-cpu", arch_lc, "-soc", mach_lc, "-platform", "BCM2837",
+                "-d", bdir, "-s", conf_dir, "-m", master_dir, kconf,
+            ],
+            cwd=bdir,
+            env=env,
+        )
+    for d in sub_deps:
+        if os.path.getmtime(d) > t_base:
+            os.utime(d, (t_base, t_base))
+    t_mk = t_base + 1
+    for fn in ("Makefile", "assym.s", "genassym.o"):
+        p = os.path.join(bdir, fn)
+        if os.path.isfile(p) and os.path.getmtime(p) > t_mk:
+            os.utime(p, (t_mk, t_mk))
+PY
+fi
+
 ${MAKE:-gmake} XCRUN="$XNU26_ROOT/xnu26/xcrun" SDKROOT="$XNU26_SDK" REDWOOD_OBJECTS="$LX" \
   ARCH_CONFIGS=ARM64 MACHINE_CONFIGS=${MACHINE:-BCM2837} KERNEL_CONFIGS=${KERNEL_CONFIG:-DEVELOPMENT} \
   ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64 BUILD_WERROR=0 BUILD_LTO=0 DO_CTFMERGE=0 LOGCOLORS=n \
-  KEXT_CREATE_SYMBOL_SET=/usr/bin/true "$@" || exit $?
+  KEXT_CREATE_SYMBOL_SET=/usr/bin/true "${make_args[@]}" || exit $?
 
 # exporthdrs and similar targets produce no kernel; stamp only when there is one.
 kernel="$SRC/BUILD/obj/${KERNEL_CONFIG:-DEVELOPMENT}_ARM64_${MACHINE:-BCM2837}/mach.$(echo "${KERNEL_CONFIG:-DEVELOPMENT}" | tr 'A-Z' 'a-z').$(echo "${MACHINE:-BCM2837}" | tr 'A-Z' 'a-z')"

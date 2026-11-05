@@ -9,11 +9,12 @@
  * IOMFBBrightnessLevel (nits, 16.16) on the IOMobileFramebuffer, which hands it on to here. Where in
  * iOS 26's shared cache each of these is: docs/analysis/2026-11-02-brightness-control.md §3.
  *
- * The panel is told nothing and stays as bright as the loader left it (DCS 0x51 would change that).
- * Every value becomes redwood_backlight_level, the fraction of that brightness to show, and with
- * boot-arg fb_dim=1 the display controller darkens the picture by it (MiniFramebufferDim.inc); without
- * it the service answers the same and nothing gets darker. Every request is logged, with all its keys:
- * one line in kBLLogMS at most, and the last of a burst always.
+ * Every value becomes a value of the panel's brightness range and a level, the fraction of the panel's
+ * brightness to show. With boot-arg fb_dcs=4 the value is sent to the panel as DCS 0x51
+ * (MiniFramebufferDCS.inc) and the picture is left whole. Otherwise the panel stays as bright as the
+ * loader left it, and with boot-arg fb_dim=1 the display controller darkens the picture by the level
+ * (MiniFramebufferDim.inc); without either the service answers the same and nothing gets darker. Every
+ * request is logged, with all its keys: one line in kBLLogMS at most, and the last of a burst always.
  */
 
 #include <IOKit/IOLib.h>
@@ -74,7 +75,7 @@ fixed_nits(uint64_t millinits)
 	return (millinits << 16) / 1000;
 }
 
-/* What was last asked for: the fraction of the panel's brightness to show, in 1024ths (nits over kBLMilliNitsMax). */
+/* The level the mixers were last given, in 1024ths (nits over kBLMilliNitsMax; full while the panel takes the value). */
 extern "C" {
 uint32_t redwood_backlight_level = kBLLevelFull;
 }
@@ -229,7 +230,7 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 	OSNumber * nits = OSDynamicCast(OSNumber, dict->getObject(nits_key));
 	OSNumber * value = value_key != NULL ? OSDynamicCast(OSNumber, dict->getObject(value_key)) : NULL;
 	uint64_t v, millinits;
-	uint32_t level;
+	uint32_t level, mixed;
 	int alpha;
 	char who[24] = "?", shown[32];
 	size_t used;
@@ -255,9 +256,11 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 		return;
 	}
 	level = (uint32_t) (millinits * kBLLevelFull / kBLMilliNitsMax);
-	if (level != redwood_backlight_level) {
-		redwood_backlight_level = level;
-		MiniIOMobileFramebufferDim(level);
+	/* with fb_dcs=4 the panel takes v itself, and the mixers are given the full level */
+	mixed = MiniIOMobileFramebufferDCS((uint32_t) v) ? kBLLevelFull : level;
+	if (mixed != redwood_backlight_level) {
+		redwood_backlight_level = mixed;
+		MiniIOMobileFramebufferDim(mixed);
 	}
 	bl.service->publish(v, millinits);
 	/* (read back from the mixer: a burst prints only its last request, which may not have changed the level) */

@@ -11,7 +11,8 @@
  * fb_flip=1 only looks: the register clocks turned on where they are off, then what the loader left
  * running (CTL paths, source pipes, layer mixers, interfaces) and how far the interfaces' frame
  * counters move in 200 ms, in "MiniIOMobileFramebuffer: flip:" lines. fb_flip=0 (the default) leaves
- * the display controller alone, unless fb_dim asks for its layer mixers (MiniFramebufferDim.inc).
+ * the display controller alone, unless fb_dim asks for its layer mixers (MiniFramebufferDim.inc) or
+ * fb_dcs for the register clocks and INTF1's frame count (MiniFramebufferDCS.inc).
  *
  * SM8750's MDSS (0x0ae00000) has a DPU 12.0; the offsets are mainline Linux's (drivers/gpu/drm/msm/
  * disp/dpu1, dpu_hw_sspp.c, dpu_hw_ctl.c, dpu_hw_intf.c), counted from the MDP block at MDSS + 0x1000.
@@ -236,19 +237,21 @@ flip_point(int which)
 }
 
 #include "MiniFramebufferDim.inc"
+#include "MiniFramebufferDCS.inc"
 
 static void
 flip_start(uint64_t fb, uint8_t * fbBase, uint32_t bytes, uint32_t rows)
 {
 	uint64_t b;
 
-	if ((gFlip == 0 && gDim == 0) || !flip_clocks() ||
+	if ((gFlip == 0 && gDim == 0 && gDcs == 0) || !flip_clocks() ||
 	    (flip.mdss = ml_io_map(FLIP_MDSS_PHYS, FLIP_MDSS_SIZE)) == 0) {
 		return;
 	}
 	if (gDim) {
 		dim_find();
 	}
+	dcs_start();
 	if (gFlip == 0) {
 		return;
 	}

@@ -68,7 +68,8 @@
  *
  * Without pcie_power=1 nothing persists -- everything written is restored -- so there is no quiesce on the
  * way out. pcie_power=1 with pcie=2 or more powers root complex 0 and the card up between steps 1
- * and 2 when step 1 finds them off (mhi_pcie_power.c); that is left on until the reset.
+ * and 2 when step 1 finds them off (mhi_pcie_power.c); that is left on until the reset. Right after that
+ * power-up, bt=N starts the chip's Bluetooth half in a thread of its own (annibale_bt_hci.c).
  *
  * The boot-arg is pcie= and not wifi= on purpose: bsd/dev/redwood_wifi.c takes wifi= for the old
  * phone's WCN6750 (there wifi=1 is its production path, its line 4269) and stays as it is -- the
@@ -956,6 +957,7 @@ pcie_thread(void *parameter, __unused wait_result_t result)
 			printf("pcie: the power-up stopped; nothing more is read\n");
 			goto out;
 		}
+		annibale_bt_start();
 		readable = show_power();
 	}
 	if (!readable) {
@@ -1006,7 +1008,7 @@ out:
 void
 mhi_pcie_init(void)
 {
-	uint32_t steps;
+	uint32_t steps, bt = 0;
 	thread_t thread;
 
 	/* pcie=N runs steps 1 through N; wifi= stays the old phone's driver, see the header */
@@ -1015,6 +1017,9 @@ mhi_pcie_init(void)
 	}
 	PE_parse_boot_argn("pcie_pause", &pause_s, sizeof(pause_s));
 	PE_parse_boot_argn("pcie_power", &power, sizeof(power));
+	if (PE_parse_boot_argn("bt", &bt, sizeof(bt)) && bt >= 4) {
+		annibale_bt_ios_early();
+	}
 	if (steps > 10) {
 		steps = 10;
 	}

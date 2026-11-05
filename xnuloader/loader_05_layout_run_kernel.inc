@@ -988,6 +988,10 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 				/* the kernel still has that core; what it logged can be had all the same */
 				print("THE KERNEL HUNG on core %x: no sign of life for %d seconds; its log follows\n", kernel_mpidr,
 				    (uint64_t)SILENCE_SECONDS);
+				if (block_write_requested) {
+					print("ufs: %d writes into dsu_store, %d bytes, read back the same; %d refused\n", block_writes,
+					    block_write_bytes, block_writes_refused);
+				}
 				set_result(kernel_resources_held ? "hung-held" : "hung", loader_ctx[CTX_LOG_LEN], 0);
 				write_logs((const char *)loader_ctx[CTX_LOG_PA], loader_ctx[CTX_LOG_LEN]);
 				return 1;

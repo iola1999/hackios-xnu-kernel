@@ -712,11 +712,11 @@ ufs_crc32(const uint8_t *p, uint64_t n)
 {
 	uint32_t c = 0xffffffffu;
 
-	for (uint64_t i = 0; i < n; i++) {
-		c ^= p[i];
-		for (int k = 0; k < 8; k++) {
-			c = (c >> 1) ^ (0xedb88320u & (0u - (c & 1)));
-		}
+	for (; n >= 8; p += 8, n -= 8) {
+		__asm__ (".arch_extension crc\n\tcrc32x %w0, %w0, %x1" : "+r" (c) : "r" (*(const uint64_t *)p));
+	}
+	for (; n > 0; p++, n--) {
+		__asm__ (".arch_extension crc\n\tcrc32b %w0, %w0, %w1" : "+r" (c) : "r" ((uint32_t)*p));
 	}
 	return ~c;
 }
