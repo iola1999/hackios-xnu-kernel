@@ -39,23 +39,30 @@ extern void annibale_spmi_unlock(void);
 #define CH_WDATA0               0x10
 #define CH_RDATA0               0x18
 #define STATUS_DONE             0x1
+#define STATUS_FAILURE          0x2
+#define STATUS_DENIED           0x4
+#define STATUS_DROPPED          0x8
 #define OPC_EXT_READ            13
 #define OPC_EXT_WRITEL          0
 #define CMD_OPC(opc)            ((uint32_t)(opc) << 27)
 #define CMD_REG(reg)            (((uint32_t)(reg) & 0xff) << 4)
 
 struct charger_module {
+	const char *name;
 	uint8_t func;
+	uint16_t ppid;
 	uint16_t apid;
+	uint8_t slave;
+	uint8_t owner;
 	bool found;
 	bool ours;
 	vm_offset_t chnl_wr;
 	vm_offset_t chnl_rd;
 };
 
-static struct charger_module chgr_mod = { .func = 0x10, .found = false };
-static struct charger_module usbin_mod = { .func = 0x13, .found = false };
-static struct charger_module typec_mod = { .func = 0x15, .found = false };
+static struct charger_module chgr_mod = { .name = "CHGR", .func = 0x10, .found = false };
+static struct charger_module usbin_mod = { .name = "USBIN", .func = 0x13, .found = false };
+static struct charger_module typec_mod = { .name = "TYPEC", .func = 0x15, .found = false };
 static vm_offset_t arb_core, arb_cnfg, arb_obsrvr;
 
 #define SDA 0
@@ -181,8 +188,11 @@ static uint32_t
 spmi_wait(vm_offset_t channel)
 {
 	uint32_t status = 0;
-	for (unsigned i = 0; i < 2000 && !(status & STATUS_DONE); i++) {
+	for (unsigned i = 0; i < 2000; i++) {
 		status = *(volatile uint32_t *)(channel + CH_STATUS);
+		if (status & (STATUS_DONE | STATUS_DENIED | STATUS_FAILURE | STATUS_DROPPED)) {
+			break;
+		}
 		delay_for_interval(1, NSEC_PER_USEC);
 	}
 	return status;
@@ -200,7 +210,7 @@ spmi_read_reg(struct charger_module *mod, uint8_t reg, uint8_t *val)
 	uint32_t data = *(volatile uint32_t *)(mod->chnl_rd + CH_RDATA0);
 	annibale_spmi_unlock();
 
-	if (status & STATUS_DONE) {
+	if ((status & STATUS_DONE) && !(status & (STATUS_DENIED | STATUS_FAILURE | STATUS_DROPPED))) {
 		*val = (uint8_t)(data & 0xff);
 		return true;
 	}
@@ -214,12 +224,55 @@ spmi_write_reg(struct charger_module *mod, uint8_t reg, uint8_t val)
 		return false;
 	}
 	annibale_spmi_lock();
+	for (unsigned i = 0; i < 1000; i++) {
+		uint32_t st = *(volatile uint32_t *)(mod->chnl_wr + CH_STATUS);
+		if ((st & (STATUS_DONE | STATUS_DROPPED | STATUS_FAILURE | STATUS_DENIED)) != 0 || st == 0) {
+			break;
+		}
+		delay_for_interval(1, NSEC_PER_USEC);
+	}
 	*(volatile uint32_t *)(mod->chnl_wr + CH_WDATA0) = val;
 	*(volatile uint32_t *)(mod->chnl_wr + CH_CMD) = CMD_OPC(OPC_EXT_WRITEL) | CMD_REG(reg) | 0;
 	uint32_t status = spmi_wait(mod->chnl_wr);
 	annibale_spmi_unlock();
 
-	return (status & STATUS_DONE) != 0;
+	if (!(status & STATUS_DONE) || (status & (STATUS_DENIED | STATUS_FAILURE | STATUS_DROPPED))) {
+		return false;
+	}
+	return true;
+}
+
+static bool
+spmi_write_verify_reg(struct charger_module *mod, uint8_t reg, uint8_t val)
+{
+	if (!mod->found) {
+		printf("battery: cannot write %s reg %#02x: module not found on SPMI bus\n", mod->name, reg);
+		return false;
+	}
+	if (!mod->ours || mod->chnl_wr == 0) {
+		printf("battery: cannot write %s reg %#02x: channel %u owned by system %u (not writable by APPS)\n",
+		       mod->name, reg, mod->apid, mod->owner);
+		return false;
+	}
+	if (!spmi_write_reg(mod, reg, val)) {
+		printf("battery: %s reg %#02x write %#02x failed (arbiter status error or timeout)\n",
+		       mod->name, reg, val);
+		return false;
+	}
+	uint8_t readback = 0;
+	if (!spmi_read_reg(mod, reg, &readback)) {
+		printf("battery: %s reg %#02x write %#02x readback failed\n", mod->name, reg, val);
+		return false;
+	}
+	if (readback != val) {
+		delay_for_interval(1, NSEC_PER_MSEC);
+		if (!spmi_read_reg(mod, reg, &readback) || readback != val) {
+			printf("battery: %s reg %#02x write %#02x readback mismatch: expected %#02x, got %#02x\n",
+			       mod->name, reg, val, val, readback);
+			return false;
+		}
+	}
+	return true;
 }
 
 static void
@@ -254,68 +307,143 @@ pm8550b_charger_probe(void)
 		uint8_t func = ppid & 0xff;
 		uint8_t owner = *(volatile uint32_t *)(arb_cnfg + APID_OWNER(n)) & 7;
 
-		if (func == 0x10 && !chgr_mod.found) {
-			chgr_mod.apid = (uint16_t)n;
-			chgr_mod.ours = (owner == ARB_SYSTEM);
-			chgr_mod.found = true;
-			chgr_mod.chnl_rd = arb_obsrvr + 0x8000UL * ARB_SYSTEM + 0x20UL * n;
-			if (chgr_mod.ours) {
-				chgr_mod.chnl_wr = ml_io_map(ARB_CHNLS_PHYS + ARB_CHANNEL_SIZE * n, ARB_CHANNEL_SIZE);
-			}
-			printf("battery: found CHGR at channel %u (slave %u, owner %u)\n", n, slave, owner);
-		} else if (func == 0x13 && slave != 0 && !usbin_mod.found) {
-			usbin_mod.apid = (uint16_t)n;
-			usbin_mod.ours = (owner == ARB_SYSTEM);
-			usbin_mod.found = true;
-			usbin_mod.chnl_rd = arb_obsrvr + 0x8000UL * ARB_SYSTEM + 0x20UL * n;
-			if (usbin_mod.ours) {
-				usbin_mod.chnl_wr = ml_io_map(ARB_CHNLS_PHYS + ARB_CHANNEL_SIZE * n, ARB_CHANNEL_SIZE);
-			}
-			printf("battery: found USBIN at channel %u (slave %u, owner %u)\n", n, slave, owner);
-		} else if (func == 0x15 && !typec_mod.found) {
-			typec_mod.apid = (uint16_t)n;
-			typec_mod.ours = (owner == ARB_SYSTEM);
-			typec_mod.found = true;
-			typec_mod.chnl_rd = arb_obsrvr + 0x8000UL * ARB_SYSTEM + 0x20UL * n;
-			if (typec_mod.ours) {
-				typec_mod.chnl_wr = ml_io_map(ARB_CHNLS_PHYS + ARB_CHANNEL_SIZE * n, ARB_CHANNEL_SIZE);
-			}
-			printf("battery: found TYPEC at channel %u (slave %u, owner %u)\n", n, slave, owner);
+		/*
+		 * Exclude PMK8550/PM8550 power-on block (0x013 and 0x113) and PON PBS (0x015)
+		 * which are power-on reset peripherals, not charger peripherals.
+		 */
+		if (ppid == 0x013 || ppid == 0x113 || ppid == 0x015) {
+			continue;
 		}
+
+		if (func == chgr_mod.func) {
+			if (!chgr_mod.found || (!chgr_mod.ours && owner == ARB_SYSTEM)) {
+				chgr_mod.apid = (uint16_t)n;
+				chgr_mod.ppid = ppid;
+				chgr_mod.slave = slave;
+				chgr_mod.owner = owner;
+				chgr_mod.ours = (owner == ARB_SYSTEM);
+				chgr_mod.found = true;
+				chgr_mod.chnl_rd = arb_obsrvr + 0x8000UL * ARB_SYSTEM + 0x20UL * n;
+				if (chgr_mod.ours && chgr_mod.chnl_wr == 0) {
+					chgr_mod.chnl_wr = ml_io_map(ARB_CHNLS_PHYS + ARB_CHANNEL_SIZE * n, ARB_CHANNEL_SIZE);
+				}
+				printf("battery: found CHGR at channel %u (ppid %#05x, slave %u, owner %u, writable=%d)\n",
+				       n, ppid, slave, owner, chgr_mod.ours);
+			}
+		} else if (func == usbin_mod.func) {
+			if (!usbin_mod.found || (!usbin_mod.ours && owner == ARB_SYSTEM)) {
+				usbin_mod.apid = (uint16_t)n;
+				usbin_mod.ppid = ppid;
+				usbin_mod.slave = slave;
+				usbin_mod.owner = owner;
+				usbin_mod.ours = (owner == ARB_SYSTEM);
+				usbin_mod.found = true;
+				usbin_mod.chnl_rd = arb_obsrvr + 0x8000UL * ARB_SYSTEM + 0x20UL * n;
+				if (usbin_mod.ours && usbin_mod.chnl_wr == 0) {
+					usbin_mod.chnl_wr = ml_io_map(ARB_CHNLS_PHYS + ARB_CHANNEL_SIZE * n, ARB_CHANNEL_SIZE);
+				}
+				printf("battery: found USBIN at channel %u (ppid %#05x, slave %u, owner %u, writable=%d)\n",
+				       n, ppid, slave, owner, usbin_mod.ours);
+			}
+		} else if (func == typec_mod.func) {
+			if (!typec_mod.found || (!typec_mod.ours && owner == ARB_SYSTEM)) {
+				typec_mod.apid = (uint16_t)n;
+				typec_mod.ppid = ppid;
+				typec_mod.slave = slave;
+				typec_mod.owner = owner;
+				typec_mod.ours = (owner == ARB_SYSTEM);
+				typec_mod.found = true;
+				typec_mod.chnl_rd = arb_obsrvr + 0x8000UL * ARB_SYSTEM + 0x20UL * n;
+				if (typec_mod.ours && typec_mod.chnl_wr == 0) {
+					typec_mod.chnl_wr = ml_io_map(ARB_CHNLS_PHYS + ARB_CHANNEL_SIZE * n, ARB_CHANNEL_SIZE);
+				}
+				printf("battery: found TYPEC at channel %u (ppid %#05x, slave %u, owner %u, writable=%d)\n",
+				       n, ppid, slave, owner, typec_mod.ours);
+			}
+		}
+	}
+	if (!chgr_mod.found) {
+		printf("battery: CHGR peripheral (func %#02x) not found on SPMI bus\n", chgr_mod.func);
+	}
+	if (!usbin_mod.found) {
+		printf("battery: USBIN peripheral (func %#02x) not found on SPMI bus\n", usbin_mod.func);
+	}
+	if (!typec_mod.found) {
+		printf("battery: TYPEC peripheral (func %#02x) not found on SPMI bus\n", typec_mod.func);
 	}
 }
 
-static void
+static bool
 pm8550b_configure_charging(bool enable)
 {
 	static int current_state = -1;
+	static int last_attempt = -1;
+
 	if (current_state == (int)enable) {
-		return;
+		return true;
 	}
-	current_state = (int)enable;
+
+	if (!chgr_mod.found && !usbin_mod.found && !typec_mod.found) {
+		if (last_attempt != (int)enable) {
+			last_attempt = (int)enable;
+			printf("battery: no PM8550B charger peripherals available on SPMI bus\n");
+		}
+		return false;
+	}
+
+	bool success = true;
 
 	if (enable) {
 		if (usbin_mod.found) {
-			spmi_write_reg(&usbin_mod, 0x40, 0x00);
-			spmi_write_reg(&usbin_mod, 0x70, 0x3c);
+			if (!spmi_write_verify_reg(&usbin_mod, 0x40, 0x00) ||
+			    !spmi_write_verify_reg(&usbin_mod, 0x70, 0x3c)) {
+				success = false;
+			}
 		}
 		if (chgr_mod.found) {
-			spmi_write_reg(&chgr_mod, 0x42, 0x01);
-			spmi_write_reg(&chgr_mod, 0x61, 0x32);
+			if (!spmi_write_verify_reg(&chgr_mod, 0x42, 0x01) ||
+			    !spmi_write_verify_reg(&chgr_mod, 0x61, 0x32)) {
+				success = false;
+			}
 		}
 		if (typec_mod.found) {
-			spmi_write_reg(&typec_mod, 0x44, 0x01);
+			if (!spmi_write_verify_reg(&typec_mod, 0x44, 0x01)) {
+				success = false;
+			}
 		}
-		printf("battery: PM8550B charging enabled (ICL 3000 mA, FastChg 2500 mA)\n");
+		if (success) {
+			current_state = 1;
+			last_attempt = 1;
+			printf("battery: PM8550B charging enabled (ICL 3000 mA, FastChg 2500 mA)\n");
+		} else {
+			if (last_attempt != 1) {
+				last_attempt = 1;
+				printf("battery: PM8550B charging enable failed (writes unverified or denied)\n");
+			}
+		}
 	} else {
 		if (chgr_mod.found) {
-			spmi_write_reg(&chgr_mod, 0x42, 0x00);
+			if (!spmi_write_verify_reg(&chgr_mod, 0x42, 0x00)) {
+				success = false;
+			}
 		}
 		if (usbin_mod.found) {
-			spmi_write_reg(&usbin_mod, 0x70, 0x0a);
+			if (!spmi_write_verify_reg(&usbin_mod, 0x70, 0x0a)) {
+				success = false;
+			}
 		}
-		printf("battery: PM8550B charging disabled (standby 500 mA)\n");
+		if (success) {
+			current_state = 0;
+			last_attempt = 0;
+			printf("battery: PM8550B charging disabled (standby 500 mA)\n");
+		} else {
+			if (last_attempt != 0) {
+				last_attempt = 0;
+				printf("battery: PM8550B charging disable failed\n");
+			}
+		}
 	}
+	return success;
 }
 
 static bool

@@ -3226,7 +3226,7 @@ enum {
 	unsigned _colorLevel[8], _colorSlice[8];
 	float _clearColor[4];
 	BOOL _clears;
-	unsigned _discards;   /* colour attachments loaded with MTLLoadActionDontCare (bit i) */
+	unsigned _discards;   /* MTLLoadActionDontCare (bit i), MTLLoadActionClear (bit 8 + i) */
 	id _depth;
 	id _depthStencilState;
 	float _clearDepth;
@@ -3258,14 +3258,12 @@ enum {
 		return nil;
 	}
 	_commandBuffer = commandBuffer;
-
 	/* What the pass is drawing into, and whether it begins by clearing. Metal keeps this in
 	 * the pass descriptor rather than in the pipeline, so it belongs to the encoder. */
 	for (unsigned i = 0; i < 8; i++) {
 		MTLRenderPassColorAttachmentDescriptor *attachment =
 		    [[descriptor colorAttachments] objectAtIndexedSubscript:i];
 		id texture = attachment != nil ? [attachment texture] : nil;
-
 		if (texture == nil) {
 			continue;
 		}
@@ -3294,14 +3292,16 @@ enum {
 			}
 		}
 		_discards |= [attachment loadAction] == MTLLoadActionDontCare ? 1u << i : 0;
-		if (i == 0 && [attachment loadAction] == MTLLoadActionClear) {
-			MTLClearColor c = [attachment clearColor];
-
-			_clearColor[0] = (float)c.red;
-			_clearColor[1] = (float)c.green;
-			_clearColor[2] = (float)c.blue;
-			_clearColor[3] = (float)c.alpha;
+		_discards |= ([attachment loadAction] == MTLLoadActionClear) ? (1u << (8 + i)) : 0;
+		if ([attachment loadAction] == MTLLoadActionClear) {
 			_clears = YES;
+			if (i == 0) {
+				MTLClearColor c = [attachment clearColor];
+				_clearColor[0] = (float)c.red;
+				_clearColor[1] = (float)c.green;
+				_clearColor[2] = (float)c.blue;
+				_clearColor[3] = (float)c.alpha;
+			}
 		}
 	}
 	/*
