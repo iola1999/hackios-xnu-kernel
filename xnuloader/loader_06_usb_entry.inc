@@ -855,25 +855,25 @@ fb_command(char *cmd)
 			print_memory_map();
 			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "oem logwrite")) {
-			/*
-			 * The only path that lets the log land on boot_a where no logdump partition
-			 * exists (review F09, ruling b); the caller knows boot_a may hold the boot image.
-			 */
+			/* Fallback that lets log land on boot_a when no logdump exists */
 			fb_reply("OKAY", "");
 			log_fallback_boot_a_allowed = 1;
 			flush_log();
 			log_fallback_boot_a_allowed = 0;
 		} else if (starts_with(cmd, "oem probe")) {
-			/* the only writable storage check, and it puts back what it moved (review F09) */
 			fb_reply("OKAY", "");
 			probe_boot_a();
 		} else if (str_eq(cmd, "flash:boot_a") || str_eq(cmd, "oem flash_boot")) {
 			const char *err = slot_flash_boot_image(payload_bytes);
 			fb_reply(err == NULL ? "OKAY" : "FAIL", err == NULL ? "" : err);
 		} else if (str_eq(cmd, "oem android")) {
-			slot_set_active_other();
-			fb_reply("OKAY", "");
-			reboot();
+			if (kernel_resources_held) {
+				fb_reply("FAIL", "kernel resources held: run oem stop first");
+			} else {
+				slot_set_active_other();
+				fb_reply("OKAY", "");
+				reboot();
+			}
 		} else if (starts_with(cmd, "oem log")) {
 			if (running_live != NULL) {
 				compose_live_log(running_live, running_slide);

@@ -3,6 +3,8 @@
 
 #include "platform_private.h"
 
+static const struct platform *PLAT;
+
 /* ------------------------------------------------------------------------ */
 
 /* LC-RESET-BEGIN -- extracted verbatim by tools/test-loader-lifecycle.py: the one PSCI
@@ -20,7 +22,7 @@ psci_reset_attempt(void)
 static void
 reboot(void)
 {
-	if (kernel_resources_held || firmware_fault) {
+	if (PLAT == &platform_annibale || kernel_resources_held || firmware_fault) {
 		/* the direct door first: takeback, log flush and the UEFI reset callbacks could all
 		 * reach storage while the kernel may still own it */
 		int64_t status = psci_reset_attempt();
@@ -324,7 +326,6 @@ __asm__ (
 
 static uint64_t smc_call(uint64_t id, uint64_t a1, uint64_t a2, uint64_t *r1, uint64_t *r2);
 static uint64_t smc_x3;
-static const struct platform *PLAT;
 static void clean_dcache(uint64_t start, uint64_t end);
 static void flush_dcache(uint64_t start, uint64_t end);
 

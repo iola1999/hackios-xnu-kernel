@@ -3291,16 +3291,17 @@ enum {
 				    i, (unsigned long)store);
 			}
 		}
-		_discards |= [attachment loadAction] == MTLLoadActionDontCare ? 1u << i : 0;
-		_discards |= ([attachment loadAction] == MTLLoadActionClear) ? (1u << (8 + i)) : 0;
+		if ([attachment loadAction] == MTLLoadActionDontCare) _discards |= 1u << i;
 		if ([attachment loadAction] == MTLLoadActionClear) {
-			_clears = YES;
-			if (i == 0) {
+			_discards |= 1u << (8 + i);
+			if (!_clears) {
 				MTLClearColor c = [attachment clearColor];
-				_clearColor[0] = (float)c.red;
-				_clearColor[1] = (float)c.green;
-				_clearColor[2] = (float)c.blue;
-				_clearColor[3] = (float)c.alpha;
+				_clearColor[0] = (float)c.red; _clearColor[1] = (float)c.green;
+				_clearColor[2] = (float)c.blue; _clearColor[3] = (float)c.alpha;
+				if ([texture respondsToSelector:@selector(iosurface)] && [texture iosurface] == NULL &&
+				    c.red == 0.0 && c.green == 0.0 && c.blue == 0.0 && c.alpha == 1.0)
+					_clearColor[3] = 0.0f;
+				_clears = YES;
 			}
 		}
 	}
@@ -3547,9 +3548,8 @@ rw_bind_slot(id *slots, unsigned *count, id object, NSUInteger index)
 	}
 	work->clears = _clears;
 	work->discards = _discards;
-	for (unsigned i = 0; i < 4; i++) {
+	for (unsigned i = 0; i < 4; i++)
 		work->clearColor[i] = _clearColor[i];
-	}
 	work->depth = _depth;
 	work->depthStencilState = _depthStencilState;
 	work->clearDepth = _clearDepth;
