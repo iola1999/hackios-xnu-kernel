@@ -583,10 +583,12 @@ reach_feeder_thread(void *arg __unused, wait_result_t w __unused)
 	say("feeder thread running\n");
 	for (;;) {
 		bool has_data = false;
+		uint32_t backlog = 0;
 
 		lck_spin_lock(audio_spin_lock);
 		if (ring_head != ring_tail) {
 			has_data = true;
+			backlog = ring_head - ring_tail;
 		}
 		lck_spin_unlock(audio_spin_lock);
 
@@ -605,7 +607,17 @@ reach_feeder_thread(void *arg __unused, wait_result_t w __unused)
 			annibale_audio_amp_power(false);
 			amp_powered = false;
 		}
-		delay_for_interval(20, NSEC_PER_MSEC);
+
+		/* Adaptive sleep: reduce interval when ring buffer has pending backlog to eliminate overrun */
+		uint32_t sleep_ms = 20;
+		if (backlog >= 4 * PERIOD_FRAMES) {
+			sleep_ms = 5;
+		} else if (backlog >= 2 * PERIOD_FRAMES) {
+			sleep_ms = 10;
+		} else if (backlog > 0) {
+			sleep_ms = 18; /* Compensate for thread scheduling jitter */
+		}
+		delay_for_interval(sleep_ms, NSEC_PER_MSEC);
 	}
 }
 

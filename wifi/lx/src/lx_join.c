@@ -729,6 +729,8 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
 	    radio->sta->deflink.supp_rates[channel->band], radio->sta->deflink.ht_cap.ht_supported ? "yes" : "no",
 	    radio->sta->deflink.vht_cap.vht_supported ? "yes" : "no", radio->sta->deflink.rx_nss);
 
+	lx_pause_ms(25);	/* (for the firmware's peer and transmit queue configuration to settle before EAPOL M2) */
+
 	lx_os_lock();
 	if (radio->pending_eapol_len != 0) {
 		uint8_t pending[sizeof(radio->pending_eapol)];
@@ -745,7 +747,7 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
 	began = lx_os_nanoseconds();
 	lx_os_lock();
 	while (radio->handshake != LX_WPA_KEYS && radio->handshake != LX_WPA_BAD && radio->answer != ANSWER_GONE &&
-	    lx_os_nanoseconds() - began < (radio->handshake == LX_WPA_NOTHING ? 2500000000ull : 8000000000ull)) {
+	    lx_os_nanoseconds() - began < (radio->handshake == LX_WPA_NOTHING ? 6000000000ull : 8000000000ull)) {
 		lx_os_sleep(&radio->handshake, 20 * 1000000ull);
 	}
 	lx_os_unlock();

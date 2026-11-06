@@ -1035,6 +1035,8 @@ annibale_bt_ios_serve(const uint8_t addr[6])
 	if (addr != NULL && (addr[0] | addr[1] | addr[2] | addr[3] | addr[4] | addr[5]) != 0) {
 		RedwoodBTSetAddress(addr);
 	}
+	extern void RedwoodBTSetPowerState(bool on);
+	RedwoodBTSetPowerState(true);
 	lck_mtx_lock(bt_ring_lock);
 	bt_ring_fill();
 	bt_serving = 1;

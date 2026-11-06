@@ -72,6 +72,15 @@ tlmm_wr(vm_offset_t reg, uint32_t val)
 }
 
 static void
+gpio_set_pull(unsigned pin, uint32_t pull)
+{
+	uint32_t cfg = tlmm_rd(GPIO_CFG(pin));
+	cfg &= ~0x3;
+	cfg |= (pull & 0x3);
+	tlmm_wr(GPIO_CFG(pin), cfg);
+}
+
+static void
 gpio_init_once(void)
 {
 	if (tlmm_base == 0) {
@@ -80,6 +89,8 @@ gpio_init_once(void)
 			amp_lock_grp = lck_grp_alloc_init("annibale-amp", LCK_GRP_ATTR_NULL);
 			amp_lock = lck_mtx_alloc_init(amp_lock_grp, LCK_ATTR_NULL);
 		}
+		gpio_set_pull(PIN_SDA, 3); /* Internal Pull-Up */
+		gpio_set_pull(PIN_SCL, 3); /* Internal Pull-Up */
 	}
 }
 
@@ -87,8 +98,11 @@ static void
 gpio_set_dir(unsigned pin, bool output)
 {
 	uint32_t cfg = tlmm_rd(GPIO_CFG(pin));
-	/* Function 0 = GPIO, 2mA drive, keep pull state */
+	/* Function 0 = GPIO, 2mA drive */
 	cfg &= ~(0x0f << 2);
+	if (pin == PIN_SDA || pin == PIN_SCL) {
+		cfg |= 3; /* Retain internal pull-up on I2C bus */
+	}
 	if (cfg & (1u << 11)) {
 		cfg |= (1u << 12); /* AP owns pad */
 	}
@@ -298,17 +312,23 @@ tfa98xx_init(uint8_t addr)
 {
 	/*
 	 * TFA98xx initial sequence:
-	 * Safe gain: -40 dBFS (or 18 dB), un-mute speaker path.
+	 * Reg 0x09: System control (power up: PWDN=0, CFE=1, AMPE=1, DCA=1).
 	 * Reg 0x04: I2S control (48 kHz slave, 16-bit format).
-	 * Reg 0x09: System control (power up DSP bypass).
+	 * Reg 0x06: Audio control (un-mute).
+	 * Reg 0x89: Initial volume control (-18 dBFS safe audible gain).
 	 */
 	uint16_t rev = 0;
 	if (amp_reg_read16(addr, 0x03, &rev)) {
 		say("TFA98xx at %#x revision: %#x\n", addr, rev);
 	}
-	/* Set safe gain (-40 dBFS attenuator) */
-	(void)amp_reg_write16(addr, 0x89, 0x0028); /* 40 dB attenuation */
-	(void)amp_reg_write16(addr, 0x04, 0x088b); /* 48 kHz 16-bit I2S */
+	/* Power up amplifier stage, boost converter and DSP bypass */
+	(void)amp_reg_write16(addr, 0x09, 0x001c);
+	/* Configure 48 kHz 16-bit standard I2S slave mode */
+	(void)amp_reg_write16(addr, 0x04, 0x088b);
+	/* Un-mute speaker output channel */
+	(void)amp_reg_write16(addr, 0x06, 0x0000);
+	/* Set safe initial gain: 18 dB attenuation (-18 dBFS) */
+	(void)amp_reg_write16(addr, 0x89, 0x0012);
 }
 
 static void

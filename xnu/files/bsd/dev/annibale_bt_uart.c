@@ -335,7 +335,7 @@ annibale_bt_uart_config(uint32_t oversampling)
 	wr(se + SE_GENI_FORCE_DEFAULT, 1);
 	wr(se + SE_IRQ_EN, rd(se + SE_IRQ_EN) | 0xf);
 	wr(se + SE_GENI_S_IRQ_EN, 0xffffffffu);
-	wr(se + SE_GENI_M_IRQ_EN, 0xffffffffu);
+	wr(se + SE_GENI_M_IRQ_EN, 0);
 	wr(se + SE_GENI_DMA_MODE, rd(se + SE_GENI_DMA_MODE) & ~1u);
 	packing();
 	wr(se + SE_GENI_RX_WATERMARK, 2);
@@ -455,14 +455,10 @@ annibale_bt_uart_irq_clear(void)
 		return;
 	}
 	uint32_t s_irq = rd(se + SE_GENI_S_IRQ_STATUS);
-	uint32_t m_irq = rd(se + SE_GENI_M_IRQ_STATUS);
 
-	/* 无论产生何种中断，全量清除已置位状态位，防止电平中断风暴 */
+	/* 仅清除 S (RX) 中断状态位，M (TX) 中断由写发送循环独占同步处理，防止抢清 CMD_DONE */
 	if (s_irq) {
 		wr(se + SE_GENI_S_IRQ_CLEAR, s_irq);
-	}
-	if (m_irq) {
-		wr(se + SE_GENI_M_IRQ_CLEAR, m_irq);
 	}
 	if (s_irq & CMD_DONE) {
 		wr(se + SE_GENI_S_CMD0, UART_START_READ << OPCODE_SHIFT);
@@ -538,6 +534,11 @@ annibale_bt_uart_write(const uint8_t *data, uint32_t length)
 	for (int t = 0; t < 10000; t++) {
 		if (rd(se + SE_GENI_M_IRQ_STATUS) & CMD_DONE) {
 			wr(se + SE_GENI_M_IRQ_CLEAR, CMD_DONE);
+			return true;
+		}
+		if ((rd(se + SE_GENI_STATUS) & GENI_M_ACTIVE) == 0 &&
+		    (rd(se + SE_GENI_TX_FIFO_STATUS) & 0x0fffffffu) == 0) {
+			wr(se + SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
 			return true;
 		}
 		(void)annibale_bt_uart_poll();

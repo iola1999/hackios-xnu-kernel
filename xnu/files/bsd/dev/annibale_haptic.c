@@ -468,9 +468,19 @@ configure(void)
 		return false;
 	}
 	if (fault != 0) {
-		wait_ms(2);
-		spmi_write16(HAP_DRIVER, HAP_CFG_FAULT_CLR, &clear, 1);
-		hap_read(HAP_DRIVER, HAP_CFG_FAULT_STATUS, &fault, 1);
+		for (int retry = 0; retry < 5 && fault != 0; retry++) {
+			wait_ms(5);
+			(void)spmi_write16(HAP_DRIVER, HAP_CFG_FAULT_CLR, &clear, 1);
+			(void)hap_read(HAP_DRIVER, HAP_CFG_FAULT_STATUS, &fault, 1);
+		}
+	}
+	/* If only transient boost UVLO (0x10) remains, verify that boost converter is stable (VREG_OK) */
+	if (fault == HAP_FAULT_BOOST_UVLO) {
+		uint8_t bstatus = 0;
+		if (hap_read(HAP_BOOST, HAP_BOOST_STATUS, &bstatus, 1) && (bstatus & 0x80)) {
+			say("haptic: boost UVLO 0x10 cleared with boost ready (bstatus %#02x)\n", bstatus);
+			fault = 0;
+		}
 	}
 	if (fault != 0) {
 		say("haptic: the fault status is %#04x after clearing\n", fault);

@@ -97,9 +97,11 @@ static struct {
 	thread_call_t           later;          /* prints the last request of a burst */
 	uint64_t                logged;         /* when the last line was printed */
 	uint64_t                last_slider_t;  /* timestamp of previous DisplayBrightness update */
+	uint64_t                last_slider_pos;/* last seen slider position */
 	uint64_t                user_until;     /* deadline until which slider updates are active */
 	uint32_t                unlogged;       /* requests since then, not printed yet */
 	bool                    initialized;    /* true once boot or user brightness has been applied */
+	bool                    slider_initialized; /* true once initial slider position is recorded */
 	char                    line[320];      /* the last request, as it is printed */
 } bl;
 
@@ -254,8 +256,19 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 	}
 	if (value_key != NULL) {
 		nanoseconds_to_absolutetime(500 * NSEC_PER_MSEC, &active_win);
-		if (dict->getObject("DisplayBrightnessSliderPosition") != NULL) {
-			bl.user_until = now + active_win;
+		OSNumber * slider = OSDynamicCast(OSNumber, dict->getObject("DisplayBrightnessSliderPosition"));
+		if (slider != NULL) {
+			uint64_t pos = slider->unsigned64BitValue();
+			if (!bl.slider_initialized) {
+				bl.slider_initialized = true;
+				bl.last_slider_pos = pos;
+			} else {
+				uint64_t diff = pos > bl.last_slider_pos ? pos - bl.last_slider_pos : bl.last_slider_pos - pos;
+				if (diff >= 32 || (now <= bl.user_until && diff > 0)) {
+					bl.user_until = now + active_win;
+					bl.last_slider_pos = pos;
+				}
+			}
 		}
 	}
 
@@ -411,6 +424,10 @@ MiniAppleARMBacklightStart(IOService * provider)
 		return;
 	}
 	bl.service = backlight;         /* (kept: the requests use it) */
+	bl.initialized = true;
+	bl.slider_initialized = false;
+	bl.last_slider_pos = 0;
+	bl.user_until = 0;
 	backlight->registerService();
 	IOLog("MiniAppleARMBacklight: brightness %u to %u, %u to %u nits, at the top; calibration %u/%u/%u nits, "
 	    "marketing table of %lu\n", kBLValueMin, kBLValueMax, kBLMilliNitsMin / 1000, kBLMilliNitsMax / 1000,

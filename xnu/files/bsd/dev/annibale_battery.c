@@ -16,6 +16,48 @@
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern kern_return_t thread_terminate(thread_t);
+extern void annibale_spmi_lock(void);
+extern void annibale_spmi_unlock(void);
+
+#define ARB_CORE_PHYS           0x0c400000UL
+#define ARB_CORE_SIZE           0x003000UL
+#define ARB_CNFG_PHYS           0x0c42d000UL
+#define ARB_CNFG_SIZE           0x004000UL
+#define ARB_CHNLS_PHYS          0x0c500000UL
+#define ARB_CHANNEL_SIZE        0x1000UL
+#define ARB_OBSRV_PHYS          0x0c440000UL
+#define ARB_OBSRV_SIZE          0x0080000UL
+
+#define ARB_VERSION_7           0x70000000u
+#define ARB_SYSTEM              0
+#define APID_MAX                ((ARB_CORE_SIZE - 0x2000) / 4)
+#define APID_MAP(n)             (0x2000UL + 4 * (n))
+#define APID_OWNER(n)           (4 * (n))
+
+#define CH_CMD                  0x00
+#define CH_STATUS               0x08
+#define CH_WDATA0               0x10
+#define CH_RDATA0               0x18
+#define STATUS_DONE             0x1
+#define OPC_EXT_READ            13
+#define OPC_EXT_WRITEL          0
+#define CMD_OPC(opc)            ((uint32_t)(opc) << 27)
+#define CMD_REG(reg)            (((uint32_t)(reg) & 0xff) << 4)
+
+struct charger_module {
+	uint8_t func;
+	uint16_t apid;
+	bool found;
+	bool ours;
+	vm_offset_t chnl_wr;
+	vm_offset_t chnl_rd;
+};
+
+static struct charger_module chgr_mod = { .func = 0x10, .found = false };
+static struct charger_module usbin_mod = { .func = 0x13, .found = false };
+static struct charger_module typec_mod = { .func = 0x15, .found = false };
+static vm_offset_t arb_core, arb_cnfg, arb_obsrvr;
+
 #define SDA 0
 #define SCL 1
 #define OUTPUT (1u << 9)
@@ -135,6 +177,147 @@ read_word(uint8_t reg, uint16_t *value)
 	return acknowledged && bus_ok;
 }
 
+static uint32_t
+spmi_wait(vm_offset_t channel)
+{
+	uint32_t status = 0;
+	for (unsigned i = 0; i < 2000 && !(status & STATUS_DONE); i++) {
+		status = *(volatile uint32_t *)(channel + CH_STATUS);
+		delay_for_interval(1, NSEC_PER_USEC);
+	}
+	return status;
+}
+
+static bool
+spmi_read_reg(struct charger_module *mod, uint8_t reg, uint8_t *val)
+{
+	if (!mod->found || mod->chnl_rd == 0) {
+		return false;
+	}
+	annibale_spmi_lock();
+	*(volatile uint32_t *)(mod->chnl_rd + CH_CMD) = CMD_OPC(OPC_EXT_READ) | CMD_REG(reg) | 0;
+	uint32_t status = spmi_wait(mod->chnl_rd);
+	uint32_t data = *(volatile uint32_t *)(mod->chnl_rd + CH_RDATA0);
+	annibale_spmi_unlock();
+
+	if (status & STATUS_DONE) {
+		*val = (uint8_t)(data & 0xff);
+		return true;
+	}
+	return false;
+}
+
+static bool
+spmi_write_reg(struct charger_module *mod, uint8_t reg, uint8_t val)
+{
+	if (!mod->found || !mod->ours || mod->chnl_wr == 0) {
+		return false;
+	}
+	annibale_spmi_lock();
+	*(volatile uint32_t *)(mod->chnl_wr + CH_WDATA0) = val;
+	*(volatile uint32_t *)(mod->chnl_wr + CH_CMD) = CMD_OPC(OPC_EXT_WRITEL) | CMD_REG(reg) | 0;
+	uint32_t status = spmi_wait(mod->chnl_wr);
+	annibale_spmi_unlock();
+
+	return (status & STATUS_DONE) != 0;
+}
+
+static void
+pm8550b_charger_probe(void)
+{
+	if (arb_core == 0) {
+		arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
+		arb_cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
+		arb_obsrvr = ml_io_map(ARB_OBSRV_PHYS, ARB_OBSRV_SIZE);
+	}
+	if (arb_core == 0 || arb_cnfg == 0 || arb_obsrvr == 0) {
+		printf("battery: failed to map SPMI arbiter windows\n");
+		return;
+	}
+	uint32_t version = *(volatile uint32_t *)(arb_core + 0);
+	if (version < ARB_VERSION_7) {
+		printf("battery: SPMI arbiter version %#x not supported\n", version);
+		return;
+	}
+	uint32_t channels = *(volatile uint32_t *)(arb_core + 4) & 0x7ff;
+	if (channels > APID_MAX) {
+		channels = APID_MAX;
+	}
+
+	for (uint32_t n = 0; n < channels; n++) {
+		uint32_t map = *(volatile uint32_t *)(arb_core + APID_MAP(n));
+		if (map == 0) {
+			continue;
+		}
+		uint16_t ppid = (map >> 8) & 0xfff;
+		uint8_t slave = (ppid >> 8) & 0x0f;
+		uint8_t func = ppid & 0xff;
+		uint8_t owner = *(volatile uint32_t *)(arb_cnfg + APID_OWNER(n)) & 7;
+
+		if (func == 0x10 && !chgr_mod.found) {
+			chgr_mod.apid = (uint16_t)n;
+			chgr_mod.ours = (owner == ARB_SYSTEM);
+			chgr_mod.found = true;
+			chgr_mod.chnl_rd = arb_obsrvr + 0x8000UL * ARB_SYSTEM + 0x20UL * n;
+			if (chgr_mod.ours) {
+				chgr_mod.chnl_wr = ml_io_map(ARB_CHNLS_PHYS + ARB_CHANNEL_SIZE * n, ARB_CHANNEL_SIZE);
+			}
+			printf("battery: found CHGR at channel %u (slave %u, owner %u)\n", n, slave, owner);
+		} else if (func == 0x13 && slave != 0 && !usbin_mod.found) {
+			usbin_mod.apid = (uint16_t)n;
+			usbin_mod.ours = (owner == ARB_SYSTEM);
+			usbin_mod.found = true;
+			usbin_mod.chnl_rd = arb_obsrvr + 0x8000UL * ARB_SYSTEM + 0x20UL * n;
+			if (usbin_mod.ours) {
+				usbin_mod.chnl_wr = ml_io_map(ARB_CHNLS_PHYS + ARB_CHANNEL_SIZE * n, ARB_CHANNEL_SIZE);
+			}
+			printf("battery: found USBIN at channel %u (slave %u, owner %u)\n", n, slave, owner);
+		} else if (func == 0x15 && !typec_mod.found) {
+			typec_mod.apid = (uint16_t)n;
+			typec_mod.ours = (owner == ARB_SYSTEM);
+			typec_mod.found = true;
+			typec_mod.chnl_rd = arb_obsrvr + 0x8000UL * ARB_SYSTEM + 0x20UL * n;
+			if (typec_mod.ours) {
+				typec_mod.chnl_wr = ml_io_map(ARB_CHNLS_PHYS + ARB_CHANNEL_SIZE * n, ARB_CHANNEL_SIZE);
+			}
+			printf("battery: found TYPEC at channel %u (slave %u, owner %u)\n", n, slave, owner);
+		}
+	}
+}
+
+static void
+pm8550b_configure_charging(bool enable)
+{
+	static int current_state = -1;
+	if (current_state == (int)enable) {
+		return;
+	}
+	current_state = (int)enable;
+
+	if (enable) {
+		if (usbin_mod.found) {
+			spmi_write_reg(&usbin_mod, 0x40, 0x00);
+			spmi_write_reg(&usbin_mod, 0x70, 0x3c);
+		}
+		if (chgr_mod.found) {
+			spmi_write_reg(&chgr_mod, 0x42, 0x01);
+			spmi_write_reg(&chgr_mod, 0x61, 0x32);
+		}
+		if (typec_mod.found) {
+			spmi_write_reg(&typec_mod, 0x44, 0x01);
+		}
+		printf("battery: PM8550B charging enabled (ICL 3000 mA, FastChg 2500 mA)\n");
+	} else {
+		if (chgr_mod.found) {
+			spmi_write_reg(&chgr_mod, 0x42, 0x00);
+		}
+		if (usbin_mod.found) {
+			spmi_write_reg(&usbin_mod, 0x70, 0x0a);
+		}
+		printf("battery: PM8550B charging disabled (standby 500 mA)\n");
+	}
+}
+
 static bool
 sample(void)
 {
@@ -192,18 +375,25 @@ sample(void)
 		uint32_t dsts = *(volatile uint32_t *)(dwc3_dev + 0x70c);
 		usb_active = ((dctl >> 31) != 0) && ((dsts & (1u << 22)) == 0) && (((dsts >> 18) & 0xf) < 4);
 	}
-	if (usb_active || state.current_ua >= DISCONNECT_FLOW_UA) {
+	bool usbin_plugged = false;
+	uint8_t usbin_sts = 0;
+	if (usbin_mod.found && spmi_read_reg(&usbin_mod, 0x10, &usbin_sts)) {
+		usbin_plugged = (usbin_sts & 0x03) != 0;
+	}
+	if (usb_active || usbin_plugged || state.current_ua >= DISCONNECT_FLOW_UA) {
 		last_external = true;
 		state.status = (values[0] >= 100 && state.current_ua <= CHARGE_FLOW_UA) ? 4 : 1;
+		pm8550b_configure_charging(true);
 	} else {
 		last_external = false;
 		state.status = 2;
+		pm8550b_configure_charging(false);
 	}
 	state.external = last_external;
 	if (state.external) {
-		state.usb_type = usb_active ? 1 : 2;
+		state.usb_type = (usb_active || usbin_plugged) ? 1 : 2;
 		state.usb_voltage_uv = 5000000;
-		state.usb_current_ua = usb_active && state.current_ua <= CHARGE_FLOW_UA ? 500000 : 2000000;
+		state.usb_current_ua = (usb_active || usbin_plugged) && state.current_ua <= CHARGE_FLOW_UA ? 500000 : 2000000;
 	}
 	state.charge_uah = values[4] * 1000;
 	state.full_uah = values[5] * 1000;
@@ -250,6 +440,7 @@ battery_thread(__unused void *parameter, __unused wait_result_t result)
 	printf("battery: BQ27Z561 on GPIO52/53, address %#x; reading standard commands\n", GAUGE_ADDRESS);
 	pins = ml_io_map(0x0f134000UL, 0x2000);
 	dwc3_dev = ml_io_map(0x0a60c000UL, 0x1000);
+	pm8550b_charger_probe();
 	if (pins) {
 		for (;;) {
 			if (!sample()) {

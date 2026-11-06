@@ -239,12 +239,12 @@ spmi_read16(uint16_t addr, uint8_t *bytes, uint32_t count)
 {
 	const char *problem = NULL;
 
-	for (int tries = 0; tries < 5; tries++) {
+	for (int tries = 0; tries < 10; tries++) {
 		problem = spmi_read16_once(addr, bytes, count);
 		if (problem == NULL || strcmp(problem, "the transfer was dropped") != 0) {
 			break;
 		}
-		spin_us(50);
+		spin_us(100);
 	}
 	return problem;
 }
@@ -302,12 +302,12 @@ spmi_write16(uint16_t addr, uint8_t value)
 {
 	const char *problem = NULL;
 
-	for (int tries = 0; tries < 5; tries++) {
+	for (int tries = 0; tries < 10; tries++) {
 		problem = spmi_write16_once(addr, value);
 		if (problem == NULL || strcmp(problem, "the transfer was dropped") != 0) {
 			break;
 		}
-		spin_us(50);
+		spin_us(100);
 	}
 	return problem;
 }
@@ -501,11 +501,15 @@ may_light(void)
 {
 	uint8_t rt = 0, latched = 0, pending = 0, enable = 0, strobe = 0, status[2];
 
-	if (!flash_get(FLASH_INT_RT_STS, &rt, 1) || !flash_get(FLASH_INT_LATCHED, &latched, 1) ||
-	    !flash_get(FLASH_INT_PENDING, &pending, 1) || !flash_get(FLASH_ENABLE_CONTROL, &enable, 1) ||
-	    !flash_get(FLASH_STROBE_CTRL, &strobe, 1) || !flash_get(FLASH_STATUS1, status, 2)) {
+	if (!flash_get(FLASH_INT_RT_STS, &rt, 1) ||
+	    !flash_get(FLASH_ENABLE_CONTROL, &enable, 1) ||
+	    !flash_get(FLASH_STROBE_CTRL, &strobe, 1) ||
+	    !flash_get(FLASH_STATUS1, status, 2)) {
 		return false;
 	}
+	/* Informational reads: non-fatal peek avoids marking broken on transient SPMI collision */
+	(void)flash_peek(FLASH_INT_LATCHED, &latched, 1);
+	(void)flash_peek(FLASH_INT_PENDING, &pending, 1);
 	say("torch: before lighting: rt_sts %#02x, latched %#02x, pending %#02x, status1 %#02x, status2 %#02x, enable %#02x, strobe %#02x\n",
 	    rt, latched, pending, status[0], status[1], enable, strobe);
 	if (enable & 0x80) {

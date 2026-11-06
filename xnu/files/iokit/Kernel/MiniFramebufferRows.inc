@@ -148,7 +148,7 @@ IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
  * whole. A pause of ROWS_SOON_NS or more goes back to hashing every frame.
  */
 #define ROWS_SOON_NS    (25 * NSEC_PER_MSEC)
-#define ROWS_UNHASHED   6
+#define ROWS_UNHASHED   16
 
 bool
 IOMobileFramebuffer::dirtyBand(RowJob * job)
@@ -196,11 +196,11 @@ IOMobileFramebuffer::dirtyBand(RowJob * job)
 		uint64_t h[4] = { 0xcbf29ce484222325ULL, 1, 2, 3 };
 		int32_t i;
 
-		for (i = 0; i + 4 <= words; i += 4) {
-			h[0] = (h[0] ^ w[i]) * 0x100000001b3ULL;
-			h[1] = (h[1] ^ w[i + 1]) * 0x100000001b3ULL;
-			h[2] = (h[2] ^ w[i + 2]) * 0x100000001b3ULL;
-			h[3] = (h[3] ^ w[i + 3]) * 0x100000001b3ULL;
+		for (i = 0; i + 8 <= words; i += 8) {
+			h[0] = (h[0] ^ w[i]) * 0x100000001b3ULL ^ w[i + 1];
+			h[1] = (h[1] ^ w[i + 2]) * 0x100000001b3ULL ^ w[i + 3];
+			h[2] = (h[2] ^ w[i + 4]) * 0x100000001b3ULL ^ w[i + 5];
+			h[3] = (h[3] ^ w[i + 6]) * 0x100000001b3ULL ^ w[i + 7];
 		}
 		for (; i < words; i++) {
 			h[0] = (h[0] ^ w[i]) * 0x100000001b3ULL;

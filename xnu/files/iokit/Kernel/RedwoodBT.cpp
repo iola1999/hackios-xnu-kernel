@@ -18,6 +18,7 @@
 
 extern "C" void RedwoodBTStart(const char * bsdname, const uint8_t * address);
 extern "C" void RedwoodBTSetAddress(const uint8_t * address);
+extern "C" void RedwoodBTSetPowerState(bool on);
 extern "C" void RedwoodDiskStart(uint64_t size_bytes);
 
 class RedwoodBT : public IOService
@@ -145,6 +146,15 @@ RedwoodBTStart(const char * bsdname, const uint8_t * address)
 	bt_set_address(bt, initial);
 	bt->setProperty("IOBuiltin", true);
 	bt->setProperty("Built-In", true);
+	bt->setProperty("bluetooth-active", true);
+	{
+		OSNumber * pwr = OSNumber::withNumber(1u, 32);
+		if (pwr != NULL) {
+			bt->setProperty("DevicePowerState", pwr);
+			bt->setProperty("PowerState", pwr);
+			pwr->release();
+		}
+	}
 	if (bt_publish(bt, platform, "bluetooth") == NULL) {
 		IOLog("RedwoodBT: the service did not start\n");
 	} else {
@@ -163,6 +173,22 @@ RedwoodBTSetAddress(const uint8_t * address)
 	bt_set_address(gRedwoodBT, address);
 	IOLog("RedwoodBT: local-mac-address %02x:%02x:%02x:%02x:%02x:%02x\n", address[0], address[1], address[2],
 	    address[3], address[4], address[5]);
+}
+
+void
+RedwoodBTSetPowerState(bool on)
+{
+	if (gRedwoodBT == NULL) {
+		return;
+	}
+	OSNumber * n = OSNumber::withNumber(on ? 1u : 0u, 32);
+	if (n != NULL) {
+		gRedwoodBT->setProperty("DevicePowerState", n);
+		gRedwoodBT->setProperty("PowerState", n);
+		n->release();
+	}
+	gRedwoodBT->setProperty("bluetooth-active", on ? kOSBooleanTrue : kOSBooleanFalse);
+	IOLog("RedwoodBT: power state updated to %s (DevicePowerState=%u)\n", on ? "ON" : "OFF", on ? 1u : 0u);
 }
 
 static AppleAPFSVolume *
