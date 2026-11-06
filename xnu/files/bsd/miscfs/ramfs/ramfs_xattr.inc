@@ -45,7 +45,12 @@ ramfs_getxattr(struct vnop_getxattr_args *ap)
 			kfree_data(copy, held);
 		}
 		held = size;
-		copy = kalloc_data(held, Z_WAITOK | Z_NOFAIL);
+		copy = kalloc_data(held, Z_WAITOK);
+		if (copy == NULL) {
+			error = ENOMEM;
+			lck_mtx_lock(&rm->rm_lock);
+			break;
+		}
 	}
 	if (!error && ap->a_uio != NULL && (size_t)uio_resid(ap->a_uio) < size) {
 		error = ERANGE;
@@ -90,8 +95,21 @@ ramfs_setxattr(struct vnop_setxattr_args *ap)
 			return error;
 		}
 	}
-	fresh = kalloc_type(struct ramfs_xattr, Z_WAITOK | Z_ZERO | Z_NOFAIL);
-	fresh->rx_name = kalloc_data(namelen + 1, Z_WAITOK | Z_NOFAIL);
+	fresh = kalloc_type(struct ramfs_xattr, Z_WAITOK | Z_ZERO);
+	if (fresh == NULL) {
+		if (data != NULL) {
+			kfree_data(data, size);
+		}
+		return ENOMEM;
+	}
+	fresh->rx_name = kalloc_data(namelen + 1, Z_WAITOK);
+	if (fresh->rx_name == NULL) {
+		kfree_type(struct ramfs_xattr, fresh);
+		if (data != NULL) {
+			kfree_data(data, size);
+		}
+		return ENOMEM;
+	}
 	memcpy(fresh->rx_name, ap->a_name, namelen + 1);
 	fresh->rx_namelen = namelen;
 	fresh->rx_data = data;
@@ -170,7 +188,12 @@ ramfs_listxattr(struct vnop_listxattr_args *ap)
 			kfree_data(copy, held);
 		}
 		held = total;
-		copy = kalloc_data(held, Z_WAITOK | Z_NOFAIL);
+		copy = kalloc_data(held, Z_WAITOK);
+		if (copy == NULL) {
+			error = ENOMEM;
+			lck_mtx_lock(&rm->rm_lock);
+			break;
+		}
 	}
 	if (ap->a_uio != NULL && total != 0 && (size_t)uio_resid(ap->a_uio) < total) {
 		error = ERANGE;

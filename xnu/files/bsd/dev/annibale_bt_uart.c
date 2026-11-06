@@ -82,10 +82,12 @@ static const uint32_t s6_parent_hz[8] = { 19200000, 600000000, 0, 0, 0, 0, 30000
 #define SE_GENI_M_CMD0          0x600
 #define SE_GENI_M_CMD_CTRL      0x604           /* bit 2 cancel, bit 1 abort */
 #define SE_GENI_M_IRQ_STATUS    0x610           /* bit 0: command done */
+#define SE_GENI_M_IRQ_EN        0x614
 #define SE_GENI_M_IRQ_CLEAR     0x618
 #define SE_GENI_S_CMD0          0x630
 #define SE_GENI_S_CMD_CTRL      0x634
 #define SE_GENI_S_IRQ_STATUS    0x640           /* bit 0: command done (the read ended on stale) */
+#define SE_GENI_S_IRQ_EN        0x644
 #define SE_GENI_S_IRQ_CLEAR     0x648
 #define SE_GENI_TX_FIFO         0x700
 #define SE_GENI_RX_FIFO         0x780
@@ -271,6 +273,14 @@ annibale_bt_uart_open(void)
 		return false;
 	}
 	pins();
+#define SE14_GIC_SPI_ID 0x1cdu
+#define SE14_GIC_INTID  (32u + SE14_GIC_SPI_ID)
+	extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
+	if (gic_v3_spi_attach(SE14_GIC_INTID, false, annibale_bt_uart_isr, NULL) == KERN_SUCCESS) {
+		bt_say("bt: attached to GIC SPI 0x1cd (INTID %u)\n", SE14_GIC_INTID);
+	} else {
+		bt_say("bt: warning: failed to attach to GIC SPI 0x1cd (INTID %u)\n", SE14_GIC_INTID);
+	}
 	return true;
 }
 
@@ -324,6 +334,8 @@ annibale_bt_uart_config(uint32_t oversampling)
 	wr(se + SE_GENI_OUTPUT_CTRL, 0x7f);
 	wr(se + SE_GENI_FORCE_DEFAULT, 1);
 	wr(se + SE_IRQ_EN, rd(se + SE_IRQ_EN) | 0xf);
+	wr(se + SE_GENI_S_IRQ_EN, 0xffffffffu);
+	wr(se + SE_GENI_M_IRQ_EN, 0xffffffffu);
 	wr(se + SE_GENI_DMA_MODE, rd(se + SE_GENI_DMA_MODE) & ~1u);
 	packing();
 	wr(se + SE_GENI_RX_WATERMARK, 2);
@@ -436,10 +448,34 @@ annibale_bt_uart_set_baud(uint32_t baud)
 	return true;
 }
 
+void
+annibale_bt_uart_irq_clear(void)
+{
+	if (se == 0) {
+		return;
+	}
+	uint32_t s_irq = rd(se + SE_GENI_S_IRQ_STATUS);
+	uint32_t m_irq = rd(se + SE_GENI_M_IRQ_STATUS);
+
+	/* 无论产生何种中断，全量清除已置位状态位，防止电平中断风暴 */
+	if (s_irq) {
+		wr(se + SE_GENI_S_IRQ_CLEAR, s_irq);
+	}
+	if (m_irq) {
+		wr(se + SE_GENI_M_IRQ_CLEAR, m_irq);
+	}
+	if (s_irq & CMD_DONE) {
+		wr(se + SE_GENI_S_CMD0, UART_START_READ << OPCODE_SHIFT);
+	}
+}
+
 uint32_t
 annibale_bt_uart_poll(void)
 {
 	uint32_t status = rd(se + SE_GENI_RX_FIFO_STATUS), words = status & 0x1ffffff, got = 0;
+
+	/* 先清除硬件中断状态 */
+	annibale_bt_uart_irq_clear();
 
 	/* words left in the FIFO when the buffer is full hold RFR, so the chip waits rather than loses bytes */
 	for (uint32_t i = 0; i < words && rx_len + 4 <= sizeof(rx_buf); i++) {
@@ -453,10 +489,6 @@ annibale_bt_uart_poll(void)
 			rx_buf[rx_len++] = (uint8_t)(word >> (8 * k));
 		}
 		got += bytes;
-	}
-	if (rd(se + SE_GENI_S_IRQ_STATUS) & CMD_DONE) {
-		wr(se + SE_GENI_S_IRQ_CLEAR, 0xffffffffu);
-		wr(se + SE_GENI_S_CMD0, UART_START_READ << OPCODE_SHIFT);
 	}
 	return got;
 }

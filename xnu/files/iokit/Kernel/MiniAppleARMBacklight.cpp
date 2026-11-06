@@ -150,10 +150,10 @@ publish_calibration(IOService * service)
 	marketing = OSData::withBytes(table, sizeof(table));
 	if (calibration != NULL) {
 		setNumber(calibration, "lMinPanel", fixed_nits(kBLMilliNitsMin));
-		setNumber(calibration, "lMidPanel", fixed_nits(kBLMilliNitsMin));
+		setNumber(calibration, "lMidPanel", fixed_nits(kBLMilliNitsMid));
 		setNumber(calibration, "lMaxPanel", fixed_nits(kBLMilliNitsMax));
 		setNumber(calibration, "lMinProduct", fixed_nits(kBLMilliNitsMin));
-		setNumber(calibration, "lMidProduct", fixed_nits(kBLMilliNitsMin));
+		setNumber(calibration, "lMidProduct", fixed_nits(kBLMilliNitsMid));
 		setNumber(calibration, "lMaxProduct", fixed_nits(kBLMilliNitsMax));
 		setNumber(calibration, "current-for-max-backlight", 0);
 		setNumber(calibration, "current-for-mid-backlight", 0);
@@ -243,7 +243,7 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 	OSNumber * nits = OSDynamicCast(OSNumber, dict->getObject(nits_key));
 	OSNumber * value = value_key != NULL ? OSDynamicCast(OSNumber, dict->getObject(value_key)) : NULL;
 	uint64_t now = mach_absolute_time(), active_win;
-	uint64_t v, millinits, diff;
+	uint64_t v, millinits;
 	uint32_t level, mixed;
 	int alpha;
 	char who[24] = "?", shown[32];
@@ -255,8 +255,6 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 	if (value_key != NULL) {
 		nanoseconds_to_absolutetime(500 * NSEC_PER_MSEC, &active_win);
 		if (dict->getObject("DisplayBrightnessSliderPosition") != NULL) {
-			bl.user_until = now + active_win;
-		} else if (dict->getObject("DisplayBrightness") != NULL && now <= bl.user_until) {
 			bl.user_until = now + active_win;
 		}
 	}
@@ -316,11 +314,10 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 		bl_log();
 		return;
 	}
-	diff = millinits > last_millinits ? millinits - last_millinits : last_millinits - millinits;
-	if (bl.initialized && now > bl.user_until && diff * 4 <= last_millinits) {
+	if (now > bl.user_until) {
 		snprintf(bl.line + used, sizeof(bl.line) - used,
-		    "; autonomous ramp ignored (%llu.%03llu nits), keeping %llu.%03llu nits",
-		    millinits / 1000, millinits % 1000, last_millinits / 1000, last_millinits % 1000);
+		    "; autonomous update ignored (no slider active), keeping %llu nits",
+		    last_millinits / 1000);
 		bl_log();
 		return;
 	}

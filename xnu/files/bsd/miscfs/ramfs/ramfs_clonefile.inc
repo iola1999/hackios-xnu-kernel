@@ -56,7 +56,10 @@ ramfs_clone_contents(struct ramfs_mount *rm, struct ramfs_node *src, struct ramf
 		}
 	} else if (src->rn_type == VLNK) {
 		if (src->rn_target != NULL) {
-			node->rn_target = kalloc_data(node->rn_size + 1, Z_WAITOK | Z_NOFAIL);
+			node->rn_target = kalloc_data(node->rn_size + 1, Z_WAITOK);
+			if (node->rn_target == NULL) {
+				return ENOMEM;
+			}
 			memcpy(node->rn_target, src->rn_target, node->rn_size + 1);
 		}
 	} else if (src->rn_type == VDIR) {
@@ -91,13 +94,25 @@ ramfs_clone_contents(struct ramfs_mount *rm, struct ramfs_node *src, struct ramf
 	}
 
 	TAILQ_FOREACH(rx, &src->rn_xattrs, rx_link) {
-		struct ramfs_xattr *new_rx = kalloc_type(struct ramfs_xattr, Z_WAITOK | Z_ZERO | Z_NOFAIL);
+		struct ramfs_xattr *new_rx = kalloc_type(struct ramfs_xattr, Z_WAITOK | Z_ZERO);
+		if (new_rx == NULL) {
+			return ENOMEM;
+		}
 		new_rx->rx_namelen = rx->rx_namelen;
 		new_rx->rx_size = rx->rx_size;
-		new_rx->rx_name = kalloc_data(rx->rx_namelen + 1, Z_WAITOK | Z_NOFAIL);
+		new_rx->rx_name = kalloc_data(rx->rx_namelen + 1, Z_WAITOK);
+		if (new_rx->rx_name == NULL) {
+			kfree_type(struct ramfs_xattr, new_rx);
+			return ENOMEM;
+		}
 		memcpy(new_rx->rx_name, rx->rx_name, rx->rx_namelen + 1);
 		if (rx->rx_size > 0 && rx->rx_data != NULL) {
-			new_rx->rx_data = kalloc_data(rx->rx_size, Z_WAITOK | Z_NOFAIL);
+			new_rx->rx_data = kalloc_data(rx->rx_size, Z_WAITOK);
+			if (new_rx->rx_data == NULL) {
+				kfree_data(new_rx->rx_name, rx->rx_namelen + 1);
+				kfree_type(struct ramfs_xattr, new_rx);
+				return ENOMEM;
+			}
 			memcpy(new_rx->rx_data, rx->rx_data, rx->rx_size);
 		}
 		TAILQ_INSERT_TAIL(&node->rn_xattrs, new_rx, rx_link);

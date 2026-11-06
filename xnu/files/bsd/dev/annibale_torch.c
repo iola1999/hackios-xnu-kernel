@@ -187,10 +187,10 @@ wait_ms(uint32_t ms)
  * lock is taken inside, so the callers do not have to think about the other readers.
  */
 static const char *
-spmi_read16(uint16_t addr, uint8_t *bytes, uint32_t count)
+spmi_read16_once(uint16_t addr, uint8_t *bytes, uint32_t count)
 {
 	vm_offset_t channel;
-	uint64_t start = mach_absolute_time(), now, interval;
+	uint64_t start, now, interval;
 	uint32_t status = 0, data[2] = { 0, 0 };
 	const char *problem = NULL;
 
@@ -199,8 +199,15 @@ spmi_read16(uint16_t addr, uint8_t *bytes, uint32_t count)
 	}
 	nanoseconds_to_absolutetime(TRANSACT_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
 	channel = arb_obsrvr + 0x8000UL * ARB_SYSTEM + 0x20UL * flash.apid;
+
 	annibale_spmi_lock();
+	start = mach_absolute_time();
+	while ((rd(channel + CH_STATUS) & (STATUS_DONE | STATUS_DROPPED | STATUS_FAILURE | STATUS_DENIED)) == 0 &&
+	       rd(channel + CH_STATUS) != 0 && mach_absolute_time() - start < interval) {
+		spin_us(1);
+	}
 	wr(channel + CH_CMD, CMD_OPC(count > 4 ? OPC_EXT_READL : OPC_EXT_READ) | CMD_REG(addr) | (count - 1));
+	start = mach_absolute_time();
 	do {
 		status = rd(channel + CH_STATUS);
 		now = mach_absolute_time();
@@ -228,10 +235,25 @@ spmi_read16(uint16_t addr, uint8_t *bytes, uint32_t count)
 }
 
 static const char *
-spmi_write16(uint16_t addr, uint8_t value)
+spmi_read16(uint16_t addr, uint8_t *bytes, uint32_t count)
+{
+	const char *problem = NULL;
+
+	for (int tries = 0; tries < 5; tries++) {
+		problem = spmi_read16_once(addr, bytes, count);
+		if (problem == NULL || strcmp(problem, "the transfer was dropped") != 0) {
+			break;
+		}
+		spin_us(50);
+	}
+	return problem;
+}
+
+static const char *
+spmi_write16_once(uint16_t addr, uint8_t value)
 {
 	vm_offset_t channel;
-	uint64_t start = mach_absolute_time(), now, interval;
+	uint64_t start, now, interval;
 	uint32_t status = 0;
 	const char *problem = NULL;
 
@@ -246,10 +268,17 @@ spmi_write16(uint16_t addr, uint8_t value)
 	}
 	nanoseconds_to_absolutetime(TRANSACT_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
 	channel = flash.channel;
+
 	annibale_spmi_lock();
+	start = mach_absolute_time();
+	while ((rd(channel + CH_STATUS) & (STATUS_DONE | STATUS_DROPPED | STATUS_FAILURE | STATUS_DENIED)) == 0 &&
+	       rd(channel + CH_STATUS) != 0 && mach_absolute_time() - start < interval) {
+		spin_us(1);
+	}
 	wr(channel + CH_WDATA0, value);
 	/* the 16-bit register address's write, as Linux's regmap-spmi-ext and redwood_torch.c send it */
 	wr(channel + CH_CMD, CMD_OPC(OPC_EXT_WRITEL) | CMD_REG(addr) | (1 - 1));
+	start = mach_absolute_time();
 	do {
 		status = rd(channel + CH_STATUS);
 		now = mach_absolute_time();
@@ -268,6 +297,21 @@ spmi_write16(uint16_t addr, uint8_t value)
 	return problem;
 }
 
+static const char *
+spmi_write16(uint16_t addr, uint8_t value)
+{
+	const char *problem = NULL;
+
+	for (int tries = 0; tries < 5; tries++) {
+		problem = spmi_write16_once(addr, value);
+		if (problem == NULL || strcmp(problem, "the transfer was dropped") != 0) {
+			break;
+		}
+		spin_us(50);
+	}
+	return problem;
+}
+
 /* one register with the house rule: the write is read back and compared; a surprise breaks the run */
 static bool
 flash_get(uint16_t reg, uint8_t *bytes, uint32_t count)
@@ -277,6 +321,19 @@ flash_get(uint16_t reg, uint8_t *bytes, uint32_t count)
 	if (problem != NULL) {
 		say("torch: reading %#06x gave: %s\n", reg, problem);
 		broken = true;
+		return false;
+	}
+	return true;
+}
+
+/* informational read: reading failure logs a warning without breaking the service loop */
+static bool
+flash_peek(uint16_t reg, uint8_t *bytes, uint32_t count)
+{
+	const char *problem = spmi_read16(reg, bytes, count);
+
+	if (problem != NULL) {
+		say("torch: reading %#06x gave: %s (non-fatal)\n", reg, problem);
 		return false;
 	}
 	return true;
@@ -419,11 +476,12 @@ bring_up_locked(void)
 static void
 show_state(const char *when)
 {
-	uint8_t id[2], st[8], ints[8], lat[2], timers[8], ctl[8], en = 0;
+	uint8_t id[2] = { 0 }, st[8] = { 0 }, ints[8] = { 0 }, lat[2] = { 0 }, timers[8] = { 0 }, ctl[8] = { 0 }, en = 0;
 
-	if (!flash_get(FLASH_TYPE, id, 2) || !flash_get(FLASH_STATUS1, st, 2) || !flash_get(FLASH_INT_RT_STS, ints, 8) ||
-	    !flash_get(FLASH_INT_LATCHED, lat, 2) || !flash_get(FLASH_SAFETY_TIMER, timers, 8) ||
-	    !flash_get(FLASH_ENABLE_CONTROL, ctl, 8) || !flash_get(FLASH_EN_LED_CTRL, &en, 1)) {
+	if (!flash_peek(FLASH_TYPE, id, 2) || !flash_peek(FLASH_STATUS1, st, 2) || !flash_peek(FLASH_INT_RT_STS, ints, 8) ||
+	    !flash_peek(FLASH_INT_LATCHED, lat, 2) || !flash_peek(FLASH_SAFETY_TIMER, timers, 8) ||
+	    !flash_peek(FLASH_ENABLE_CONTROL, ctl, 8) || !flash_peek(FLASH_EN_LED_CTRL, &en, 1)) {
+		say("torch: %s: registers partially read\n", when);
 		return;
 	}
 	say("torch, %s: type %#02x subtype %#02x status1 %#02x status2 %#02x | rt_sts %#02x latched %#02x pending %#02x | "

@@ -190,6 +190,7 @@ public:
 	virtual bool getMachineName(char * name, int maxLength) APPLE_KEXT_OVERRIDE;
 	virtual long getGMTTimeOfDay(void) APPLE_KEXT_OVERRIDE;
 	virtual void setGMTTimeOfDay(long secs) APPLE_KEXT_OVERRIDE;
+	virtual int haltRestart(unsigned int type) APPLE_KEXT_OVERRIDE;
 };
 
 #define super IODTPlatformExpert
@@ -430,4 +431,18 @@ GenericARMPE::getMachineName(char * name, int maxLength)
 		strlcpy(name, "arm64", maxLength);
 	}
 	return true;
+}
+
+extern "C" {
+void hv_wdt_pet_NOW(void);
+void loader_return(void);
+}
+
+int
+GenericARMPE::haltRestart(unsigned int type)
+{
+	IOLog("GenericARMPE::haltRestart(%u)\n", type);
+	hv_wdt_pet_NOW();
+	loader_return();
+	return 0;
 }

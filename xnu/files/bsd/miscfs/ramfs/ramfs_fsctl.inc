@@ -22,7 +22,11 @@ static int
 ramfs_fsync(struct vnop_fsync_args *ap)
 {
 	struct ramfs_node *node = RAMFS_NODE(ap->a_vp);
+	struct ramfs_mount *rm = node->rn_mount;
 
 	ramfs_sync_mapping(ap->a_vp, node);
-	return ramfs_disk_sync(node->rn_mount);
+	if (rm != NULL && node->rn_ino == RAMFS_ROOT_INO && !rm->rm_seed_done) {
+		ramfs_disk_mark_seed_done(rm);
+	}
+	return ramfs_disk_sync(rm);
 }

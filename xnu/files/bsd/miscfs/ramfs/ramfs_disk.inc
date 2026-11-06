@@ -12,7 +12,8 @@ extern bool redwood_ufs_var_info(uint64_t *size_bytes_out);
 extern int redwood_ufs_var_io(bool write, uint64_t offset, void *buf, uint64_t len);
 
 #define RDWFS_MAGIC_STR          "RDWFS001"
-#define RDWFS_VERSION            1u
+#define RDWFS_VERSION            2u
+#define rm_disk_enabled          rm_disk_backed
 #define RDWFS_SUPER_BYTES        4096u
 #define RDWFS_SLOT0_OFFSET       0ULL
 #define RDWFS_SLOT1_OFFSET       (32ULL << 20)
@@ -91,10 +92,54 @@ struct rdwfs_dirent_rec {
 static struct ramfs_mount *ramfs_disk_rm;
 static bool ramfs_disk_claimed;
 static int ramfs_var_disk_loaded;
+static int ramfs_var_seed_done = 1;
+
+static void ramfs_disk_dirty_locked(struct ramfs_mount *rm);
+static int ramfs_disk_sync_impl(struct ramfs_mount *rm);
+#define ramfs_disk_sync(rm, ...) ramfs_disk_sync_impl(rm)
+
+static void
+ramfs_disk_mark_seed_done(struct ramfs_mount *rm)
+{
+	if (rm != NULL) {
+		lck_mtx_lock(&rm->rm_lock);
+		rm->rm_seed_done = true;
+		ramfs_var_seed_done = 1;
+		ramfs_disk_dirty_locked(rm);
+		lck_mtx_unlock(&rm->rm_lock);
+		(void)ramfs_disk_sync(rm, true);
+	}
+}
+
+static int
+sysctl_var_seed_done SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int val = ramfs_var_seed_done;
+	int error = sysctl_io_number(req, val, sizeof(val), &val, NULL);
+
+	if (error == 0 && req->newptr != USER_ADDR_NULL) {
+		ramfs_var_seed_done = val;
+		if (ramfs_disk_rm != NULL) {
+			if (val != 0) {
+				ramfs_disk_mark_seed_done(ramfs_disk_rm);
+			} else {
+				lck_mtx_lock(&ramfs_disk_rm->rm_lock);
+				ramfs_disk_rm->rm_seed_done = false;
+				lck_mtx_unlock(&ramfs_disk_rm->rm_lock);
+			}
+		}
+	}
+	return error;
+}
 
 SYSCTL_DECL(_kern_redwood);
 SYSCTL_INT(_kern_redwood, OID_AUTO, var_disk_loaded, CTLFLAG_RD | CTLFLAG_LOCKED,
     &ramfs_var_disk_loaded, 0, "1 when /private/var was loaded from RDWFS001 on disk");
+SYSCTL_PROC(_kern_redwood, OID_AUTO, var_seed_done,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    &ramfs_var_seed_done, 0, sysctl_var_seed_done, "I",
+    "1 when /private/var seed unpack has completed");
 
 static void *
 ramfs_vm_alloc(size_t bytes)
@@ -213,16 +258,41 @@ ramfs_disk_fault_page(struct ramfs_node *node, uint64_t index)
 }
 
 static void
+ramfs_disk_evict_page_locked(struct ramfs_mount *rm, struct ramfs_node *node, uint64_t index, void *page)
+{
+	if (os_atomic_load(&ramfs_pages_in_use, relaxed) >= rm->rm_max_pages / 2) {
+		if (node->rn_pages != NULL && index < node->rn_nslots && node->rn_pages[index] == page) {
+			ramfs_page_free(page);
+			node->rn_pages[index] = NULL;
+			os_atomic_dec(&ramfs_pages_in_use, relaxed);
+		}
+	}
+}
+
+static void
+ramfs_disk_evict_page(struct ramfs_mount *rm, struct ramfs_node *node, uint64_t index, void *page)
+{
+	if (os_atomic_load(&ramfs_pages_in_use, relaxed) >= rm->rm_max_pages / 2) {
+		lck_mtx_lock(&rm->rm_lock);
+		ramfs_disk_evict_page_locked(rm, node, index, page);
+		lck_mtx_unlock(&rm->rm_lock);
+	}
+}
+
+static void
 ramfs_disk_dirty_locked(struct ramfs_mount *rm)
 {
 	if (rm == NULL || !rm->rm_disk_backed || rm->rm_disk_loading) {
 		return;
 	}
 	rm->rm_meta_dirty = true;
+	if (ramfs_var_seed_done == 0 || !rm->rm_seed_done) {
+		return;
+	}
 	if (rm->rm_meta_gen > 0 && rm->rm_meta_call != NULL && !rm->rm_meta_syncing) {
 		uint64_t deadline;
 
-		clock_interval_to_deadline(20, NSEC_PER_MSEC, &deadline);
+		clock_interval_to_deadline(1500, NSEC_PER_MSEC, &deadline);
 		thread_call_enter_delayed((thread_call_t)rm->rm_meta_call, deadline);
 	}
 }
@@ -369,102 +439,105 @@ ramfs_disk_pack_locked(struct ramfs_mount *rm, uint64_t *payload_bytes_out, uint
 }
 
 static int
-ramfs_disk_sync(struct ramfs_mount *rm)
+ramfs_disk_sync_impl(struct ramfs_mount *rm)
 {
+	uint64_t payload_bytes = 0, write_bytes, gen, slot_off;
+	uint32_t node_count = 0;
+	struct rdwfs_super *sup;
 	int error = 0;
 
-	if (rm == NULL || !rm->rm_disk_backed || rm->rm_disk_loading) {
+	if (rm == NULL || !rm->rm_disk_enabled || !rm->rm_seed_done || ramfs_var_seed_done == 0 || rm->rm_disk_loading) {
 		return 0;
 	}
 	lck_mtx_lock(&rm->rm_lock);
 	if (rm->rm_meta_gen == 0) {
 		rm->rm_meta_dirty = true;
 	}
-	while (rm->rm_meta_dirty || rm->rm_meta_syncing) {
-		uint64_t payload_bytes = 0, write_bytes, gen, slot_off;
-		uint32_t node_count = 0;
-		struct rdwfs_super *sup;
-
-		if (rm->rm_meta_syncing) {
-			msleep(&rm->rm_meta_syncing, &rm->rm_lock, PRIBIO, "rdwfssync", NULL);
-			continue;
-		}
-		if (!rm->rm_meta_dirty) {
-			break;
-		}
-		if (ramfs_disk_pack_locked(rm, &payload_bytes, &node_count) == ENOSPC) {
-			size_t old_cap = rm->rm_meta_cap;
-			size_t new_cap = old_cap ? old_cap * 2 : RDWFS_INIT_META_CAP;
-			void *new_buf;
-
-			if (new_cap > RDWFS_SLOT_MAX) {
-				error = ENOSPC;
-				break;
-			}
-			rm->rm_meta_syncing = true;
-			lck_mtx_unlock(&rm->rm_lock);
-			new_buf = ramfs_vm_alloc(new_cap);
-			lck_mtx_lock(&rm->rm_lock);
-			rm->rm_meta_syncing = false;
-			wakeup(&rm->rm_meta_syncing);
-			if (new_buf == NULL) {
-				error = ENOMEM;
-				break;
-			}
-			if (rm->rm_meta_cap == old_cap) {
-				ramfs_vm_free(rm->rm_meta_buf, old_cap);
-				rm->rm_meta_buf = new_buf;
-				rm->rm_meta_cap = new_cap;
-			} else {
-				ramfs_vm_free(new_buf, new_cap);
-			}
-			continue;
-		}
-		rm->rm_meta_dirty = false;
-		rm->rm_meta_syncing = true;
-		gen = ++rm->rm_meta_gen;
-		write_bytes = RDWFS_ALIGN4K(RDWFS_SUPER_BYTES + payload_bytes);
-		if (write_bytes > RDWFS_SUPER_BYTES + payload_bytes) {
-			bzero((uint8_t *)rm->rm_meta_buf + RDWFS_SUPER_BYTES + payload_bytes,
-			    (size_t)(write_bytes - (RDWFS_SUPER_BYTES + payload_bytes)));
-		}
-		sup = (struct rdwfs_super *)rm->rm_meta_buf;
-		bzero(sup, sizeof(*sup));
-		memcpy(sup->magic, RDWFS_MAGIC_STR, 8);
-		sup->version = RDWFS_VERSION;
-		sup->page_size = PAGE_SIZE;
-		sup->generation = gen;
-		sup->payload_bytes = payload_bytes;
-		sup->next_ino = rm->rm_next_ino;
-		sup->node_count = node_count;
-		sup->payload_crc = crc32(0, (uint8_t *)rm->rm_meta_buf + RDWFS_SUPER_BYTES, (size_t)payload_bytes);
-		sup->super_crc = crc32(0, sup, __builtin_offsetof(struct rdwfs_super, super_crc));
-
-		slot_off = (gen & 1ULL) ? RDWFS_SLOT0_OFFSET : RDWFS_SLOT1_OFFSET;
+	while (rm->rm_meta_syncing) {
+		msleep(&rm->rm_meta_syncing, &rm->rm_lock, PRIBIO, "rdwfssync", NULL);
+	}
+	if (!rm->rm_meta_dirty) {
 		lck_mtx_unlock(&rm->rm_lock);
+		return 0;
+	}
 
-		if (write_bytes > RDWFS_SUPER_BYTES) {
-			error = redwood_ufs_var_io(true, slot_off + RDWFS_SUPER_BYTES,
-			    (uint8_t *)rm->rm_meta_buf + RDWFS_SUPER_BYTES, write_bytes - RDWFS_SUPER_BYTES);
-		}
-		if (error == 0) {
-			error = redwood_ufs_var_io(true, slot_off, rm->rm_meta_buf, RDWFS_SUPER_BYTES);
-		}
-		if (error == 0 && gen == 1) {
-			if (write_bytes > RDWFS_SUPER_BYTES) {
-				(void)redwood_ufs_var_io(true, RDWFS_SLOT1_OFFSET + RDWFS_SUPER_BYTES,
-				    (uint8_t *)rm->rm_meta_buf + RDWFS_SUPER_BYTES, write_bytes - RDWFS_SUPER_BYTES);
-			}
-			(void)redwood_ufs_var_io(true, RDWFS_SLOT1_OFFSET, rm->rm_meta_buf, RDWFS_SUPER_BYTES);
-		}
+	while (ramfs_disk_pack_locked(rm, &payload_bytes, &node_count) == ENOSPC) {
+		size_t old_cap = rm->rm_meta_cap;
+		size_t new_cap = old_cap ? old_cap * 2 : RDWFS_INIT_META_CAP;
+		void *new_buf;
 
+		if (new_cap > RDWFS_SLOT_MAX) {
+			lck_mtx_unlock(&rm->rm_lock);
+			return ENOSPC;
+		}
+		rm->rm_meta_syncing = true;
+		lck_mtx_unlock(&rm->rm_lock);
+		new_buf = ramfs_vm_alloc(new_cap);
 		lck_mtx_lock(&rm->rm_lock);
 		rm->rm_meta_syncing = false;
 		wakeup(&rm->rm_meta_syncing);
-		if (error != 0) {
-			printf("ramfs: metadata write failed (%d)\n", error);
-			break;
+		if (new_buf == NULL) {
+			lck_mtx_unlock(&rm->rm_lock);
+			return ENOMEM;
 		}
+		if (rm->rm_meta_cap == old_cap) {
+			ramfs_vm_free(rm->rm_meta_buf, old_cap);
+			rm->rm_meta_buf = new_buf;
+			rm->rm_meta_cap = new_cap;
+		} else {
+			ramfs_vm_free(new_buf, new_cap);
+		}
+	}
+
+	rm->rm_meta_dirty = false;
+	rm->rm_meta_syncing = true;
+	gen = ++rm->rm_meta_gen;
+	write_bytes = RDWFS_ALIGN4K(RDWFS_SUPER_BYTES + payload_bytes);
+	if (write_bytes > RDWFS_SUPER_BYTES + payload_bytes) {
+		bzero((uint8_t *)rm->rm_meta_buf + RDWFS_SUPER_BYTES + payload_bytes,
+		    (size_t)(write_bytes - (RDWFS_SUPER_BYTES + payload_bytes)));
+	}
+	sup = (struct rdwfs_super *)rm->rm_meta_buf;
+	bzero(sup, sizeof(*sup));
+	memcpy(sup->magic, RDWFS_MAGIC_STR, 8);
+	sup->version = RDWFS_VERSION;
+	sup->page_size = PAGE_SIZE;
+	sup->generation = gen;
+	sup->payload_bytes = payload_bytes;
+	sup->next_ino = rm->rm_next_ino;
+	sup->node_count = node_count;
+	sup->payload_crc = crc32(0, (uint8_t *)rm->rm_meta_buf + RDWFS_SUPER_BYTES, (size_t)payload_bytes);
+	sup->super_crc = crc32(0, sup, __builtin_offsetof(struct rdwfs_super, super_crc));
+
+	slot_off = (gen & 1ULL) ? RDWFS_SLOT0_OFFSET : RDWFS_SLOT1_OFFSET;
+	lck_mtx_unlock(&rm->rm_lock);
+
+	if (write_bytes > RDWFS_SUPER_BYTES) {
+		error = redwood_ufs_var_io(true, slot_off + RDWFS_SUPER_BYTES,
+		    (uint8_t *)rm->rm_meta_buf + RDWFS_SUPER_BYTES, write_bytes - RDWFS_SUPER_BYTES);
+	}
+	if (error == 0) {
+		error = redwood_ufs_var_io(true, slot_off, rm->rm_meta_buf, RDWFS_SUPER_BYTES);
+	}
+	if (error == 0 && gen == 1) {
+		if (write_bytes > RDWFS_SUPER_BYTES) {
+			(void)redwood_ufs_var_io(true, RDWFS_SLOT1_OFFSET + RDWFS_SUPER_BYTES,
+			    (uint8_t *)rm->rm_meta_buf + RDWFS_SUPER_BYTES, write_bytes - RDWFS_SUPER_BYTES);
+		}
+		(void)redwood_ufs_var_io(true, RDWFS_SLOT1_OFFSET, rm->rm_meta_buf, RDWFS_SUPER_BYTES);
+	}
+
+	lck_mtx_lock(&rm->rm_lock);
+	rm->rm_meta_syncing = false;
+	wakeup(&rm->rm_meta_syncing);
+	if (error != 0) {
+		printf("ramfs: metadata write failed (%d)\n", error);
+	} else if (rm->rm_meta_dirty && rm->rm_seed_done && ramfs_var_seed_done != 0 &&
+	    rm->rm_meta_call != NULL) {
+		uint64_t deadline;
+
+		clock_interval_to_deadline(1500, NSEC_PER_MSEC, &deadline);
+		thread_call_enter_delayed((thread_call_t)rm->rm_meta_call, deadline);
 	}
 	lck_mtx_unlock(&rm->rm_lock);
 	return error;
@@ -510,7 +583,9 @@ ramfs_disk_read_slot(struct ramfs_mount *rm, uint64_t slot_off, struct rdwfs_sup
 	if (redwood_ufs_var_io(false, slot_off, sup, RDWFS_SUPER_BYTES) != 0) {
 		return false;
 	}
-	if (memcmp(sup->magic, RDWFS_MAGIC_STR, 8) != 0 || sup->version != RDWFS_VERSION ||
+	if (memcmp(sup->magic, RDWFS_MAGIC_STR, 8) != 0 ||
+	    (sup->version != 1u && sup->version != RDWFS_VERSION) ||
+	    sup->node_count < 1000 ||
 	    sup->page_size != PAGE_SIZE || sup->payload_bytes > RDWFS_SLOT_MAX - RDWFS_SUPER_BYTES) {
 		return false;
 	}
@@ -591,7 +666,10 @@ ramfs_disk_unpack(struct ramfs_mount *rm, const struct rdwfs_super *sup)
 			if (at + alen > end) {
 				return false;
 			}
-			node->rn_target = kalloc_data(rec.target_len + 1, Z_WAITOK | Z_NOFAIL);
+			node->rn_target = kalloc_data(rec.target_len + 1, Z_WAITOK);
+			if (node->rn_target == NULL) {
+				return false;
+			}
 			memcpy(node->rn_target, base + at, rec.target_len);
 			node->rn_target[rec.target_len] = '\0';
 			at += alen;
@@ -607,8 +685,19 @@ ramfs_disk_unpack(struct ramfs_mount *rm, const struct rdwfs_super *sup)
 			while (want < rec.nblocks) {
 				want *= 2;
 			}
-			node->rn_pages = kalloc_type(void *, want, Z_WAITOK | Z_ZERO | Z_NOFAIL);
-			node->rn_blocks = kalloc_data(want * sizeof(uint32_t), Z_WAITOK | Z_ZERO | Z_NOFAIL);
+			node->rn_pages = kalloc_type(void *, want, Z_WAITOK | Z_ZERO);
+			node->rn_blocks = kalloc_data(want * sizeof(uint32_t), Z_WAITOK | Z_ZERO);
+			if (node->rn_pages == NULL || node->rn_blocks == NULL) {
+				if (node->rn_pages != NULL) {
+					kfree_type(void *, want, node->rn_pages);
+					node->rn_pages = NULL;
+				}
+				if (node->rn_blocks != NULL) {
+					kfree_data(node->rn_blocks, want * sizeof(uint32_t));
+					node->rn_blocks = NULL;
+				}
+				return false;
+			}
 			node->rn_nslots = want;
 			memcpy(node->rn_blocks, base + at, (size_t)bbytes);
 			for (uint32_t b = 0; b < rec.nblocks; b++) {
@@ -637,13 +726,25 @@ ramfs_disk_unpack(struct ramfs_mount *rm, const struct rdwfs_super *sup)
 			if (at + alen > end || xrec.namelen > XATTR_MAXNAMELEN || xrec.size > RAMFS_MAX_XATTR) {
 				return false;
 			}
-			xa = kalloc_type(struct ramfs_xattr, Z_WAITOK | Z_ZERO | Z_NOFAIL);
-			xa->rx_name = kalloc_data(xrec.namelen + 1, Z_WAITOK | Z_NOFAIL);
+			xa = kalloc_type(struct ramfs_xattr, Z_WAITOK | Z_ZERO);
+			if (xa == NULL) {
+				return false;
+			}
+			xa->rx_name = kalloc_data(xrec.namelen + 1, Z_WAITOK);
+			if (xa->rx_name == NULL) {
+				kfree_type(struct ramfs_xattr, xa);
+				return false;
+			}
 			memcpy(xa->rx_name, base + at, xrec.namelen);
 			xa->rx_name[xrec.namelen] = '\0';
 			xa->rx_namelen = xrec.namelen;
 			if (xrec.size > 0) {
-				xa->rx_data = kalloc_data(xrec.size, Z_WAITOK | Z_NOFAIL);
+				xa->rx_data = kalloc_data(xrec.size, Z_WAITOK);
+				if (xa->rx_data == NULL) {
+					kfree_data(xa->rx_name, xrec.namelen + 1);
+					kfree_type(struct ramfs_xattr, xa);
+					return false;
+				}
 				memcpy(xa->rx_data, base + at + xrec.namelen, xrec.size);
 			}
 			xa->rx_size = xrec.size;
@@ -796,8 +897,19 @@ ramfs_disk_restore_panic_log(struct ramfs_mount *rm)
 		nslots *= 2;
 	}
 
-	pages = kalloc_type(void *, nslots, Z_WAITOK | Z_ZERO | Z_NOFAIL);
-	blocks = kalloc_data((size_t)nslots * sizeof(uint32_t), Z_WAITOK | Z_ZERO | Z_NOFAIL);
+	pages = kalloc_type(void *, nslots, Z_WAITOK | Z_ZERO);
+	blocks = kalloc_data((size_t)nslots * sizeof(uint32_t), Z_WAITOK | Z_ZERO);
+	if (pages == NULL || blocks == NULL) {
+		if (pages != NULL) {
+			kfree_type(void *, nslots, pages);
+		}
+		if (blocks != NULL) {
+			kfree_data(blocks, (size_t)nslots * sizeof(uint32_t));
+		}
+		ramfs_vm_free(full_buf, (size_t)total_len);
+		ramfs_vm_free(head_buf, PAGE_SIZE);
+		return;
+	}
 
 	for (uint64_t i = 0; i < npages; i++) {
 		void *p = ramfs_page_alloc(true);
@@ -905,7 +1017,7 @@ static void
 ramfs_disk_mount(struct ramfs_mount *rm)
 {
 	uint64_t part_bytes = 0, avail_bytes, max_blocks;
-	struct rdwfs_super sup0, sup1, win_sup;
+	struct rdwfs_super *sup0 = NULL, *sup1 = NULL, *win_sup = NULL;
 	bool ok0 = false, ok1 = false, loaded = false;
 	uint32_t win_slot = 0;
 
@@ -940,37 +1052,49 @@ ramfs_disk_mount(struct ramfs_mount *rm)
 	rm->rm_bmap_next = part_bytes >= (8ULL << 30) ? (uint32_t)((2048ULL << 20) / PAGE_SIZE) : 1u;
 	rm->rm_disk_loading = true;
 
+	sup0 = kalloc_type(struct rdwfs_super, Z_WAITOK | Z_ZERO);
+	sup1 = kalloc_type(struct rdwfs_super, Z_WAITOK | Z_ZERO);
+	win_sup = kalloc_type(struct rdwfs_super, Z_WAITOK | Z_ZERO);
+	if (sup0 == NULL || sup1 == NULL || win_sup == NULL) {
+		goto out_cleanup_supers;
+	}
+
 	/* Inspect both checkpoint slots and pick the newer valid generation. */
-	if (redwood_ufs_var_io(false, RDWFS_SLOT0_OFFSET, &sup0, sizeof(sup0)) == 0 &&
-	    memcmp(sup0.magic, RDWFS_MAGIC_STR, 8) == 0 && sup0.version == RDWFS_VERSION &&
-	    sup0.page_size == PAGE_SIZE &&
-	    crc32(0, &sup0, __builtin_offsetof(struct rdwfs_super, super_crc)) == sup0.super_crc) {
+	if (redwood_ufs_var_io(false, RDWFS_SLOT0_OFFSET, sup0, sizeof(*sup0)) == 0 &&
+	    memcmp(sup0->magic, RDWFS_MAGIC_STR, 8) == 0 &&
+	    (sup0->version == 1u || sup0->version == RDWFS_VERSION) &&
+	    sup0->node_count >= 1000 &&
+	    sup0->page_size == PAGE_SIZE &&
+	    crc32(0, sup0, __builtin_offsetof(struct rdwfs_super, super_crc)) == sup0->super_crc) {
 		ok0 = true;
 	}
-	if (redwood_ufs_var_io(false, RDWFS_SLOT1_OFFSET, &sup1, sizeof(sup1)) == 0 &&
-	    memcmp(sup1.magic, RDWFS_MAGIC_STR, 8) == 0 && sup1.version == RDWFS_VERSION &&
-	    sup1.page_size == PAGE_SIZE &&
-	    crc32(0, &sup1, __builtin_offsetof(struct rdwfs_super, super_crc)) == sup1.super_crc) {
+	if (redwood_ufs_var_io(false, RDWFS_SLOT1_OFFSET, sup1, sizeof(*sup1)) == 0 &&
+	    memcmp(sup1->magic, RDWFS_MAGIC_STR, 8) == 0 &&
+	    (sup1->version == 1u || sup1->version == RDWFS_VERSION) &&
+	    sup1->node_count >= 1000 &&
+	    sup1->page_size == PAGE_SIZE &&
+	    crc32(0, sup1, __builtin_offsetof(struct rdwfs_super, super_crc)) == sup1->super_crc) {
 		ok1 = true;
 	}
-	if (ok0 && (!ok1 || sup0.generation >= sup1.generation)) {
-		if (ramfs_disk_read_slot(rm, RDWFS_SLOT0_OFFSET, &win_sup)) {
-			loaded = ramfs_disk_unpack(rm, &win_sup);
+	if (ok0 && (!ok1 || sup0->generation >= sup1->generation)) {
+		if (ramfs_disk_read_slot(rm, RDWFS_SLOT0_OFFSET, win_sup)) {
+			loaded = ramfs_disk_unpack(rm, win_sup);
 			win_slot = 0;
-		} else if (ok1 && ramfs_disk_read_slot(rm, RDWFS_SLOT1_OFFSET, &win_sup)) {
-			loaded = ramfs_disk_unpack(rm, &win_sup);
+		} else if (ok1 && ramfs_disk_read_slot(rm, RDWFS_SLOT1_OFFSET, win_sup)) {
+			loaded = ramfs_disk_unpack(rm, win_sup);
 			win_slot = 1;
 		}
 	} else if (ok1) {
-		if (ramfs_disk_read_slot(rm, RDWFS_SLOT1_OFFSET, &win_sup)) {
-			loaded = ramfs_disk_unpack(rm, &win_sup);
+		if (ramfs_disk_read_slot(rm, RDWFS_SLOT1_OFFSET, win_sup)) {
+			loaded = ramfs_disk_unpack(rm, win_sup);
 			win_slot = 1;
-		} else if (ok0 && ramfs_disk_read_slot(rm, RDWFS_SLOT0_OFFSET, &win_sup)) {
-			loaded = ramfs_disk_unpack(rm, &win_sup);
+		} else if (ok0 && ramfs_disk_read_slot(rm, RDWFS_SLOT0_OFFSET, win_sup)) {
+			loaded = ramfs_disk_unpack(rm, win_sup);
 			win_slot = 0;
 		}
 	}
 
+out_cleanup_supers:
 	rm->rm_disk_loading = false;
 	rm->rm_disk_backed = true;
 	rm->rm_meta_call = thread_call_allocate(ramfs_disk_meta_thread, (thread_call_param_t)rm);
@@ -979,12 +1103,25 @@ ramfs_disk_mount(struct ramfs_mount *rm)
 
 	if (loaded) {
 		ramfs_var_disk_loaded = 1;
+		ramfs_var_seed_done = 1;
+		rm->rm_seed_done = true;
 		printf("ramfs: loaded /private/var from disk (slot %u, gen %llu, %llu nodes, %llu pages)\n",
-		    win_slot, win_sup.generation, rm->rm_nodes, rm->rm_pages);
+		    win_slot, win_sup != NULL ? win_sup->generation : 0ULL, rm->rm_nodes, rm->rm_pages);
 	} else {
 		ramfs_var_disk_loaded = 0;
+		ramfs_var_seed_done = 0;
+		rm->rm_seed_done = false;
 		printf("ramfs: /private/var backed by UFS (%llu MB data region, fresh checkpoint)\n",
 		    avail_bytes >> 20);
+	}
+	if (sup0 != NULL) {
+		kfree_type(struct rdwfs_super, 1, sup0);
+	}
+	if (sup1 != NULL) {
+		kfree_type(struct rdwfs_super, 1, sup1);
+	}
+	if (win_sup != NULL) {
+		kfree_type(struct rdwfs_super, 1, win_sup);
 	}
 	ramfs_disk_restore_panic_log(rm);
 }

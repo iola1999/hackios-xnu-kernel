@@ -26,7 +26,7 @@ DEFAULT_CMDLINE = (
     "touch_lat=1 gpu_coherent=1 fb_flip=2 fb_beat=0 fb_hz=120 fb_ca_hz=120 dl_max=1 "
     "touch_poll_us=4000 pcie=10 pcie_power=1 pcie_sleep_clock=board pcie_bdf=bd_p11.elf "
     "pcie_smps_hpm=1 pcie_bt_en=1 pcie_aop_pdc=1 pcie_rddm=1 wifi_mlo=1 "
-    "wifi_mac=02:4b:39:30:00:01 wifi_station=1 ufs=2 ufs_write=1 "
+    "wifi_mac=02:4b:39:30:00:01 wifi_station=1 ufs=2 ufs_native=1 ufs_write=1 "
     "var_store=1 var_save_ms=60000 bt=4 fbwidth=1206 fbheight=2622 fbpitch=460"
 )
 

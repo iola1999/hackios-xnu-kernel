@@ -105,7 +105,7 @@ struct ramfs_mount {
 	struct ramfs_node  *rm_root;
 	uint64_t            rm_next_ino, rm_nodes, rm_pages, rm_max_pages; /* rm_pages: file pages in use */
 	struct ramfs_node **rm_hash;            /* every node by its number, for vfs_vget */
-	bool                rm_disk_backed, rm_disk_loading, rm_meta_dirty, rm_meta_syncing;
+	bool                rm_disk_backed, rm_disk_loading, rm_meta_dirty, rm_meta_syncing, rm_seed_done;
 	uint32_t            rm_bmap_words, rm_bmap_max, rm_bmap_next;
 	uint32_t           *rm_bmap;
 	void               *rm_io_page, *rm_meta_buf, *rm_meta_call;
@@ -535,80 +535,7 @@ ramfs_grow_slots(struct ramfs_node *node, uint64_t index)
 	return 0;
 }
 
-/*
- * Copy len bytes (within one page) into the file at offset off, extending
- * the file if needed. *spare is a zeroed page the caller allocated without
- * the lock; it is consumed if the slot was empty. The mount lock is held.
- */
-static int
-ramfs_store(struct ramfs_node *node, uint64_t off, const void *src, size_t len, void **spare)
-{
-	struct ramfs_mount *rm = node->rn_mount;
-	uint64_t index = off / PAGE_SIZE;
-	int error = ramfs_grow_slots(node, index);
-
-	if (error) {
-		return error;
-	}
-	if (node->rn_pages[index] == NULL) {
-		uint32_t existing_blk = node->rn_blocks != NULL ? node->rn_blocks[index] : 0;
-
-		if (*spare == NULL || (!rm->rm_disk_backed && rm->rm_pages >= rm->rm_max_pages)) {
-			return ENOSPC;
-		}
-		if (existing_blk != 0) {
-			if (len < PAGE_SIZE) {
-				error = ramfs_disk_read_block(rm, existing_blk, *spare);
-				if (error) {
-					return error;
-				}
-			}
-			node->rn_pages[index] = *spare;
-			*spare = NULL;
-			os_atomic_inc(&ramfs_pages_in_use, relaxed);
-		} else {
-			if (rm->rm_disk_backed) {
-				uint32_t dblk = ramfs_disk_bmap_alloc(rm);
-
-				if (dblk == 0) {
-					return ENOSPC;
-				}
-				node->rn_blocks[index] = dblk;
-				os_atomic_inc(&ramfs_var_used_pages, relaxed);
-			}
-			node->rn_pages[index] = *spare;
-			*spare = NULL;
-			node->rn_nalloc++;
-			rm->rm_pages++;
-			os_atomic_inc(&ramfs_pages_in_use, relaxed);
-		}
-	} else if (rm->rm_disk_backed && node->rn_blocks[index] == 0) {
-		uint32_t dblk = ramfs_disk_bmap_alloc(rm);
-
-		if (dblk == 0) {
-			return ENOSPC;
-		}
-		node->rn_blocks[index] = dblk;
-		os_atomic_inc(&ramfs_var_used_pages, relaxed);
-	}
-	memcpy((char *)node->rn_pages[index] + (off & PAGE_MASK), src, len);
-	if (off + len > node->rn_size) {
-		node->rn_size = off + len;
-	}
-	if (rm->rm_disk_backed && node->rn_blocks[index] != 0) {
-		error = ramfs_disk_write_block(rm, node->rn_blocks[index], node->rn_pages[index]);
-		if (error) {
-			return error;
-		}
-		if (os_atomic_load(&ramfs_pages_in_use, relaxed) >= rm->rm_max_pages / 2) {
-			ramfs_page_free(node->rn_pages[index]);
-			node->rn_pages[index] = NULL;
-			os_atomic_dec(&ramfs_pages_in_use, relaxed);
-		}
-		ramfs_disk_dirty_locked(rm);
-	}
-	return 0;
-}
+#include "ramfs_store.inc"
 
 /* Copy len bytes (within one page) out of the file; holes read as zeros. The mount lock is held. */
 static void
@@ -1177,14 +1104,21 @@ ramfs_write(struct vnop_write_args *ap)
 		if (spare == NULL) {
 			spare = ramfs_page_alloc(true);
 		}
+		uint32_t write_dblk = 0;
+		void *write_page = NULL;
+
 		ramfs_reserve_slots(rm, node, off / PAGE_SIZE);
 		lck_mtx_lock(&rm->rm_lock);
-		error = ramfs_store(node, off, bounce, len, &spare);
+		error = ramfs_store(node, off, bounce, len, &spare, &write_dblk, &write_page);
 		lck_mtx_unlock(&rm->rm_lock);
 		if (error) {
 			/* nothing of this piece was stored: hand it back to the caller's count */
 			uio_setoffset(uio, (off_t)off);
 			uio_setresid(uio, uio_resid(uio) + (user_ssize_t)len);
+			break;
+		}
+		error = ramfs_store_write(rm, node, off / PAGE_SIZE, write_dblk, write_page);
+		if (error) {
 			break;
 		}
 	}
@@ -1462,22 +1396,29 @@ ramfs_pageout(struct vnop_pageout_args *ap)
 	}
 	addr += ap->a_pl_offset;
 
-	lck_mtx_lock(&rm->rm_lock);
 	for (upl_size_t done = 0; done < size && off + done < node->rn_size && !error; done += PAGE_SIZE) {
 		size_t len = (size_t)MIN((uint64_t)PAGE_SIZE, node->rn_size - (off + done));
 		uint64_t index = (off + done) / PAGE_SIZE;
+		uint32_t write_dblk = 0;
+		void *write_page = NULL;
 		/* this may be the pageout daemon looking for memory: never wait for more of it here */
 		void *spare = index < node->rn_nslots && node->rn_pages[index] != NULL ? NULL : ramfs_page_alloc(false);
 
-		error = ramfs_store(node, off + done, (const void *)(addr + done), len, &spare);
+		lck_mtx_lock(&rm->rm_lock);
+		error = ramfs_store(node, off + done, (const void *)(addr + done), len, &spare, &write_dblk, &write_page);
+		lck_mtx_unlock(&rm->rm_lock);
 		if (spare != NULL) {
 			ramfs_page_free(spare);
 		}
+		if (!error) {
+			error = ramfs_store_write(rm, node, index, write_dblk, write_page);
+		}
 	}
 	if (!error) {
+		lck_mtx_lock(&rm->rm_lock);
 		ramfs_touch(node, true);
+		lck_mtx_unlock(&rm->rm_lock);
 	}
-	lck_mtx_unlock(&rm->rm_lock);
 	ubc_upl_unmap(upl);
 
 	if (commit) {

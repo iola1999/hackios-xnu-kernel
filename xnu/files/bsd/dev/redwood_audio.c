@@ -356,6 +356,12 @@ redwood_audio_init(void)
 	annibale_buttons_init();
 	annibale_battery_init();
 	annibale_torch_init();
+	extern void annibale_audio_reach_init(void);
+	extern void annibale_camera_init(void);
+	extern void annibale_iris_init(void);
+	annibale_audio_reach_init();
+	annibale_camera_init();
+	annibale_iris_init();
 	mhi_pcie_init();
 	adreno8_init();                   /* boot-arg adreno8=N: the Adreno 830's stepper, on this phone (bsd/dev/adreno8.c) */
 	redwood_outbox_init();            /* boot-arg outbox_mb=N: memory in one piece for kern.redwood.outbox (redwood_threads.c) */

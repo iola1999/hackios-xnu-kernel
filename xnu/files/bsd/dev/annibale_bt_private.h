@@ -27,6 +27,7 @@ uint32_t annibale_bt_uart_get_baud(void);
 bool annibale_bt_uart_write(const uint8_t *data, uint32_t length);
 /* the RX FIFO into the receive buffer, whole words while there is room; how many bytes came */
 uint32_t annibale_bt_uart_poll(void);
+void annibale_bt_uart_irq_clear(void);
 /* the received bytes nobody has taken yet, oldest first; valid until the next poll or take */
 const uint8_t *annibale_bt_uart_rx(uint32_t *length);
 void annibale_bt_uart_take(uint32_t length);
@@ -39,5 +40,7 @@ bool annibale_bt_hci_set_baudrate(uint32_t baud);
 /* bt=4 (annibale_bt_ios.c): /dev/uart.bluetooth, com.apple.uart.sk.bluetooth and the Skywalk nexus for bluetoothd */
 void annibale_bt_ios_early(void);
 void annibale_bt_ios_serve(const uint8_t addr[6]);
+void annibale_bt_uart_isr(void *ctx, uint32_t intid);
 
 #endif
+

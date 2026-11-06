@@ -285,7 +285,7 @@ rw_air_cache_key(id library, NSString *name, NSString *specialized, id constantV
 	const char *lib_str = [lib_id UTF8String];
 	if (lib_str) CC_SHA256_Update(&ctx, lib_str, strlen(lib_str));
 
-	uint8_t sep = 0x1f;
+	uint8_t sep = 0;
 	CC_SHA256_Update(&ctx, &sep, 1);
 
 	const char *fn_str = [name UTF8String];
@@ -334,7 +334,7 @@ rw_air_cache_lookup(NSString *key)
 	if (data != nil)
 		return data;
 
-	NSString *path = [NSString stringWithFormat:@"%s/%@.bc", RW_AIR_CACHE_DIR, key];
+	NSString *path = [NSString stringWithFormat:@"%s/%@.air", RW_AIR_CACHE_DIR, key];
 	data = [NSData dataWithContentsOfFile:path options:0 error:nil];
 	if (data != nil && [data length] > 0) {
 		[rw_air_memcache setObject:data forKey:key];
@@ -352,7 +352,7 @@ rw_air_cache_store(NSString *key, NSData *bitcode)
 
 	[rw_air_memcache setObject:bitcode forKey:key];
 
-	NSString *path = [NSString stringWithFormat:@"%s/%@.bc", RW_AIR_CACHE_DIR, key];
+	NSString *path = [NSString stringWithFormat:@"%s/%@.air", RW_AIR_CACHE_DIR, key];
 	mkdir(RW_AIR_CACHE_DIR, 0777);
 	NSError *err = nil;
 	[bitcode writeToFile:path options:NSDataWritingAtomic error:&err];

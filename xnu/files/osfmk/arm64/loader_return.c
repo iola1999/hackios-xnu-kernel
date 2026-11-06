@@ -51,6 +51,7 @@ extern void gic_v3_irq_cpu_shutdown(void);
 
 void loader_log_putc(char c);
 void loader_return(void);
+void hv_wdt_pet_NOW(void);
 extern void redwood_adreno_quiesce(void);
 extern void redwood_adreno_stop(void);
 extern void redwood_adreno_minute(void);
@@ -90,6 +91,29 @@ struct klog_head {
 	uint8_t  reserved[24];
 };
 _Static_assert(sizeof(struct klog_head) == 64, "klog_head must be 64 bytes");
+
+struct loader_live {
+	uint64_t magic;                 /* "XNULIVE!" */
+	uint64_t heartbeat;             /* goes up every HV_WDT_PET_SECONDS while the kernel is alive */
+	const char *log;                /* loader_log */
+	const uint32_t *log_len;        /* how much of it is in use */
+	const uint32_t *log_ring_at;    /* where the ring part is being written */
+	const bool *log_wrapped;        /* the ring has gone round */
+	uint64_t log_head, log_ring;    /* sizes of the two parts */
+	const uint64_t *recording;      /* loader_recording: { physical address, length } of a screen recording */
+	volatile uint64_t stop;         /* the loader's to write: the host has asked for the run to end */
+	uint64_t magic2;                /* "XNULIVE2": what follows is there (a loader may meet an older kernel) */
+	const uint64_t *sound;          /* loader_sound: the same for a recording of the sound */
+	uint64_t magic3;                /* "XNULIVE3": the command mailbox follows */
+	volatile uint64_t cmd_seq;      /* the loader's to write, after cmd: a new command is in cmd */
+	volatile char cmd[120];         /* the loader's to write: "oem sh TEXT" from the host, NUL-terminated */
+	uint64_t magic4;                /* "XNULIVE4": the inbox follows */
+	char *inbox;                    /* where the loader puts a file the host pushes ("oem push") */
+	uint64_t inbox_size;            /* how many bytes it holds */
+	volatile uint64_t inbox_len;    /* the loader's to write: the length of the last file */
+	volatile uint64_t inbox_seq;    /* the loader's to write, after the file and inbox_len */
+};
+extern struct loader_live loader_live;
 
 void loader_panic_sync_ufs(const char *reason, uint32_t flags);
 
@@ -349,27 +373,6 @@ extern uint64_t loader_stub_slot[4];
  * it has loaded. The addresses are the kernel's virtual ones, filled in by the linker and so
  * valid from the first instruction; the loader knows the distance to the physical ones.
  */
-struct loader_live {
-	uint64_t magic;                 /* "XNULIVE!" */
-	uint64_t heartbeat;             /* goes up every HV_WDT_PET_SECONDS while the kernel is alive */
-	const char *log;                /* loader_log */
-	const uint32_t *log_len;        /* how much of it is in use */
-	const uint32_t *log_ring_at;    /* where the ring part is being written */
-	const bool *log_wrapped;        /* the ring has gone round */
-	uint64_t log_head, log_ring;    /* sizes of the two parts */
-	const uint64_t *recording;      /* loader_recording: { physical address, length } of a screen recording */
-	volatile uint64_t stop;         /* the loader's to write: the host has asked for the run to end */
-	uint64_t magic2;                /* "XNULIVE2": what follows is there (a loader may meet an older kernel) */
-	const uint64_t *sound;          /* loader_sound: the same for a recording of the sound */
-	uint64_t magic3;                /* "XNULIVE3": the command mailbox follows */
-	volatile uint64_t cmd_seq;      /* the loader's to write, after cmd: a new command is in cmd */
-	volatile char cmd[120];         /* the loader's to write: "oem sh TEXT" from the host, NUL-terminated */
-	uint64_t magic4;                /* "XNULIVE4": the inbox follows */
-	char *inbox;                    /* where the loader puts a file the host pushes ("oem push") */
-	uint64_t inbox_size;            /* how many bytes it holds */
-	volatile uint64_t inbox_len;    /* the loader's to write: the length of the last file */
-	volatile uint64_t inbox_seq;    /* the loader's to write, after the file and inbox_len */
-};
 
 /* The inbox: a file from the host while the kernel runs, for rwsh "pull" (kern.redwood.inbox), so a
  * library can be replaced without a new image. In the kernel image so its memory is contiguous and
@@ -626,6 +629,7 @@ loader_return(void)
 	redwood_mic_quiesce();          /* (what the microphones' path did, said again: it happens in the log's middle) */
 	MiniIOMobileFramebufferQuiesce();       /* the display back on the boot framebuffer, the last frame in it (fb_flip) */
 
+	hv_wdt_pet_NOW();
 	loader_jump(0, 0);
 }
 
@@ -800,6 +804,18 @@ memory_report(void)
 	redwood_adreno_minute();                /* (and how warm the GPU is, if it is in use) */
 }
 
+void
+hv_wdt_pet_NOW(void)
+{
+	register uint64_t x0 __asm__("x0") = VIRT_WDT_PET;
+	register uint64_t x1 __asm__("x1") = 0;
+	register uint64_t x2 __asm__("x2") = 0;
+	register uint64_t x3 __asm__("x3") = 0;
+
+	__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3) : :
+	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17");
+}
+
 /* Every HV_WDT_PET_SECONDS: feed the watchdog if there is one, and show any watching loader a sign of life. */
 static void
 hv_wdt_pet(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
@@ -811,13 +827,7 @@ hv_wdt_pet(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 	}
 
 	if (hv_wdt_enabled) {
-		register uint64_t x0 __asm__("x0") = VIRT_WDT_PET;
-		register uint64_t x1 __asm__("x1") = 0;
-		register uint64_t x2 __asm__("x2") = 0;
-		register uint64_t x3 __asm__("x3") = 0;
-
-		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3) : :
-		    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17");
+		hv_wdt_pet_NOW();
 	}
 	if (++loader_live.heartbeat % MEMORY_REPORT_BEATS == 0) {
 		memory_report();

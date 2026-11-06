@@ -251,6 +251,7 @@ static struct {
 /* Which fingers were down in the last report, and where. */
 static struct {
 	bool down, seen;
+	uint32_t missed;
 	uint32_t x, y;
 } contact[GOODIX_MAX_TOUCHES];
 static uint32_t flip;           /* boot-arg touch_flip: 1 = mirror left-right, 2 = mirror top-bottom */
@@ -287,6 +288,7 @@ goodix_report(const uint8_t *touches, uint32_t count)
 			y = 65535 - y;
 		}
 		contact[id].seen = true;
+		contact[id].missed = 0;
 		if (!contact[id].down) {
 			redwood_touch_post(REDWOOD_TOUCH_DOWN, id, x, y);
 		} else if (contact[id].x != x || contact[id].y != y) {
@@ -296,11 +298,14 @@ goodix_report(const uint8_t *touches, uint32_t count)
 		contact[id].x = x;
 		contact[id].y = y;
 	}
-	/* a finger that is no longer in the report has lifted */
+	/* a finger that is no longer in the report has lifted; missed >= 2 triggers UP */
 	for (uint32_t id = 0; id < GOODIX_MAX_TOUCHES; id++) {
 		if (contact[id].down && !contact[id].seen) {
-			contact[id].down = false;
-			redwood_touch_post(REDWOOD_TOUCH_UP, id, contact[id].x, contact[id].y);
+			if (++contact[id].missed >= 2) {
+				contact[id].down = false;
+				contact[id].missed = 0;
+				redwood_touch_post(REDWOOD_TOUCH_UP, id, contact[id].x, contact[id].y);
+			}
 		}
 	}
 }
@@ -628,11 +633,10 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 	for (unsigned tick = 1;; tick++) {
 		uint64_t looked = micros_now(), read_at;
 
-		/* the interrupt line is low while a report waits, or an edge was latched since the last look;
-		 * or a finger is down on the glass: poll every round unconditionally so liftoff is caught at once.
-		 * look anyway every 16 ms in case edges are missed. */
-		bool touching = chip_touching();
-		bool waiting = touching || !gpio_get(PIN_INT);
+		/* the interrupt line is low while a report waits, or an edge was latched since the last look.
+		 * do not blindly read SPI on touching==true every 4ms; read only when !gpio_get(PIN_INT)
+		 * or interrupt status is set, falling back to idle_looks (16ms). */
+		bool waiting = !gpio_get(PIN_INT);
 
 		if (int_latched && (rd(GPIO_INTR_STATUS(PIN_INT)) & 1)) {
 			wr(GPIO_INTR_STATUS(PIN_INT), 0);       /* before the read, so an edge during it is kept */

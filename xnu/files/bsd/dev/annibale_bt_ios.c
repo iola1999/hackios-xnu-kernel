@@ -11,7 +11,9 @@
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
+#include <kern/sched_prim.h>
 #include <kern/thread.h>
+#include <kern/thread_call.h>
 #include <libkern/libkern.h>
 #include <miscfs/devfs/devfs.h>
 #include <pexpert/pexpert.h>
@@ -28,6 +30,7 @@
 #include <sys/uio.h>
 #include <sys/vnode.h>
 
+#include <os/atomic_private.h>
 #include "annibale_bt_private.h"
 
 extern void RedwoodBTStart(const char *bsdname, const uint8_t *address);
@@ -46,6 +49,7 @@ static lck_mtx_t *bt_ring_lock;
 static struct selinfo bt_sel;
 static int bt_serving;
 static bool bt_ibs_asleep;
+static volatile uint32_t bt_irq_event;
 
 SYSCTL_INT(_kern_redwood, OID_AUTO, bt_ready, CTLFLAG_RD | CTLFLAG_LOCKED, &bt_serving, 0,
     "whether the WCN7850 Bluetooth firmware and reset are ready");
@@ -670,6 +674,88 @@ bt_answer_vendor(const uint8_t *packet, uint32_t n)
 			return false;
 		}
 	}
+	if (packet[1] == 0x48 && packet[2] == 0xfc) {
+		uint32_t old_baud = annibale_bt_uart_get_baud();
+		uint32_t req_baud = (n > 4 && packet[4] == 0x0e) ? 3000000u : 115200u;
+		bool chip_acked = false;
+
+		bt_say("bt: baud transition: sending vendor command 0xFC48 (param %#x for %u baud, current %u)\n",
+		    n > 4 ? packet[4] : 0, req_baud, old_baud);
+
+		/* 1. 向物理芯片下发指令并检查返回值 */
+		if (!bt_uart_send_locked(packet, n)) {
+			bt_say("bt: stop: failed to transmit 0xFC48 command to chip\n");
+			const uint8_t ev_err[7] = { 0x04, 0x0e, 0x04, 0x01, 0x48, 0xfc, 0x12 };
+			lck_mtx_lock(bt_ring_lock);
+			for (unsigned i = 0; i < sizeof(ev_err); i++) {
+				bt_ring_put_byte(ev_err[i]);
+			}
+			wakeup(&bt_ring_in);
+			lck_mtx_unlock(bt_ring_lock);
+			selwakeup(&bt_sel);
+			return false;
+		}
+
+		/* 2. 等待芯片以当前波特率回复 Command Complete 事件（最多等待 200 ms） */
+		for (int t = 0; t < 200; t++) {
+			delay_for_interval(1, NSEC_PER_MSEC);
+			lck_mtx_lock(bt_ring_lock);
+			bt_ring_fill();
+			if (bt_ring_used() >= 7) {
+				for (uint32_t pos = bt_ring_out; pos + 7 <= bt_ring_in; pos++) {
+					if (bt_ring[pos % BT_RING] == 0x04 &&
+					    bt_ring[(pos + 1) % BT_RING] == 0x0e &&
+					    bt_ring[(pos + 4) % BT_RING] == 0x48 &&
+					    bt_ring[(pos + 5) % BT_RING] == 0xfc) {
+						chip_acked = (bt_ring[(pos + 6) % BT_RING] == 0x00);
+						break;
+					}
+				}
+			}
+			lck_mtx_unlock(bt_ring_lock);
+			if (chip_acked) {
+				break;
+			}
+		}
+
+		if (!chip_acked) {
+			bt_say("bt: stop: WCN7850 chip did not acknowledge 0xFC48, aborting baud transition\n");
+			const uint8_t ev_fail[7] = { 0x04, 0x0e, 0x04, 0x01, 0x48, 0xfc, 0x1f };
+			lck_mtx_lock(bt_ring_lock);
+			for (unsigned i = 0; i < sizeof(ev_fail); i++) {
+				bt_ring_put_byte(ev_fail[i]);
+			}
+			wakeup(&bt_ring_in);
+			lck_mtx_unlock(bt_ring_lock);
+			selwakeup(&bt_sel);
+			return false;
+		}
+
+		/* 3. 延时 10 ms 待物理总线稳定 */
+		delay_for_interval(10, NSEC_PER_MSEC);
+
+		/* 4. 切换主机串口时钟，失败时执行降级回滚 */
+		if (!annibale_bt_uart_set_baud(req_baud)) {
+			bt_say("bt: stop: host UART switch to %u failed; performing rollback to %u baud\n", req_baud, old_baud);
+			(void)annibale_bt_uart_set_baud(old_baud ? old_baud : 115200u);
+			return false;
+		}
+
+		delay_for_interval(10, NSEC_PER_MSEC);
+		bt_say("bt: baud transition to %u completed successfully\n", req_baud);
+
+		/* 5. 唤醒上层处理协议栈 */
+		lck_mtx_lock(bt_ring_lock);
+		if (bt_ring_used() != 0 && (btsk_up || bt_kctl_up)) {
+			lck_mtx_unlock(bt_ring_lock);
+			btsk_kick();
+			lck_mtx_lock(bt_ring_lock);
+		}
+		wakeup(&bt_ring_in);
+		lck_mtx_unlock(bt_ring_lock);
+		selwakeup(&bt_sel);
+		return true;
+	}
 	lck_mtx_lock(bt_ring_lock);
 	{
 		bool vendor = (packet[2] & 0xfc) == 0xfc;
@@ -718,12 +804,6 @@ bt_answer_vendor(const uint8_t *packet, uint32_t n)
 	wakeup(&bt_ring_in);
 	lck_mtx_unlock(bt_ring_lock);
 	selwakeup(&bt_sel);
-	if (packet[1] == 0x48 && packet[2] == 0xfc) {
-		uint32_t req_baud = (n > 4 && packet[4] == 0x0e) ? 3000000u : 115200u;
-		bt_say("bt: iOS requested baud rate switch via 0xFC48: %u baud (param %#x)\n",
-		    req_baud, n > 4 ? packet[4] : 0);
-		(void)annibale_bt_uart_set_baud(req_baud);
-	}
 	if (bt_vsc_answered++ < 120) {
 		bt_say("bt: iOS's command %#06x (%u bytes of parameters) answered here, not sent\n",
 		    packet[1] | packet[2] << 8, packet[3]);
@@ -731,12 +811,32 @@ bt_answer_vendor(const uint8_t *packet, uint32_t n)
 	return true;
 }
 
+void
+annibale_bt_uart_isr(void *ctx __unused, uint32_t intid)
+{
+	/* 1. 屏蔽 GIC 电平中断，防止工作线程运行期间产生中断风暴 */
+	extern void gic_v3_spi_mask(uint32_t intid);
+	gic_v3_spi_mask(intid);
+
+	/* 2. 清除 GENI 硬件中断状态位 */
+	annibale_bt_uart_irq_clear();
+
+	/* 3. 中断安全地唤醒工作线程，严禁获取睡眠互斥锁 */
+	os_atomic_inc(&bt_irq_event, relaxed);
+	thread_wakeup((event_t)&bt_irq_event);
+}
+
 __dead2
 static void
 bt_pump_thread(void *arg __unused, wait_result_t w __unused)
 {
+	extern void gic_v3_spi_unmask(uint32_t intid);
 	for (;;) {
 		bool woke = false;
+
+		/* 等待中断唤醒或 20 ms 保底超时轮询 */
+		assert_wait_timeout((event_t)&bt_irq_event, THREAD_INTERRUPTIBLE, 20, NSEC_PER_MSEC);
+		thread_block(THREAD_CONTINUE_NULL);
 
 		lck_mtx_lock(bt_ring_lock);
 		bt_ring_fill();
@@ -753,7 +853,9 @@ bt_pump_thread(void *arg __unused, wait_result_t w __unused)
 		if (woke) {
 			selwakeup(&bt_sel);
 		}
-		ms(2);
+
+		/* 处理完毕后重新使能 GIC 电平中断 */
+		gic_v3_spi_unmask(32u + 0x1cdu);
 	}
 }
 

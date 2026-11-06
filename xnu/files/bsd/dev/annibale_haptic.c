@@ -55,6 +55,7 @@
 #include <pexpert/pexpert.h>
 #include <miscfs/devfs/devfs.h>
 #include <sys/conf.h>
+#include <sys/redwood_audio.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
 
@@ -144,9 +145,6 @@ found_ppid(uint16_t ppid)
 	return false;
 }
 
-static LCK_GRP_DECLARE(spmi_lck_grp, "hv-haptic-spmi");
-static LCK_SPIN_DECLARE(spmi_lock, &spmi_lck_grp);
-
 /*
  * One transfer at a time through the arbiter (Linux holds one lock for the bus as well): a read goes
  * through the read window and is answered in it, a write through the write window, the address being
@@ -156,7 +154,7 @@ static const char *
 spmi_read16(uint16_t ppid, uint16_t addr, uint8_t *bytes, uint32_t count)
 {
 	vm_offset_t channel;
-	uint64_t start = mach_absolute_time(), now, interval;
+	uint64_t start, now, interval;
 	uint32_t status = 0, data[2] = { 0, 0 };
 	const char *problem = NULL;
 	int apid = -1;
@@ -171,8 +169,15 @@ spmi_read16(uint16_t ppid, uint16_t addr, uint8_t *bytes, uint32_t count)
 	}
 	nanoseconds_to_absolutetime(TRANSACT_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
 	channel = arb_obsrvr + 0x8000UL * ARB_SYSTEM + 0x20UL * (uint32_t)apid;
-	lck_spin_lock(&spmi_lock);
+
+	annibale_spmi_lock();
+	start = mach_absolute_time();
+	while ((rd(channel + CH_STATUS) & (STATUS_DONE | STATUS_DROPPED | STATUS_FAILURE | STATUS_DENIED)) == 0 &&
+	       rd(channel + CH_STATUS) != 0 && mach_absolute_time() - start < interval) {
+		spin_us(1);
+	}
 	wr(channel + CH_CMD, CMD_OPC(count > 4 ? OPC_EXT_READL : OPC_EXT_READ) | CMD_REG(addr & 0xff) | (count - 1));
+	start = mach_absolute_time();
 	do {
 		status = rd(channel + CH_STATUS);
 		now = mach_absolute_time();
@@ -181,7 +186,7 @@ spmi_read16(uint16_t ppid, uint16_t addr, uint8_t *bytes, uint32_t count)
 		data[0] = rd(channel + CH_RDATA0);
 		data[1] = count > 4 ? rd(channel + CH_RDATA1) : 0;
 	}
-	lck_spin_unlock(&spmi_lock);
+	annibale_spmi_unlock();
 
 	if (!(status & STATUS_DONE)) {
 		problem = "no answer from the arbiter";
@@ -203,7 +208,7 @@ static const char *
 spmi_write16(uint16_t ppid, uint16_t addr, const uint8_t *bytes, uint32_t count)
 {
 	vm_offset_t channel;
-	uint64_t start = mach_absolute_time(), now, interval;
+	uint64_t start, now, interval;
 	uint32_t status = 0;
 	const char *problem = NULL;
 	int apid = -1;
@@ -237,18 +242,25 @@ spmi_write16(uint16_t ppid, uint16_t addr, const uint8_t *bytes, uint32_t count)
 			w1 |= (uint32_t)bytes[i] << (8 * (i - 4));
 		}
 	}
-	lck_spin_lock(&spmi_lock);
+
+	annibale_spmi_lock();
+	start = mach_absolute_time();
+	while ((rd(channel + CH_STATUS) & (STATUS_DONE | STATUS_DROPPED | STATUS_FAILURE | STATUS_DENIED)) == 0 &&
+	       rd(channel + CH_STATUS) != 0 && mach_absolute_time() - start < interval) {
+		spin_us(1);
+	}
 	wr(channel + CH_WDATA0, w0);
 	if (count > 4) {
 		wr(channel + CH_WDATA1, w1);
 	}
 	/* Extended Register Write Long for every write: the short form left annibale_torch.c's register unchanged */
 	wr(channel + CH_CMD, CMD_OPC(OPC_EXT_WRITEL) | CMD_REG(addr & 0xff) | (count - 1));
+	start = mach_absolute_time();
 	do {
 		status = rd(channel + CH_STATUS);
 		now = mach_absolute_time();
 	} while (!(status & STATUS_DONE) && now - start < interval);
-	lck_spin_unlock(&spmi_lock);
+	annibale_spmi_unlock();
 
 	if (!(status & STATUS_DONE)) {
 		problem = "no answer from the arbiter";
@@ -342,7 +354,21 @@ find_peripherals(void)
 			pbuf[i].channel = ml_io_map(ARB_CHNLS_PHYS + ARB_CHANNEL_SIZE * pbuf[i].apid, ARB_CHANNEL_SIZE);
 		}
 	}
-	return pbuf[0].found && pbuf[1].found;
+	if (!pbuf[0].found || !pbuf[1].found || !pbuf[2].found) {
+		say("haptic: missing peripherals: driver=%d pattern=%d boost=%d\n",
+		    pbuf[0].found, pbuf[1].found, pbuf[2].found);
+		return false;
+	}
+	if (!pbuf[0].ours || !pbuf[1].ours || !pbuf[2].ours) {
+		say("haptic: peripherals not owned by APPS: driver=%d pattern=%d boost=%d\n",
+		    pbuf[0].ours, pbuf[1].ours, pbuf[2].ours);
+		return false;
+	}
+	if (pbuf[0].channel == 0 || pbuf[1].channel == 0 || pbuf[2].channel == 0) {
+		say("haptic: failed to map write channels for haptics peripherals\n");
+		return false;
+	}
+	return true;
 }
 
 static void
@@ -357,8 +383,15 @@ show_state(const char *why)
 	if (hap_read(HAP_PATTERN, HAP_PTN_REVISION, rev, 2)) {
 		say("haptic:   the pattern engine's revision %#02x.%#02x\n", rev[1], rev[0]);
 	}
-	if (found_ppid(HAP_BOOST) && hap_read(HAP_BOOST, 0, rev, 2)) {
-		say("haptic:   the boost's revision %#02x.%#02x\n", rev[1], rev[0]);
+	if (found_ppid(HAP_BOOST)) {
+		uint8_t bstatus = 0;
+
+		if (hap_read(HAP_BOOST, 0, rev, 2)) {
+			say("haptic:   the boost's revision %#02x.%#02x\n", rev[1], rev[0]);
+		}
+		if (hap_read(HAP_BOOST, HAP_BOOST_STATUS, &bstatus, 1)) {
+			say("haptic:   boost status %#02x\n", bstatus);
+		}
 	}
 	hap_read(HAP_DRIVER, HAP_CFG_FAULT_STATUS, &fault, 1);
 	hap_read(HAP_DRIVER, HAP_CFG_INT_RT_STS, &rt, 1);
@@ -370,6 +403,33 @@ show_state(const char *why)
 	if (fault != 0) {
 		say("haptic:   (a fault is set: under-voltage, over-current, over-temperature, or the boost's -- see the vendor's bits at 0x0c)\n");
 	}
+}
+
+static bool
+boost_enable(bool enable)
+{
+	uint8_t value = enable ? HAP_BOOST_EN : 0;
+
+	if (!pbuf[2].found || !pbuf[2].ours) {
+		say("haptic: boost converter peripheral not accessible\n");
+		return false;
+	}
+	if (!hap_put(HAP_BOOST, HAP_BOOST_EN_CTL, value, false)) {
+		say("haptic: failed to %s boost converter\n", enable ? "enable" : "disable");
+		return false;
+	}
+	if (enable) {
+		uint8_t bstatus = 0;
+
+		for (int i = 0; i < 20; i++) {
+			wait_ms(1);
+			if (hap_read(HAP_BOOST, HAP_BOOST_STATUS, &bstatus, 1) && (bstatus & 0x80)) {
+				break;
+			}
+		}
+		say("haptic: boost converter ready, status %#02x\n", bstatus);
+	}
+	return true;
 }
 
 static bool
@@ -394,14 +454,23 @@ configure(void)
 	uint8_t two[2], eight[8], clear = HAP_FAULT_CLR_ALL, fault = 0;
 
 	written = true;
+	if (!boost_enable(true)) {
+		return false;
+	}
 	if (!module_enable(true)) {
 		return false;
 	}
+	wait_ms(2);
 	/* FAULT_CLR is a command whose bits clear themselves (it reads 0): the fault status tells instead */
 	if (spmi_write16(HAP_DRIVER, HAP_CFG_FAULT_CLR, &clear, 1) != NULL || !hap_read(HAP_DRIVER, HAP_CFG_FAULT_STATUS, &fault, 1)) {
 		say("haptic: clearing the faults did not go through\n");
 		broken = true;
 		return false;
+	}
+	if (fault != 0) {
+		wait_ms(2);
+		spmi_write16(HAP_DRIVER, HAP_CFG_FAULT_CLR, &clear, 1);
+		hap_read(HAP_DRIVER, HAP_CFG_FAULT_STATUS, &fault, 1);
 	}
 	if (fault != 0) {
 		say("haptic: the fault status is %#04x after clearing\n", fault);
@@ -431,8 +500,8 @@ configure(void)
 		return false;
 	}
 	configured = true;
-	say("haptic: the driver is configured: %u mV, %u us period, brake ff 3f 1f, sine waveforms, module enabled\n", VMAX_MV,
-	    LRA_PERIOD_US);
+	say("haptic: the driver and boost converter are configured: %u mV, %u us period, brake ff 3f 1f, sine waveforms, module enabled\n",
+	    VMAX_MV, LRA_PERIOD_US);
 	return true;
 }
 
@@ -700,10 +769,11 @@ haptic_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 done:
 	if (written) {
-		static const uint8_t stop_play = HAP_SRC_DIRECT, module_off = 0;
+		static const uint8_t stop_play = HAP_SRC_DIRECT, module_off = 0, boost_off = 0;
 
 		(void)spmi_write16(HAP_DRIVER, HAP_CFG_SPMI_PLAY, &stop_play, 1);
 		(void)spmi_write16(HAP_DRIVER, HAP_CFG_EN_CTL, &module_off, 1);
+		(void)spmi_write16(HAP_BOOST, HAP_BOOST_EN_CTL, &boost_off, 1);
 	}
 	say("haptic: done\n");
 	thread_terminate(current_thread());
@@ -734,14 +804,15 @@ void
 annibale_haptic_quiesce(void)
 {
 	if (written) {
-		static const uint8_t stop_play = HAP_SRC_DIRECT, module_off = 0;
+		static const uint8_t stop_play = HAP_SRC_DIRECT, module_off = 0, boost_off = 0;
 
 		leaving = true;
 		(void)spmi_write16(HAP_DRIVER, HAP_CFG_SPMI_PLAY, &stop_play, 1);
 		(void)spmi_write16(HAP_DRIVER, HAP_CFG_EN_CTL, &module_off, 1);
+		(void)spmi_write16(HAP_BOOST, HAP_BOOST_EN_CTL, &boost_off, 1);
 		if (level == 4) {
 			say("haptic: at the run's end: %u taps and %u vibrations played (%u cut at %u ms), from %llu frames iOS wrote; "
-			    "the driver module is disabled\n", taps, loops, capped, HAPTIC_MAX_MS, written_frames);
+			    "the driver module and boost converter are disabled\n", taps, loops, capped, HAPTIC_MAX_MS, written_frames);
 		}
 	}
 }

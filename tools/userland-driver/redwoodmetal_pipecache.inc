@@ -48,7 +48,8 @@ rw_pipe_add_bytes(CC_SHA256_CTX *ctx, const void *bytes, size_t length)
 static void
 rw_pipe_key(unsigned char key[CC_SHA256_DIGEST_LENGTH], NSData *vertex_air,
 	    const char *vertex_name, NSData *fragment_air, const char *fragment_name,
-	    const struct rwa_render_shape *shape)
+	    const struct rwa_render_shape *shape,
+	    const struct rwa_linked_function *linked, unsigned num_linked)
 {
 	CC_SHA256_CTX ctx;
 
@@ -58,6 +59,18 @@ rw_pipe_key(unsigned char key[CC_SHA256_DIGEST_LENGTH], NSData *vertex_air,
 	rw_pipe_add_bytes(&ctx, [fragment_air bytes], [fragment_air length]);
 	rw_pipe_add_bytes(&ctx, fragment_name, fragment_name != NULL ? strlen(fragment_name) : 0);
 	rw_pipe_add_bytes(&ctx, shape, sizeof(*shape));
+	rw_pipe_add_bytes(&ctx, &num_linked, sizeof(num_linked));
+	for (unsigned i = 0; i < num_linked; i++) {
+		rw_pipe_add_bytes(&ctx, linked[i].name, linked[i].name ? strlen(linked[i].name) : 0);
+		rw_pipe_add_bytes(&ctx, &linked[i].output, sizeof(linked[i].output));
+		rw_pipe_add_bytes(&ctx, &linked[i].num_nodes, sizeof(linked[i].num_nodes));
+		for (unsigned j = 0; j < linked[i].num_nodes; j++) {
+			rw_pipe_add_bytes(&ctx, linked[i].nodes[j].bitcode, linked[i].nodes[j].size);
+			rw_pipe_add_bytes(&ctx, linked[i].nodes[j].function,
+					  linked[i].nodes[j].function ? strlen(linked[i].nodes[j].function) : 0);
+			rw_pipe_add_bytes(&ctx, &linked[i].nodes[j].num_args, sizeof(linked[i].nodes[j].num_args));
+		}
+	}
 	CC_SHA256_Final(key, &ctx);
 }
 

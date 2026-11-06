@@ -428,6 +428,9 @@ dcs_test(void)
 		return;
 	}
 	dcs.state = gDcs >= 4 ? DCS_READY : DCS_OFF;
+	if (gDcs >= 4) {
+		dcs_write(0xae4, true);
+	}
 	IOLog("MiniIOMobileFramebuffer: dcs: %s\n", gDcs >= 4 ? "brightness goes to the panel" : "tests done, nothing more sent");
 }
 

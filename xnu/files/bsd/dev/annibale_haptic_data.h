@@ -75,13 +75,20 @@
 #define HAP_SRC_DIRECT          1                       /* the pattern engine's DIRECT_PLAY amplitude */
 #define HAP_CFG_BRAKE_MODE      0xf050                  /* [7:6] brake mode (1 = closed loop), [3:2] sine gain, [1:0] brake shape */
 #define HAP_CFG_TLRA_HIGH       0xf05c                  /* the motor's period, two bytes big-endian, steps of 5 us */
-#define HAP_CFG_FAULT_CLR       0xf066                  /* bits 2, 1, 0: clear short circuit, auto-res error, hpwr */
-#define HAP_FAULT_CLR_ALL       0x07
+#define HAP_CFG_FAULT_CLR       0xf066                  /* bits 4, 2, 1, 0: clear boost UVLO, short circuit, auto-res error, hpwr */
+#define HAP_FAULT_BOOST_UVLO    (1u << 4)
+#define HAP_FAULT_CLR_ALL       0x1f
 
 #define HAP_PTN_REVISION        0xf100
 #define HAP_PTN_FIFO_READY      0xf108
 #define HAP_PTN_DIRECT_PLAY     0xf126                  /* the amplitude the motor is driven at, 0..255 */
 #define HAP_PTN_BRAKE_SAMPLES   0xf170                  /* eight steps, the device tree's ff 3f 1f padded with 0 */
+
+/* ---- the boost regulator block (HAP_BOOST): PMIH010X function 0xf2 -------------------------------- */
+#define HAP_BOOST_REVISION      0xf200
+#define HAP_BOOST_STATUS        0xf208                  /* bit 7: boost ready / VREG_OK */
+#define HAP_BOOST_EN_CTL        0xf246                  /* bit 7: the module's enable */
+#define HAP_BOOST_EN            (1u << 7)
 
 #define LRA_PERIOD_US           5714                    /* the device tree's lra-period-us 0x1652 */
 #define VMAX_MV                 1300                    /* its vmax-mv 0x514, of 50 mV steps */

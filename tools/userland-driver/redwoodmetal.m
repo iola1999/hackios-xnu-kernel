@@ -1586,11 +1586,9 @@ struct gem_close { uint32_t handle, pad; };
 	    ? rw_linked_fragment_functions(descriptor, linked, RW_LINKED_MAX, linked_scratch) : 0;
 	const char *vertex_name = vertex != nil ? [[vertex name] UTF8String] : NULL;
 	struct rwa_render *render = NULL;
-	if (num_linked == 0) {
-		rw_pipe_key(key, vertex_air, vertex_name, fragment_air, fragment != nil ? fragment_name : NULL,
-			    &shape);
-		render = rw_pipe_find(_mesa, key, &info);
-	}
+	rw_pipe_key(key, vertex_air, vertex_name, fragment_air, fragment != nil ? fragment_name : NULL,
+		    &shape, linked, num_linked);
+	render = rw_pipe_find(_mesa, key, &info);
 	bool reused = render != NULL;
 	if (!reused) {
 		render = mesa.render_create_linked != NULL
@@ -1600,7 +1598,7 @@ struct gem_close { uint32_t handle, pad; };
 		    : mesa.render_create(_mesa, [vertex_air bytes], [vertex_air length], vertex_name,
 			  [fragment_air bytes], [fragment_air length], fragment != nil ? fragment_name : NULL,
 			  &shape, &info, why, sizeof(why));
-		if (render != NULL && num_linked == 0) {
+		if (render != NULL) {
 			rw_pipe_keep(_mesa, key, render, &info);
 		}
 	}
