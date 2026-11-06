@@ -358,8 +358,9 @@ static int
 dsu_block_is_zero_or_head(const uint8_t *p, uint64_t bs)
 {
 	static const char magic[8] = "RDWVAR\0";
+	static const char fs_magic[8] = {'R', 'D', 'W', 'F', 'S', '0', '0', '1'};
 
-	if (memcmp(p, magic, sizeof(magic)) == 0) {
+	if (memcmp(p, magic, sizeof(magic)) == 0 || memcmp(p, fs_magic, sizeof(fs_magic)) == 0) {
 		return 1;
 	}
 	for (uint64_t i = 0; i < bs; i++) {
@@ -447,6 +448,8 @@ dsu_store_open(struct loader_block_part *bp, int want_write, int *writable)
 	for (uint64_t slot = 0; slot < DSU_STORE_BYTES / DSU_STORE_SLOT && why == NULL; slot++) {
 		if (EFI_ERROR(dsu_slot_io(0, dsu_store_at + slot * DSU_STORE_SLOT, bs, ufs_buffer))) {
 			why = "a header block does not read";
+		} else if (slot == 0 && memcmp(ufs_buffer, "RDWFS001", 8) == 0) {
+			break;
 		} else if (!dsu_block_is_zero_or_head(ufs_buffer, bs)) {
 			why = "a header block holds something else than zeros or a header";
 		}

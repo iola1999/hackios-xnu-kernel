@@ -509,6 +509,38 @@ ufs_cwrite(dev_t dev, struct uio *uio, __unused int ioflag)
 	return error;
 }
 
+bool
+redwood_ufs_var_info(uint64_t *size_bytes_out)
+{
+	int part = ufs_darwin_var_part >= 0 ? ufs_darwin_var_part : ufs_write_part;
+
+	if (!ufs_ready || part < 0 || (uint32_t)part >= ufs_parts) {
+		return false;
+	}
+	if (size_bytes_out != NULL) {
+		*size_bytes_out = ufs_part_bytes((uint32_t)part);
+	}
+	return true;
+}
+
+int
+redwood_ufs_var_io(bool write, uint64_t offset, void *buf, uint64_t len)
+{
+	int part = ufs_darwin_var_part >= 0 ? ufs_darwin_var_part : ufs_write_part;
+
+	if (!ufs_ready || part < 0 || (uint32_t)part >= ufs_parts) {
+		return ENXIO;
+	}
+	if (write) {
+		int error = ufs_write((uint32_t)part, offset, (const uint8_t *)buf, len);
+		if (part == ufs_write_part) {
+			ufs_write_restore();
+		}
+		return error;
+	}
+	return ufs_read((uint32_t)part, offset, (uint8_t *)buf, len);
+}
+
 static const struct bdevsw ufs_bdevsw = {
 	.d_open     = ufs_open,
 	.d_close    = ufs_close,

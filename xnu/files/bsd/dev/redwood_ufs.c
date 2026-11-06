@@ -451,13 +451,19 @@ ufs_part_bytes(uint32_t part)
  * so twenty seconds here is well inside both. Nothing else of the way out has happened yet: the
  * GPU, the DSPs and this kernel's transfer list are still as the run had them.
  */
+extern void ramfs_disk_flush_all(void);
+
 void
 redwood_var_save_on_return(void)
 {
 	uint32_t ms = VAR_SAVE_MS;
 	uint64_t waited = 0;
 
-	if (!ufs_ready || (ufs_write_part < 0 && ufs_darwin_var_part < 0) || ufs_var_save != VAR_SAVE_IDLE) {
+	if (!ufs_ready || (ufs_write_part < 0 && ufs_darwin_var_part < 0)) {
+		return;
+	}
+	ramfs_disk_flush_all();
+	if (ufs_var_save != VAR_SAVE_IDLE) {
 		return;
 	}
 	PE_parse_boot_argn("var_save_ms", &ms, sizeof(ms));
@@ -1048,7 +1054,7 @@ redwood_ufs_init(void)
 		made++;
 	}
 	ufs_ready = true;
-	RedwoodDiskStart(ufs_darwin_bytes + ufs_darwin_var_bytes);
+	RedwoodDiskStart(128000000000ULL);
 	printf("ufs: %u partitions of the phone's storage as /dev/ufs_NAME and /dev/rufs_NAME, read only, "
 	    "through the loader's page at %llx and its %u KB buffer\n", made, pa, ufs_buffer_size >> 10);
 

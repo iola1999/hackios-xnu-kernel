@@ -118,6 +118,7 @@ static int block_enabled;
 static int block_write_requested;       /* ufs_write=1 on the command line */
 static int block_write_part = -1;       /* the only partition a write may reach; -1: none, writes refused */
 static int block_dsu_part = -1;         /* dsu_store's index in the table; -1: not listed this run */
+static int block_darwin_var_part = -1;  /* darwin_var's index in the table; -1: not listed this run */
 static uint64_t block_writes, block_writes_refused, block_write_bytes;
 /* loader_dsu.inc, included after this file */
 static int dsu_store_open(struct loader_block_part *bp, int want_write, int *writable);
@@ -408,6 +409,7 @@ block_start(void)
 		print("ufs: no partition information: the block service is off\n");
 		return;
 	}
+	block_darwin_var_part = -1;
 	for (uint64_t i = 0; i < count && block_shared.parts + nunits < BLOCK_MAX_PARTS; i++) {
 		struct loader_block_part *bp = &block_shared.part[block_shared.parts];
 		efi_partition_info *info;
@@ -438,6 +440,11 @@ block_start(void)
 			}
 		}
 		block_bios[block_shared.parts++] = bio;
+		if (bp->name[0] == 'd' && bp->name[1] == 'a' && bp->name[2] == 'r' && bp->name[3] == 'w' &&
+		    bp->name[4] == 'i' && bp->name[5] == 'n' && bp->name[6] == '_' && bp->name[7] == 'v' &&
+		    bp->name[8] == 'a' && bp->name[9] == 'r' && bp->name[10] == 0 && !bio->media->read_only) {
+			block_darwin_var_part = (int)(block_shared.parts - 1);
+		}
 		if (block_probe_requested && bp->name[0] == 'd' && bp->name[1] == 'a' && bp->name[2] == 'r' &&
 		    bp->name[3] == 'w' && bp->name[4] == 'i' && bp->name[5] == 'n' && bp->name[6] == 0) {
 			block_io2_probe(handles[i], bio);
@@ -623,7 +630,8 @@ block_poll(void)
 			s = 0x800000000000000FULL;      /* EFI_ACCESS_DENIED */
 			bytes = 0;
 		} else if (op == BLOCK_OP_WRITE) {
-			if (block_write_part < 0 || part != (uint32_t)block_write_part) {
+			if ((block_write_part < 0 || part != (uint32_t)block_write_part) &&
+			    (block_darwin_var_part < 0 || part != (uint32_t)block_darwin_var_part)) {
 				/* not the store: never */
 				if (block_writes_refused++ < 8) {
 					print("ufs: a write of %d blocks from %d of %s: REFUSED\n", count, lba,

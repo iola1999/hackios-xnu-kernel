@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Carve dual iOS partitions (8 GiB darwin root + 112 GiB darwin_var) off the end of Android's userdata.
+"""Carve dual iOS partitions (16 GiB darwin root + 104 GiB darwin_var) off the end of Android's userdata.
 
-Usage: userdata-dual-carve.py DIR [--root-gib 8] [--var-gib 112]
+Usage: userdata-dual-carve.py DIR [--root-gib 16] [--var-gib 104]
   DIR   Directory with phone partition metadata:
           gpt-head.bin              first 8 blocks of LUN 0 (dd if=/dev/block/sda bs=4096 count=8)
           gpt-tail.bin              last 8 blocks of LUN 0 (skip=BLOCKS-8 count=8)
@@ -11,8 +11,8 @@ Usage: userdata-dual-carve.py DIR [--root-gib 8] [--var-gib 112]
 
 Dual Partition Architecture:
   1. Shrink Android userdata f2fs by exactly 120 GiB (retaining ~110.88 GiB for Android).
-  2. Create /dev/ufs_darwin (8 GiB): for system26.apfs read-only root mount.
-  3. Create /dev/ufs_darwin_var (112 GiB): for /private/var block-level real-time read-write data.
+  2. Create /dev/ufs_darwin (16 GiB): for unmodified Apple iOS 26 os.dmg + systemos.dmg + appos.dmg (c=0,1,2).
+  3. Create /dev/ufs_darwin_var (104 GiB): for /private/var kernel-native direct read-write persistence (RDWFS001).
 """
 import argparse
 import os
@@ -104,8 +104,8 @@ def check(name, head, tail, disk):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('dir', help='directory with gpt-head.bin, gpt-tail.bin, etc.')
-    parser.add_argument('--root-gib', type=int, default=8, help='size of root partition (darwin) in GiB (default 8)')
-    parser.add_argument('--var-gib', type=int, default=112, help='size of data partition (darwin_var) in GiB (default 112)')
+    parser.add_argument('--root-gib', type=int, default=16, help='size of root partition (darwin) in GiB (default 16)')
+    parser.add_argument('--var-gib', type=int, default=104, help='size of data partition (darwin_var) in GiB (default 104)')
     parser.add_argument('--root-name', default='darwin', help='root partition name (default darwin)')
     parser.add_argument('--var-name', default='darwin_var', help='data partition name (default darwin_var)')
     args = parser.parse_args()
@@ -270,8 +270,10 @@ def main():
     print('  4. Apply backup GPT table and header:')
     print(f'     dd if=gpt-tail.new of=/dev/block/sda bs={BS} skip={changed_tail[0]} '
           f'seek={disk - 8 + changed_tail[0]} count={changed_tail[-1] - changed_tail[0] + 1} conv=notrunc,fsync')
-    print('  5. Format / write rootfs:')
-    print(f'     dd if=system26.apfs of=/dev/block/sda{slot_root + 1} bs=1M')
+    print('  5. Write unmodified Apple iOS 26 containers (os.dmg + systemos.dmg + appos.dmg) to rootfs:')
+    print(f'     dd if=os.dmg of=/dev/block/sda{slot_root + 1} bs=4096 seek=0 conv=notrunc,fsync')
+    print(f'     dd if=systemos.dmg of=/dev/block/sda{slot_root + 1} bs=4096 seek=2382336 conv=notrunc,fsync')
+    print(f'     dd if=appos.dmg of=/dev/block/sda{slot_root + 1} bs=4096 seek=3666944 conv=notrunc,fsync')
     print(f'  6. Verified: /dev/ufs_{args.root_name} (rootfs) and /dev/ufs_{args.var_name} (data) are ready!')
     return 0
 

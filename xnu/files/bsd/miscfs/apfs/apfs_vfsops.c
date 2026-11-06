@@ -1169,11 +1169,9 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 	vfs_setlocklocal(mp);
 
 	sp = vfs_statfs(mp);
-	sp->f_bsize = am->am_nx.block_size;
-	sp->f_iosize = am->am_nx.block_size;
-	sp->f_blocks = am->am_nx.block_count;
-	sp->f_bfree = 0;
-	sp->f_bavail = 0;
+	sp->f_bsize = sp->f_iosize = am->am_nx.block_size;
+	sp->f_blocks = redwood_container_total_bytes() / am->am_nx.block_size;
+	sp->f_bfree = sp->f_bavail = redwood_container_free_bytes() / am->am_nx.block_size;
 	sp->f_bused = am->am_vol.alloc_count;
 	sp->f_files = am->am_vol.num_files + am->am_vol.num_dirs;
 	sp->f_ffree = 0;
@@ -1371,13 +1369,14 @@ apfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
 {
 	struct apfs_mount *am = APFS_MP(mp);
 	uint64_t files = am->am_vol.num_files + am->am_vol.num_dirs;
+	uint64_t free_blks = redwood_container_free_bytes() / am->am_nx.block_size;
 
 	VFSATTR_RETURN(fsap, f_objcount, files);
 	VFSATTR_RETURN(fsap, f_bsize, am->am_nx.block_size);
 	VFSATTR_RETURN(fsap, f_iosize, am->am_nx.block_size);
-	VFSATTR_RETURN(fsap, f_blocks, am->am_nx.block_count);
-	VFSATTR_RETURN(fsap, f_bfree, 0);
-	VFSATTR_RETURN(fsap, f_bavail, 0);
+	VFSATTR_RETURN(fsap, f_blocks, redwood_container_total_bytes() / am->am_nx.block_size);
+	VFSATTR_RETURN(fsap, f_bfree, free_blks);
+	VFSATTR_RETURN(fsap, f_bavail, free_blks);
 	VFSATTR_RETURN(fsap, f_bused, am->am_vol.alloc_count);
 	VFSATTR_RETURN(fsap, f_files, files);
 	VFSATTR_RETURN(fsap, f_ffree, 0);

@@ -239,4 +239,7 @@ void apfs_unlock_inner(struct apfs_mount *am);   /* let go of in the middle of o
 extern const struct vnodeopv_desc apfs_vnodeop_opv_desc;
 extern int (**apfs_vnodeop_p)(void *);
 
+uint64_t redwood_container_total_bytes(void);
+uint64_t redwood_container_free_bytes(void);
+
 #endif /* _MISCFS_APFS_APFS_H_ */

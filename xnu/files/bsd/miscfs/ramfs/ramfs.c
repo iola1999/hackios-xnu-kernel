@@ -23,8 +23,11 @@
  */
 
 #include <kern/assert.h>
+#include <kern/clock.h>
 #include <kern/kalloc.h>
 #include <kern/locks.h>
+#include <kern/thread_call.h>
+#include <libkern/crc.h>
 #include <libkern/libkern.h>
 #include <mach/vm_param.h>
 #include <sys/attr.h>
@@ -38,6 +41,7 @@
 #include <sys/proc.h>
 #include <sys/queue.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <sys/systm.h>
 #include <sys/time.h>
 #include <sys/ubc.h>
@@ -84,6 +88,7 @@ struct ramfs_node {
 	TAILQ_HEAD(, ramfs_dirent) rn_entries;
 	/* regular file */
 	void              **rn_pages;           /* rn_nslots slots; NULL is a hole that reads as zeros */
+	uint32_t           *rn_blocks;          /* rn_nslots disk block numbers on darwin_var (0 = hole) */
 	uint64_t            rn_nslots, rn_nalloc; /* rn_nalloc: pages actually allocated */
 	bool                rn_mapped_write, rn_hashed; /* rn_mapped_write: page cache may be ahead */
 	/* symlink */
@@ -100,12 +105,19 @@ struct ramfs_mount {
 	struct ramfs_node  *rm_root;
 	uint64_t            rm_next_ino, rm_nodes, rm_pages, rm_max_pages; /* rm_pages: file pages in use */
 	struct ramfs_node **rm_hash;            /* every node by its number, for vfs_vget */
+	bool                rm_disk_backed, rm_disk_loading, rm_meta_dirty, rm_meta_syncing;
+	uint32_t            rm_bmap_words, rm_bmap_max, rm_bmap_next;
+	uint32_t           *rm_bmap;
+	void               *rm_io_page, *rm_meta_buf, *rm_meta_call;
+	size_t              rm_meta_cap;
+	uint64_t            rm_meta_gen;
 };
 
 #define RAMFS_HASH_SIZE         4096u       /* chains, a power of two */
 
 /* file pages in use on all the mounts together (each mount has its own lock): for the kernel's memory report */
 _Atomic uint64_t ramfs_pages_in_use;
+_Atomic uint64_t ramfs_var_used_pages;
 
 #define RAMFS_MP(mp)    ((struct ramfs_mount *)vfs_fsprivate(mp))
 #define RAMFS_NODE(vp)  ((struct ramfs_node *)vnode_fsnode(vp))
@@ -211,6 +223,7 @@ ramfs_reserve_slots(struct ramfs_mount *rm, struct ramfs_node *node, uint64_t in
 	for (int tries = 0; tries < 4; tries++) {
 		uint64_t have, want;
 		void **slots;
+		uint32_t *blks;
 
 		lck_mtx_lock(&rm->rm_lock);
 		have = node->rn_nslots;
@@ -221,7 +234,14 @@ ramfs_reserve_slots(struct ramfs_mount *rm, struct ramfs_node *node, uint64_t in
 		for (want = have ? have : 4; want <= index; want *= 2) {
 		}
 		slots = kalloc_type(void *, want, Z_WAITOK | Z_ZERO);
-		if (slots == NULL) {
+		blks = kalloc_data(want * sizeof(uint32_t), Z_WAITOK | Z_ZERO);
+		if (slots == NULL || blks == NULL) {
+			if (slots != NULL) {
+				kfree_type(void *, want, slots);
+			}
+			if (blks != NULL) {
+				kfree_data(blks, want * sizeof(uint32_t));
+			}
 			return;
 		}
 		lck_mtx_lock(&rm->rm_lock);
@@ -230,50 +250,25 @@ ramfs_reserve_slots(struct ramfs_mount *rm, struct ramfs_node *node, uint64_t in
 				memcpy(slots, node->rn_pages, have * sizeof(void *));
 				kfree_type(void *, have, node->rn_pages);
 			}
+			if (node->rn_blocks != NULL) {
+				memcpy(blks, node->rn_blocks, have * sizeof(uint32_t));
+				kfree_data(node->rn_blocks, have * sizeof(uint32_t));
+			}
 			node->rn_pages = slots;
+			node->rn_blocks = blks;
 			node->rn_nslots = want;
 			slots = NULL;
+			blks = NULL;
 		}
 		lck_mtx_unlock(&rm->rm_lock);
 		if (slots == NULL) {
 			return;
 		}
-		kfree_type(void *, want, slots);        /* it grew meanwhile: look again */
+		kfree_type(void *, want, slots);
+		kfree_data(blks, want * sizeof(uint32_t));
 	}
 }
 
-/* Drop file pages from slot `from` on. The mount lock is held. */
-static void
-ramfs_free_pages(struct ramfs_node *node, uint64_t from)
-{
-	for (uint64_t i = from; i < node->rn_nslots; i++) {
-		if (node->rn_pages[i] != NULL) {
-			ramfs_page_free(node->rn_pages[i]);
-			node->rn_pages[i] = NULL;
-			node->rn_nalloc--;
-			node->rn_mount->rm_pages--;
-			os_atomic_dec(&ramfs_pages_in_use, relaxed);
-		}
-	}
-}
-
-static void
-ramfs_xattr_free(struct ramfs_xattr *xa)
-{
-	kfree_data(xa->rx_name, xa->rx_namelen + 1);
-	if (xa->rx_data != NULL) {
-		kfree_data(xa->rx_data, xa->rx_size);
-	}
-	kfree_type(struct ramfs_xattr, xa);
-}
-
-/*
- * Nodes by their number. What asks for a file by number rather than by name -- fsgetpath(), and through
- * it LaunchServices, which keeps an application as its volume and file number and finds the path again
- * from them -- comes to vfs_vget, which this filesystem did not have: an application in /private/var
- * (the package manager's prefix, /var/jb/Applications) could not be registered at all ("Unable to
- * register"), while one on an APFS volume could. The mount lock is held.
- */
 static void
 ramfs_hash_insert(struct ramfs_mount *rm, struct ramfs_node *node)
 {
@@ -298,6 +293,46 @@ ramfs_hash_remove(struct ramfs_mount *rm, struct ramfs_node *node)
 	node->rn_hashed = false;
 }
 
+static struct ramfs_dirent *ramfs_dirent_alloc(const char *name, size_t len);
+#include "ramfs_disk.inc"
+
+/* Drop file pages from slot `from` on. The mount lock is held. */
+static void
+ramfs_free_pages(struct ramfs_node *node, uint64_t from)
+{
+	struct ramfs_mount *rm = node->rn_mount;
+
+	for (uint64_t i = from; i < node->rn_nslots; i++) {
+		bool had_ram = node->rn_pages != NULL && node->rn_pages[i] != NULL;
+		bool had_blk = node->rn_blocks != NULL && node->rn_blocks[i] != 0;
+
+		if (had_ram) {
+			ramfs_page_free(node->rn_pages[i]);
+			node->rn_pages[i] = NULL;
+			os_atomic_dec(&ramfs_pages_in_use, relaxed);
+		}
+		if (had_blk) {
+			ramfs_disk_bmap_free(rm, node->rn_blocks[i]);
+			node->rn_blocks[i] = 0;
+			os_atomic_dec(&ramfs_var_used_pages, relaxed);
+		}
+		if (had_ram || had_blk) {
+			node->rn_nalloc--;
+			rm->rm_pages--;
+		}
+	}
+}
+
+static void
+ramfs_xattr_free(struct ramfs_xattr *xa)
+{
+	kfree_data(xa->rx_name, xa->rx_namelen + 1);
+	if (xa->rx_data != NULL) {
+		kfree_data(xa->rx_data, xa->rx_size);
+	}
+	kfree_type(struct ramfs_xattr, xa);
+}
+
 /* The node is named by nothing and has no vnode. The mount lock is held. */
 static void
 ramfs_node_free(struct ramfs_node *node)
@@ -317,6 +352,9 @@ ramfs_node_free(struct ramfs_node *node)
 	if (node->rn_pages != NULL) {
 		kfree_type(void *, node->rn_nslots, node->rn_pages);
 	}
+	if (node->rn_blocks != NULL) {
+		kfree_data(node->rn_blocks, node->rn_nslots * sizeof(uint32_t));
+	}
 	if (node->rn_target != NULL) {
 		kfree_data(node->rn_target, node->rn_size + 1);
 	}
@@ -334,6 +372,7 @@ ramfs_touch(struct ramfs_node *node, bool modified)
 	if (modified) {
 		node->rn_mtime = now;
 	}
+	ramfs_disk_dirty_locked(node->rn_mount);
 }
 
 static struct ramfs_dirent *
@@ -463,6 +502,7 @@ ramfs_grow_slots(struct ramfs_node *node, uint64_t index)
 {
 	uint64_t want = node->rn_nslots ? node->rn_nslots : 4;
 	void **slots;
+	uint32_t *blks;
 
 	if (index < node->rn_nslots) {
 		return 0;
@@ -471,14 +511,26 @@ ramfs_grow_slots(struct ramfs_node *node, uint64_t index)
 		want *= 2;
 	}
 	slots = kalloc_type(void *, want, Z_NOWAIT | Z_ZERO);
-	if (slots == NULL) {
+	blks = kalloc_data(want * sizeof(uint32_t), Z_NOWAIT | Z_ZERO);
+	if (slots == NULL || blks == NULL) {
+		if (slots != NULL) {
+			kfree_type(void *, want, slots);
+		}
+		if (blks != NULL) {
+			kfree_data(blks, want * sizeof(uint32_t));
+		}
 		return ENOSPC;
 	}
 	if (node->rn_pages != NULL) {
 		memcpy(slots, node->rn_pages, node->rn_nslots * sizeof(void *));
 		kfree_type(void *, node->rn_nslots, node->rn_pages);
 	}
+	if (node->rn_blocks != NULL) {
+		memcpy(blks, node->rn_blocks, node->rn_nslots * sizeof(uint32_t));
+		kfree_data(node->rn_blocks, node->rn_nslots * sizeof(uint32_t));
+	}
 	node->rn_pages = slots;
+	node->rn_blocks = blks;
 	node->rn_nslots = want;
 	return 0;
 }
@@ -499,18 +551,61 @@ ramfs_store(struct ramfs_node *node, uint64_t off, const void *src, size_t len, 
 		return error;
 	}
 	if (node->rn_pages[index] == NULL) {
-		if (*spare == NULL || rm->rm_pages >= rm->rm_max_pages) {
+		uint32_t existing_blk = node->rn_blocks != NULL ? node->rn_blocks[index] : 0;
+
+		if (*spare == NULL || (!rm->rm_disk_backed && rm->rm_pages >= rm->rm_max_pages)) {
 			return ENOSPC;
 		}
-		node->rn_pages[index] = *spare;
-		*spare = NULL;
-		node->rn_nalloc++;
-		rm->rm_pages++;
-		os_atomic_inc(&ramfs_pages_in_use, relaxed);
+		if (existing_blk != 0) {
+			if (len < PAGE_SIZE) {
+				error = ramfs_disk_read_block(rm, existing_blk, *spare);
+				if (error) {
+					return error;
+				}
+			}
+			node->rn_pages[index] = *spare;
+			*spare = NULL;
+			os_atomic_inc(&ramfs_pages_in_use, relaxed);
+		} else {
+			if (rm->rm_disk_backed) {
+				uint32_t dblk = ramfs_disk_bmap_alloc(rm);
+
+				if (dblk == 0) {
+					return ENOSPC;
+				}
+				node->rn_blocks[index] = dblk;
+				os_atomic_inc(&ramfs_var_used_pages, relaxed);
+			}
+			node->rn_pages[index] = *spare;
+			*spare = NULL;
+			node->rn_nalloc++;
+			rm->rm_pages++;
+			os_atomic_inc(&ramfs_pages_in_use, relaxed);
+		}
+	} else if (rm->rm_disk_backed && node->rn_blocks[index] == 0) {
+		uint32_t dblk = ramfs_disk_bmap_alloc(rm);
+
+		if (dblk == 0) {
+			return ENOSPC;
+		}
+		node->rn_blocks[index] = dblk;
+		os_atomic_inc(&ramfs_var_used_pages, relaxed);
 	}
 	memcpy((char *)node->rn_pages[index] + (off & PAGE_MASK), src, len);
 	if (off + len > node->rn_size) {
 		node->rn_size = off + len;
+	}
+	if (rm->rm_disk_backed && node->rn_blocks[index] != 0) {
+		error = ramfs_disk_write_block(rm, node->rn_blocks[index], node->rn_pages[index]);
+		if (error) {
+			return error;
+		}
+		if (os_atomic_load(&ramfs_pages_in_use, relaxed) >= rm->rm_max_pages / 2) {
+			ramfs_page_free(node->rn_pages[index]);
+			node->rn_pages[index] = NULL;
+			os_atomic_dec(&ramfs_pages_in_use, relaxed);
+		}
+		ramfs_disk_dirty_locked(rm);
 	}
 	return 0;
 }
@@ -521,6 +616,15 @@ ramfs_fetch(struct ramfs_node *node, uint64_t off, void *dst, size_t len)
 {
 	uint64_t index = off / PAGE_SIZE;
 
+	if (index < node->rn_nslots && node->rn_pages[index] == NULL &&
+	    node->rn_blocks != NULL && node->rn_blocks[index] != 0) {
+		ramfs_disk_fault_page(node, index);
+		if (node->rn_pages[index] == NULL && node->rn_mount->rm_io_page != NULL &&
+		    ramfs_disk_read_block(node->rn_mount, node->rn_blocks[index], node->rn_mount->rm_io_page) == 0) {
+			memcpy(dst, (char *)node->rn_mount->rm_io_page + (off & PAGE_MASK), len);
+			return;
+		}
+	}
 	if (index < node->rn_nslots && node->rn_pages[index] != NULL) {
 		memcpy(dst, (char *)node->rn_pages[index] + (off & PAGE_MASK), len);
 	} else {
@@ -536,8 +640,17 @@ ramfs_resize(struct ramfs_node *node, uint64_t size)
 		uint64_t keep = (size + PAGE_MASK) / PAGE_SIZE;
 
 		ramfs_free_pages(node, keep);
-		if ((size & PAGE_MASK) != 0 && keep - 1 < node->rn_nslots && node->rn_pages[keep - 1] != NULL) {
-			bzero((char *)node->rn_pages[keep - 1] + (size & PAGE_MASK), PAGE_SIZE - (size & PAGE_MASK));
+		if ((size & PAGE_MASK) != 0 && keep - 1 < node->rn_nslots) {
+			if (node->rn_pages[keep - 1] == NULL && node->rn_blocks != NULL && node->rn_blocks[keep - 1] != 0) {
+				ramfs_disk_fault_page(node, keep - 1);
+			}
+			if (node->rn_pages[keep - 1] != NULL) {
+				bzero((char *)node->rn_pages[keep - 1] + (size & PAGE_MASK), PAGE_SIZE - (size & PAGE_MASK));
+				if (node->rn_mount->rm_disk_backed && node->rn_blocks != NULL && node->rn_blocks[keep - 1] != 0) {
+					(void)ramfs_disk_write_block(node->rn_mount, node->rn_blocks[keep - 1],
+					    node->rn_pages[keep - 1]);
+				}
+			}
 		}
 	}
 	node->rn_size = size;
@@ -879,6 +992,7 @@ ramfs_getattr(struct vnop_getattr_args *ap)
 	VATTR_RETURN(vap, va_mode, node->rn_mode);
 	VATTR_RETURN(vap, va_flags, node->rn_bsdflags);
 	VATTR_RETURN(vap, va_create_time, node->rn_btime);
+	VATTR_RETURN(vap, va_addedtime, node->rn_btime);
 	VATTR_RETURN(vap, va_access_time, node->rn_atime);
 	VATTR_RETURN(vap, va_modify_time, node->rn_mtime);
 	VATTR_RETURN(vap, va_change_time, node->rn_ctime);
@@ -974,6 +1088,7 @@ ramfs_setattr(struct vnop_setattr_args *ap)
 	if (VATTR_IS_ACTIVE(vap, va_change_time)) {
 		node->rn_ctime = vap->va_change_time;
 		VATTR_SET_SUPPORTED(vap, va_change_time);
+		ramfs_disk_dirty_locked(rm);
 	} else {
 		ramfs_touch(node, false);
 	}
@@ -1411,7 +1526,7 @@ const struct vnodeopv_entry_desc ramfs_vnodeop_entries[] = {
 	{ .opve_op = &vnop_read_desc, .opve_impl = (VOPFUNC)ramfs_read },
 	{ .opve_op = &vnop_write_desc, .opve_impl = (VOPFUNC)ramfs_write },
 	{ .opve_op = &vnop_ioctl_desc, .opve_impl = (VOPFUNC)ramfs_ioctl },
-	{ .opve_op = &vnop_fsync_desc, .opve_impl = (VOPFUNC)nop_fsync },
+	{ .opve_op = &vnop_fsync_desc, .opve_impl = (VOPFUNC)ramfs_fsync },
 	{ .opve_op = &vnop_remove_desc, .opve_impl = (VOPFUNC)ramfs_remove },
 	{ .opve_op = &vnop_link_desc, .opve_impl = (VOPFUNC)ramfs_link },
 	{ .opve_op = &vnop_rename_desc, .opve_impl = (VOPFUNC)ramfs_rename },
@@ -1443,6 +1558,8 @@ const struct vnodeopv_desc ramfs_vnodeop_opv_desc = {
 
 /* ------------------------------------------------------------------------ */
 /* Mount operations                                                         */
+
+#include "ramfs_getattr.inc"
 
 /* mount(2) with no arguments: an empty filesystem appears. */
 static int
@@ -1476,23 +1593,9 @@ ramfs_mount(mount_t mp, __unused vnode_t devvp, __unused user_addr_t data, __unu
 	vfs_setextendedsecurity(mp);
 	vfs_getnewfsid(mp);
 
-	extern uint64_t ufs_darwin_bytes, ufs_darwin_var_bytes;
-	uint64_t cap_bytes = ufs_darwin_bytes + ufs_darwin_var_bytes;
-	uint64_t cap_pages = cap_bytes != 0 ? (cap_bytes / PAGE_SIZE) : ((120ULL << 30) / PAGE_SIZE);
-	if (cap_pages < rm->rm_max_pages) {
-		cap_pages = rm->rm_max_pages;
-	}
-
+	ramfs_disk_mount(rm);
 	sp = vfs_statfs(mp);
-	sp->f_bsize = PAGE_SIZE;
-	sp->f_iosize = PAGE_SIZE;
-	sp->f_blocks = cap_pages;
-	sp->f_bfree = sp->f_bavail = cap_pages;
-	sp->f_bused = 0;
-	/* there is no table of nodes to run out of; report as many as there could be pages */
-	sp->f_files = rm->rm_max_pages;
-	sp->f_ffree = rm->rm_max_pages - 1;
-	strlcpy(sp->f_mntfromname, "ramfs", sizeof(sp->f_mntfromname));
+	ramfs_fill_statfs(rm, sp);
 	return 0;
 }
 
@@ -1525,6 +1628,7 @@ ramfs_unmount(mount_t mp, int mntflags, __unused vfs_context_t ctx)
 	if (error) {
 		return error;
 	}
+	ramfs_disk_unmount(rm);
 	lck_mtx_lock(&rm->rm_lock);
 	ramfs_free_tree(rm->rm_root);
 	ramfs_node_free(rm->rm_root);
@@ -1575,157 +1679,9 @@ ramfs_vfs_vget(mount_t mp, ino64_t ino, vnode_t *vpp, __unused vfs_context_t ctx
 }
 
 static int
-ramfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
+ramfs_sync(mount_t mp, __unused int waitfor, __unused vfs_context_t ctx)
 {
-	extern uint64_t ufs_darwin_bytes, ufs_darwin_var_bytes;
-	struct ramfs_mount *rm = RAMFS_MP(mp);
-	uint64_t used, nodes, cap_bytes, cap_pages;
-
-	lck_mtx_lock(&rm->rm_lock);
-	used = rm->rm_pages;
-	nodes = rm->rm_nodes;
-	lck_mtx_unlock(&rm->rm_lock);
-
-	cap_bytes = ufs_darwin_bytes + ufs_darwin_var_bytes;
-	cap_pages = cap_bytes != 0 ? (cap_bytes / PAGE_SIZE) : ((120ULL << 30) / PAGE_SIZE);
-	if (cap_pages < rm->rm_max_pages) {
-		cap_pages = rm->rm_max_pages;
-	}
-
-	VFSATTR_RETURN(fsap, f_objcount, nodes);
-	VFSATTR_RETURN(fsap, f_bsize, PAGE_SIZE);
-	VFSATTR_RETURN(fsap, f_iosize, PAGE_SIZE);
-	VFSATTR_RETURN(fsap, f_blocks, cap_pages);
-	VFSATTR_RETURN(fsap, f_bfree, cap_pages - MIN(used, cap_pages));
-	VFSATTR_RETURN(fsap, f_bavail, cap_pages - MIN(used, cap_pages));
-	VFSATTR_RETURN(fsap, f_bused, used);
-	VFSATTR_RETURN(fsap, f_files, rm->rm_max_pages);
-	VFSATTR_RETURN(fsap, f_ffree, rm->rm_max_pages - MIN(nodes, rm->rm_max_pages));
-
-	if (VFSATTR_IS_ACTIVE(fsap, f_capabilities)) {
-		vol_capabilities_attr_t *cap = &fsap->f_capabilities;
-
-		bzero(cap, sizeof(*cap));
-		cap->capabilities[VOL_CAPABILITIES_FORMAT] =
-		    VOL_CAP_FMT_SYMBOLICLINKS |
-		    VOL_CAP_FMT_HARDLINKS |
-		    VOL_CAP_FMT_SPARSE_FILES |
-		    VOL_CAP_FMT_CASE_SENSITIVE |
-		    VOL_CAP_FMT_CASE_PRESERVING |
-		    VOL_CAP_FMT_FAST_STATFS |
-		    VOL_CAP_FMT_2TB_FILESIZE |
-		    /*
-		     * A file keeps its number for as long as it exists (the life of the mount, a boot), a node is
-		     * found by it (vfs_vget) and a path made from it (fsgetpath): LaunchServices keeps an
-		     * application by number, and takes none from a volume that does not say so -- everything a
-		     * package installed under the prefix was "Unable to register", with nothing tried on its files.
-		     */
-		    VOL_CAP_FMT_PERSISTENTOBJECTIDS |
-		    VOL_CAP_FMT_PATH_FROM_ID;
-		cap->capabilities[VOL_CAPABILITIES_INTERFACES] =
-		    VOL_CAP_INT_ADVLOCK |
-		    VOL_CAP_INT_FLOCK |
-		    VOL_CAP_INT_EXTENDED_SECURITY |
-		    VOL_CAP_INT_EXTENDED_ATTR;
-		cap->valid[VOL_CAPABILITIES_FORMAT] =
-		    VOL_CAP_FMT_PERSISTENTOBJECTIDS |
-		    VOL_CAP_FMT_SYMBOLICLINKS |
-		    VOL_CAP_FMT_HARDLINKS |
-		    VOL_CAP_FMT_JOURNAL |
-		    VOL_CAP_FMT_JOURNAL_ACTIVE |
-		    VOL_CAP_FMT_NO_ROOT_TIMES |
-		    VOL_CAP_FMT_SPARSE_FILES |
-		    VOL_CAP_FMT_ZERO_RUNS |
-		    VOL_CAP_FMT_CASE_SENSITIVE |
-		    VOL_CAP_FMT_CASE_PRESERVING |
-		    VOL_CAP_FMT_FAST_STATFS |
-		    VOL_CAP_FMT_2TB_FILESIZE |
-		    VOL_CAP_FMT_OPENDENYMODES |
-		    VOL_CAP_FMT_HIDDEN_FILES |
-		    VOL_CAP_FMT_PATH_FROM_ID;
-		cap->valid[VOL_CAPABILITIES_INTERFACES] =
-		    VOL_CAP_INT_SEARCHFS |
-		    VOL_CAP_INT_ATTRLIST |
-		    VOL_CAP_INT_NFSEXPORT |
-		    VOL_CAP_INT_READDIRATTR |
-		    VOL_CAP_INT_EXCHANGEDATA |
-		    VOL_CAP_INT_COPYFILE |
-		    VOL_CAP_INT_ALLOCATE |
-		    VOL_CAP_INT_VOL_RENAME |
-		    VOL_CAP_INT_ADVLOCK |
-		    VOL_CAP_INT_FLOCK |
-		    VOL_CAP_INT_EXTENDED_SECURITY |
-		    VOL_CAP_INT_USERACCESS |
-		    VOL_CAP_INT_MANLOCK |
-		    VOL_CAP_INT_EXTENDED_ATTR |
-		    VOL_CAP_INT_NAMEDSTREAMS;
-		VFSATTR_SET_SUPPORTED(fsap, f_capabilities);
-	}
-	/*
-	 * The rest of what getattrlist(2) may be asked about a volume. Unless the caller also asks
-	 * which attributes came back, one that the filesystem leaves out fails the whole call with
-	 * EINVAL, and callers take that badly: CacheDelete then hands assetsd a nil volume, which
-	 * ends in an uncaught exception.
-	 */
-	VFSATTR_RETURN(fsap, f_filecount, nodes);
-	VFSATTR_RETURN(fsap, f_dircount, 0);
-	VFSATTR_RETURN(fsap, f_maxobjcount, rm->rm_max_pages);
-	VFSATTR_RETURN(fsap, f_owner, 0);
-	VFSATTR_RETURN(fsap, f_fssubtype, 0);
-	VFSATTR_RETURN(fsap, f_signature, 0x4244);              /* 'BD', what the VFS layer defaults to */
-	VFSATTR_RETURN(fsap, f_carbon_fsid, 0);
-	VFSATTR_RETURN(fsap, f_quota, 0);
-	VFSATTR_RETURN(fsap, f_reserved, 0);
-	if (VFSATTR_IS_ACTIVE(fsap, f_fsid)) {
-		fsap->f_fsid = vfs_statfs(mp)->f_fsid;
-		VFSATTR_SET_SUPPORTED(fsap, f_fsid);
-	}
-	if (VFSATTR_IS_ACTIVE(fsap, f_create_time) || VFSATTR_IS_ACTIVE(fsap, f_modify_time) ||
-	    VFSATTR_IS_ACTIVE(fsap, f_access_time) || VFSATTR_IS_ACTIVE(fsap, f_backup_time)) {
-		struct timeval boot;
-		struct timespec since = { .tv_sec = 0, .tv_nsec = 0 };
-
-		/* nothing here is older than this boot */
-		boottime_timeval(&boot);
-		since.tv_sec = boot.tv_sec;
-		VFSATTR_RETURN(fsap, f_create_time, since);
-		VFSATTR_RETURN(fsap, f_modify_time, since);
-		VFSATTR_RETURN(fsap, f_access_time, since);
-		since.tv_sec = 0;
-		VFSATTR_RETURN(fsap, f_backup_time, since);
-	}
-	if (VFSATTR_IS_ACTIVE(fsap, f_uuid)) {
-		/* the same at every boot as long as the mounts are made in the same order: programs key caches by it */
-		static const uuid_t base = { 'r', 'e', 'd', 'w', 'o', 'o', 0x50, 'd', 0x80, 'R', 0, 0, 0, 0, 0, 0 };
-		fsid_t fsid = vfs_statfs(mp)->f_fsid;
-
-		memcpy(fsap->f_uuid, base, sizeof(uuid_t));
-		memcpy(&fsap->f_uuid[10], &fsid.val[0], 4);
-		fsap->f_uuid[14] = (uint8_t)fsid.val[1];
-		VFSATTR_SET_SUPPORTED(fsap, f_uuid);
-	}
-	if (VFSATTR_IS_ACTIVE(fsap, f_attributes)) {
-		vol_attributes_attr_t *attr = &fsap->f_attributes;
-
-		attr->validattr.commonattr = ATTR_CMN_VALIDMASK;
-		attr->validattr.volattr = ATTR_VOL_VALIDMASK;
-		attr->validattr.dirattr = ATTR_DIR_VALIDMASK;
-		attr->validattr.fileattr = ATTR_FILE_VALIDMASK;
-		attr->validattr.forkattr = 0;
-		attr->nativeattr = attr->validattr;
-		VFSATTR_SET_SUPPORTED(fsap, f_attributes);
-	}
-	if (VFSATTR_IS_ACTIVE(fsap, f_vol_name)) {
-		strlcpy(fsap->f_vol_name, "ramfs", MAXPATHLEN);
-		VFSATTR_SET_SUPPORTED(fsap, f_vol_name);
-	}
-	return 0;
-}
-
-static int
-ramfs_sync(__unused mount_t mp, __unused int waitfor, __unused vfs_context_t ctx)
-{
-	return 0;
+	return ramfs_disk_sync(RAMFS_MP(mp));
 }
 
 static int

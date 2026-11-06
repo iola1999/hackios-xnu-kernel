@@ -149,7 +149,7 @@ RedwoodDiskStart(uint64_t size_bytes)
 	RedwoodDisk * disk;
 	OSString * s;
 	OSNumber * n;
-	uint64_t sz = size_bytes != 0 ? size_bytes : (120ULL << 30);
+	uint64_t sz = size_bytes != 0 ? size_bytes : 128000000000ULL;
 
 	if (gRedwoodDisk != NULL) {
 		if ((n = OSNumber::withNumber(sz, 64)) != NULL) {

@@ -9,5 +9,20 @@
 static int
 ramfs_ioctl(struct vnop_ioctl_args *ap)
 {
+	if (ap->a_command == F_FULLFSYNC || ap->a_command == 85 /* F_BARRIERFSYNC */) {
+		struct ramfs_node *node = RAMFS_NODE(ap->a_vp);
+
+		ramfs_sync_mapping(ap->a_vp, node);
+		return ramfs_disk_sync(node->rn_mount);
+	}
 	return ap->a_command == RAMFS_APFSIOC_MARK_PURGEABLE ? 0 : ENOTTY;
+}
+
+static int
+ramfs_fsync(struct vnop_fsync_args *ap)
+{
+	struct ramfs_node *node = RAMFS_NODE(ap->a_vp);
+
+	ramfs_sync_mapping(ap->a_vp, node);
+	return ramfs_disk_sync(node->rn_mount);
 }
