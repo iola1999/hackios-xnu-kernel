@@ -21,8 +21,8 @@ extern kern_return_t thread_terminate(thread_t);
 #define OUTPUT (1u << 9)
 #define GAUGE_ADDRESS 0x55
 #define CHARGE_FLOW_UA 50000        /* 50 mA */
-#define DISCONNECT_FLOW_UA (-250000) /* -250 mA */
-static vm_offset_t pins;
+#define DISCONNECT_FLOW_UA (-150000) /* -150 mA */
+static vm_offset_t pins, dwc3_dev;
 static uint32_t saved_cfg[2], saved_io[2], input_cfg[2];
 static bool bus_ok;
 static bool last_external = false;
@@ -186,16 +186,25 @@ sample(void)
 	 * > +50 mA: battery is actively charging from external power
 	 * < -250 mA: battery is actively discharging, external power disconnected
 	 * [-250 mA, +50 mA]: maintain current external state */
-	if (state.current_ua > CHARGE_FLOW_UA) {
+	bool usb_active = false;
+	if (dwc3_dev != 0) {
+		uint32_t dctl = *(volatile uint32_t *)(dwc3_dev + 0x704);
+		uint32_t dsts = *(volatile uint32_t *)(dwc3_dev + 0x70c);
+		usb_active = ((dctl >> 31) != 0) && ((dsts & (1u << 22)) == 0) && (((dsts >> 18) & 0xf) < 4);
+	}
+	if (usb_active || state.current_ua >= DISCONNECT_FLOW_UA) {
 		last_external = true;
-		state.status = 1;
-	} else if (state.current_ua < DISCONNECT_FLOW_UA) {
+		state.status = (values[0] >= 100 && state.current_ua <= CHARGE_FLOW_UA) ? 4 : 1;
+	} else {
 		last_external = false;
 		state.status = 2;
-	} else {
-		state.status = last_external ? 3 : 2;
 	}
 	state.external = last_external;
+	if (state.external) {
+		state.usb_type = usb_active ? 1 : 2;
+		state.usb_voltage_uv = 5000000;
+		state.usb_current_ua = usb_active && state.current_ua <= CHARGE_FLOW_UA ? 500000 : 2000000;
+	}
 	state.charge_uah = values[4] * 1000;
 	state.full_uah = values[5] * 1000;
 	state.design_uah = values[6] * 1000;
@@ -240,6 +249,7 @@ battery_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	printf("battery: BQ27Z561 on GPIO52/53, address %#x; reading standard commands\n", GAUGE_ADDRESS);
 	pins = ml_io_map(0x0f134000UL, 0x2000);
+	dwc3_dev = ml_io_map(0x0a60c000UL, 0x1000);
 	if (pins) {
 		for (;;) {
 			if (!sample()) {

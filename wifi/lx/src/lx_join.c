@@ -595,6 +595,8 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
 	radio->wpa.rsn = radio->rsn;
 	radio->wpa.rsn_length = 22;
 	radio->handshake = LX_WPA_NOTHING;
+	radio->eapol = 0;
+	radio->pending_eapol_len = 0;
 	printf("lx: the key of the name (%u bytes) and the passphrase (%u bytes; 0: the key itself was given) is there: %llu ms; "
 	    "its fingerprint %04x\n", name_length, what->passphrase_length, (lx_os_nanoseconds() - began) / 1000000ull,
 	    lx_wpa_fingerprint(radio->wpa.pmk));
@@ -727,11 +729,23 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
 	    radio->sta->deflink.supp_rates[channel->band], radio->sta->deflink.ht_cap.ht_supported ? "yes" : "no",
 	    radio->sta->deflink.vht_cap.vht_supported ? "yes" : "no", radio->sta->deflink.rx_nss);
 
+	lx_os_lock();
+	if (radio->pending_eapol_len != 0) {
+		uint8_t pending[sizeof(radio->pending_eapol)];
+		unsigned pending_len = radio->pending_eapol_len;
+		memcpy(pending, radio->pending_eapol, pending_len);
+		radio->pending_eapol_len = 0;
+		lx_os_unlock();
+		lx_handshake_message(radio, pending, pending_len);
+	} else {
+		lx_os_unlock();
+	}
+
 	/* the handshake: the access point begins it; its messages come in as frames and are answered where they come in */
 	began = lx_os_nanoseconds();
 	lx_os_lock();
 	while (radio->handshake != LX_WPA_KEYS && radio->handshake != LX_WPA_BAD && radio->answer != ANSWER_GONE &&
-	    lx_os_nanoseconds() - began < 8000000000ull) {
+	    lx_os_nanoseconds() - began < (radio->handshake == LX_WPA_NOTHING ? 2500000000ull : 8000000000ull)) {
 		lx_os_sleep(&radio->handshake, 20 * 1000000ull);
 	}
 	lx_os_unlock();
@@ -927,6 +941,10 @@ boundary_join(const struct redwood_sta_join *what)
 	}
 	radio->joining = true;
 	error = station_join(radio, what);
+	if (error == EAUTH && radio->handshake != LX_WPA_BAD && radio->answer != ANSWER_GONE) {
+		lx_tell("lx: retrying handshake once after initial association timeout\n");
+		error = station_join(radio, what);
+	}
 	radio->last_error = error;
 	radio->joining = false;
 	return (error);

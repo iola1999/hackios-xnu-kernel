@@ -424,12 +424,12 @@ slot_update_menu_text(void)
 }
 
 static efi_block_io *
-lun4_get_bio(void)
+lun_get_bio(uint16_t target_lun, const char *probe_part)
 {
-	uint16_t target_unit = 4;
+	uint16_t target_unit = target_lun;
 	for (uint32_t i = 0; i < block_shared.parts; i++) {
 		if (!(block_shared.part[i].flags & BLOCK_PART_UNIT) &&
-		    str_eq(block_shared.part[i].name, "boot_a") &&
+		    str_eq(block_shared.part[i].name, probe_part) &&
 		    block_shared.part[i].unit != 0xffff) {
 			target_unit = block_shared.part[i].unit;
 			break;
@@ -437,11 +437,17 @@ lun4_get_bio(void)
 	}
 	for (uint32_t i = 0; i < block_shared.parts; i++) {
 		if ((block_shared.part[i].flags & BLOCK_PART_UNIT) &&
-		    (block_shared.part[i].lun == 4 || block_shared.part[i].unit == target_unit)) {
+		    (block_shared.part[i].lun == target_lun || block_shared.part[i].unit == target_unit)) {
 			return block_bios[i];
 		}
 	}
 	return NULL;
+}
+
+static efi_block_io *
+lun4_get_bio(void)
+{
+	return lun_get_bio(4, "boot_a");
 }
 
 static int
@@ -823,7 +829,7 @@ ui_boot_menu(void)
 }
 
 static void
-gpt_sync_lun4(efi_block_io *bio)
+gpt_sync_lun(efi_block_io *bio)
 {
 	if (!bio || !bio->media) return;
 	uint32_t bs = bio->media->block_size;
@@ -832,12 +838,8 @@ gpt_sync_lun4(efi_block_io *bio)
 	static uint8_t primary_hdr[4096] __attribute__((aligned(4096)));
 	static uint8_t backup_hdr[4096] __attribute__((aligned(4096)));
 
-	if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, 1, bs, primary_hdr))) {
-		print("slot: failed to read primary GPT header on LUN 4\n");
-		return;
-	}
-	if (memcmp(primary_hdr, "EFI PART", 8) != 0) {
-		print("slot: invalid primary GPT header on LUN 4\n");
+	if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, 1, bs, primary_hdr)) ||
+	    memcmp(primary_hdr, "EFI PART", 8) != 0) {
 		return;
 	}
 
@@ -849,72 +851,78 @@ gpt_sync_lun4(efi_block_io *bio)
 	uint32_t entry_size = *(uint32_t *)(primary_hdr + 84);
 	uint64_t total_bytes = (uint64_t)num_entries * entry_size;
 	uint64_t num_blocks = (total_bytes + bs - 1) / bs;
+	if (total_bytes == 0 || total_bytes > sizeof(ufs_buffer) || alt_lba == 0) return;
 
-	if (total_bytes == 0 || total_bytes > sizeof(ufs_buffer) || alt_lba == 0) {
-		print("slot: invalid GPT table geometry on LUN 4\n");
-		return;
-	}
-
-	/* 1. Recalculate partition entries CRC-32 (offset 88) */
 	uint32_t entries_crc = ufs_crc32(ufs_buffer, total_bytes);
 	*(uint32_t *)(primary_hdr + 88) = entries_crc;
-
-	/* 2. Zero offset 16..19 and recalculate 92-byte header CRC-32 (offset 16) */
 	*(uint32_t *)(primary_hdr + 16) = 0;
 	uint32_t primary_crc = ufs_crc32(primary_hdr, hdr_size);
 	*(uint32_t *)(primary_hdr + 16) = primary_crc;
 
-	/* 3. Write primary GPT header to LBA 1 */
-	efi_status s1 = bio->write_blocks(bio, bio->media->media_id, 1, bs, primary_hdr);
-	if (EFI_ERROR(s1)) {
-		print("slot: failed to write primary GPT header: %x\n", s1);
-	}
-
-	/* 4. Write backup partition entries array */
+	(void)bio->write_blocks(bio, bio->media->media_id, 1, bs, primary_hdr);
 	uint64_t backup_entries_lba = alt_lba - num_blocks;
-	efi_status sb_entries = safe_write_blocks(bio, backup_entries_lba, num_blocks, bs, ufs_buffer);
-	if (EFI_ERROR(sb_entries)) {
-		print("slot: failed to write backup partition entries: %x\n", sb_entries);
-	}
+	(void)safe_write_blocks(bio, backup_entries_lba, num_blocks, bs, ufs_buffer);
 
-	/* 5. Prepare backup GPT header */
 	memcpy(backup_hdr, primary_hdr, bs);
-	*(uint64_t *)(backup_hdr + 24) = alt_lba;            /* MyLBA */
-	*(uint64_t *)(backup_hdr + 32) = 1;                  /* AlternateLBA */
-	*(uint64_t *)(backup_hdr + 72) = backup_entries_lba; /* PartitionEntryLBA */
-	*(uint32_t *)(backup_hdr + 88) = entries_crc;        /* PartitionEntryArrayCRC32 */
+	*(uint64_t *)(backup_hdr + 24) = alt_lba;
+	*(uint64_t *)(backup_hdr + 32) = 1;
+	*(uint64_t *)(backup_hdr + 72) = backup_entries_lba;
+	*(uint32_t *)(backup_hdr + 88) = entries_crc;
 	*(uint32_t *)(backup_hdr + 16) = 0;
 	uint32_t backup_crc = ufs_crc32(backup_hdr, hdr_size);
 	*(uint32_t *)(backup_hdr + 16) = backup_crc;
 
-	/* 6. Write backup GPT header to alt_lba */
-	efi_status sb_hdr = bio->write_blocks(bio, bio->media->media_id, alt_lba, bs, backup_hdr);
-	if (EFI_ERROR(sb_hdr)) {
-		print("slot: failed to write backup GPT header: %x\n", sb_hdr);
-	}
-
+	(void)bio->write_blocks(bio, bio->media->media_id, alt_lba, bs, backup_hdr);
 	bio->flush_blocks(bio);
-	print("slot: LUN 4 GPT CRC-32 synchronized (entries=%x primary=%x backup=%x at LBA %x)\n",
+	print("slot: GPT CRC-32 synchronized (entries=%x primary=%x backup=%x at LBA %x)\n",
 	    (uint64_t)entries_crc, (uint64_t)primary_crc, (uint64_t)backup_crc, alt_lba);
 }
 
-static void
-slot_maintain_current(void)
+static uint32_t
+gpt_swap_ab_type_guids(uint8_t *entries, uint32_t num_entries, uint32_t entry_size)
 {
-	print("slot: maintaining current Slot %s (tries 7, successful 1, unbootable 0)\n",
-	    loader_slot == 'b' ? "b" : "a");
-	efi_block_io *bio = lun4_get_bio();
-	if (!bio || !bio->media) {
-		print("slot: LUN 4 not found\n");
-		return;
+	uint32_t swapped = 0;
+	for (uint32_t i = 0; i < num_entries; i++) {
+		uint8_t *ei = entries + i * entry_size;
+		const uint8_t *pi = ei + 56;
+		uint32_t len = 0;
+		while (len < 35 && (pi[len * 2] != 0 || pi[len * 2 + 1] != 0)) len++;
+		if (len < 3 || pi[(len - 2) * 2] != '_' || pi[(len - 2) * 2 + 1] != 0 ||
+		    pi[(len - 1) * 2] != 'a' || pi[(len - 1) * 2 + 1] != 0) {
+			continue;
+		}
+		for (uint32_t j = 0; j < num_entries; j++) {
+			uint8_t *ej = entries + j * entry_size;
+			const uint8_t *pj = ej + 56;
+			if (pj[len * 2] != 0 || pj[len * 2 + 1] != 0 ||
+			    pj[(len - 2) * 2] != '_' || pj[(len - 2) * 2 + 1] != 0 ||
+			    pj[(len - 1) * 2] != 'b' || pj[(len - 1) * 2 + 1] != 0) {
+				continue;
+			}
+			if (memcmp(pi, pj, (len - 2) * 2) == 0) {
+				uint8_t tmp[16];
+				memcpy(tmp, ei, 16);
+				memcpy(ei, ej, 16);
+				memcpy(ej, tmp, 16);
+				swapped++;
+				break;
+			}
+		}
 	}
+	return swapped;
+}
+
+static void
+slot_apply_active(char target_slot)
+{
+	efi_block_io *bio = lun4_get_bio();
+	if (!bio || !bio->media) return;
 	uint32_t bs = bio->media->block_size;
 	if (bs < 512 || bs > 4096) return;
 
 	static uint8_t hdr[4096] __attribute__((aligned(4096)));
 	if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, 1, bs, hdr)) ||
 	    memcmp(hdr, "EFI PART", 8) != 0) {
-		print("slot: cannot read LUN 4 GPT header\n");
 		return;
 	}
 
@@ -923,88 +931,66 @@ slot_maintain_current(void)
 	uint32_t entry_size = *(uint32_t *)(hdr + 84);
 	uint64_t total_bytes = (uint64_t)num_entries * entry_size;
 	uint64_t num_blocks = (total_bytes + bs - 1) / bs;
-
 	if (total_bytes == 0 || total_bytes > sizeof(ufs_buffer)) return;
-	if (EFI_ERROR(safe_read_blocks(bio, entries_lba, num_blocks, bs, ufs_buffer))) {
-		print("slot: cannot read partition entries\n");
-		return;
-	}
+	if (EFI_ERROR(safe_read_blocks(bio, entries_lba, num_blocks, bs, ufs_buffer))) return;
 
-	const char *target_name = (loader_slot == 'b') ? "boot_b" : "boot_a";
-	const char *other_name = (android_slot == 'b') ? "boot_b" : "boot_a";
+	const char *target_name = (target_slot == 'b') ? "boot_b" : "boot_a";
+	const char *target_abl = (target_slot == 'b') ? "abl_b" : "abl_a";
+	const char *other_name = (target_slot == 'b') ? "boot_a" : "boot_b";
 	uint8_t *entry = gpt_find_entry(ufs_buffer, num_entries, entry_size, target_name);
+	uint8_t *abl = gpt_find_entry(ufs_buffer, num_entries, entry_size, target_abl);
 	uint8_t *entry_other = gpt_find_entry(ufs_buffer, num_entries, entry_size, other_name);
-	if (!entry) {
-		print("slot: partition %s not found on LUN 4\n", target_name);
-		return;
+	if (!entry) return;
+
+	/* Qualcomm LinuxLoader ValidateSlotGuids requires active slot partitions to hold distinct
+	 * PartitionTypeGUIDs rather than the shared inactive GUID (77036cd4-03d5-42bb-8ed1-37e5a88baa34). */
+	int need_guid_swap = (abl != NULL && memcmp(entry, abl, 16) == 0);
+	if (need_guid_swap) {
+		uint32_t n4 = gpt_swap_ab_type_guids(ufs_buffer, num_entries, entry_size);
+		print("slot: swapped %d A/B PartitionTypeGUID pairs on LUN 4 for Slot %s\n",
+		    (uint64_t)n4, target_slot == 'b' ? "b" : "a");
 	}
 
 	*(uint64_t *)(entry + 48) = 0x006f000000000000ULL;
 	if (entry_other) {
 		*(uint64_t *)(entry_other + 48) = 0x006a000000000000ULL;
 	}
-	if (EFI_ERROR(safe_write_blocks(bio, entries_lba, num_blocks, bs, ufs_buffer))) {
-		print("slot: failed to write updated partition entries\n");
-		return;
-	}
+	if (EFI_ERROR(safe_write_blocks(bio, entries_lba, num_blocks, bs, ufs_buffer))) return;
+	gpt_sync_lun(bio);
 
-	gpt_sync_lun4(bio);
-	print("slot: Slot %s (%s) GPT attributes refreshed to 0x006f000000000000\n",
-	    loader_slot == 'b' ? "b" : "a", target_name);
+	if (need_guid_swap) {
+		efi_block_io *bio0 = lun_get_bio(0, "userdata");
+		if (bio0 && bio0->media && bio0->media->block_size == bs &&
+		    !EFI_ERROR(bio0->read_blocks(bio0, bio0->media->media_id, 1, bs, hdr)) &&
+		    memcmp(hdr, "EFI PART", 8) == 0) {
+			uint64_t elba0 = *(uint64_t *)(hdr + 72);
+			uint32_t nent0 = *(uint32_t *)(hdr + 80);
+			uint32_t esz0 = *(uint32_t *)(hdr + 84);
+			uint64_t tbytes0 = (uint64_t)nent0 * esz0;
+			uint64_t nblk0 = (tbytes0 + bs - 1) / bs;
+			if (tbytes0 > 0 && tbytes0 <= sizeof(ufs_buffer) &&
+			    !EFI_ERROR(safe_read_blocks(bio0, elba0, nblk0, bs, ufs_buffer))) {
+				uint32_t n0 = gpt_swap_ab_type_guids(ufs_buffer, nent0, esz0);
+				if (n0 > 0 && !EFI_ERROR(safe_write_blocks(bio0, elba0, nblk0, bs, ufs_buffer))) {
+					gpt_sync_lun(bio0);
+				}
+			}
+		}
+	}
+	print("slot: Slot %s (%s) active=0x006f000000000000 (%s=0x006a000000000000)\n",
+	    target_slot == 'b' ? "b" : "a", target_name, other_name);
+}
+
+static void
+slot_maintain_current(void)
+{
+	slot_apply_active(loader_slot);
 }
 
 static void
 slot_set_active_other(void)
 {
-	print("slot: switching active slot to %s (Android)\n", android_slot == 'b' ? "b" : "a");
-	efi_block_io *bio = lun4_get_bio();
-	if (!bio || !bio->media) {
-		print("slot: LUN 4 not found\n");
-		return;
-	}
-	uint32_t bs = bio->media->block_size;
-	if (bs < 512 || bs > 4096) return;
-
-	static uint8_t hdr[4096] __attribute__((aligned(4096)));
-	if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, 1, bs, hdr)) ||
-	    memcmp(hdr, "EFI PART", 8) != 0) {
-		print("slot: cannot read LUN 4 GPT header\n");
-		return;
-	}
-
-	uint64_t entries_lba = *(uint64_t *)(hdr + 72);
-	uint32_t num_entries = *(uint32_t *)(hdr + 80);
-	uint32_t entry_size = *(uint32_t *)(hdr + 84);
-	uint64_t total_bytes = (uint64_t)num_entries * entry_size;
-	uint64_t num_blocks = (total_bytes + bs - 1) / bs;
-
-	if (total_bytes == 0 || total_bytes > sizeof(ufs_buffer)) return;
-	if (EFI_ERROR(safe_read_blocks(bio, entries_lba, num_blocks, bs, ufs_buffer))) {
-		print("slot: cannot read partition entries\n");
-		return;
-	}
-
-	const char *cur_name = (loader_slot == 'b') ? "boot_b" : "boot_a";
-	const char *other_name = (android_slot == 'b') ? "boot_b" : "boot_a";
-
-	uint8_t *entry_cur = gpt_find_entry(ufs_buffer, num_entries, entry_size, cur_name);
-	uint8_t *entry_other = gpt_find_entry(ufs_buffer, num_entries, entry_size, other_name);
-
-	if (entry_cur) {
-		*(uint64_t *)(entry_cur + 48) = 0x006a000000000000ULL;
-	}
-	if (entry_other) {
-		*(uint64_t *)(entry_other + 48) = 0x006f000000000000ULL;
-	}
-
-	if (EFI_ERROR(safe_write_blocks(bio, entries_lba, num_blocks, bs, ufs_buffer))) {
-		print("slot: failed to write updated partition entries\n");
-		return;
-	}
-
-	gpt_sync_lun4(bio);
-	print("slot: Slot %s (%s) activated, Slot %s (%s) deactivated\n",
-	    android_slot == 'b' ? "b" : "a", other_name, loader_slot == 'b' ? "b" : "a", cur_name);
+	slot_apply_active(android_slot);
 }
 
 /* Compatibility wrappers */
@@ -1142,6 +1128,7 @@ slot_unlock_held_recovery(void)
 	}
 	kernel_resources_held = 0;
 	firmware_fault = 0;
+	hc_take_back("recovery unlock");
 	set_result("idle", 0, 0);
 	return NULL;
 }

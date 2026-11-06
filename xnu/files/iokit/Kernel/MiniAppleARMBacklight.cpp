@@ -150,10 +150,10 @@ publish_calibration(IOService * service)
 	marketing = OSData::withBytes(table, sizeof(table));
 	if (calibration != NULL) {
 		setNumber(calibration, "lMinPanel", fixed_nits(kBLMilliNitsMin));
-		setNumber(calibration, "lMidPanel", fixed_nits(kBLMilliNitsMid));
+		setNumber(calibration, "lMidPanel", fixed_nits(kBLMilliNitsMin));
 		setNumber(calibration, "lMaxPanel", fixed_nits(kBLMilliNitsMax));
 		setNumber(calibration, "lMinProduct", fixed_nits(kBLMilliNitsMin));
-		setNumber(calibration, "lMidProduct", fixed_nits(kBLMilliNitsMid));
+		setNumber(calibration, "lMidProduct", fixed_nits(kBLMilliNitsMin));
 		setNumber(calibration, "lMaxProduct", fixed_nits(kBLMilliNitsMax));
 		setNumber(calibration, "current-for-max-backlight", 0);
 		setNumber(calibration, "current-for-mid-backlight", 0);
@@ -242,7 +242,7 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 	static uint64_t last_millinits = kBLMilliNitsMax;
 	OSNumber * nits = OSDynamicCast(OSNumber, dict->getObject(nits_key));
 	OSNumber * value = value_key != NULL ? OSDynamicCast(OSNumber, dict->getObject(value_key)) : NULL;
-	uint64_t now = mach_absolute_time(), burst_gap, active_win;
+	uint64_t now = mach_absolute_time(), active_win;
 	uint64_t v, millinits, diff;
 	uint32_t level, mixed;
 	int alpha;
@@ -253,16 +253,11 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 		nits = OSDynamicCast(OSNumber, dict->getObject("DisplayBrightnessNitsNVRAM"));
 	}
 	if (value_key != NULL) {
-		nanoseconds_to_absolutetime(250 * NSEC_PER_MSEC, &burst_gap);
-		nanoseconds_to_absolutetime(400 * NSEC_PER_MSEC, &active_win);
+		nanoseconds_to_absolutetime(500 * NSEC_PER_MSEC, &active_win);
 		if (dict->getObject("DisplayBrightnessSliderPosition") != NULL) {
 			bl.user_until = now + active_win;
-		}
-		if (dict->getObject("DisplayBrightness") != NULL) {
-			if (bl.last_slider_t != 0 && now - bl.last_slider_t <= burst_gap) {
-				bl.user_until = now + active_win;
-			}
-			bl.last_slider_t = now;
+		} else if (dict->getObject("DisplayBrightness") != NULL && now <= bl.user_until) {
+			bl.user_until = now + active_win;
 		}
 	}
 
@@ -291,7 +286,13 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 
 		if (n16 >= 65536) {
 			/* Standard 16.16 fixed-point nits (>= 1.0 nit) */
-			millinits = (n16 < (uint64_t) kBLMilliNitsMax << 16 ? n16 : (uint64_t) kBLMilliNitsMax << 16) * 1000 >> 16;
+			OSNumber * db_num = OSDynamicCast(OSNumber, dict->getObject("DisplayBrightness"));
+			uint64_t db = db_num != NULL ? db_num->unsigned64BitValue() : 65536;
+			if (n16 == fixed_nits(kBLMilliNitsMid) && db < 49398) {
+				millinits = kBLMilliNitsMin + db * (kBLMilliNitsMid - kBLMilliNitsMin) / 49398;
+			} else {
+				millinits = (n16 < (uint64_t) kBLMilliNitsMax << 16 ? n16 : (uint64_t) kBLMilliNitsMax << 16) * 1000 >> 16;
+			}
 			millinits = millinits < kBLMilliNitsMin ? kBLMilliNitsMin : millinits > kBLMilliNitsMax ? kBLMilliNitsMax : millinits;
 			v = kBLValueMin + (millinits - kBLMilliNitsMin) * (kBLValueMax - kBLValueMin) / (kBLMilliNitsMax - kBLMilliNitsMin);
 		} else if (n16 >= 1 && n16 <= kBLLevelFull) {

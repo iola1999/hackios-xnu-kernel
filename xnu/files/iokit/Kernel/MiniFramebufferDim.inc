@@ -106,11 +106,18 @@ dim_find(void)
 		dim.stage[dim.count] = m + DIM_LM_STAGE(stage);
 		dim.op[dim.count] = flip_rd(dim.stage[dim.count] + DIM_STAGE_OP);
 		dim.alpha[dim.count] = flip_rd(dim.stage[dim.count] + DIM_STAGE_CONST_ALPHA);
+		if ((dim.alpha[dim.count] >> 16 & DIM_ALPHA_FULL) == 0) {
+			dim.op[dim.count] = (dim.op[dim.count] & ~DIM_OP_CONSTANT) | DIM_OP_BLEND;
+			dim.alpha[dim.count] = 0xffff0000u;
+			flip_wr(dim.stage[dim.count] + DIM_STAGE_CONST_ALPHA, dim.alpha[dim.count]);
+			flip_wr(dim.stage[dim.count] + DIM_STAGE_OP, dim.op[dim.count]);
+		}
 		dim.flush |= dimFlush[n];
 		IOLog("MiniIOMobileFramebuffer: dim: lm%u: the picture in stage %u (src %08x), op %08x alpha %08x\n", n, stage,
 		    flip_rd(dim.stage[dim.count] + DIM_STAGE_SRC_SEL), dim.op[dim.count], dim.alpha[dim.count]);
 		dim.count++;
 	}
+	flip_wr(FLIP_CTL(dim.ctl) + FLIP_CTL_FLUSH, dim.flush | FLIP_CTL_FLUSH_CTL);
 	dim.ready = true;
 	IOLog("MiniIOMobileFramebuffer: dim: ctl%u, %u mixers: brightness below full darkens the picture (flush %#x)\n",
 	    dim.ctl, dim.count, dim.flush | FLIP_CTL_FLUSH_CTL);
@@ -197,4 +204,17 @@ dim_quiesce(void)
 	dim_taken(40000, false);
 	dim_write(DIM_ALPHA_FULL);
 	dim_taken(40000, false);
+}
+
+/* Darken the panel to black on OS shutdown and keep dim_quiesce() from restoring full alpha on loader_return(). */
+static void
+dim_poweroff(void)
+{
+	if (!dim.ready) {
+		return;
+	}
+	dim_taken(40000, false);
+	dim_write(0);
+	dim_taken(40000, false);
+	dim.ready = false;
 }

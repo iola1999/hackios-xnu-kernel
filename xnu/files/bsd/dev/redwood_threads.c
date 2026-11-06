@@ -569,3 +569,22 @@ redwood_say_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unus
 
 SYSCTL_PROC(_kern_redwood, OID_AUTO, say, CTLTYPE_STRING | CTLFLAG_WR | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
     NULL, 0, redwood_say_sysctl, "A", "a line for the kernel log, from any process");
+
+extern void halt_all_cpus(boolean_t reboot) __attribute__((noreturn));
+
+static int
+redwood_halt_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	int value = 0, changed = 0;
+	int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
+
+	if (error == 0 && changed && value != 0) {
+		redwood_tl("halt requested by pid %d\n", proc_selfpid());
+		halt_all_cpus(FALSE);
+	}
+	return error;
+}
+
+SYSCTL_PROC(_kern_redwood, OID_AUTO, halt, CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+    NULL, 0, redwood_halt_sysctl, "I", "1: blank the panel, save /private/var and return to the loader");

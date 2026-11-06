@@ -736,8 +736,8 @@ to_ethernet(struct sk_buff *skb, bool cipher_header_gone)
 }
 
 /* A message of the handshake from the access point: answered at once; the keys are for join() to give to the driver. */
-static void
-handshake_message(struct lx_radio *radio, const uint8_t *frame, unsigned length)
+void
+lx_handshake_message(struct lx_radio *radio, const uint8_t *frame, unsigned length)
 {
 	uint8_t reply[14 + LX_WPA_REPLY_MOST];
 	unsigned reply_length = 0;
@@ -777,7 +777,17 @@ static void
 ethernet_received(struct lx_radio *radio, struct sk_buff *skb)
 {
 	if (skb->len >= 14 && skb->data[12] == 0x88 && skb->data[13] == 0x8e) {
-		handshake_message(radio, skb->data, skb->len);
+		if (radio->reached < IEEE80211_STA_ASSOC && skb->len <= sizeof(radio->pending_eapol)) {
+			lx_os_lock();
+			if (radio->reached < IEEE80211_STA_ASSOC) {
+				memcpy(radio->pending_eapol, skb->data, skb->len);
+				radio->pending_eapol_len = skb->len;
+				lx_os_unlock();
+				return;
+			}
+			lx_os_unlock();
+		}
+		lx_handshake_message(radio, skb->data, skb->len);
 	} else if (radio->joined && skb->len >= 14) {
 		*(skb->data[0] & 1 ? &radio->received_group : &radio->received) += 1;
 		lx_os_net_input(skb->data, skb->len);

@@ -391,6 +391,22 @@ MiniIOMobileFramebufferQuiesce(void)
 	flip.ready = false;
 }
 
+extern "C" void
+MiniIOMobileFramebufferPowerOff(void)
+{
+	dim_poweroff();
+	if (flip.ready) {
+		flip_taken(40000, false);
+		bzero(flip.va[0], flip.bytes);
+		bzero(flip.va[1], flip.bytes);
+		flip_point(0);
+		flip_taken(40000, false);
+		flip.ready = false;
+	} else if (vinfo.v_baseaddr != 0 && vinfo.v_height != 0 && vinfo.v_rowbytes != 0) {
+		bzero((void *) vinfo.v_baseaddr, (size_t) vinfo.v_rowbytes * vinfo.v_height);
+	}
+}
+
 /*
  * A picture from inside the kernel (the GPU driver's first ones): rows of 32-bit pixels, put at
  * the top left corner of the panel as they are and cut to its size, in the buffer on screen.

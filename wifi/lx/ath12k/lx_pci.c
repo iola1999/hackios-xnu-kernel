@@ -115,6 +115,9 @@ __ath12k_dbg(struct ath12k_base *ab, enum ath12k_debug_mask mask, const char *fo
 {
 	va_list list;
 
+	if (!(ath12k_debug_mask & mask)) {
+		return;
+	}
 	va_start(list, format);
 	driver_says(" (debug)", format, list, false);
 	va_end(list);
@@ -652,7 +655,7 @@ lx_start(void)
 		return (ENOMEM);
 	}
 	ath12k_debug_mask = lx_os_option("wifi_quiet") ? 0 : ATH12K_DBG_QMI | ATH12K_DBG_BOOT | ATH12K_DBG_PCI |
-	    ATH12K_DBG_WMI | ATH12K_DBG_REG | ATH12K_DBG_MAC | ATH12K_DBG_HTC;
+	    ATH12K_DBG_WMI | ATH12K_DBG_REG | ATH12K_DBG_MAC;
 	if ((ret = probe(&ab)) != 0) {
 		return (ret);
 	}

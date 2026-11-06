@@ -86,6 +86,8 @@ struct lx_radio {
 	struct lx_wpa wpa;
 	volatile int handshake;			/* the last thing lx_wpa_message() said */
 	const char *handshake_why;
+	unsigned pending_eapol_len;
+	uint8_t pending_eapol[256];
 	struct work_struct group_work;		/* a new group key, later on */
 	/* block ack: the access point's requests to send us frames in aggregates, by traffic class (TID) */
 	struct work_struct ba_work;
@@ -124,6 +126,7 @@ struct sk_buff *lx_frame_new(struct lx_radio *radio, unsigned length, uint8_t **
 uint8_t *lx_management(struct lx_radio *radio, uint8_t *frame, unsigned kind);
 void lx_frame_send(struct lx_radio *radio, struct sk_buff *skb);
 bool lx_ethernet_send(struct lx_radio *radio, const uint8_t *frame, unsigned length);
+void lx_handshake_message(struct lx_radio *radio, const uint8_t *frame, unsigned length);
 /* the interface in station mode, up and down; a scan with it */
 int lx_station_up(struct lx_radio *radio);
 void lx_station_down(struct lx_radio *radio);
