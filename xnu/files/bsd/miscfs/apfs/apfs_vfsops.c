@@ -1179,6 +1179,13 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 	sp->f_fsid.val[0] = (int32_t)vnode_specrdev(devvp);
 	sp->f_fsid.val[1] = (int32_t)((vfs_typenum(mp) & 0xff) | (container << 8) | (am->am_vol.index << 20));
 	strlcpy(sp->f_fstypename, "apfs", sizeof(sp->f_fstypename));
+	if (container == 1) {
+		strlcpy(sp->f_mntfromname, "/dev/disk2s1", sizeof(sp->f_mntfromname));
+	} else if (container == 2) {
+		strlcpy(sp->f_mntfromname, "/dev/disk3s1", sizeof(sp->f_mntfromname));
+	} else if (sp->f_mntfromname[0] == '\0') {
+		strlcpy(sp->f_mntfromname, "/dev/disk1s1", sizeof(sp->f_mntfromname));
+	}
 
 	apfs_the_mount = am;
 	am->am_rdev = vnode_specrdev(devvp);
@@ -1294,24 +1301,27 @@ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
 				APFS_MP(mp)->am_owns_devvp = true;
 				APFS_MP(mp)->am_shares_devvp = shared;
 				/* what mount(8) and df show as where it came from */
-				if (vfs_statfs(mp)->f_mntfromname[0] == '\0' || container != 0 || volume >= 0) {
+				if (container == 1) {
+					strlcpy(vfs_statfs(mp)->f_mntfromname, "/dev/disk2s1", MAXPATHLEN);
+				} else if (container == 2) {
+					strlcpy(vfs_statfs(mp)->f_mntfromname, "/dev/disk3s1", MAXPATHLEN);
+				} else if (container == 0 && (volume == -1 || volume == 0)) {
+					strlcpy(vfs_statfs(mp)->f_mntfromname, "/dev/disk1s1", MAXPATHLEN);
+				} else if (vfs_statfs(mp)->f_mntfromname[0] == '\0' || container != 0 || volume >= 0) {
 					char opts[40] = "";
 
-					if (container != 0) {
+					if (container != 0)
 						snprintf(opts, sizeof(opts), ",c=%u", container);
-					}
-					if (volume >= 0) {
+					if (volume >= 0)
 						snprintf(opts + strlen(opts), sizeof(opts) - strlen(opts), ",v=%d", volume);
-					}
 					snprintf(vfs_statfs(mp)->f_mntfromname, MAXPATHLEN, "%s%s", path, opts);
 				}
 			} else if (!shared) {
 				(void)VNOP_CLOSE(vp, FREAD, ctx);
 			}
 		}
-		if (error != 0) {
+		if (error != 0)
 			vnode_put(vp);
-		}
 	} else if (vp != NULLVP) {
 		vnode_put(vp);
 	}
@@ -1353,9 +1363,7 @@ apfs_unmount(mount_t mp, int mntflags, vfs_context_t ctx)
 static int
 apfs_root(mount_t mp, vnode_t *vpp, __unused vfs_context_t ctx)
 {
-	struct apfs_mount *am = APFS_MP(mp);
-
-	return apfs_node_vnode(am, am->am_root_id, NULLVP, NULL, vpp);
+	return apfs_node_vnode(APFS_MP(mp), APFS_MP(mp)->am_root_id, NULLVP, NULL, vpp);
 }
 
 static int
@@ -1439,16 +1447,9 @@ apfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
 
 /* Nothing is ever dirty. */
 static int
-apfs_sync(__unused mount_t mp, __unused int waitfor, __unused vfs_context_t ctx)
-{
-	return 0;
-}
-
+apfs_sync(__unused mount_t mp, __unused int waitfor, __unused vfs_context_t ctx) { return 0; }
 static int
-apfs_init(__unused struct vfsconf *vfsc)
-{
-	return 0;
-}
+apfs_init(__unused struct vfsconf *vfsc) { return 0; }
 
 struct vfsops apfs_vfsops = {
 	.vfs_mount = apfs_mount,

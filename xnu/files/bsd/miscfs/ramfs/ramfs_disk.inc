@@ -17,10 +17,29 @@ extern int redwood_ufs_var_io(bool write, uint64_t offset, void *buf, uint64_t l
 #define RDWFS_SLOT0_OFFSET       0ULL
 #define RDWFS_SLOT1_OFFSET       (32ULL << 20)
 #define RDWFS_SLOT_MAX           (32ULL << 20)
+#define RDWFS_PANIC_OFFSET       (64ULL << 20)
+#define RDWFS_PANIC_SIZE         (16ULL << 20)
 #define RDWFS_DATA_OFFSET        (512ULL << 20)
 #define RDWFS_INIT_META_CAP      (8ULL << 20)
 #define RDWFS_ALIGN8(n)          (((uint64_t)(n) + 7ULL) & ~7ULL)
 #define RDWFS_ALIGN4K(n)         (((uint64_t)(n) + 4095ULL) & ~4095ULL)
+
+#define KLOG_MAGIC               0x474f4c4bU     /* 'KLOG' */
+#define KLOG_MAGIC_ARCHIVED      0x474f4c44U     /* 'DLOG' */
+#define KLOG_VERSION             1U
+
+struct klog_head {
+	uint32_t magic;
+	uint32_t version;
+	uint64_t payload_bytes;
+	uint64_t timestamp;
+	uint32_t boot_counter;
+	uint32_t payload_crc;
+	uint32_t head_crc;
+	uint32_t flags;
+	uint8_t  reserved[24];
+};
+_Static_assert(sizeof(struct klog_head) == 64, "klog_head must be 64 bytes");
 
 struct rdwfs_super {
 	char     magic[8];
@@ -693,6 +712,195 @@ ramfs_disk_unpack(struct ramfs_mount *rm, const struct rdwfs_super *sup)
 	return true;
 }
 
+static struct ramfs_node *
+ramfs_disk_find_child(struct ramfs_node *dir, const char *name, size_t len)
+{
+	struct ramfs_dirent *de;
+
+	if (dir == NULL || dir->rn_type != VDIR) {
+		return NULL;
+	}
+	TAILQ_FOREACH(de, &dir->rn_entries, rd_link) {
+		if (de->rd_namelen == len && memcmp(de->rd_name, name, len) == 0) {
+			return de->rd_node;
+		}
+	}
+	return NULL;
+}
+
+static void
+ramfs_disk_restore_panic_log(struct ramfs_mount *rm)
+{
+	uint8_t *head_buf;
+	struct klog_head *kh;
+	uint64_t pay_len, total_len, npages, nslots;
+	uint8_t *full_buf;
+	const uint8_t *payload;
+	void **pages;
+	uint32_t *blocks;
+	struct ramfs_node *db_node, *log_node;
+	struct ramfs_dirent *de;
+
+	if (rm == NULL || !rm->rm_disk_backed || rm->rm_root == NULL) {
+		return;
+	}
+
+	head_buf = (uint8_t *)ramfs_vm_alloc(PAGE_SIZE);
+	if (head_buf == NULL) {
+		return;
+	}
+	if (redwood_ufs_var_io(false, RDWFS_PANIC_OFFSET, head_buf, PAGE_SIZE) != 0) {
+		ramfs_vm_free(head_buf, PAGE_SIZE);
+		return;
+	}
+
+	kh = (struct klog_head *)head_buf;
+	if (kh->magic != KLOG_MAGIC || kh->version != KLOG_VERSION) {
+		ramfs_vm_free(head_buf, PAGE_SIZE);
+		return;
+	}
+	if (crc32(0, kh, __builtin_offsetof(struct klog_head, head_crc)) != kh->head_crc) {
+		printf("ramfs: panic log header crc mismatch\n");
+		ramfs_vm_free(head_buf, PAGE_SIZE);
+		return;
+	}
+	if (kh->payload_bytes == 0 || kh->payload_bytes > (RDWFS_PANIC_SIZE - sizeof(struct klog_head))) {
+		ramfs_vm_free(head_buf, PAGE_SIZE);
+		return;
+	}
+
+	pay_len = kh->payload_bytes;
+	total_len = RDWFS_ALIGN4K(sizeof(struct klog_head) + pay_len);
+	full_buf = (uint8_t *)ramfs_vm_alloc((size_t)total_len);
+	if (full_buf == NULL) {
+		ramfs_vm_free(head_buf, PAGE_SIZE);
+		return;
+	}
+	if (redwood_ufs_var_io(false, RDWFS_PANIC_OFFSET, full_buf, total_len) != 0) {
+		ramfs_vm_free(full_buf, (size_t)total_len);
+		ramfs_vm_free(head_buf, PAGE_SIZE);
+		return;
+	}
+
+	payload = full_buf + sizeof(struct klog_head);
+	if (crc32(0, payload, (size_t)pay_len) != kh->payload_crc) {
+		printf("ramfs: panic log payload crc mismatch\n");
+		ramfs_vm_free(full_buf, (size_t)total_len);
+		ramfs_vm_free(head_buf, PAGE_SIZE);
+		return;
+	}
+
+	npages = (pay_len + PAGE_MASK) / PAGE_SIZE;
+	nslots = 4;
+	while (nslots < npages) {
+		nslots *= 2;
+	}
+
+	pages = kalloc_type(void *, nslots, Z_WAITOK | Z_ZERO | Z_NOFAIL);
+	blocks = kalloc_data((size_t)nslots * sizeof(uint32_t), Z_WAITOK | Z_ZERO | Z_NOFAIL);
+
+	for (uint64_t i = 0; i < npages; i++) {
+		void *p = ramfs_page_alloc(true);
+		if (p == NULL) {
+			for (uint64_t j = 0; j < i; j++) {
+				ramfs_page_free(pages[j]);
+			}
+			kfree_type(void *, nslots, pages);
+			kfree_data(blocks, (size_t)nslots * sizeof(uint32_t));
+			ramfs_vm_free(full_buf, (size_t)total_len);
+			ramfs_vm_free(head_buf, PAGE_SIZE);
+			return;
+		}
+		size_t chunk = (i + 1 == npages && (pay_len & PAGE_MASK)) ? (size_t)(pay_len & PAGE_MASK) : PAGE_SIZE;
+		memcpy(p, payload + i * PAGE_SIZE, chunk);
+		pages[i] = p;
+	}
+
+	lck_mtx_lock(&rm->rm_lock);
+	db_node = ramfs_disk_find_child(rm->rm_root, "db", 2);
+	if (db_node == NULL) {
+		db_node = ramfs_node_alloc(rm, VDIR, NULL);
+		db_node->rn_ino = rm->rm_next_ino++;
+		db_node->rn_mode = 0755;
+		db_node->rn_nlink = 2;
+		db_node->rn_parent = rm->rm_root;
+		ramfs_hash_insert(rm, db_node);
+		rm->rm_nodes++;
+
+		de = ramfs_dirent_alloc("db", 2);
+		de->rd_node = db_node;
+		TAILQ_INSERT_TAIL(&rm->rm_root->rn_entries, de, rd_link);
+		rm->rm_root->rn_nentries++;
+	}
+
+	log_node = ramfs_disk_find_child(db_node, "panic.log", 9);
+	if (log_node != NULL) {
+		if (log_node->rn_pages != NULL) {
+			for (uint64_t i = 0; i < log_node->rn_nslots; i++) {
+				if (log_node->rn_pages[i] != NULL) {
+					ramfs_page_free(log_node->rn_pages[i]);
+					os_atomic_dec(&ramfs_pages_in_use, relaxed);
+				}
+				if (log_node->rn_blocks != NULL && log_node->rn_blocks[i] != 0) {
+					ramfs_disk_bmap_free(rm, log_node->rn_blocks[i]);
+					os_atomic_dec(&ramfs_var_used_pages, relaxed);
+				}
+			}
+			kfree_type(void *, log_node->rn_nslots, log_node->rn_pages);
+		}
+		if (log_node->rn_blocks != NULL) {
+			kfree_data(log_node->rn_blocks, (size_t)log_node->rn_nslots * sizeof(uint32_t));
+		}
+	} else {
+		log_node = ramfs_node_alloc(rm, VREG, NULL);
+		log_node->rn_ino = rm->rm_next_ino++;
+		log_node->rn_mode = 0644;
+		log_node->rn_nlink = 1;
+		ramfs_hash_insert(rm, log_node);
+		rm->rm_nodes++;
+
+		de = ramfs_dirent_alloc("panic.log", 9);
+		de->rd_node = log_node;
+		TAILQ_INSERT_TAIL(&db_node->rn_entries, de, rd_link);
+		db_node->rn_nentries++;
+	}
+
+	log_node->rn_pages = pages;
+	log_node->rn_blocks = blocks;
+	log_node->rn_nslots = nslots;
+	log_node->rn_nalloc = (uint32_t)npages;
+	log_node->rn_size = pay_len;
+	rm->rm_pages += npages;
+	os_atomic_add(&ramfs_pages_in_use, npages, relaxed);
+
+	for (uint64_t i = 0; i < npages; i++) {
+		uint32_t dblk = ramfs_disk_bmap_alloc(rm);
+		if (dblk != 0) {
+			blocks[i] = dblk;
+			os_atomic_inc(&ramfs_var_used_pages, relaxed);
+		}
+	}
+	ramfs_disk_dirty_locked(rm);
+	lck_mtx_unlock(&rm->rm_lock);
+
+	for (uint64_t i = 0; i < npages; i++) {
+		if (blocks[i] != 0 && pages[i] != NULL) {
+			(void)ramfs_disk_write_block(rm, blocks[i], pages[i]);
+		}
+	}
+
+	kh->magic = KLOG_MAGIC_ARCHIVED;
+	kh->head_crc = crc32(0, kh, __builtin_offsetof(struct klog_head, head_crc));
+	bzero(head_buf, PAGE_SIZE);
+	memcpy(head_buf, kh, sizeof(*kh));
+	(void)redwood_ufs_var_io(true, RDWFS_PANIC_OFFSET, head_buf, PAGE_SIZE);
+
+	ramfs_vm_free(full_buf, (size_t)total_len);
+	ramfs_vm_free(head_buf, PAGE_SIZE);
+	(void)ramfs_disk_sync(rm);
+	printf("ramfs: restored %llu bytes of crash log to /private/var/db/panic.log\n", (unsigned long long)pay_len);
+}
+
 static void
 ramfs_disk_mount(struct ramfs_mount *rm)
 {
@@ -778,6 +986,7 @@ ramfs_disk_mount(struct ramfs_mount *rm)
 		printf("ramfs: /private/var backed by UFS (%llu MB data region, fresh checkpoint)\n",
 		    avail_bytes >> 20);
 	}
+	ramfs_disk_restore_panic_log(rm);
 }
 
 static void

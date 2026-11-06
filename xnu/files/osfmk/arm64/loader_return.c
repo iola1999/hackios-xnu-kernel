@@ -69,7 +69,29 @@ extern void redwood_mic_quiesce(void);
 extern void MiniIOMobileFramebufferQuiesce(void);   /* iokit/Kernel/MiniFramebufferFlip.inc */
 extern void redwood_ufs_quiesce(void);
 extern void redwood_var_save_on_return(void);   /* bsd/dev/redwood_ufs.c: the data volume into the flash */
+extern int redwood_ufs_var_io(bool write, uint64_t offset, void *buf, uint64_t len);
+extern uint32_t crc32(uint32_t crc, const void *buf, size_t len);
 void loader_checkpoint(uint64_t n);
+
+#define RDWFS_PANIC_OFFSET       (64ULL << 20)
+#define RDWFS_PANIC_SIZE         (16ULL << 20)
+#define KLOG_MAGIC               0x474f4c4bU     /* 'KLOG' */
+#define KLOG_VERSION             1U
+
+struct klog_head {
+	uint32_t magic;
+	uint32_t version;
+	uint64_t payload_bytes;
+	uint64_t timestamp;
+	uint32_t boot_counter;
+	uint32_t payload_crc;
+	uint32_t head_crc;
+	uint32_t flags;
+	uint8_t  reserved[24];
+};
+_Static_assert(sizeof(struct klog_head) == 64, "klog_head must be 64 bytes");
+
+void loader_panic_sync_ufs(const char *reason, uint32_t flags);
 
 /* Also referenced from the early exception vector in start.s. */
 char     loader_log[LOADER_LOG_SIZE];
@@ -157,6 +179,103 @@ loader_fault_log(const char *message, uint64_t pc, uint64_t lr, uint32_t esr, ui
 	loader_log_line(text);
 }
 
+#define LOADER_PANIC_BUF_SIZE    (256 * 1024)
+static char loader_panic_buf[LOADER_PANIC_BUF_SIZE] __attribute__((aligned(4096)));
+static uint32_t loader_panic_sync_lock;
+static uint32_t loader_panic_sync_seq;
+
+void
+loader_panic_sync_ufs(const char *reason, uint32_t flags)
+{
+	uint64_t daif;
+	bool locked = false;
+	clock_sec_t secs = 0;
+	clock_usec_t usecs = 0;
+	char *p;
+	size_t cap, at = 0;
+	struct klog_head *kh;
+	uint64_t write_len;
+	int n;
+
+	daif = __builtin_arm_rsr64("DAIF");
+	__builtin_arm_wsr("DAIFSet", DAIFSC_IRQF | DAIFSC_FIQF);
+	for (uint32_t tries = 0; !locked && tries < 1000000; tries++) {
+		locked = os_atomic_cmpxchg(&loader_panic_sync_lock, 0, 1, acquire);
+	}
+
+	clock_get_system_microtime(&secs, &usecs);
+	p = loader_panic_buf + sizeof(struct klog_head);
+	cap = LOADER_PANIC_BUF_SIZE - sizeof(struct klog_head);
+
+	n = snprintf(p + at, cap - at,
+	    "=== HACKIOS KERNEL CRASH LOG ===\n"
+	    "Reason: %s, Flags: 0x%x, Time: %llu sec, Beat: %llu, SyncSeq: %u\n",
+	    reason ? reason : "unknown", flags, (unsigned long long)secs,
+	    (unsigned long long)loader_live.heartbeat, ++loader_panic_sync_seq);
+	if (n > 0 && (size_t)n < cap - at) {
+		at += (size_t)n;
+	}
+
+	if (debug_buf_base != NULL && debug_buf_ptr > debug_buf_base) {
+		size_t pb_len = (size_t)(debug_buf_ptr - debug_buf_base);
+		int hn = snprintf(p + at, cap - at, "\n--- panic buffer (%lu bytes) ---\n", (unsigned long)pb_len);
+		if (hn > 0 && (size_t)hn < cap - at) {
+			at += (size_t)hn;
+		}
+		if (pb_len > cap - at - 1) {
+			pb_len = cap - at - 1;
+		}
+		if (pb_len > 0) {
+			memcpy(p + at, debug_buf_base, pb_len);
+			at += pb_len;
+			p[at] = '\0';
+		}
+	}
+
+	if (loader_log_len > 0) {
+		uint32_t log_take = loader_log_len;
+		if (log_take > (uint32_t)(cap - at - 64)) {
+			log_take = (uint32_t)(cap - at - 64);
+		}
+		if (log_take > 0) {
+			int hn = snprintf(p + at, cap - at, "\n--- console log tail (%u bytes) ---\n", log_take);
+			if (hn > 0 && (size_t)hn < cap - at) {
+				at += (size_t)hn;
+			}
+			uint32_t log_start = loader_log_len - log_take;
+			memcpy(p + at, loader_log + log_start, log_take);
+			at += log_take;
+			p[at] = '\0';
+		}
+	}
+
+	write_len = (sizeof(struct klog_head) + at + 4095ULL) & ~4095ULL;
+	if (write_len > LOADER_PANIC_BUF_SIZE) {
+		write_len = LOADER_PANIC_BUF_SIZE;
+	}
+	if (write_len > sizeof(struct klog_head) + at) {
+		bzero(p + at, (size_t)(write_len - (sizeof(struct klog_head) + at)));
+	}
+
+	kh = (struct klog_head *)loader_panic_buf;
+	bzero(kh, sizeof(*kh));
+	kh->magic = KLOG_MAGIC;
+	kh->version = KLOG_VERSION;
+	kh->payload_bytes = at;
+	kh->timestamp = (uint64_t)secs;
+	kh->boot_counter = (uint32_t)loader_live.heartbeat;
+	kh->flags = flags;
+	kh->payload_crc = crc32(0, p, at);
+	kh->head_crc = crc32(0, kh, __builtin_offsetof(struct klog_head, head_crc));
+
+	(void)redwood_ufs_var_io(true, RDWFS_PANIC_OFFSET, loader_panic_buf, write_len);
+
+	if (locked) {
+		os_atomic_store(&loader_panic_sync_lock, 0, release);
+	}
+	__builtin_arm_wsr64("DAIF", daif);
+}
+
 /* Save the original panic before platform debugger setup can itself fault. */
 void loader_panic_log(const char *format, va_list *args, unsigned long caller);
 
@@ -173,6 +292,8 @@ loader_panic_log(const char *format, va_list *args, unsigned long caller)
 	va_end(copy);
 	loader_log_line(text);
 	loader_log_putc('\n');
+
+	loader_panic_sync_ufs("panic_trap", 1);
 }
 
 static void
@@ -472,19 +593,6 @@ loader_return(void)
 	 */
 	psci_smp_stop_others();
 #endif
-	redwood_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
-	redwood_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
-	adreno8_quiesce();              /* the other phone's GMU, if its stepper ran, back in reset, and its translation off */
-	redwood_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
-	redwood_adsp_quiesce();         /* nor the audio DSP */
-	redwood_ddr_quiesce();          /* and the vote for the memory's bandwidth taken away */
-	redwood_haptic_quiesce();       /* the vibration motor's chip back into reset, if it was let out */
-	annibale_haptic_quiesce();      /* or the PMIC's haptics block of the other phone, if it was configured */
-	redwood_torch_quiesce();        /* the flashlight off, if it was lit */
-	annibale_torch_quiesce();       /* or the other phone's, lit on its PMIC's flash module */
-	redwood_camera_quiesce();       /* the camera powered down, if it was powered up */
-	redwood_mic_quiesce();          /* (what the microphones' path did, said again: it happens in the log's middle) */
-	MiniIOMobileFramebufferQuiesce();       /* the display back on the boot framebuffer, the last frame in it (fb_flip) */
 	/*
 	 * A panic's text is first collected in the panic buffer and only later
 	 * flushed to the console; if the console itself is what failed, that
@@ -501,6 +609,23 @@ loader_return(void)
 			loader_log_putc(*c);
 		}
 	}
+	/* Synchronously flush final complete panic/crash log to darwin_var reserved sector before storage quiesce */
+	loader_panic_sync_ufs("loader_return", 1);
+
+	redwood_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
+	redwood_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
+	adreno8_quiesce();              /* the other phone's GMU, if its stepper ran, back in reset, and its translation off */
+	redwood_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
+	redwood_adsp_quiesce();         /* nor the audio DSP */
+	redwood_ddr_quiesce();          /* and the vote for the memory's bandwidth taken away */
+	redwood_haptic_quiesce();       /* the vibration motor's chip back into reset, if it was let out */
+	annibale_haptic_quiesce();      /* or the PMIC's haptics block of the other phone, if it was configured */
+	redwood_torch_quiesce();        /* the flashlight off, if it was lit */
+	annibale_torch_quiesce();       /* or the other phone's, lit on its PMIC's flash module */
+	redwood_camera_quiesce();       /* the camera powered down, if it was powered up */
+	redwood_mic_quiesce();          /* (what the microphones' path did, said again: it happens in the log's middle) */
+	MiniIOMobileFramebufferQuiesce();       /* the display back on the boot framebuffer, the last frame in it (fb_flip) */
+
 	loader_jump(0, 0);
 }
 
@@ -542,6 +667,9 @@ loader_return_timer(__unused thread_call_param_t p0, __unused thread_call_param_
 		loader_log_putc(*c);
 	}
 	PE_parse_boot_argn("return_panic", &as_panic, sizeof(as_panic));
+	if (as_panic) {
+		loader_panic_sync_ufs("return_panic_timer", 2);
+	}
 	if (!as_panic) {
 		redwood_var_save_on_return();   /* the data volume kept, while the system is still whole */
 		redwood_adreno_stop();          /* a GPU kept for the system is given back while there is a thread to wait in */
@@ -677,6 +805,10 @@ static void
 hv_wdt_pet(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
 	uint64_t deadline;
+
+	if (debug_buf_base != NULL && debug_buf_ptr > debug_buf_base) {
+		loader_panic_sync_ufs("watchdog_panic", 2);
+	}
 
 	if (hv_wdt_enabled) {
 		register uint64_t x0 __asm__("x0") = VIRT_WDT_PET;

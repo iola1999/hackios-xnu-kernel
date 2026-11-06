@@ -829,19 +829,16 @@ ramfs_make(vnode_t dvp, vnode_t *vpp, struct componentname *cnp, struct vnode_at
 	}
 	return error;
 }
-
 static int
 ramfs_create(struct vnop_create_args *ap)
 {
 	return ramfs_make(ap->a_dvp, ap->a_vpp, ap->a_cnp, ap->a_vap, VREG, NULL);
 }
-
 static int
 ramfs_mkdir(struct vnop_mkdir_args *ap)
 {
 	return ramfs_make(ap->a_dvp, ap->a_vpp, ap->a_cnp, ap->a_vap, VDIR, NULL);
 }
-
 static int
 ramfs_symlink(struct vnop_symlink_args *ap)
 {
@@ -850,7 +847,6 @@ ramfs_symlink(struct vnop_symlink_args *ap)
 	}
 	return ramfs_make(ap->a_dvp, ap->a_vpp, ap->a_cnp, ap->a_vap, VLNK, ap->a_target);
 }
-
 /* Only the name of a local socket can be made here (bind); devices live in devfs. */
 static int
 ramfs_mknod(struct vnop_mknod_args *ap)
@@ -1513,6 +1509,8 @@ ramfs_offtoblk(struct vnop_offtoblk_args *ap)
 
 #define VOPFUNC int (*)(void *)
 
+#include "ramfs_clonefile.inc"
+
 int(**ramfs_vnodeop_p)(void *);
 const struct vnodeopv_entry_desc ramfs_vnodeop_entries[] = {
 	{ .opve_op = &vnop_default_desc, .opve_impl = (VOPFUNC)vn_default_error },
@@ -1549,6 +1547,7 @@ const struct vnodeopv_entry_desc ramfs_vnodeop_entries[] = {
 	{ .opve_op = &vnop_listxattr_desc, .opve_impl = (VOPFUNC)ramfs_listxattr },
 	{ .opve_op = &vnop_blktooff_desc, .opve_impl = (VOPFUNC)ramfs_blktooff },
 	{ .opve_op = &vnop_offtoblk_desc, .opve_impl = (VOPFUNC)ramfs_offtoblk },
+	{ .opve_op = &vnop_clonefile_desc, .opve_impl = (VOPFUNC)ramfs_clonefile },
 	{ .opve_op = (struct vnodeop_desc *)NULL, .opve_impl = (VOPFUNC)NULL }
 };
 const struct vnodeopv_desc ramfs_vnodeop_opv_desc = {
@@ -1594,6 +1593,7 @@ ramfs_mount(mount_t mp, __unused vnode_t devvp, __unused user_addr_t data, __unu
 	vfs_getnewfsid(mp);
 
 	ramfs_disk_mount(rm);
+	vfs_setfstypename(mp, "apfs");
 	sp = vfs_statfs(mp);
 	ramfs_fill_statfs(rm, sp);
 	return 0;

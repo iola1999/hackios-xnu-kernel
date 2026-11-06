@@ -549,7 +549,16 @@ redwood_sysctl_switch_root SYSCTL_HANDLER_ARGS
 	error = vfs_switch_root(buf, outgoing, 0);
 	printf("redwood: %s is the root now, the one before it on /%s: %d\n", buf, outgoing, error);
 	if (error == 0) {
+		vnode_t rootvp = NULLVP;
 		redwood_root_switched = 1;
+		if (vnode_lookup("/", 0, &rootvp, vfs_context_kernel()) == 0 && rootvp != NULLVP) {
+			mount_t rmp = vnode_mount(rootvp);
+			if (rmp != NULL) {
+				strlcpy(vfs_statfs(rmp)->f_fstypename, "apfs", sizeof(vfs_statfs(rmp)->f_fstypename));
+				strlcpy(vfs_statfs(rmp)->f_mntfromname, "/dev/disk1s1", sizeof(vfs_statfs(rmp)->f_mntfromname));
+			}
+			vnode_put(rootvp);
+		}
 	}
 	return error;
 }

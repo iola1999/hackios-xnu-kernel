@@ -38,8 +38,8 @@ ramfs_fill_statfs(struct ramfs_mount *rm, struct vfsstatfs *sp)
 	sp->f_bused = total_pages - free_pages;
 	sp->f_files = rm->rm_max_pages;
 	sp->f_ffree = rm->rm_max_pages - MIN(rm->rm_nodes, rm->rm_max_pages);
-	strlcpy(sp->f_mntfromname, rm->rm_disk_backed ? "/dev/ufs_darwin_var" : "ramfs",
-	    sizeof(sp->f_mntfromname));
+	strlcpy(sp->f_fstypename, "apfs", sizeof(sp->f_fstypename));
+	strlcpy(sp->f_mntfromname, "/dev/disk1s2", sizeof(sp->f_mntfromname));
 }
 
 static int
@@ -80,12 +80,14 @@ ramfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
 		    VOL_CAP_FMT_2TB_FILESIZE |
 		    VOL_CAP_FMT_PERSISTENTOBJECTIDS |
 		    VOL_CAP_FMT_PATH_FROM_ID |
+		    VOL_CAP_FMT_CLONE_MAPPING |
 		    (rm->rm_disk_backed ? (VOL_CAP_FMT_JOURNAL | VOL_CAP_FMT_JOURNAL_ACTIVE) : 0);
 		cap->capabilities[VOL_CAPABILITIES_INTERFACES] =
 		    VOL_CAP_INT_ADVLOCK |
 		    VOL_CAP_INT_FLOCK |
 		    VOL_CAP_INT_EXTENDED_SECURITY |
-		    VOL_CAP_INT_EXTENDED_ATTR;
+		    VOL_CAP_INT_EXTENDED_ATTR |
+		    VOL_CAP_INT_CLONE;
 		cap->valid[VOL_CAPABILITIES_FORMAT] =
 		    VOL_CAP_FMT_PERSISTENTOBJECTIDS |
 		    VOL_CAP_FMT_SYMBOLICLINKS |
@@ -101,7 +103,8 @@ ramfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
 		    VOL_CAP_FMT_2TB_FILESIZE |
 		    VOL_CAP_FMT_OPENDENYMODES |
 		    VOL_CAP_FMT_HIDDEN_FILES |
-		    VOL_CAP_FMT_PATH_FROM_ID;
+		    VOL_CAP_FMT_PATH_FROM_ID |
+		    VOL_CAP_FMT_CLONE_MAPPING;
 		cap->valid[VOL_CAPABILITIES_INTERFACES] =
 		    VOL_CAP_INT_SEARCHFS |
 		    VOL_CAP_INT_ATTRLIST |
@@ -117,7 +120,8 @@ ramfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
 		    VOL_CAP_INT_USERACCESS |
 		    VOL_CAP_INT_MANLOCK |
 		    VOL_CAP_INT_EXTENDED_ATTR |
-		    VOL_CAP_INT_NAMEDSTREAMS;
+		    VOL_CAP_INT_NAMEDSTREAMS |
+		    VOL_CAP_INT_CLONE;
 		VFSATTR_SET_SUPPORTED(fsap, f_capabilities);
 	}
 	VFSATTR_RETURN(fsap, f_filecount, nodes);
@@ -167,7 +171,7 @@ ramfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
 		VFSATTR_SET_SUPPORTED(fsap, f_attributes);
 	}
 	if (VFSATTR_IS_ACTIVE(fsap, f_vol_name)) {
-		strlcpy(fsap->f_vol_name, rm->rm_disk_backed ? "Data" : "ramfs", MAXPATHLEN);
+		strlcpy(fsap->f_vol_name, "Data", MAXPATHLEN);
 		VFSATTR_SET_SUPPORTED(fsap, f_vol_name);
 	}
 	return 0;
