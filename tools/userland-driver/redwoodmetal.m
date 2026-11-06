@@ -3275,20 +3275,18 @@ enum {
 		_colorSlice[i] = (unsigned)[attachment slice];
 		_resolve[i] = [attachment resolveTexture];
 		NSUInteger store = [attachment storeAction];
-		BOOL one = [texture sampleCount] <= 1 &&
-		    store == MTLStoreActionMultisampleResolve &&
-		    [attachment loadAction] != MTLLoadActionLoad &&
-		    getenv("REDWOOD_RESOLVE_BLIT") == NULL &&
-		    [_resolve[i] pixelFormat] == [texture pixelFormat];
-		if (_resolve[i] != nil && (one || (rw_one_sample() && [texture sampleCount] > 1))) {
+		if (_resolve[i] != nil && rw_one_sample() && [texture sampleCount] > 1) {
 			_color[i] = rw_attachment_level(_resolve[i], [attachment resolveLevel]);
 			_resolve[i] = nil;
-		} else if (store == MTLStoreActionMultisampleResolve ||
-		    store == MTLStoreActionStoreAndMultisampleResolve) {
+		} else if (store == MTLStoreActionMultisampleResolve || store == MTLStoreActionStoreAndMultisampleResolve) {
 			if (_resolve[i] != nil) {
-				_resolveTo[i] = [_resolve[i] retain];
-				_resolveLevel[i] = (unsigned)[attachment resolveLevel];
-				_resolveSlice[i] = (unsigned)[attachment resolveSlice];
+				if ([texture sampleCount] <= 1 && [(id<MTLTexture>)_resolve[i] sampleCount] <= 1 &&
+				    [_resolve[i] pixelFormat] == [texture pixelFormat]) {
+					_resolveTo[i] = [_resolve[i] retain];
+					_resolveLevel[i] = (unsigned)[attachment resolveLevel];
+					_resolveSlice[i] = (unsigned)[attachment resolveSlice];
+					_resolve[i] = nil;
+				}
 			} else {
 				rw_print("colour attachment %u asks for storeAction %lu with no "
 				    "resolveTexture: attachment stored without resolve\n",
@@ -4599,6 +4597,7 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
  */
 - (void)endEncoding
 {
+	rw_record_resolve_blits(_commandBuffer, _colorCount, _color, _resolveTo, _colorLevel, _colorSlice, _resolveLevel, _resolveSlice);
 	[super endEncoding];
 }
 

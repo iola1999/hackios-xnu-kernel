@@ -152,4 +152,8 @@ for _ in range(ncmds):
 else:
     sys.exit("%s: no LC_UUID to stamp" % path)
 PY
+  mkdir -p "$XNU26_ROOT/out"
+  cp -f "$kernel" "$XNU26_ROOT/out/xnu12377-st4.bin"
+  cp -f "$kernel" "$XNU26_ROOT/out/xnu12377-st10.bin"
+  echo "Staged $kernel -> $XNU26_ROOT/out/xnu12377-st4.bin and xnu12377-st10.bin"
 fi

@@ -33,6 +33,7 @@ DEFAULT_CMDLINE = (
 
 def find_default_kernel(root_dir: Path) -> Path:
     candidates = [
+        root_dir / "out/xnu12377-cmd/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837",
         root_dir / "out/xnu12377-st4.bin",
         root_dir / "out/ios26-resume/k90-ready/inputs/kernel26",
         root_dir / "out/ios26-resume/k90-ready/sources/kernel",
