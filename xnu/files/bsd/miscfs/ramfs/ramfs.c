@@ -54,8 +54,6 @@
 #define RAMFS_ROOT_INO          2
 
 struct ramfs_mount;
-struct ramfs_node;
-
 struct ramfs_dirent {
 	TAILQ_ENTRY(ramfs_dirent) rd_link;
 	struct ramfs_node *rd_node;
@@ -67,43 +65,30 @@ struct ramfs_dirent {
 struct ramfs_xattr {
 	TAILQ_ENTRY(ramfs_xattr) rx_link;
 	char   *rx_name;                        /* rx_namelen bytes and a terminator */
-	size_t  rx_namelen;
 	void   *rx_data;
-	size_t  rx_size;
+	size_t  rx_namelen, rx_size;
 };
 
 struct ramfs_node {
 	struct ramfs_mount *rn_mount;
-	uint64_t            rn_ino;
+	uint64_t            rn_ino, rn_size;    /* rn_size: file bytes or symlink target length */
 	enum vtype          rn_type;
 	uint32_t            rn_mode;            /* permission bits only */
 	uid_t               rn_uid;
 	gid_t               rn_gid;
-	uint32_t            rn_bsdflags;
-	uint32_t            rn_nlink;
-	uint32_t            rn_state;
+	uint32_t            rn_bsdflags, rn_dataprotect_class, rn_nlink, rn_state, rn_vid, rn_nentries;
 	vnode_t             rn_vp;
-	uint32_t            rn_vid;
 	struct timespec     rn_atime, rn_mtime, rn_ctime, rn_btime;
-	uint64_t            rn_size;            /* file: bytes; symlink: target length */
-
 	/* directory */
 	struct ramfs_node  *rn_parent;          /* NULL once the directory has been removed */
 	TAILQ_HEAD(, ramfs_dirent) rn_entries;
-	uint32_t            rn_nentries;
-
 	/* regular file */
 	void              **rn_pages;           /* rn_nslots slots; NULL is a hole that reads as zeros */
-	uint64_t            rn_nslots;
-	uint64_t            rn_nalloc;          /* pages actually allocated */
-	bool                rn_mapped_write;    /* has been mapped writable: the page cache may be ahead of us */
-
+	uint64_t            rn_nslots, rn_nalloc; /* rn_nalloc: pages actually allocated */
+	bool                rn_mapped_write, rn_hashed; /* rn_mapped_write: page cache may be ahead */
 	/* symlink */
 	char               *rn_target;
-
 	struct ramfs_node  *rn_hnext;           /* the next node in rm_hash's chain */
-	bool                rn_hashed;
-
 	TAILQ_HEAD(, ramfs_xattr) rn_xattrs;
 };
 #define RAMFS_N_CREATING        0x1         /* a thread is in vnode_create() for this node */
@@ -111,13 +96,9 @@ struct ramfs_node {
 
 struct ramfs_mount {
 	mount_t             rm_mp;
-	lck_mtx_t           rm_lock;
-	lck_mtx_t           rm_rename_lock;
+	lck_mtx_t           rm_lock, rm_rename_lock;
 	struct ramfs_node  *rm_root;
-	uint64_t            rm_next_ino;
-	uint64_t            rm_nodes;
-	uint64_t            rm_pages;           /* file pages in use */
-	uint64_t            rm_max_pages;
+	uint64_t            rm_next_ino, rm_nodes, rm_pages, rm_max_pages; /* rm_pages: file pages in use */
 	struct ramfs_node **rm_hash;            /* every node by its number, for vfs_vget */
 };
 
@@ -146,6 +127,7 @@ ramfs_node_alloc(struct ramfs_mount *rm, enum vtype type, struct vnode_attr *vap
 	node->rn_mount = rm;
 	node->rn_type = type;
 	node->rn_mode = type == VLNK ? 0755 : (type == VDIR ? 0755 : 0644);
+	node->rn_dataprotect_class = PROTECTION_CLASS_D;
 	node->rn_atime = node->rn_mtime = node->rn_ctime = node->rn_btime = now;
 	TAILQ_INIT(&node->rn_entries);
 	TAILQ_INIT(&node->rn_xattrs);
@@ -166,6 +148,11 @@ ramfs_node_alloc(struct ramfs_mount *rm, enum vtype type, struct vnode_attr *vap
 		if (VATTR_IS_ACTIVE(vap, va_flags)) {
 			node->rn_bsdflags = vap->va_flags;
 			VATTR_SET_SUPPORTED(vap, va_flags);
+		}
+		if (VATTR_IS_ACTIVE(vap, va_dataprotect_class)) {
+			if (vap->va_dataprotect_class != PROTECTION_CLASS_DEFAULT)
+				node->rn_dataprotect_class = vap->va_dataprotect_class;
+			VATTR_SET_SUPPORTED(vap, va_dataprotect_class);
 		}
 		if (VATTR_IS_ACTIVE(vap, va_create_time)) {
 			node->rn_btime = vap->va_create_time;
@@ -703,6 +690,9 @@ ramfs_make(vnode_t dvp, vnode_t *vpp, struct componentname *cnp, struct vnode_at
 		return error;
 	}
 	node->rn_ino = rm->rm_next_ino++;
+	if ((vap == NULL || !VATTR_IS_ACTIVE(vap, va_dataprotect_class) ||
+	    vap->va_dataprotect_class == PROTECTION_CLASS_DEFAULT) && dir->rn_dataprotect_class != 0)
+		node->rn_dataprotect_class = dir->rn_dataprotect_class;
 	ramfs_hash_insert(rm, node);
 	if (type == VDIR) {
 		node->rn_nlink = 2;
@@ -897,7 +887,7 @@ ramfs_getattr(struct vnop_getattr_args *ap)
 	VATTR_RETURN(vap, va_fsid, vfs_statfs(vnode_mount(vp))->f_fsid.val[0]);
 	VATTR_RETURN(vap, va_filerev, 0);
 	VATTR_RETURN(vap, va_gen, 0);
-	VATTR_RETURN(vap, va_dataprotect_class, PROTECTION_CLASS_D);   /* "none", which PosterBoard checks */
+	VATTR_RETURN(vap, va_dataprotect_class, node->rn_dataprotect_class ? node->rn_dataprotect_class : PROTECTION_CLASS_D);   /* "none", which PosterBoard checks */
 	if (node->rn_type == VDIR && node->rn_parent != NULL) {
 		VATTR_RETURN(vap, va_parentid, node->rn_parent->rn_ino);
 		/*
@@ -963,6 +953,11 @@ ramfs_setattr(struct vnop_setattr_args *ap)
 	if (VATTR_IS_ACTIVE(vap, va_flags)) {
 		node->rn_bsdflags = vap->va_flags;
 		VATTR_SET_SUPPORTED(vap, va_flags);
+	}
+	if (VATTR_IS_ACTIVE(vap, va_dataprotect_class)) {
+		if (vap->va_dataprotect_class != PROTECTION_CLASS_DEFAULT)
+			node->rn_dataprotect_class = vap->va_dataprotect_class;
+		VATTR_SET_SUPPORTED(vap, va_dataprotect_class);
 	}
 	if (VATTR_IS_ACTIVE(vap, va_create_time)) {
 		node->rn_btime = vap->va_create_time;

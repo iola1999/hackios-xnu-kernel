@@ -10,6 +10,7 @@
 #include <libkern/libkern.h>
 #include <miscfs/apfs/apfs.h>
 #include <sys/attr.h>
+#include <sys/content_protection.h>
 #include <sys/dirent.h>
 #include <sys/errno.h>
 #include <sys/namei.h>
@@ -25,7 +26,6 @@
 #include <vfs/vfs_support.h>
 
 /* How much is read out of a file at a time when copying into a uio. */
-
 extern integer_t thread_kern_get_pri(thread_t thr);    /* the thread's base priority */
 extern void thread_runnable_and_run_self(uint64_t *runnable, uint64_t *run);
 
@@ -366,8 +366,7 @@ apfs_vnop_getattr(struct vnop_getattr_args *ap)
 	size = an->an_size;
 
 	VATTR_RETURN(vap, va_rdev, (dev_t)ino.rdev);
-	VATTR_RETURN(vap, va_nlink, vnode_isdir(vp) ? 2 : (uint32_t)(ino.nchildren > 0
-	    ? ino.nchildren : 1));
+	VATTR_RETURN(vap, va_nlink, vnode_isdir(vp) ? 2 : (uint32_t)(ino.nchildren > 0 ? ino.nchildren : 1));
 	VATTR_RETURN(vap, va_data_size, size);
 	VATTR_RETURN(vap, va_total_size, size);
 	VATTR_RETURN(vap, va_total_alloc, ino.alloced_size);
@@ -384,6 +383,7 @@ apfs_vnop_getattr(struct vnop_getattr_args *ap)
 	VATTR_RETURN(vap, va_filerev, 0);
 	VATTR_RETURN(vap, va_gen, 0);
 	VATTR_RETURN(vap, va_type, vnode_vtype(vp));
+	VATTR_RETURN(vap, va_dataprotect_class, PROTECTION_CLASS_D);
 
 	/* the times are nanoseconds since the Unix epoch */
 	if (VATTR_IS_ACTIVE(vap, va_access_time)) {
