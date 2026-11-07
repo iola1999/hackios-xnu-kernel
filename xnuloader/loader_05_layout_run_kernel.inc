@@ -23,6 +23,7 @@ static uint64_t win_base, win_size; /* XNU's physical memory window, claimed onc
 static uint64_t low_dma;
 static uint64_t resident_rd_size;   /* root image kept at win_base + RESIDENT_RD_OFFSET, 0 if none */
 static char last_result[64] = "idle";
+static int usb_run_requested;
 
 static void
 set_result(const char *what, uint64_t a, uint64_t b)
@@ -673,6 +674,17 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	}
 	for (const char *c = pi.cmdline; *c && n < BOOT_LINE_LENGTH - 1; c++) {
 		ba->commandLine[n++] = *c;
+	}
+	if (usb_run_requested) {
+		int own_autounlock = 0;
+		for (const char *c = pi.cmdline; *c; c++) {
+			own_autounlock |= starts_with(c, "autounlock=") && (c == pi.cmdline || c[-1] == ' ');
+		}
+		if (!own_autounlock) {
+			for (const char *c = " autounlock=1"; *c && n < BOOT_LINE_LENGTH - 1; c++) {
+				ba->commandLine[n++] = *c;
+			}
+		}
 	}
 
 	/* --- device tree ---------------------------------------------------- */

@@ -830,7 +830,10 @@ fb_command(char *cmd)
 			log_len = 0;
 			print("== XNULOADER run (usb) ==\n");
 			ui_stage("BOOTING KERNEL");
-			if (!run_kernel(have_cp, cp)) {
+			usb_run_requested = 1;
+			int ok = run_kernel(have_cp, cp);
+			usb_run_requested = 0;
+			if (!ok) {
 				set_result("not-started", 0, 0);
 				compose_logs(NULL, 0);
 				ui_stage("BOOT FAILED");
