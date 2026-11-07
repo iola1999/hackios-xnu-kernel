@@ -3,6 +3,28 @@
 static int
 rw_run_copy(RedwoodMetalWork *work, char *why, size_t why_size)
 {
+	if (work->copyKind == RW_COPY_CLEAR) {
+		struct rwa_texture *color[8] = { 0 };
+		id owner = work->depth;
+		for (unsigned i = 0; i < work->colorCount; i++) {
+			color[i] = [work->color[i] mesaTexture];
+			if (work->color[i]) owner = work->color[i];
+		}
+		struct rwa_texture *depth = [work->depth mesaTexture];
+		if (work->depth && !depth) {
+			snprintf(why, why_size, "clear depth attachment is not an AIR texture");
+			return -1;
+		}
+		struct rwa_draw pass = { .color = color, .color_count = work->colorCount,
+			.clear_color = work->clears ? &work->clearColor[0][0] : NULL,
+			.discard = work->discards, .depth = depth,
+			.clear_depth = work->clearsDepth ? &work->clearDepth : NULL,
+			.clear_stencil = work->clearsStencil ? &work->clearStencil : NULL };
+		if (mesa.render_clear)
+			return mesa.render_clear([[owner device] mesaDevice], &pass, why, why_size);
+		snprintf(why, why_size, "AIR library lacks render-pass clear support");
+		return -1;
+	}
 	if (work->copyKind == RW_COPY_ERROR) {
 		snprintf(why, why_size, "%s", work->copyError);
 		return -1;

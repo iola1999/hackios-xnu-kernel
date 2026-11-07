@@ -72,6 +72,7 @@ static struct {
 					    const struct rwa_render_shape *,
 					    struct rwa_render_info *, char *, size_t);
 	void (*render_destroy)(struct rwa_render *);
+	int (*render_clear)(struct rwa_device *, const struct rwa_draw *, char *, size_t);
 	int (*render_draw)(struct rwa_render *, const struct rwa_draw *, char *, size_t);
 	struct rwa_depth_stencil *(*depth_stencil_create)(struct rwa_device *,
 							  const struct rwa_depth_stencil_state *,
@@ -156,6 +157,7 @@ mesa_available(void)
 	*(void **)&mesa.render_create = dlsym(mesa.handle, "rwa_render_create");
 	*(void **)&mesa.render_create_linked = dlsym(mesa.handle, "rwa_render_create_linked");
 	*(void **)&mesa.render_destroy = dlsym(mesa.handle, "rwa_render_destroy");
+	*(void **)&mesa.render_clear = dlsym(mesa.handle, "rwa_render_clear");
 	*(void **)&mesa.render_draw = dlsym(mesa.handle, "rwa_render_draw");
 	/* Depth likewise: a library that can draw and not test depth is a real state of
 	 * this work, and -newDepthStencilStateWithDescriptor: says so when it is asked

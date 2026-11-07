@@ -34,6 +34,8 @@
 #include <libkern/libkern.h>
 #include <kern/startup.h>
 #include <kern/task.h>
+#include <kern/kalloc.h>
+#include <os/refcnt.h>
 #include <mach/vm_param.h>
 #include <vm/vm_kern.h>
 #include <vm/vm_map.h>
@@ -200,25 +202,11 @@ SECURITY_READ_ONLY_LATE(static struct mac_policy_conf) miniamfi_conf = {
 };
 SECURITY_READ_ONLY_LATE(static mac_policy_handle_t) miniamfi_handle;
 
-/*
- * Request 4, "container path of a process": sandbox_container_path_for_pid() and
- * sandbox_container_path_for_audit_token() of libsystem_sandbox. The argument is
- * { pid, version of the pid, buffer, its size, whether the version is to be compared }.
- *
- * On a device the Sandbox learns the container when the program is executed (it asks
- * containermanagerd) and confines the process to it. Nothing is confined here, but the question
- * is still asked and the answer matters: an application extension hosted by PlugInKit does not
- * run without a container. It gives the buffer a "?" to start with and wants a longer string
- * back, else "plugin has invalid sandbox or container" (-[PKService checkEnvironment:]) -- the
- * end of every Intents extension while this request "succeeded" without writing anything.
- *
- * Whoever starts a program that lives in a container -- RunningBoard an application, pkd an
- * extension -- has had the path from containermanagerd and passes it in the environment as
- * CFFIXED_USER_HOME, which is where Foundation takes the home directory from. So that is the
- * answer: it is looked up among the strings exec left at the top of the stack of the process.
- * A process without the variable has no container, and gets what every process got before:
- * success and an untouched buffer.
- */
+extern kern_return_t miniamfi_entitlement_boolean(struct proc *proc, const char *name);
+
+#include "kern_minisandbox_container.inc"
+
+/* Query the credential's container, then the exec environment for older launchers. */
 #define SANDBOX_SYSCALL_CONTAINER_PATH  4
 #define SANDBOX_CONTAINER_VARIABLE      "CFFIXED_USER_HOME="
 
@@ -255,6 +243,12 @@ minisandbox_container_path(user_addr_t arg)
 	if (args.check_pidversion && (uint64_t)proc_pidversion(p) != args.pidversion) {
 		proc_rele(p);
 		return ESRCH;
+	}
+	bool found;
+	error = minisandbox_label_container_path(p, args.buffer, args.size, &found);
+	if (found) {
+		proc_rele(p);
+		return error;
 	}
 	user_stack = p->user_stack;
 	argslen = p->p_argslen;
@@ -314,6 +308,9 @@ minisandbox_policy_syscall(struct proc *p, int call, user_addr_t arg)
 		printf("minisandbox: request %d (first seen from %s[%d]): %s\n", call, p->p_comm, proc_getpid(p),
 		    call == SANDBOX_SYSCALL_CONTAINER_PATH ? "answered" : "allowed");
 	}
+	if (call == SANDBOX_SYSCALL_SET_CONTAINER_PATH) {
+		return minisandbox_set_container_path(p, arg);
+	}
 	if (call == SANDBOX_SYSCALL_CONTAINER_PATH) {
 		return minisandbox_container_path(arg);
 	}
@@ -345,7 +342,6 @@ minisandbox_policy_syscall(struct proc *p, int call, user_addr_t arg)
  * Whatever is refused is said once, to learn what there is. Boot-arg privs=0: only
  * PRIV_WORK_INTERVAL, as before.
  */
-extern kern_return_t miniamfi_entitlement_boolean(struct proc *proc, const char *name);
 
 static const struct {
 	int priv;
@@ -430,12 +426,17 @@ minisandbox_priv_grant(kauth_cred_t cred, int priv)
 static const struct mac_policy_ops minisandbox_ops = {
 	.mpo_policy_syscall = minisandbox_policy_syscall,
 	.mpo_priv_grant = minisandbox_priv_grant,
+	.mpo_cred_label_destroy = minisandbox_label_destroy,
+	.mpo_cred_label_associate = minisandbox_label_associate,
+	.mpo_cred_check_label_update_execve = minisandbox_check_exec,
+	.mpo_cred_label_update_execve = minisandbox_update_exec,
 };
 
 SECURITY_READ_ONLY_LATE(static struct mac_policy_conf) minisandbox_conf = {
 	.mpc_name = "Sandbox",
 	.mpc_fullname = "Seatbelt sandbox policy (stand-in)",
 	.mpc_ops = &minisandbox_ops,
+	.mpc_field_off = &minisandbox_slot,
 };
 SECURITY_READ_ONLY_LATE(static mac_policy_handle_t) minisandbox_handle;
 

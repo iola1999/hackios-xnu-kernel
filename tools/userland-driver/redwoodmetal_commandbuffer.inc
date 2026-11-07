@@ -948,7 +948,7 @@ done:
 	struct rwa_draw draw = {
 		.color = color,
 		.color_count = work->colorCount,
-		.clear_color = work->clears ? work->clearColor : NULL,
+		.clear_color = work->clears ? &work->clearColor[0][0] : NULL,
 		/* The depth attachment, its two load actions, the state that was bound and
 		 * the depth range of the viewport -- which is where the quad's own depth
 		 * comes from, the generated vertex stage putting every corner at clip z = 0

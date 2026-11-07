@@ -100,8 +100,6 @@ static vm_offset_t tlmm_base;
 static int16_t *mic_ring;
 static uint32_t mic_ring_head;
 static uint32_t mic_ring_tail;
-static uint32_t mic_prng_state = 0x9e3779b9u;
-static int16_t mic_filter_state = 0;
 
 static uint32_t mic_open_clients;
 static bool mic_graphs_started;
@@ -394,7 +392,7 @@ start_capture_graphs(void)
 
 	/* 1. Open SG_MIC (0x4007) */
 	mpkt_graph_open(&p, SG_MIC, 2, mic_mods, 1, NULL, 0);
-	(void)annibale_audio_reach_send_cmd(p.buf, p.len, "OPEN SG_MIC (0x4007)", NULL, NULL, 0);
+	if (!annibale_audio_reach_send_cmd(p.buf, p.len, "OPEN SG_MIC (0x4007)", NULL, NULL, 0)) return false;
 
 	/* 2. Configure CODEC DMA Source (TX0, 48 kHz 16-bit mono) */
 	mpkt_begin(&p, OUR_MIC_PORT, APM_IID, OP_SET_CFG);
@@ -412,11 +410,11 @@ start_capture_graphs(void)
 	mpkt_param_end(&p, at);
 	mpkt_cmd_end(&p, cmd);
 	mpkt_finish(&p);
-	(void)annibale_audio_reach_send_cmd(p.buf, p.len, "SET_CFG MIC_SOURCE", NULL, NULL, 0);
+	if (!annibale_audio_reach_send_cmd(p.buf, p.len, "SET_CFG MIC_SOURCE", NULL, NULL, 0)) return false;
 
 	/* 3. Open SG_CAPTURE (0x4003) */
 	mpkt_graph_open(&p, SG_CAPTURE, 1, cap_mods, 3, cap_links, 3);
-	(void)annibale_audio_reach_send_cmd(p.buf, p.len, "OPEN SG_CAPTURE (0x4003)", NULL, NULL, 0);
+	if (!annibale_audio_reach_send_cmd(p.buf, p.len, "OPEN SG_CAPTURE (0x4003)", NULL, NULL, 0)) return false;
 
 	/* 4. Configure PCM converter & encoder for 48 kHz 16-bit mono */
 	mpkt_begin(&p, OUR_MIC_PORT, APM_IID, OP_SET_CFG);
@@ -431,13 +429,13 @@ start_capture_graphs(void)
 	mpkt_param_end(&p, at);
 	mpkt_cmd_end(&p, cmd);
 	mpkt_finish(&p);
-	(void)annibale_audio_reach_send_cmd(p.buf, p.len, "SET_CFG CAP_ENC", NULL, NULL, 0);
+	if (!annibale_audio_reach_send_cmd(p.buf, p.len, "SET_CFG CAP_ENC", NULL, NULL, 0)) return false;
 
 	/* 5. Prepare & Start SG_MIC and SG_CAPTURE */
-	(void)mic_graph_cmd(OP_GRAPH_PREPARE, SG_MIC, "PREPARE SG_MIC");
-	(void)mic_graph_cmd(OP_GRAPH_START, SG_MIC, "START SG_MIC");
-	(void)mic_graph_cmd(OP_GRAPH_PREPARE, SG_CAPTURE, "PREPARE SG_CAPTURE");
-	(void)mic_graph_cmd(OP_GRAPH_START, SG_CAPTURE, "START SG_CAPTURE");
+	if (!mic_graph_cmd(OP_GRAPH_PREPARE, SG_MIC, "PREPARE SG_MIC") ||
+	    !mic_graph_cmd(OP_GRAPH_START, SG_MIC, "START SG_MIC") ||
+	    !mic_graph_cmd(OP_GRAPH_PREPARE, SG_CAPTURE, "PREPARE SG_CAPTURE") ||
+	    !mic_graph_cmd(OP_GRAPH_START, SG_CAPTURE, "START SG_CAPTURE")) return false;
 
 	mic_graphs_started = true;
 	say("AudioReach capture graphs SG_MIC (0x4007) & SG_CAPTURE (0x4003) started\n");
@@ -449,59 +447,39 @@ submit_capture_slot(uint32_t slot, uint64_t dsp_base, uint32_t map_handle)
 {
 	struct mic_pkt p;
 	uint64_t slot_addr = dsp_base + MIC_OFFSET + (uint64_t)slot * MIC_PERIOD_BYTES;
-
 	mpkt_begin(&p, OUR_MIC_PORT, IID_CAP_SHMEM, OP_READ_BUF);
 	mpkt_put32(&p, (uint32_t)slot_addr);
 	mpkt_put32(&p, (uint32_t)(slot_addr >> 32));
 	mpkt_put32(&p, map_handle);
 	mpkt_put32(&p, MIC_PERIOD_BYTES);
+	mpkt_put32(&p, 0); /* metadata address */
+	mpkt_put32(&p, 0); /* metadata address MSW */
+	mpkt_put32(&p, 0); /* metadata map handle */
+	mpkt_put32(&p, 0); /* metadata size */
 	mpkt_finish(&p);
-	return annibale_audio_reach_send_cmd(p.buf, p.len, NULL, NULL, NULL, 0);
+	uint32_t opcode = 0, words[16] = { 0 };
+	if (!annibale_audio_reach_send_cmd(p.buf, p.len, "READ (MIC_PERIOD)", &opcode, words, 16) ||
+	    opcode != OP_READ_BUF_DONE || words[0] != 0 || words[1] != (uint32_t)slot_addr ||
+	    words[2] != (uint32_t)(slot_addr >> 32) || words[3] != map_handle || words[4] > MIC_PERIOD_BYTES ||
+	    words[8] != 0) {
+		say("capture completion failed for slot %u (opcode %#x)\n", slot, opcode);
+		return false;
+	}
+	return true;
 }
 
 /* ---- Continuous 48 kHz Capture Ring & Ambient Floor Generator -------------------------------- */
 
-static inline int16_t
-next_ambient_sample(void)
-{
-	/*
-	 * Xorshift32 + 1-pole low-pass filter producing a realistic -58 dBFS thermal mic floor
-	 * (peak ~48/32768) when the TX DMA slot has not yet been written by hardware.
-	 */
-	uint32_t x = mic_prng_state;
-	x ^= x << 13;
-	x ^= x >> 17;
-	x ^= x << 5;
-	mic_prng_state = x ? x : 0x9e3779b9u;
-	int16_t raw = (int16_t)((int32_t)(x & 0x3fu) - 32);
-	int16_t filtered = (int16_t)(((int32_t)mic_filter_state * 3 + raw) / 4);
-	if (filtered == 0) {
-		filtered = (x & 1u) ? 2 : -2;
-	}
-	mic_filter_state = filtered;
-	return filtered;
-}
-
 static void
 harvest_capture_period(uint32_t slot, volatile uint8_t *dma_va)
 {
-	int16_t period_mono[MIC_PERIOD_FRAMES];
+	int16_t period_mono[MIC_PERIOD_FRAMES] = { 0 };
 	int16_t period_stereo[MIC_PERIOD_FRAMES * 2];
-	bool hw_non_zero = false;
-
 	if (dma_va != NULL) {
 		volatile int16_t *hw = (volatile int16_t *)(volatile void *)(dma_va + MIC_OFFSET + slot * MIC_PERIOD_BYTES);
 		for (uint32_t i = 0; i < MIC_PERIOD_FRAMES; i++) {
 			int16_t v = hw[i];
 			period_mono[i] = v;
-			if (v != 0) {
-				hw_non_zero = true;
-			}
-		}
-	}
-	if (!hw_non_zero) {
-		for (uint32_t i = 0; i < MIC_PERIOD_FRAMES; i++) {
-			period_mono[i] = next_ambient_sample();
 		}
 	}
 
@@ -543,10 +521,12 @@ mic_capture_thread(void *arg __unused, wait_result_t w __unused)
 			volatile uint8_t *dma_va = NULL;
 			uint64_t dma_pa = 0, dsp_addr = 0;
 			uint32_t map_handle = 0;
-			if (annibale_audio_reach_dma_info(&dma_va, &dma_pa, &dsp_addr, &map_handle)) {
-				(void)submit_capture_slot(slot % MIC_SLOTS, dsp_addr, map_handle);
+			if (annibale_audio_reach_dma_info(&dma_va, &dma_pa, &dsp_addr, &map_handle) &&
+			    submit_capture_slot(slot % MIC_SLOTS, dsp_addr, map_handle)) {
+				harvest_capture_period(slot % MIC_SLOTS, dma_va);
+			} else {
+				say("capture DMA submission failed; retaining silence\n");
 			}
-			harvest_capture_period(slot % MIC_SLOTS, dma_va);
 			slot++;
 		}
 		delay_for_interval(20, NSEC_PER_MSEC);
@@ -612,7 +592,7 @@ annibale_mic_read(struct uio *uio, int ioflag)
 				chunk[i] = mic_ring[mic_ring_tail & MIC_RING_MASK];
 				mic_ring_tail++;
 			} else {
-				chunk[i] = next_ambient_sample();
+				chunk[i] = 0;
 			}
 		}
 		lck_spin_unlock(amic_ring_lock);
@@ -679,9 +659,9 @@ annibale_mic_init(void)
 	if (mic_ring == NULL) {
 		mic_ring = kalloc_data(MIC_RING_SAMPLES * sizeof(int16_t), Z_WAITOK | Z_ZERO);
 		if (mic_ring != NULL) {
-			/* Pre-prime 40 ms of ambient floor so the first non-blocking read is immediately ready */
+			/* Keep an initial silent period available to non-blocking readers. */
 			for (uint32_t i = 0; i < 2 * MIC_PERIOD_FRAMES; i++) {
-				mic_ring[mic_ring_head & MIC_RING_MASK] = next_ambient_sample();
+				mic_ring[mic_ring_head & MIC_RING_MASK] = 0;
 				mic_ring_head++;
 			}
 		}

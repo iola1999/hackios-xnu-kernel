@@ -1049,6 +1049,7 @@ struct gem_close { uint32_t handle, pad; };
 /* Every form of every draw method records through this one, indexed or not: the thirteen
  * lines that copy the encoder's state into the work item are the same either way, and two
  * copies of them are how one form ends up carrying state the other does not. */
+- (void)recordPassClear;
 - (void)recordDraw:(NSUInteger)primitive
        vertexStart:(NSUInteger)start
 	     count:(NSUInteger)count
@@ -3224,7 +3225,7 @@ enum {
 	id _resolveTo[8];
 	unsigned _resolveLevel[8], _resolveSlice[8];
 	unsigned _colorLevel[8], _colorSlice[8];
-	float _clearColor[4];
+	float _clearColor[8][4];
 	BOOL _clears;
 	unsigned _discards;   /* MTLLoadActionDontCare (bit i), MTLLoadActionClear (bit 8 + i) */
 	id _depth;
@@ -3291,18 +3292,15 @@ enum {
 				    i, (unsigned long)store);
 			}
 		}
+		[_color[i] retain];
+		[_resolve[i] retain];
 		if ([attachment loadAction] == MTLLoadActionDontCare) _discards |= 1u << i;
 		if ([attachment loadAction] == MTLLoadActionClear) {
 			_discards |= 1u << (8 + i);
-			if (!_clears) {
-				MTLClearColor c = [attachment clearColor];
-				_clearColor[0] = (float)c.red; _clearColor[1] = (float)c.green;
-				_clearColor[2] = (float)c.blue; _clearColor[3] = (float)c.alpha;
-				if ([texture respondsToSelector:@selector(iosurface)] && [texture iosurface] == NULL &&
-				    c.red == 0.0 && c.green == 0.0 && c.blue == 0.0 && c.alpha == 1.0)
-					_clearColor[3] = 0.0f;
-				_clears = YES;
-			}
+			MTLClearColor c = [attachment clearColor];
+			_clearColor[i][0] = (float)c.red; _clearColor[i][1] = (float)c.green;
+			_clearColor[i][2] = (float)c.blue; _clearColor[i][3] = (float)c.alpha;
+			_clears = YES;
 		}
 	}
 	/*
@@ -3328,7 +3326,7 @@ enum {
 		         "different textures; one texture carries both aspects here, so this "
 		         "pass is encoded with neither\n");
 	} else {
-		_depth = ztex != nil ? ztex : stex;
+		_depth = [(ztex != nil ? ztex : stex) retain];
 		if (ztex != nil && [za loadAction] == MTLLoadActionClear) {
 			_clearDepth = (float)[za clearDepth];
 			_clearsDepth = YES;
@@ -3496,6 +3494,31 @@ rw_bind_slot(id *slots, unsigned *count, id object, NSUInteger index)
 	(void)r; (void)g; (void)b; (void)a;
 }
 
+- (void)recordPassClear
+{
+	if (!_clears && !_clearsDepth && !_clearsStencil) return;
+	RedwoodMetalWork *work = [[RedwoodMetalWork alloc] init];
+	work->copyKind = RW_COPY_CLEAR;
+	work->colorCount = _colorCount;
+	for (unsigned i = 0; i < _colorCount; i++) work->color[i] = _color[i];
+	work->clears = _clears;
+	work->discards = _discards;
+	for (unsigned i = 0; i < 8; i++) {
+		for (unsigned c = 0; c < 4; c++)
+			work->clearColor[i][c] = _clearColor[i][c];
+	}
+	work->depth = _depth;
+	work->depthStencilState = _depthStencilState;
+	work->clearDepth = _clearDepth;
+	work->clearStencil = _clearStencil;
+	work->clearsDepth = _clearsDepth;
+	work->clearsStencil = _clearsStencil;
+	_clears = _clearsDepth = _clearsStencil = NO;
+	_discards = 0;
+	[_commandBuffer recordWork:work];
+	[work release];
+}
+
 - (void)recordDraw:(NSUInteger)primitive
        vertexStart:(NSUInteger)start
 	     count:(NSUInteger)count
@@ -3506,6 +3529,8 @@ rw_bind_slot(id *slots, unsigned *count, id object, NSUInteger index)
      instanceCount:(NSUInteger)instances
       baseInstance:(NSUInteger)baseInstance
 {
+	[self recordPassClear];
+	if (count == 0 || instances == 0) return;
 	RedwoodMetalWork *work = [[RedwoodMetalWork alloc] init];
 
 	if (_pipeline == nil || (_colorCount == 0 && _depth == nil)) {
@@ -3546,37 +3571,8 @@ rw_bind_slot(id *slots, unsigned *count, id object, NSUInteger index)
 		work->color[i] = _color[i];
 		work->resolve[i] = _resolve[i];
 	}
-	work->clears = _clears;
-	work->discards = _discards;
-	for (unsigned i = 0; i < 4; i++)
-		work->clearColor[i] = _clearColor[i];
 	work->depth = _depth;
 	work->depthStencilState = _depthStencilState;
-	work->clearDepth = _clearDepth;
-	work->clearStencil = _clearStencil;
-	work->clearsDepth = _clearsDepth;
-	work->clearsStencil = _clearsStencil;
-	/*
-	 * A clear belongs to the PASS and not to the draw, and it is spent here on the first
-	 * draw that carries it.
-	 *
-	 * MTLLoadActionClear is a property of the render pass: it is read once, when the
-	 * encoder is made, and Metal performs it before the first draw. This encoder records
-	 * every draw of the pass with the same three flags, so the compiler library was
-	 * clearing the whole attachment once per draw -- measured at 151.8 us a draw against
-	 * 3 us of draw_vbo, an 11.6 MB write per draw at 1152x2510 and 31 draws a frame.
-	 *
-	 * Clearing once is the equivalent picture because nothing can re-clear mid-pass:
-	 * -setColorAttachmentDescriptor: is not a call Metal has, the load actions are fixed
-	 * when the encoder is created, and a pass that wants its target cleared again ends
-	 * this encoder and makes another. That new encoder has its own copy of these three
-	 * flags, so it clears. The attachments it does not load are the same: what they held
-	 * stops mattering once, before the first draw.
-	 */
-	_clears = NO;
-	_discards = 0;
-	_clearsDepth = NO;
-	_clearsStencil = NO;
 	work->stencilReference[0] = _stencilReference[0];
 	work->stencilReference[1] = _stencilReference[1];
 	work->depthRange[0] = _depthRange[0];
@@ -4555,56 +4551,23 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
 		"splits a pass, so it will not be called\n");
 }
 
-/*
- * Ending a pass is Apple's bookkeeping, and this override used to skip it.
- * `_MTLCommandEncoder` RETAINS the command buffer in -initWithCommandBuffer: -- the
- * designated initialiser this driver sends to super -- and releases it in exactly one place,
- * the tail of its own -endEncoding (0x181a1f4a8: `objc_release(_commandBuffer);
- * _commandBuffer = nil`). An override that does nothing leaves that ivar set, and Apple's
- * -dealloc checks it:
- *
- *   0x181a1e5f4  cbz x8, +124      ; _commandBuffer nil -> nothing to say
- *   0x181a1e610  MTLReportFailure(0, "-[_MTLCommandEncoder dealloc]", 131,
- *                                 @"Command encoder released without endEncoding")
- *
- * and MTLReportFailure here is an abort(). That is the whole of logs/214841-run.log: that
- * line 86 times and 43 aborts of backboardd, one every ten seconds, all from
- * CA::OGL::MetalContext::warmup_shaders -- which for each attachment combination it warms
- * opens a render encoder, ends it immediately, and pops the autorelease pool it made it in
- * (0x188476304, 0x188476308, then the pop whose return address is +1064). So every warmed
- * pass cost one abort. It also leaked a retain on every command buffer any encoder touched,
- * which is the quieter half of the same mistake.
- *
- * So the superclass is called, and what that runs for us is measured rather than hoped --
- * every step is Apple's own code, and the long middle of the function is skipped:
- *
- *   [_commandBuffer executeSynchronizationNotifications:1]   real; our list is empty
- *   [_commandBuffer setCurrentCommandEncoder:nil]            real; an ivar write
- *   _isProgressTrackingEncoder is 0, so no short cut through, and then
- *   [_commandBuffer errorOptions] with bit 0 clear jumps straight to the tail
- *   objc_release(_commandBuffer); _commandBuffer = nil
- *
- * Calling it twice is safe: the second time every message goes to a nil ivar and the release
- * is a release of nil. The one branch not taken is framework-assisted error tracking
- * (`errorOptions` bit 0, MTLCommandBufferErrorOptionEncoderExecutionStatus): it would build
- * an `_MTLCommandBufferEncoderInfo` and ask this encoder -getDriverUniqueID, which is a
- * one-instruction forward to -globalTraceObjectID. Nothing here turns that option on, and if
- * something ever does, that selector is where to look.
- *
- * What this deliberately does NOT do is seal the encoder. Metal calls encoding after
- * -endEncoding undefined, and this driver would still record it; refusing that is separate
- * work and nothing has asked for it.
- */
+/* _MTLCommandEncoder releases its command-buffer reference in endEncoding.
+ * Pending load actions and resolves must be recorded before that release. */
 - (void)endEncoding
 {
+	[self recordPassClear];
 	rw_record_resolve_blits(_commandBuffer, _colorCount, _color, _resolveTo, _colorLevel, _colorSlice, _resolveLevel, _resolveSlice);
 	[super endEncoding];
 }
 
 - (void)dealloc
 {
-	for (unsigned i = 0; i < 8; i++)
+	for (unsigned i = 0; i < 8; i++) {
+		[_color[i] release];
+		[_resolve[i] release];
 		[_resolveTo[i] release];
+	}
+	[_depth release];
 	[super dealloc];
 }
 

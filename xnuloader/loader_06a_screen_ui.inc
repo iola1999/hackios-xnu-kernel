@@ -1026,8 +1026,6 @@ slot_flash_boot_image(uint64_t bytes)
 	return NULL;
 }
 
-static int recovery_pending_after_return;
-
 static void
 ui_draw_fault_banner(const char *status_line, const char *klog, uint64_t klog_len)
 {
@@ -1096,37 +1094,14 @@ ui_draw_fault_banner(const char *status_line, const char *klog, uint64_t klog_le
 }
 
 static const char *
-slot_unlock_held_recovery(void)
+menu_enter_fastboot(void)
 {
+	/* The menu and kernel watcher both service USB commands. Preserve ownership
+	 * if the countdown has already handed control to the kernel. */
+	if (running_live != NULL || kernel_resources_held || firmware_fault || held_irq_masked) {
+		return "kernel resources are unavailable for recovery";
+	}
 	usb_menu_interrupted = 1;
-	if (!skip_ufs_arbitration) {
-		return "only supported on ramdisk platforms";
-	}
-	if (running_live != NULL) {
-		((struct kernel_live *)(uintptr_t)running_live)->stop = 1;
-		other_cpu_done = 1;
-		clean_dcache((uint64_t)(uintptr_t)&other_cpu_done,
-		    (uint64_t)(uintptr_t)&other_cpu_done + sizeof(other_cpu_done));
-		active_watch = 0;
-		running_live = NULL;
-		recovery_pending_after_return = 1;
-		set_result("idle", 0, 0);
-		return NULL;
-	}
-	other_cpu_done = 1;
-	clean_dcache((uint64_t)(uintptr_t)&other_cpu_done,
-	    (uint64_t)(uintptr_t)&other_cpu_done + sizeof(other_cpu_done));
-	active_watch = 0;
-	recovery_pending_after_return = 0;
-	if (held_irq_masked) {
-		__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" (held_group1));
-		__asm__ volatile ("msr daif, %0" : : "r" (held_daif));
-		held_irq_masked = 0;
-	}
-	kernel_resources_held = 0;
-	firmware_fault = 0;
-	hc_take_back("recovery unlock");
-	set_result("idle", 0, 0);
 	return NULL;
 }
 
@@ -1141,7 +1116,6 @@ boot_fallback_enter(void)
 	}
 	saved_status[i] = 0;
 	print("boot fallback: entering Fastboot debug mode (%s)\n", saved_status);
-	(void)slot_unlock_held_recovery();
 	boot_fallback_active = 1;
 	host_last_cmd = READ_SYSREG(CNTVCT_EL0);
 	ui_stage("BOOT FALLBACK - FASTBOOT MODE");

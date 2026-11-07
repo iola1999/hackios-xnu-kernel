@@ -216,13 +216,15 @@ static LCK_GRP_DECLARE(aadsp_lck_grp, "annibale-adsp");
 static LCK_MTX_DECLARE(aadsp_lock, &aadsp_lck_grp);
 static LCK_MTX_DECLARE(aadsp_rsc_lock, &aadsp_lck_grp);
 static LCK_MTX_DECLARE(aadsp_gpr_lock, &aadsp_lck_grp);
+static LCK_MTX_DECLARE(aadsp_tx_lock, &aadsp_lck_grp);
+static LCK_MTX_DECLARE(glink_tx_lock, &aadsp_lck_grp);
 
 static volatile uint8_t *smem_base;
 static const struct cmd_db_header *cmd_db_base;
 static vm_offset_t rsc_base, aoss_base, ipcc_base;
 static uint32_t aoss_our_box;
 
-static bool adsp_inited, adsp_hw_up, adsp_sim_mode;
+static bool adsp_inited, adsp_hw_up;
 static uint16_t glink_gpr_our_cid, glink_gpr_their_cid;
 static uint16_t glink_pmic_our_cid, glink_pmic_their_cid;
 #define GLINK_MAX_INTENTS 16
@@ -236,6 +238,7 @@ static uint32_t smp2p_our_val;
 
 static annibale_gpr_event_fn gpr_event_handler;
 static uint32_t waited_token, waited_opcode, waited_words[32], waited_word_count;
+static uint32_t waited_response_src, waited_response_dst;
 static bool waited_done;
 
 /* ---- Low-level MMIO & timing helpers --------------------------------------------------------- */
@@ -614,10 +617,12 @@ static uint32_t glink_q_read32(uint32_t q_off, uint32_t q_sz, uint32_t at)
 	return v;
 }
 
-static void glink_q_write(uint32_t q_off, uint32_t q_sz, uint32_t *write_at, const void *buf, uint32_t len)
+static bool glink_q_write(uint32_t q_off, uint32_t q_sz, uint32_t *write_at, const void *buf, uint32_t len)
 {
 	const uint8_t *bytes = (const uint8_t *)buf;
 	uint32_t aligned = (len + 7u) & ~7u, pos = *write_at;
+	if (q_sz < 8 || aligned >= q_sz - 8 || pos >= q_sz) return false;
+	lck_mtx_lock(&glink_tx_lock);
 	if (q_off == glink_our_q && glink_our_read_at != 0 && q_sz > aligned + 8u) {
 		for (unsigned wait = 0; wait < 200; wait++) {
 			uint32_t r = 0;
@@ -625,6 +630,10 @@ static void glink_q_write(uint32_t q_off, uint32_t q_sz, uint32_t *write_at, con
 			uint32_t used = (pos >= r) ? (pos - r) : (q_sz - r + pos);
 			if (used + aligned + 8u < q_sz) {
 				break;
+			}
+			if (wait == 199) {
+				lck_mtx_unlock(&glink_tx_lock);
+				return false;
 			}
 			sleep_us(100);
 		}
@@ -641,6 +650,8 @@ static void glink_q_write(uint32_t q_off, uint32_t q_sz, uint32_t *write_at, con
 	*write_at = pos;
 	smem_poke(glink_our_write_at, pos);
 	ipcc_ring(IPCC_CLIENT_LPASS, IPCC_SIGNAL_GLINK);
+	lck_mtx_unlock(&glink_tx_lock);
+	return true;
 }
 
 static void glink_send_cmd2(uint16_t cmd, uint16_t p1, uint32_t p2)
@@ -682,7 +693,8 @@ static void handle_incoming_gpr(const uint8_t *data, uint32_t len)
 	uint32_t plen = len - 24;
 
 	lck_mtx_lock(&aadsp_gpr_lock);
-	if (waited_token != 0 && token == waited_token) {
+	if (waited_token != 0 && token == waited_token && src_port == waited_response_src &&
+	    dst_port == waited_response_dst) {
 		waited_opcode = opcode;
 		waited_word_count = MIN(plen / 4u, 32u);
 		if (waited_word_count > 0) {
@@ -913,63 +925,21 @@ static bool glink_init_queues(bool cold_boot)
 	return true;
 }
 
-/* ---- Simulated / Loopback GPR responder when ADSP firmware is absent ------------------------- */
-
-static void simulate_gpr_response(const uint8_t *pkt, uint32_t len)
-{
-	if (len < 24) {
-		return;
-	}
-	uint32_t src_port, dst_port, token, opcode;
-	memcpy(&src_port, pkt + 8, 4);
-	memcpy(&dst_port, pkt + 12, 4);
-	memcpy(&token, pkt + 16, 4);
-	memcpy(&opcode, pkt + 20, 4);
-
-	uint8_t rsp[64] = { 0 };
-	uint32_t rlen = 24, rop = GPR_BASIC_RSP_RESULT, word0 = 0;
-	if (opcode == APM_CMD_GET_SPF_STATE) {
-		rop = APM_CMD_RSP_GET_SPF_STATE;
-		word0 = 1u;
-		memcpy(rsp + 24, &word0, 4);
-		rlen = 28;
-	} else if (opcode == OP_MEM_MAP) {
-		rop = OP_MEM_MAP_DONE;
-		word0 = 0x1001u;
-		memcpy(rsp + 24, &word0, 4);
-		rlen = 28;
-	} else if (opcode == OP_WRITE) {
-		rop = OP_WRITE_DONE;
-		rlen = 28;
-	} else if (opcode == OP_READ_BUF) {
-		rop = OP_READ_BUF_DONE;
-		if (len >= 40) {
-			memcpy(rsp + 28, pkt + 24, 16);
-			rlen = 44;
-		}
-	} else {
-		memcpy(rsp + 24, &opcode, 4);
-		rlen = 32;
-	}
-	uint32_t hdr0 = (6u << 4) | (rlen << 8), hdr1 = 3u | (2u << 8);
-	memcpy(rsp + 0, &hdr0, 4);
-	memcpy(rsp + 4, &hdr1, 4);
-	memcpy(rsp + 8, &dst_port, 4);
-	memcpy(rsp + 12, &src_port, 4);
-	memcpy(rsp + 16, &token, 4);
-	memcpy(rsp + 20, &rop, 4);
-	handle_incoming_gpr(rsp, rlen);
-}
-
 bool annibale_adsp_gpr_send(const void *pkt, uint32_t len, uint32_t wait_ms,
     uint32_t *rsp_opcode, uint32_t *rsp_words, uint32_t max_words)
 {
-	if (pkt == NULL || len < 24) {
+	if (pkt == NULL || len < 24 || len > 544 || !adsp_hw_up ||
+	    glink_our_q == 0 || glink_gpr_our_cid == 0 || glink_gpr_their_cid == 0) {
 		return false;
 	}
+	lck_mtx_lock(&aadsp_tx_lock);
 	const uint8_t *bytes = (const uint8_t *)pkt;
-	uint32_t token = 0;
+	uint32_t token = 0, request_opcode = 0, request_src = 0, request_dst = 0;
+	memcpy(&request_src, bytes + 8, 4);
+	memcpy(&request_dst, bytes + 12, 4);
 	memcpy(&token, bytes + 16, 4);
+	memcpy(&request_opcode, bytes + 20, 4);
+	bool sent = false;
 
 	lck_mtx_lock(&aadsp_gpr_lock);
 	if (wait_ms > 0) {
@@ -977,6 +947,8 @@ bool annibale_adsp_gpr_send(const void *pkt, uint32_t len, uint32_t wait_ms,
 		waited_done = false;
 		waited_opcode = 0;
 		waited_word_count = 0;
+		waited_response_src = request_dst;
+		waited_response_dst = request_src;
 	}
 	lck_mtx_unlock(&aadsp_gpr_lock);
 
@@ -994,12 +966,18 @@ bool annibale_adsp_gpr_send(const void *pkt, uint32_t len, uint32_t wait_ms,
 			memcpy(tx + 8, &len, 4);
 			memcpy(tx + 12, &left, 4);
 			memcpy(tx + 16, bytes, len);
-			glink_q_write(glink_our_q, glink_our_q_size, &glink_tx_write_pos, tx, 16u + len);
+			sent = glink_q_write(glink_our_q, glink_our_q_size, &glink_tx_write_pos, tx, 16u + len);
 		}
-	} else {
-		simulate_gpr_response(bytes, len);
+	}
+	if (!sent) {
+		lck_mtx_lock(&aadsp_gpr_lock);
+		waited_token = 0;
+		lck_mtx_unlock(&aadsp_gpr_lock);
+		lck_mtx_unlock(&aadsp_tx_lock);
+		return false;
 	}
 	if (wait_ms == 0) {
+		lck_mtx_unlock(&aadsp_tx_lock);
 		return true;
 	}
 
@@ -1018,28 +996,26 @@ bool annibale_adsp_gpr_send(const void *pkt, uint32_t len, uint32_t wait_ms,
 				memcpy(rsp_words, waited_words, MIN(waited_word_count, max_words) * 4u);
 			}
 			waited_token = 0;
-			ok = true;
+			ok = waited_opcode == GPR_BASIC_RSP_RESULT && waited_word_count >= 2 &&
+			    waited_words[0] == request_opcode && waited_words[1] == 0;
+			if (request_opcode == APM_CMD_GET_SPF_STATE)
+				ok = waited_opcode == APM_CMD_RSP_GET_SPF_STATE && waited_word_count >= 1;
+			else if (request_opcode == OP_MEM_MAP)
+				ok = waited_opcode == OP_MEM_MAP_DONE && waited_word_count >= 1;
+			else if (request_opcode == OP_WRITE)
+				ok = waited_opcode == OP_WRITE_DONE && waited_word_count >= 8;
+			else if (request_opcode == OP_READ_BUF)
+				ok = waited_opcode == OP_READ_BUF_DONE && waited_word_count >= 13;
 			lck_mtx_unlock(&aadsp_gpr_lock);
 			break;
 		}
 		lck_mtx_unlock(&aadsp_gpr_lock);
 		sleep_us(200);
 	}
-	if (!ok) {
-		simulate_gpr_response(bytes, len);
-		lck_mtx_lock(&aadsp_gpr_lock);
-		if (waited_done) {
-			if (rsp_opcode != NULL) {
-				*rsp_opcode = waited_opcode;
-			}
-			if (rsp_words != NULL && max_words > 0) {
-				memcpy(rsp_words, waited_words, MIN(waited_word_count, max_words) * 4u);
-			}
-			ok = true;
-		}
-		waited_token = 0;
-		lck_mtx_unlock(&aadsp_gpr_lock);
-	}
+	lck_mtx_lock(&aadsp_gpr_lock);
+	waited_token = 0;
+	lck_mtx_unlock(&aadsp_gpr_lock);
+	lck_mtx_unlock(&aadsp_tx_lock);
 	return ok;
 }
 
@@ -1118,7 +1094,6 @@ static void annibale_adsp_boot_thread(void *arg __unused, wait_result_t w __unus
 		say("SM8750 LPASS ADSP already running in SMEM (SMP2P slave-kernel READY)\n");
 		(void)glink_init_queues(false);
 		adsp_hw_up = true;
-		adsp_sim_mode = false;
 	} else {
 		uint32_t try_boot = 1;
 		PE_parse_boot_argn("annibale_adsp", &try_boot, sizeof(try_boot));
@@ -1149,7 +1124,6 @@ static void annibale_adsp_boot_thread(void *arg __unused, wait_result_t w __unus
 						for (unsigned ms = 0; ms < 3000; ms += 20) {
 							if (check_smp2p_ready()) {
 								adsp_hw_up = true;
-								adsp_sim_mode = false;
 								say("SM8750 LPASS ADSP authenticated and READY in %u ms\n", ms);
 								break;
 							}
@@ -1167,7 +1141,7 @@ static void annibale_adsp_boot_thread(void *arg __unused, wait_result_t w __unus
 	}
 
 	if (!adsp_hw_up) {
-		say("ADSP firmware not present; running in direct LPASS shmem + GPR responder mode\n");
+		say("ADSP is not ready; audio transport unavailable\n");
 		thread_terminate(current_thread());
 		return;
 	}
@@ -1185,7 +1159,6 @@ void annibale_adsp_init(void)
 		return;
 	}
 	(void)smem_ensure();
-	adsp_sim_mode = true;
 	adsp_inited = true;
 	lck_mtx_unlock(&aadsp_lock);
 

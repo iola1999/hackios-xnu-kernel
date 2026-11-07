@@ -24,6 +24,7 @@
 #include <sys/systm.h>
 #include <sys/uio.h>
 
+extern kern_return_t thread_terminate(thread_t thread);
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 
@@ -412,7 +413,7 @@ annibale_audio_reach_send_cmd(const void *raw_pkt, uint32_t raw_len, const char 
 		__builtin_arm_dsb(0xf);
 	}
 
-	uint32_t wait_ms = (descr != NULL && strcmp(descr, "WRITE (AUDIO_PERIOD)") == 0) ? 0u : 250u;
+	uint32_t wait_ms = 250u;
 	uint32_t rop = 0;
 	uint32_t rwords[8] = { 0 };
 	bool ok = annibale_adsp_gpr_send(p.buf, p.len, wait_ms, &rop, rwords, 8);
@@ -435,7 +436,9 @@ annibale_audio_reach_send_cmd(const void *raw_pkt, uint32_t raw_len, const char 
 static bool
 gpr_send_command(struct gpr_pkt *p, const char *descr)
 {
-	return annibale_audio_reach_send_cmd(p->buf, p->len, descr, NULL, NULL, 0);
+	uint32_t opcode = 0;
+	return annibale_audio_reach_send_cmd(p->buf, p->len, descr, &opcode, NULL, 0) &&
+	    opcode == GPR_BASIC_RSP_RESULT;
 }
 
 static bool
@@ -500,7 +503,8 @@ build_audioreach_graphs(void)
 	/* 0. Query SPF state */
 	gpr_begin(&p, OUR_PORT, APM_IID, APM_CMD_GET_SPF_STATE);
 	gpr_finish(&p);
-	(void)annibale_audio_reach_send_cmd(p.buf, p.len, "GET_SPF_STATE", &rop, rwords, 4);
+	if (!annibale_audio_reach_send_cmd(p.buf, p.len, "GET_SPF_STATE", &rop, rwords, 4) ||
+	    rop != APM_CMD_RSP_GET_SPF_STATE || rwords[0] != 1) return false;
 
 	/* 1. Map contiguous 64 KiB buffer [0xcf66f000, 0xcf67f000) to ADSP */
 	gpr_begin(&p, OUR_PORT, APM_IID, OP_MEM_MAP);
@@ -510,18 +514,18 @@ build_audioreach_graphs(void)
 	gpr_put32(&p, (uint32_t)dsp_address);
 	gpr_put32(&p, (uint32_t)(dsp_address >> 32));
 	gpr_put32(&p, BUFFER_BYTES);
-	gpr_pad_to(&p, p.len + 16);
 	gpr_finish(&p);
 	rop = 0;
 	rwords[0] = 0;
-	(void)annibale_audio_reach_send_cmd(p.buf, p.len, "MEM_MAP", &rop, rwords, 4);
-	map_handle = (rop == OP_MEM_MAP_DONE && rwords[0] != 0) ? rwords[0] : 0x1001u;
+	if (!annibale_audio_reach_send_cmd(p.buf, p.len, "MEM_MAP", &rop, rwords, 4) ||
+	    rop != OP_MEM_MAP_DONE || rwords[0] == 0) return false;
+	map_handle = rwords[0];
 	say("OP_MEM_MAP_DONE: dsp_address=%#llx size=%#x map_handle=%#x\n",
 	    dsp_address, BUFFER_BYTES, map_handle);
 
 	/* 2. Open SG_SPEAKER */
 	gpr_graph_open(&p, SG_SPEAKER, 1, speaker_mods, 1, NULL, 0);
-	(void)gpr_send_command(&p, "OPEN SG_SPEAKER (0x4005)");
+	if (!gpr_send_command(&p, "OPEN SG_SPEAKER (0x4005)")) return false;
 
 	/* 3. Configure I2S sink (secondary MI2S, 48 kHz 16-bit stereo) */
 	gpr_begin(&p, OUR_PORT, APM_IID, OP_SET_CFG);
@@ -534,30 +538,47 @@ build_audioreach_graphs(void)
 	gpr_param_end(&p, at);
 	gpr_cmd_end(&p, cmd);
 	gpr_finish(&p);
-	(void)gpr_send_command(&p, "SET_CFG I2S SINK");
+	if (!gpr_send_command(&p, "SET_CFG I2S SINK")) return false;
 
 	/* 4. Open SG_PLAY */
 	gpr_graph_open(&p, SG_PLAY, 2, play_mods, 3, play_links, 3);
-	(void)gpr_send_command(&p, "OPEN SG_PLAY (0x4001)");
+	if (!gpr_send_command(&p, "OPEN SG_PLAY (0x4001)")) return false;
 
-	/* 5. Configure formats for decoder & converter */
-	gpr_begin(&p, OUR_PORT, APM_IID, OP_SET_CFG);
+	/* The shared-memory endpoint needs its input format before PREPARE. */
+	gpr_begin(&p, OUR_PORT, IID_PLAY_SHMEM, OP_SET_CFG);
 	cmd = gpr_cmd_begin(&p);
-	at = gpr_param_begin(&p, IID_PLAY_DEC, 0x08001008);
-	gpr_put32(&p, 1); gpr_put32(&p, 0x09001000); gpr_put32(&p, 20);
+	at = gpr_param_begin(&p, IID_PLAY_SHMEM, 0x0800100c);
+	gpr_put32(&p, 1); gpr_put32(&p, 0x09001000); gpr_put32(&p, 18);
+	gpr_put32(&p, RATE);
 	gpr_put16(&p, 16); gpr_put16(&p, 1); gpr_put16(&p, 16); gpr_put16(&p, 15);
-	gpr_put16(&p, 1); gpr_put16(&p, 1); gpr_put16(&p, 0); gpr_put16(&p, CHANNELS);
+	gpr_put16(&p, 1); gpr_put16(&p, CHANNELS);
 	gpr_put8(&p, 1); gpr_put8(&p, 2);
 	gpr_param_end(&p, at);
 	gpr_cmd_end(&p, cmd);
 	gpr_finish(&p);
-	(void)gpr_send_command(&p, "SET_CFG PCM_DEC & CNV");
+	if (!gpr_send_command(&p, "SET_CFG WR_SHMEM PCM input")) return false;
+
+	/* Media payload sizes exclude alignment padding. */
+	gpr_begin(&p, OUR_PORT, APM_IID, OP_SET_CFG);
+	cmd = gpr_cmd_begin(&p);
+	const uint32_t pcm_iids[] = { IID_PLAY_DEC, IID_PLAY_CNV };
+	for (unsigned i = 0; i < 2; i++) {
+		at = gpr_param_begin(&p, pcm_iids[i], 0x08001008);
+		gpr_put32(&p, 1); gpr_put32(&p, 0x09001000); gpr_put32(&p, 18);
+		gpr_put16(&p, 16); gpr_put16(&p, 1); gpr_put16(&p, 16); gpr_put16(&p, 15);
+		gpr_put16(&p, 1); gpr_put16(&p, 1); gpr_put16(&p, 0); gpr_put16(&p, CHANNELS);
+		gpr_put8(&p, 1); gpr_put8(&p, 2);
+		gpr_param_end(&p, at);
+	}
+	gpr_cmd_end(&p, cmd);
+	gpr_finish(&p);
+	if (!gpr_send_command(&p, "SET_CFG PCM_DEC & CNV")) return false;
 
 	/* 6. Start Subgraphs */
-	(void)gpr_graph_cmd(OP_GRAPH_PREPARE, SG_SPEAKER, "PREPARE SG_SPEAKER");
-	(void)gpr_graph_cmd(OP_GRAPH_START, SG_SPEAKER, "START SG_SPEAKER");
-	(void)gpr_graph_cmd(OP_GRAPH_PREPARE, SG_PLAY, "PREPARE SG_PLAY");
-	(void)gpr_graph_cmd(OP_GRAPH_START, SG_PLAY, "START SG_PLAY");
+	if (!gpr_graph_cmd(OP_GRAPH_PREPARE, SG_SPEAKER, "PREPARE SG_SPEAKER")) return false;
+	if (!gpr_graph_cmd(OP_GRAPH_START, SG_SPEAKER, "START SG_SPEAKER")) return false;
+	if (!gpr_graph_cmd(OP_GRAPH_PREPARE, SG_PLAY, "PREPARE SG_PLAY")) return false;
+	if (!gpr_graph_cmd(OP_GRAPH_START, SG_PLAY, "START SG_PLAY")) return false;
 
 	say("AudioReach graphs SG_PLAY (0x4001) & SG_SPEAKER (0x4005) initialized and started\n");
 	return true;
@@ -577,9 +598,13 @@ send_audio_period(uint32_t slot)
 	gpr_put32(&p, map_handle);
 	gpr_put32(&p, PERIOD_BYTES);
 	gpr_put32(&p, 0); gpr_put32(&p, 0); gpr_put32(&p, 0);
+	/* V2 includes the metadata address, map handle and size even without metadata. */
+	for (unsigned i = 0; i < 4; i++) gpr_put32(&p, 0);
 	gpr_finish(&p);
-
-	if (!gpr_send_command(&p, "WRITE (AUDIO_PERIOD)")) {
+	uint32_t opcode = 0, words[8] = { 0 };
+	if (!annibale_audio_reach_send_cmd(p.buf, p.len, "WRITE (AUDIO_PERIOD)", &opcode, words, 8) ||
+	    opcode != OP_WRITE_DONE || words[0] != (uint32_t)period_addr ||
+	    words[1] != (uint32_t)(period_addr >> 32) || words[2] != map_handle || words[3] != 0 || words[7] != 0) {
 		return false;
 	}
 	reach_sent_count++;
@@ -643,7 +668,6 @@ fill_period_slot(uint32_t slot, bool muted, uint32_t below_eighths)
 }
 
 /* Feeder background thread with burst draining to prevent ring buffer overrun */
-__dead2
 static void
 reach_feeder_thread(void *arg __unused, wait_result_t w __unused)
 {
@@ -660,19 +684,14 @@ reach_feeder_thread(void *arg __unused, wait_result_t w __unused)
 		delay_for_interval(50, NSEC_PER_MSEC);
 	}
 	if (annibale_adsp_gpr_ready()) {
-		say("LPASS ADSP GPR channel ready; building AudioReach graphs on hardware\n");
-		build_audioreach_graphs();
-		graphs_built_on_hw = true;
-	} else {
-		say("LPASS ADSP GPR not ready after 12 s; building initial AudioReach graphs\n");
-		build_audioreach_graphs();
+		graphs_built_on_hw = build_audioreach_graphs();
+	}
+	if (!graphs_built_on_hw) {
+		say("AudioReach graph setup failed; playback stopped\n");
+		thread_terminate(current_thread());
+		return;
 	}
 	for (;;) {
-		if (!graphs_built_on_hw && annibale_adsp_gpr_ready()) {
-			say("LPASS ADSP GPR channel became ready; rebuilding AudioReach graphs on hardware\n");
-			build_audioreach_graphs();
-			graphs_built_on_hw = true;
-		}
 		uint32_t cur_below = 0, cur_gen = 0;
 		bool cur_muted = false;
 		if (redwood_audio_volume(&cur_below, &cur_muted, &cur_gen) && cur_gen != last_vol_gen) {
@@ -707,7 +726,12 @@ reach_feeder_thread(void *arg __unused, wait_result_t w __unused)
 				annibale_audio_amp_power(true);
 				amp_powered = true;
 			}
-			(void)send_audio_period(next % SLOTS);
+			if (!send_audio_period(next % SLOTS)) {
+				annibale_audio_amp_power(false);
+				say("PCM completion failed; playback stopped\n");
+				thread_terminate(current_thread());
+				return;
+			}
 			next++;
 
 			lck_spin_lock(audio_spin_lock);

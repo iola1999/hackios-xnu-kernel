@@ -344,16 +344,19 @@ rw_describe_draw(RedwoodMetalWork *work, const void *render, unsigned commit, un
 	    "sync: commit %u work %u: pipeline %p prim %u vertices %u+%u instances %u%s, colour",
 	    commit, index, render, work->primitive, work->vertexStart,
 	    work->vertexCount, work->instanceCount, work->indexBuffer != nil ? " indexed" : "");
-	for (unsigned i = 0; i < work->colorCount && at < sizeof(text); i++)
-		at += rw_describe_attachment(work->color[i], work->clears, text + at, sizeof(text) - at);
+	for (unsigned i = 0; i < work->colorCount && at < sizeof(text); i++) {
+		bool clears = (work->discards & (1u << (8 + i))) != 0;
+		at += rw_describe_attachment(work->color[i], clears, text + at, sizeof(text) - at);
+		if (clears && at < sizeof(text))
+			at += (size_t)snprintf(text + at, sizeof(text) - at, ", clear colour %u %g %g %g %g",
+			    i, work->clearColor[i][0], work->clearColor[i][1],
+			    work->clearColor[i][2], work->clearColor[i][3]);
+	}
 	if (at < sizeof(text)) {
 		at += (size_t)snprintf(text + at, sizeof(text) - at, ", depth");
 	}
 	if (at < sizeof(text))
 		at += rw_describe_attachment(work->depth, work->clearsDepth, text + at, sizeof(text) - at);
-	if (at < sizeof(text) && work->clears)
-		at += (size_t)snprintf(text + at, sizeof(text) - at, ", clear colour %g %g %g %g",
-		    work->clearColor[0], work->clearColor[1], work->clearColor[2], work->clearColor[3]);
 	if (at < sizeof(text) && work->clearsDepth)
 		at += (size_t)snprintf(text + at, sizeof(text) - at, ", clear depth %g", work->clearDepth);
 	if (at < sizeof(text) && work->depthStencilState != nil) {

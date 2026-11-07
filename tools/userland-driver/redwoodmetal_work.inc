@@ -16,6 +16,7 @@
 	[indexBuffer retain];
 	for (unsigned i = 0; i < colorCount; i++) {
 		[color[i] retain];
+		[resolve[i] retain];
 	}
 	for (unsigned i = 0; i < vertexBufferCount; i++) {
 		[vertexBuffers[i] retain];
@@ -47,6 +48,7 @@
 		[indexBuffer release];
 		for (unsigned i = 0; i < colorCount; i++) {
 			[color[i] release];
+			[resolve[i] release];
 		}
 		for (unsigned i = 0; i < vertexBufferCount; i++) {
 			[vertexBuffers[i] release];

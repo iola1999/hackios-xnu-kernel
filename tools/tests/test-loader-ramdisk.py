@@ -91,7 +91,7 @@ static void boot_fallback_check(void) {}
 static inline void ui_stage(const char *word) { (void)word; }
 static inline void ui_progress(uint64_t done, uint64_t total) { (void)done; (void)total; }
 /* "oem sh": tools/test-loader-shell.py */
-static const char *slot_unlock_held_recovery(void) { assert(0); return "unexpected recovery"; }
+static const char *menu_enter_fastboot(void) { assert(0); return "unexpected recovery"; }
 static void oem_shell(const char *text) { (void)text; }
 /* the host-silence watchdog clock, "oem push" into a running kernel's inbox and "oem dsu": not what this test checks */
 static uint64_t host_last_cmd;

@@ -9,7 +9,7 @@
 @class RedwoodMetalRenderPipeline;
 
 enum RWCopyKind { RW_COPY_NONE, RW_COPY_BUFFER, RW_COPY_TEXTURE, RW_COPY_MIPMAP,
-                   RW_COPY_BUFFER_TEXTURE, RW_COPY_ERROR };
+                   RW_COPY_BUFFER_TEXTURE, RW_COPY_ERROR, RW_COPY_CLEAR };
 
 #define RW_BLIT_TEXTURE RW_COPY_TEXTURE
 
@@ -31,7 +31,7 @@ enum RWCopyKind { RW_COPY_NONE, RW_COPY_BUFFER, RW_COPY_TEXTURE, RW_COPY_MIPMAP,
 	/* the resolveTexture of each colour attachment, or nil; struct rwa_draw says what the
 	 * library does with one and why it is resolved per draw rather than per pass */
 	id resolve[8];
-	float clearColor[4];
+	float clearColor[8][4];
 	BOOL clears;
 	unsigned discards;   /* first draw of a pass: colour attachments it does not load (bit i) */
 	/* the depth/stencil attachment of the pass, its two load actions and the state

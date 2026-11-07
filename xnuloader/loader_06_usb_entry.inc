@@ -614,7 +614,7 @@ fb_command(char *cmd)
 			download_to_inbox = inbox_live() != NULL;
 			fb_reply(download_to_inbox ? "OKAY" : "FAIL", download_to_inbox ? "" : "no kernel with an inbox is running");
 		} else if (str_eq(cmd, "oem recovery")) {
-			const char *err = slot_unlock_held_recovery();
+			const char *err = menu_enter_fastboot();
 			fb_reply(err == NULL ? "OKAY" : "FAIL", err == NULL ? "" : err);
 		} else if (lc_cmd_denied(kernel_resources_held, firmware_fault, live, cmd)) {
 			fb_reply("FAIL", live ? "a kernel is running (oem stop ends it)"
@@ -839,9 +839,6 @@ fb_command(char *cmd)
 				ui_stage("BOOT FAILED");
 			} else {
 				UI.ready = 0;   /* the panel keeps the kernel's last frame for oem screenshot */
-				if (recovery_pending_after_return) {
-					(void)slot_unlock_held_recovery();
-				}
 			}
 		} else if (starts_with(cmd, "oem hang")) {
 			/* the watchdog's reset, from here: with memory and devices held too (a host cold reset),
@@ -1157,7 +1154,7 @@ efi_main(efi_handle image, efi_system_table *st)
 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
 	}
 	print("platform %s\n", PLAT->name);
-	skip_ufs_arbitration = (PLAT == &platform_annibale); /* ramdisk kernel, no UFS handover (k90-port) */
+	skip_ufs_arbitration = (PLAT == &platform_annibale); /* Native UFS driver owns controller setup on K90. */
 
 	install_exception_hook();
 	wdt_arm();
