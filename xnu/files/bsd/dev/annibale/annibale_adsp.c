@@ -620,9 +620,14 @@ static uint32_t glink_q_read32(uint32_t q_off, uint32_t q_sz, uint32_t at)
 static bool glink_q_write(uint32_t q_off, uint32_t q_sz, uint32_t *write_at, const void *buf, uint32_t len)
 {
 	const uint8_t *bytes = (const uint8_t *)buf;
-	uint32_t aligned = (len + 7u) & ~7u, pos = *write_at;
-	if (q_sz < 8 || aligned >= q_sz - 8 || pos >= q_sz) return false;
+	uint32_t aligned = (len + 7u) & ~7u;
+	if (q_sz < 8 || aligned >= q_sz - 8) return false;
 	lck_mtx_lock(&glink_tx_lock);
+	uint32_t pos = *write_at;
+	if (pos >= q_sz) {
+		lck_mtx_unlock(&glink_tx_lock);
+		return false;
+	}
 	if (q_off == glink_our_q && glink_our_read_at != 0 && q_sz > aligned + 8u) {
 		for (unsigned wait = 0; wait < 200; wait++) {
 			uint32_t r = 0;
@@ -1005,7 +1010,7 @@ bool annibale_adsp_gpr_send(const void *pkt, uint32_t len, uint32_t wait_ms,
 			else if (request_opcode == OP_WRITE)
 				ok = waited_opcode == OP_WRITE_DONE && waited_word_count >= 8;
 			else if (request_opcode == OP_READ_BUF)
-				ok = waited_opcode == OP_READ_BUF_DONE && waited_word_count >= 13;
+				ok = waited_opcode == OP_READ_BUF_DONE && waited_word_count >= 14;
 			lck_mtx_unlock(&aadsp_gpr_lock);
 			break;
 		}

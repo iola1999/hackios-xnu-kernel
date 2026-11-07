@@ -49,7 +49,10 @@ static int aadsp_gpr_lock, aadsp_tx_lock, glink_tx_lock, glink_gpr_intents, resp
 static uint32_t waited_response_src, waited_response_dst;
 static uint32_t reader;
 static uint64_t ticks;
-static void lck_mtx_lock(void *p) { (void)p; }
+static bool advance_on_lock;
+static void lck_mtx_lock(void *p) {
+    if(p==&glink_tx_lock && advance_on_lock) { glink_tx_write_pos=128;advance_on_lock=false; }
+}
 static void lck_mtx_unlock(void *p) { (void)p; }
 static uint64_t now_us(void) { return ticks++; }
 static void sleep_us(unsigned n) { ticks += n; }
@@ -68,6 +71,9 @@ static void glink_poll_rx(void) {
     if(response_mode>=5) {
         waited_opcode=OP_WRITE_DONE; waited_word_count=response_mode==5 ? 3 : 8;
     }
+    if(response_mode>=7) {
+        waited_opcode=OP_READ_BUF_DONE; waited_word_count=response_mode==7 ? 13 : 14;
+    }
 }
 '''
 TRANSPORT_MAIN = r'''
@@ -83,6 +89,11 @@ int main(void) {
         glink_tx_write_pos=0;
         assert(annibale_adsp_gpr_send(pkt,sizeof(pkt),1,&op,words,2)==(response_mode==6));
     }
+    pkt[5]=OP_READ_BUF;
+    for (response_mode=7;response_mode<=8;response_mode++) {
+        glink_tx_write_pos=0;
+        assert(annibale_adsp_gpr_send(pkt,sizeof(pkt),1,&op,words,2)==(response_mode==8));
+    }
     adsp_hw_up=false; int prior=writes;
     assert(!annibale_adsp_gpr_send(pkt,sizeof(pkt),0,0,0,0)); assert(writes==prior);
     adsp_hw_up=true; intents=0;
@@ -91,7 +102,10 @@ int main(void) {
     assert(!annibale_adsp_gpr_send(pkt,sizeof(pkt),0,0,0,0)); assert(writes==prior);
     glink_tx_write_pos=0; assert(annibale_adsp_gpr_send(pkt,sizeof(pkt),0,0,0,0));
     assert(writes>prior);
-    puts("PASS: real GPR response/error/timeout and queue-full refusal");
+    glink_tx_write_pos=0;advance_on_lock=true;
+    assert(glink_q_write(glink_our_q,glink_our_q_size,&glink_tx_write_pos,pkt,8));
+    assert(glink_tx_write_pos==136);
+    puts("PASS: GPR response lengths/errors and GLINK lock acquisition/write position");
 }
 '''
 PCM_HEADER = r'''
@@ -232,6 +246,9 @@ def main():
             subprocess.run([str(binary)],check=True)
         mutations = (
             (transport, 'waited_words[1] == 0', 'true'),
+            (transport, 'waited_word_count >= 14', 'waited_word_count >= 13'),
+            (transport, 'lck_mtx_lock(&glink_tx_lock);\n\tuint32_t pos = *write_at;',
+             'uint32_t pos = *write_at;\n\tlck_mtx_lock(&glink_tx_lock);'),
             (transport, 'if (wait == 199) {\n\t\t\t\tlck_mtx_unlock(&glink_tx_lock);\n\t\t\t\treturn false;\n\t\t\t}', 'if (wait == 199) break;'),
             (pcm, 'i < 4', 'i < 3'),
             (graph, 'if (!gpr_send_command(&p, "OPEN SG_PLAY (0x4001)")) return false;',

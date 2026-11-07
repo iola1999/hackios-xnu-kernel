@@ -281,9 +281,9 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 	used = (size_t) snprintf(bl.line, sizeof(bl.line), "%s[%d] to the %s:", who, proc_selfpid(),
 	    value_key != NULL ? "backlight" : "framebuffer");
 	used = list_keys(bl.line, sizeof(bl.line), used < sizeof(bl.line) ? used : sizeof(bl.line), dict);
-	if (value_key == NULL) {
+	if (value_key == NULL && (bl.user_until == 0 || now > bl.user_until)) {
 		snprintf(bl.line + used, sizeof(bl.line) - used,
-		    "; framebuffer brightness ignored, keeping %llu.%03llu nits",
+		    "; framebuffer update outside slider window ignored, keeping %llu.%03llu nits",
 		    last_millinits / 1000, last_millinits % 1000);
 		bl_log();
 		return;
@@ -335,9 +335,10 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 		bl_log();
 		return;
 	}
-	if (bl.initialized && !slider_moved) {
+	/* CoreBrightness sends nits separately after the slider-position request. */
+	if (bl.initialized && !slider_moved && (bl.user_until == 0 || now > bl.user_until)) {
 		snprintf(bl.line + used, sizeof(bl.line) - used,
-		    "; autonomous update ignored (no slider move), keeping %llu nits",
+		    "; update outside slider window ignored, keeping %llu nits",
 		    last_millinits / 1000);
 		bl_log();
 		return;

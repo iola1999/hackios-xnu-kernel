@@ -103,6 +103,7 @@ static uint32_t mic_ring_tail;
 
 static uint32_t mic_open_clients;
 static bool mic_graphs_started;
+static int mic_capture_error;
 static bool mic_wcd_powered;
 static uint32_t mic_token = 500;
 static uint64_t last_blocking_read_ns;
@@ -304,21 +305,29 @@ mic_graph_cmd(uint32_t opcode, uint32_t sg, const char *descr)
 
 /* ---- WCD9395 Codec Power, Reset & AudioReach Capture Graph Setup ----------------------------- */
 
-static void
+static bool
 wcd9395_power_and_reset(void)
 {
 	if (mic_wcd_powered) {
-		return;
+		return true;
 	}
+	if (!annibale_adsp_is_hw_up()) return false;
 	/* Enable WCD9395 RPMh power supplies (ldob15 1.8V, ldoi2 1.2V, bobb1 BuckBoost) */
-	(void)annibale_rpmh_regulator("ldob15", 1800, true, 7);
-	(void)annibale_rpmh_regulator("ldoi2", 1200, true, 7);
-	(void)annibale_rpmh_regulator("bobb1", 0, true, 0);
+	if (!annibale_rpmh_regulator("ldob15", 1800, true, 7) ||
+	    !annibale_rpmh_regulator("ldoi2", 1200, true, 7) ||
+	    !annibale_rpmh_regulator("bobb1", 0, true, 0)) {
+		say("WCD9395 power rail setup failed\n");
+		return false;
+	}
 
 	if (tlmm_base == 0) {
 		tlmm_base = ml_io_map(TLMM_PHYS, TLMM_SIZE);
 	}
-	if (tlmm_base != 0) {
+	if (tlmm_base == 0) {
+		say("WCD9395 reset GPIO mapping failed\n");
+		return false;
+	}
+	{
 		vm_offset_t cfg_reg = tlmm_base + 0x1000UL * PIN_WCD_RST;
 		vm_offset_t io_reg = cfg_reg + 4UL;
 		uint32_t cfg = *(volatile uint32_t *)cfg_reg;
@@ -346,10 +355,17 @@ wcd9395_power_and_reset(void)
 		mpkt_param_end(&p, at);
 		mpkt_cmd_end(&p, cmd);
 		mpkt_finish(&p);
-		(void)annibale_audio_reach_send_cmd(p.buf, p.len, "REQ LPASS CORE", NULL, NULL, 0);
+		if (!annibale_audio_reach_send_cmd(p.buf, p.len, "REQ LPASS CORE", NULL, NULL, 0)) {
+			say("LPASS core resource request failed\n");
+			return false;
+		}
 
 		vm_offset_t lpi_tlmm = ml_io_map(LPI_TLMM_PHYS, LPI_TLMM_SIZE);
-		if (lpi_tlmm != 0) {
+		if (lpi_tlmm == 0) {
+			say("LPI TLMM mapping failed\n");
+			return false;
+		}
+		{
 			/* LPI GPIO 3 (TX SWR CLK), 4 (TX SWR DATA0), 5 (TX SWR DATA1), 15 (TX SWR DATA2) func 1 */
 			static const unsigned swr_pins[] = { 3, 4, 5, 15 };
 			for (unsigned i = 0; i < 4; i++) {
@@ -364,6 +380,7 @@ wcd9395_power_and_reset(void)
 
 	mic_wcd_powered = true;
 	say("WCD9395 supplies enabled and reset GPIO101 released\n");
+	return true;
 }
 
 static bool
@@ -372,7 +389,7 @@ start_capture_graphs(void)
 	if (mic_graphs_started) {
 		return true;
 	}
-	wcd9395_power_and_reset();
+	if (!wcd9395_power_and_reset()) return false;
 
 	static const struct mic_mod mic_mods[] = {
 		{ MOD_CODEC_DMA_SOURCE, IID_MIC_SOURCE, 0, 1 }
@@ -443,7 +460,7 @@ start_capture_graphs(void)
 }
 
 static bool
-submit_capture_slot(uint32_t slot, uint64_t dsp_base, uint32_t map_handle)
+submit_capture_slot(uint32_t slot, uint64_t dsp_base, uint32_t map_handle, uint32_t *data_bytes_out)
 {
 	struct mic_pkt p;
 	uint64_t slot_addr = dsp_base + MIC_OFFSET + (uint64_t)slot * MIC_PERIOD_BYTES;
@@ -460,31 +477,34 @@ submit_capture_slot(uint32_t slot, uint64_t dsp_base, uint32_t map_handle)
 	uint32_t opcode = 0, words[16] = { 0 };
 	if (!annibale_audio_reach_send_cmd(p.buf, p.len, "READ (MIC_PERIOD)", &opcode, words, 16) ||
 	    opcode != OP_READ_BUF_DONE || words[0] != 0 || words[1] != (uint32_t)slot_addr ||
-	    words[2] != (uint32_t)(slot_addr >> 32) || words[3] != map_handle || words[4] > MIC_PERIOD_BYTES ||
-	    words[8] != 0) {
+	    words[2] != (uint32_t)(slot_addr >> 32) || words[3] != map_handle ||
+	    words[4] > MIC_PERIOD_BYTES || (words[4] % sizeof(int16_t)) != 0 ||
+	    words[9] != 0 || words[13] != 0) {
 		say("capture completion failed for slot %u (opcode %#x)\n", slot, opcode);
 		return false;
 	}
+	if (data_bytes_out != NULL) *data_bytes_out = words[4];
 	return true;
 }
 
-/* ---- Continuous 48 kHz Capture Ring & Ambient Floor Generator -------------------------------- */
+/* ---- Continuous 48 kHz Capture Ring --------------------------------------------------------- */
 
 static void
-harvest_capture_period(uint32_t slot, volatile uint8_t *dma_va)
+harvest_capture_period(uint32_t slot, volatile uint8_t *dma_va, uint32_t valid_bytes)
 {
-	int16_t period_mono[MIC_PERIOD_FRAMES] = { 0 };
+	int16_t period_mono[MIC_PERIOD_FRAMES];
+	uint32_t valid_samples = valid_bytes / sizeof(int16_t);
+	if (dma_va == NULL || valid_samples > MIC_PERIOD_FRAMES) return;
 	int16_t period_stereo[MIC_PERIOD_FRAMES * 2];
 	if (dma_va != NULL) {
 		volatile int16_t *hw = (volatile int16_t *)(volatile void *)(dma_va + MIC_OFFSET + slot * MIC_PERIOD_BYTES);
-		for (uint32_t i = 0; i < MIC_PERIOD_FRAMES; i++) {
-			int16_t v = hw[i];
-			period_mono[i] = v;
+		for (uint32_t i = 0; i < valid_samples; i++) {
+			period_mono[i] = hw[i];
 		}
 	}
 
 	lck_spin_lock(amic_ring_lock);
-	for (uint32_t i = 0; i < MIC_PERIOD_FRAMES; i++) {
+	for (uint32_t i = 0; i < valid_samples; i++) {
 		if ((mic_ring_head - mic_ring_tail) >= MIC_RING_SAMPLES) {
 			mic_ring_tail++;
 		}
@@ -494,11 +514,11 @@ harvest_capture_period(uint32_t slot, volatile uint8_t *dma_va)
 	lck_spin_unlock(amic_ring_lock);
 
 	if (redwood_audio_recording_mic()) {
-		for (uint32_t i = 0; i < MIC_PERIOD_FRAMES; i++) {
+		for (uint32_t i = 0; i < valid_samples; i++) {
 			period_stereo[2 * i] = period_mono[i];
 			period_stereo[2 * i + 1] = period_mono[i];
 		}
-		redwood_audio_record_fed(period_stereo, MIC_PERIOD_FRAMES);
+		redwood_audio_record_fed(period_stereo, valid_samples);
 	}
 }
 
@@ -513,19 +533,24 @@ mic_capture_thread(void *arg __unused, wait_result_t w __unused)
 		bool active = (mic_open_clients > 0) || redwood_audio_recording_mic();
 		if (active) {
 			lck_mtx_lock(&amic_lock);
-			if (!mic_graphs_started) {
-				(void)start_capture_graphs();
+			if (mic_capture_error != 0 || (!mic_graphs_started && !start_capture_graphs())) {
+				lck_mtx_unlock(&amic_lock);
+				delay_for_interval(20, NSEC_PER_MSEC);
+				continue;
 			}
 			lck_mtx_unlock(&amic_lock);
 
 			volatile uint8_t *dma_va = NULL;
 			uint64_t dma_pa = 0, dsp_addr = 0;
-			uint32_t map_handle = 0;
+			uint32_t map_handle = 0, data_bytes = 0;
 			if (annibale_audio_reach_dma_info(&dma_va, &dma_pa, &dsp_addr, &map_handle) &&
-			    submit_capture_slot(slot % MIC_SLOTS, dsp_addr, map_handle)) {
-				harvest_capture_period(slot % MIC_SLOTS, dma_va);
+			    submit_capture_slot(slot % MIC_SLOTS, dsp_addr, map_handle, &data_bytes)) {
+				harvest_capture_period(slot % MIC_SLOTS, dma_va, data_bytes);
 			} else {
-				say("capture DMA submission failed; retaining silence\n");
+				lck_mtx_lock(&amic_lock);
+				mic_capture_error = EIO;
+				lck_mtx_unlock(&amic_lock);
+				say("capture DMA completion failed; capture stopped\n");
 			}
 			slot++;
 		}
@@ -545,12 +570,13 @@ annibale_mic_read(struct uio *uio, int ioflag)
 	int error = 0;
 
 	if (mic_ring == NULL) {
-		return 0;
+		return ENXIO;
 	}
 
 	lck_mtx_lock(&amic_lock);
-	if (!mic_graphs_started) {
-		(void)start_capture_graphs();
+	if (mic_capture_error != 0 || (!mic_graphs_started && !start_capture_graphs())) {
+		lck_mtx_unlock(&amic_lock);
+		return EIO;
 	}
 	lck_mtx_unlock(&amic_lock);
 
@@ -609,10 +635,11 @@ static int
 mic_cdev_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
 {
 	lck_mtx_lock(&amic_lock);
-	mic_open_clients++;
-	if (!mic_graphs_started) {
-		(void)start_capture_graphs();
+	if (mic_ring == NULL || mic_capture_error != 0 || (!mic_graphs_started && !start_capture_graphs())) {
+		lck_mtx_unlock(&amic_lock);
+		return EIO;
 	}
+	mic_open_clients++;
 	lck_mtx_unlock(&amic_lock);
 	return 0;
 }

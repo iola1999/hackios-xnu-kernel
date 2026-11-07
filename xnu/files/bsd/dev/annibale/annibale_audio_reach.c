@@ -415,15 +415,15 @@ annibale_audio_reach_send_cmd(const void *raw_pkt, uint32_t raw_len, const char 
 
 	uint32_t wait_ms = 250u;
 	uint32_t rop = 0;
-	uint32_t rwords[8] = { 0 };
-	bool ok = annibale_adsp_gpr_send(p.buf, p.len, wait_ms, &rop, rwords, 8);
+	uint32_t rwords[16] = { 0 };
+	bool ok = annibale_adsp_gpr_send(p.buf, p.len, wait_ms, &rop, rwords, 16);
 	lck_mtx_unlock(cmd_oob_lock);
 
 	if (rsp_opcode != NULL) {
 		*rsp_opcode = rop;
 	}
 	if (rsp_words != NULL && max_words > 0) {
-		memcpy(rsp_words, rwords, MIN(max_words, 8u) * 4u);
+		memcpy(rsp_words, rwords, MIN(max_words, 16u) * 4u);
 	}
 	if (descr != NULL && strcmp(descr, "WRITE (AUDIO_PERIOD)") != 0) {
 		uint32_t tok = 0;
