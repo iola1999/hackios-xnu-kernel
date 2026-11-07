@@ -316,7 +316,7 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 	shape.array_length = (type == MTLTextureType2DArray || type == MTLTextureTypeCubeArray)
 				? (unsigned)slices.length : 1;
 	texture = [[RedwoodMetalTexture alloc] initWithRedwoodDevice:_owner texture:view
-							       shape:&shape iosurface:NULL plane:0];
+							       shape:&shape iosurface:_iosurface plane:_iosurfacePlane];
 	if (texture != nil) {
 		texture->_parentTexture = [self retain];
 		texture->_parentRelativeLevel = levels.location;

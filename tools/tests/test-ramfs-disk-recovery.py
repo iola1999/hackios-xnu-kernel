@@ -89,12 +89,19 @@ source += r'''
 static uint8_t *device;
 static bool device_present = true;
 static int64_t io_fail = -1;
+static uint64_t partial_write;
 static unsigned writes, panic_calls;
 static uint64_t last_write;
 static bool redwood_ufs_var_info(uint64_t *size) { *size = 1ULL << 30; return device_present; }
 static int redwood_ufs_var_io(bool write, uint64_t offset, void *buf, uint64_t len) {
     assert(offset + len <= 64ULL << 20);
-    if ((int64_t)offset == io_fail) return EIO;
+    if ((int64_t)offset == io_fail) {
+        if (write && partial_write != 0) {
+            assert(partial_write < len);
+            memcpy(device + offset, buf, partial_write); writes++;
+        }
+        return EIO;
+    }
     if (write) { writes++; last_write = offset; memcpy(device + offset, buf, len); }
     else memcpy(buf, device + offset, len);
     return 0;
@@ -165,7 +172,7 @@ source += r'''
 static void setup(struct ramfs_mount *rm) {
     assert(allocations == 0 && ramfs_var_used_pages == 0);
     memset(device, 0, 64ULL << 20); memset(rm, 0, sizeof(*rm));
-    device_present = true; io_fail = -1; writes = panic_calls = 0;
+    device_present = true; io_fail = -1; partial_write = 0; writes = panic_calls = 0;
     ramfs_disk_claimed = false; ramfs_disk_rm = NULL;
     fail_alloc = alloc_call = 0;
     rm->rm_hash = calloc(RAMFS_HASH_SIZE, sizeof(*rm->rm_hash)); assert(rm->rm_hash);
@@ -222,6 +229,35 @@ int main(void) {
     rm.rm_meta_dirty = true;
     assert(ramfs_disk_sync_impl(&rm) == 0 && last_write == RDWFS_SLOT0_OFFSET && rm.rm_meta_gen == 4);
     cleanup(&rm);
+    /* A failed target-slot write must preserve the last committed checkpoint. */
+    for (unsigned stop = 0; stop < 2; stop++) {
+        setup(&rm); checkpoint(0, 3, false); checkpoint(1, 4, false);
+        assert(ramfs_disk_mount(&rm) == 0 && rm.rm_meta_slot == 1);
+        uint8_t committed[8192];
+        memcpy(committed, device + RDWFS_SLOT1_OFFSET, sizeof(committed));
+        rm.rm_root->rn_mode = 0700; rm.rm_meta_dirty = true;
+        io_fail = stop == 0 ? RDWFS_SUPER_BYTES : RDWFS_SLOT0_OFFSET;
+        partial_write = stop == 0 ? 128 : 0;
+        assert(ramfs_disk_sync_impl(&rm) == EIO && rm.rm_meta_dirty);
+        assert(rm.rm_meta_gen == 4 && rm.rm_meta_slot == 1);
+        assert(memcmp(committed, device + RDWFS_SLOT1_OFFSET, sizeof(committed)) == 0);
+        io_fail = -1; partial_write = 0;
+        struct rdwfs_super *old_header = (void *)device;
+        assert(old_header->generation == 3 && ramfs_disk_super_valid(old_header));
+        assert(ramfs_disk_read_slot(&rm, RDWFS_SLOT0_OFFSET, old_header) == EINVAL);
+        cleanup(&rm);
+
+        memset(&rm, 0, sizeof(rm));
+        rm.rm_hash = calloc(RAMFS_HASH_SIZE, sizeof(*rm.rm_hash)); assert(rm.rm_hash);
+        ramfs_disk_empty_root(&rm); ramfs_disk_claimed = false; ramfs_disk_rm = NULL;
+        io_fail = -1; partial_write = 0;
+        assert(ramfs_disk_mount(&rm) == 0 && rm.rm_meta_gen == 4 && rm.rm_meta_slot == 1);
+        assert(rm.rm_root->rn_mode == 0);
+        rm.rm_root->rn_mode = 0600; rm.rm_meta_dirty = true;
+        assert(ramfs_disk_sync_impl(&rm) == 0 && rm.rm_meta_gen == 5 && rm.rm_meta_slot == 0);
+        assert(ramfs_disk_read_slot(&rm, RDWFS_SLOT0_OFFSET, (void *)device) == 0);
+        cleanup(&rm);
+    }
     setup(&rm); checkpoint(0, 5, true); checkpoint(1, 3, false); fail_alloc = 7;
     assert(ramfs_disk_mount(&rm) == ENOMEM && writes == 0 && ramfs_var_used_pages == 0); cleanup(&rm);
     setup(&rm); checkpoint(1, 3, false);
@@ -253,7 +289,7 @@ int main(void) {
         }
         assert(allocations == 0);
     }
-    free(device); puts("ramfs recovery: missing device, allocation/I/O faults, corrupt/empty slots, fallback and small checkpoints passed");
+    free(device); puts("ramfs recovery: missing device, allocation/I/O faults, interrupted writes, corrupt/empty slots, fallback and small checkpoints passed");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='ramfs-recovery-') as tmp:
