@@ -904,11 +904,12 @@ gpt_swap_ab_type_guids(uint8_t *entries, uint32_t num_entries, uint32_t entry_si
 					memcpy(ei, ej, 16);
 					memcpy(ej, tmp, 16);
 					swapped++;
+					int is_boot = (len == 6 && pi[0] == 'b' && pi[2] == 'o' && pi[4] == 'o' && pi[6] == 't');
+					uint64_t keep_t = *(uint64_t *)(et + 48) & 0x1000000000000001ULL;
+					uint64_t keep_o = *(uint64_t *)(eo + 48) & 0x1000000000000001ULL;
+					*(uint64_t *)(et + 48) = is_boot ? 0x006f000000000000ULL : (keep_t | 0x007f000000000000ULL);
+					*(uint64_t *)(eo + 48) = is_boot ? 0x006a000000000000ULL : (keep_o | 0x00c4000000000000ULL);
 				}
-				/* Update Qualcomm LUN 4 active/inactive slot attributes on all A/B pairs. */
-				int is_boot = (len == 6 && pi[0] == 'b' && pi[2] == 'o' && pi[4] == 'o' && pi[6] == 't');
-				*(uint64_t *)(et + 48) = is_boot ? 0x006f000000000000ULL : 0x007f000000000000ULL;
-				*(uint64_t *)(eo + 48) = is_boot ? 0x006a000000000000ULL : 0x00c0000000000000ULL;
 				break;
 			}
 		}
@@ -945,59 +946,41 @@ slot_apply_active(char target_slot)
 	if (!entry) return;
 
 	uint32_t n4 = gpt_swap_ab_type_guids(ufs_buffer, num_entries, entry_size, target_slot);
-	if (n4 > 0) {
-		print("slot: swapped %d A/B PartitionTypeGUID pairs on LUN 4 for Slot %s\n",
-		    (uint64_t)n4, target_slot == 'b' ? "b" : "a");
+	uint64_t want_t = 0x006f000000000000ULL, want_o = 0x006a000000000000ULL;
+	if (n4 > 0 || *(uint64_t *)(entry + 48) != want_t ||
+	    (entry_other && *(uint64_t *)(entry_other + 48) != want_o)) {
+		*(uint64_t *)(entry + 48) = want_t;
+		if (entry_other) *(uint64_t *)(entry_other + 48) = want_o;
+		if (!EFI_ERROR(safe_write_blocks(bio, entries_lba, num_blocks, bs, ufs_buffer))) {
+			gpt_sync_lun(bio);
+			print("slot: LUN 4 Slot %s (%s) active=0x006f000000000000 (swapped=%d)\n",
+			    target_slot == 'b' ? "b" : "a", target_name, (uint64_t)n4);
+		}
 	}
 
-	*(uint64_t *)(entry + 48) = 0x006f000000000000ULL;
-	if (entry_other) {
-		*(uint64_t *)(entry_other + 48) = 0x006a000000000000ULL;
+	efi_block_io *bio0 = lun_get_bio(0, "super");
+	if (bio0 && bio0->media && bio0->media->block_size == bs &&
+	    !EFI_ERROR(bio0->read_blocks(bio0, bio0->media->media_id, 1, bs, hdr)) &&
+	    memcmp(hdr, "EFI PART", 8) == 0) {
+		uint64_t lba0 = *(uint64_t *)(hdr + 72);
+		uint32_t ne0 = *(uint32_t *)(hdr + 80), es0 = *(uint32_t *)(hdr + 84);
+		uint64_t tb0 = (uint64_t)ne0 * es0, nb0 = (tb0 + bs - 1) / bs;
+		if (tb0 > 0 && tb0 <= sizeof(ufs_buffer) &&
+		    !EFI_ERROR(safe_read_blocks(bio0, lba0, nb0, bs, ufs_buffer))) {
+			uint32_t n0 = gpt_swap_ab_type_guids(ufs_buffer, ne0, es0, target_slot);
+			if (n0 > 0 && !EFI_ERROR(safe_write_blocks(bio0, lba0, nb0, bs, ufs_buffer))) {
+				gpt_sync_lun(bio0);
+				print("slot: swapped %d A/B PartitionTypeGUID pairs on LUN 0 for Slot %s\n",
+				    (uint64_t)n0, target_slot == 'b' ? "b" : "a");
+			}
+		}
 	}
-	if (EFI_ERROR(safe_write_blocks(bio, entries_lba, num_blocks, bs, ufs_buffer))) return;
-	gpt_sync_lun(bio);
-
-	print("slot: Slot %s (%s) active=0x006f000000000000 (%s=0x006a000000000000)\n",
-	    target_slot == 'b' ? "b" : "a", target_name, other_name);
 }
 
 static void
 slot_maintain_current(void)
 {
-	efi_block_io *bio = lun4_get_bio();
-	if (!bio || !bio->media) return;
-	uint32_t bs = bio->media->block_size;
-	if (bs < 512 || bs > 4096) return;
-
-	static uint8_t hdr[4096] __attribute__((aligned(4096)));
-	if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, 1, bs, hdr)) ||
-	    memcmp(hdr, "EFI PART", 8) != 0) {
-		return;
-	}
-
-	uint64_t entries_lba = *(uint64_t *)(hdr + 72);
-	uint32_t num_entries = *(uint32_t *)(hdr + 80);
-	uint32_t entry_size = *(uint32_t *)(hdr + 84);
-	uint64_t total_bytes = (uint64_t)num_entries * entry_size;
-	uint64_t num_blocks = (total_bytes + bs - 1) / bs;
-	if (total_bytes == 0 || total_bytes > sizeof(ufs_buffer)) return;
-	if (EFI_ERROR(safe_read_blocks(bio, entries_lba, num_blocks, bs, ufs_buffer))) return;
-
-	static const uint8_t inactive_guid[16] = {
-		0xd4, 0x6c, 0x03, 0x77, 0xd5, 0x03, 0xbb, 0x42,
-		0x8e, 0xd1, 0x37, 0xe5, 0xa8, 0x8b, 0xaa, 0x34
-	};
-	const char *target_name = (loader_slot == 'b') ? "boot_b" : "boot_a";
-	uint8_t *entry = gpt_find_entry(ufs_buffer, num_entries, entry_size, target_name);
-	if (!entry || memcmp(entry, inactive_guid, 16) == 0) return;
-
-	uint64_t attr = *(uint64_t *)(entry + 48);
-	if ((attr & (1ULL << 54)) != 0 || attr == 0x006f000000000000ULL) return;
-
-	*(uint64_t *)(entry + 48) = 0x006f000000000000ULL;
-	if (EFI_ERROR(safe_write_blocks(bio, entries_lba, num_blocks, bs, ufs_buffer))) return;
-	gpt_sync_lun(bio);
-	print("slot: refreshed %s retry budget to 0x006f000000000000\n", target_name);
+	slot_apply_active(loader_slot);
 }
 
 static void

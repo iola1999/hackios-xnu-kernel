@@ -61,7 +61,8 @@ def main():
         open(kernel, 'wb').write(packer.compress(blob) + packer.flush() + dtb)
         open(rd, 'wb').write(ramdisk)
         subprocess.check_call([sys.executable, MKBOOTIMG, '--kernel', kernel, '--ramdisk', rd,
-                               '--header_version', '1', '-o', args.output])
+                               '--header_version', '1', '--os_version', '15.0.0',
+                               '--os_patch_level', '2026-02', '-o', args.output])
     data = open(args.output, 'rb').read()
     print(f'{args.output}: {len(data)} bytes, sha256 {hashlib.sha256(data).hexdigest()}; '
           f'shim+FD {len(prefix)} bytes, container {len(container)} bytes, DTB {len(dtb)} bytes')
