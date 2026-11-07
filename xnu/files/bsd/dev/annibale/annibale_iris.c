@@ -111,7 +111,6 @@ static lck_grp_t *iris_lock_grp;
 static lck_mtx_t *iris_lock;
 static bool iris_is_ready = false;
 static uint32_t iris_irq_count = 0;
-static int iris_event_wait = 0;
 
 static inline uint32_t
 iris_rd(uint32_t off)
@@ -224,7 +223,6 @@ annibale_iris_isr(void *ctx __unused, uint32_t intid __unused)
 		iris_wr(CPU_CS_A2H_CLEAR, status);
 		__builtin_arm_dsb(0xf);
 	}
-	wakeup(&iris_event_wait);
 }
 
 /*
@@ -525,91 +523,13 @@ iris_dev_ioctl(dev_t dev __unused, u_long cmd, caddr_t data, int flags __unused,
 
 	lck_mtx_lock(iris_lock);
 	switch (cmd) {
-	case IRIS_IOC_OPEN_SESSION: {
-		struct iris_session_params *sp = (struct iris_session_params *)data;
-		sp->session_id = 1;
-		say("opened decode session for codec type %u (width %u, height %u)\n",
-		    sp->codec_type, sp->width, sp->height);
+	case IRIS_IOC_OPEN_SESSION:
+	case IRIS_IOC_DECODE_FRAME:
+	case IRIS_IOC_CLOSE_SESSION:
+		/* HFI gen2 session and completion packets are not implemented yet. */
+		say("Iris HFI session ioctl %#lx is unavailable until native packet handling is implemented\n", cmd);
+		error = EOPNOTSUPP;
 		break;
-	}
-	case IRIS_IOC_DECODE_FRAME: {
-		struct iris_decode_frame *df = (struct iris_decode_frame *)data;
-
-		/* Copyin user bitstream data if provided */
-		if (df->input_len > 0 && df->input_user_addr != 0) {
-			uint32_t copy_len = MIN(df->input_len, 0x100000u);
-			uint8_t *kbuf = kalloc_data(copy_len, Z_WAITOK);
-			if (kbuf != NULL) {
-				if (copyin((user_addr_t)df->input_user_addr, kbuf, copy_len) == 0) {
-					if (video_region_vbase != 0) {
-						memcpy((void *)(video_region_vbase + 0x8000), kbuf, copy_len);
-						__builtin_arm_dsb(0xf);
-					}
-				}
-				kfree_data(kbuf, copy_len);
-			}
-		}
-
-		uint32_t stride = df->out_stride;
-		if (stride == 0) {
-			stride = 1920;
-		}
-		uint32_t height = 1080;
-		if (stride <= 640) {
-			height = 480;
-		} else if (stride <= 1280) {
-			height = 720;
-		} else {
-			height = 1080;
-		}
-		uint32_t y_size = stride * height;
-		uint32_t uv_size = stride * (height / 2);
-
-		/* Clamp to maximum allocated video_region NV12 buffer space */
-		if (y_size > 1920 * 1080) {
-			y_size = 1920 * 1080;
-		}
-		if (uv_size > 1920 * 540) {
-			uv_size = 1920 * 540;
-		}
-
-		/* Submit HFI decode command into Command Queue */
-		uint32_t cmd_pkt[8];
-		cmd_pkt[0] = 8 * sizeof(uint32_t); /* packet size in bytes */
-		cmd_pkt[1] = 0x01;                  /* HFI_CMD_FRAME_DECODE */
-		cmd_pkt[2] = df->session_id;
-		cmd_pkt[3] = (uint32_t)(VIDEO_REGION_PHYS + 0x8000); /* input bitstream */
-		cmd_pkt[4] = df->input_len;
-		cmd_pkt[5] = (uint32_t)(VIDEO_REGION_PHYS + 0x100000); /* output Y plane */
-		cmd_pkt[6] = (uint32_t)(VIDEO_REGION_PHYS + 0x100000 + y_size); /* output UV plane */
-		cmd_pkt[7] = 0;
-		if (!iris_hfi_cmd_write(cmd_pkt, 8)) {
-			error = EBUSY;
-			break;
-		}
-
-		/* Wait for completion via GIC SPI 174 (atomically drop iris_lock during sleep) */
-		lck_mtx_sleep(iris_lock, LCK_SLEEP_DEFAULT, (event_t)&iris_event_wait, THREAD_INTERRUPTIBLE);
-
-		df->out_phys_y = VIDEO_REGION_PHYS + 0x100000;
-		df->out_phys_uv = df->out_phys_y + y_size;
-		df->out_stride = stride;
-		df->flags = 0x01; /* Frame ready */
-
-		/* Copyout decoded NV12 planes to user buffer if provided */
-		if (df->out_user_y != 0 && video_region_vbase != 0) {
-			copyout((void *)(video_region_vbase + 0x100000), (user_addr_t)df->out_user_y, y_size);
-		}
-		if (df->out_user_uv != 0 && video_region_vbase != 0) {
-			copyout((void *)(video_region_vbase + 0x100000 + y_size), (user_addr_t)df->out_user_uv, uv_size);
-		}
-		break;
-	}
-	case IRIS_IOC_CLOSE_SESSION: {
-		uint32_t *sid = (uint32_t *)data;
-		say("closed decode session %u\n", *sid);
-		break;
-	}
 	default:
 		error = ENOTTY;
 		break;
