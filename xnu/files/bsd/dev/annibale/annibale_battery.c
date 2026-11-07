@@ -269,7 +269,7 @@ spmi_wait(vm_offset_t channel)
 static bool
 spmi_read_reg(struct charger_module *mod, uint8_t reg, uint8_t *val)
 {
-	if (!mod->found || mod->chnl_rd == 0) {
+	if (!mod->found || !mod->ours || mod->chnl_rd == 0) {
 		return false;
 	}
 	annibale_spmi_lock();
@@ -376,10 +376,10 @@ pm8550b_charger_probe(void)
 		uint8_t owner = *(volatile uint32_t *)(arb_cnfg + APID_OWNER(n)) & 7;
 
 		/*
-		 * Exclude PMK8550/PM8550 power-on block (0x013 and 0x113) and PON PBS (0x015)
-		 * which are power-on reset peripherals, not charger peripherals.
+		 * Exclude PMK8550 (slave 0) and PM8550 (slave 1) system/power-on blocks;
+		 * charger and fuel-gauge peripherals on SM8750 live on slave >= 2.
 		 */
-		if (ppid == 0x013 || ppid == 0x113 || ppid == 0x015) {
+		if (slave <= 1 || ppid == 0x013 || ppid == 0x113 || ppid == 0x015) {
 			continue;
 		}
 
@@ -782,12 +782,6 @@ sample(void)
 	 * > +50 mA: battery is actively charging from external power
 	 * < -250 mA: battery is actively discharging, external power disconnected
 	 * [-250 mA, +50 mA]: maintain current external state */
-	bool usb_active = false;
-	if (dwc3_dev != 0) {
-		uint32_t dctl = *(volatile uint32_t *)(dwc3_dev + 0x704);
-		uint32_t dsts = *(volatile uint32_t *)(dwc3_dev + 0x70c);
-		usb_active = ((dctl >> 31) != 0) && ((dsts & (1u << 22)) == 0) && (((dsts >> 18) & 0xf) < 4);
-	}
 	bool usbin_plugged = false;
 	uint8_t usbin_sts = 0;
 	if (usbin_mod.found && spmi_read_reg(&usbin_mod, 0x10, &usbin_sts)) {
@@ -795,28 +789,29 @@ sample(void)
 	}
 	bool mca_vbus = pmic_glink_state.active &&
 	    (pmic_glink_state.vbus_uv > 4000000 || pmic_glink_state.chg_status == 1 || pmic_glink_state.chg_status == 4);
-	if (usb_active || usbin_plugged || mca_vbus || state.current_ua >= DISCONNECT_FLOW_UA) {
+	bool flow_charging = (state.current_ua >= CHARGE_FLOW_UA) ||
+	    (values[0] >= 99 && state.current_ua >= -30000);
+	pm8550b_configure_charging(true);
+	if (usbin_plugged || mca_vbus || flow_charging) {
 		last_external = true;
 		if (pmic_glink_state.active && pmic_glink_state.chg_status >= 1 && pmic_glink_state.chg_status <= 4) {
 			state.status = pmic_glink_state.chg_status;
 		} else {
 			state.status = (values[0] >= 100 && state.current_ua <= CHARGE_FLOW_UA) ? 4 : 1;
 		}
-		pm8550b_configure_charging(true);
 	} else {
 		last_external = false;
 		state.status = 2;
-		pm8550b_configure_charging(false);
 	}
 	state.external = last_external;
 	if (state.external) {
 		int32_t vbus_uv = (pmic_glink_state.active && pmic_glink_state.vbus_uv > 4000000) ?
 		    pmic_glink_state.vbus_uv : 5000000;
 		state.usb_type = (vbus_uv >= 8000000 || pmic_glink_state.chg_type >= 5) ? 6 :
-		    ((usb_active || usbin_plugged) ? 1 : 2);
+		    (usbin_plugged ? 1 : 2);
 		state.usb_voltage_uv = vbus_uv;
 		state.usb_current_ua = state.usb_type == 6 ? 3000000 :
-		    ((usb_active || usbin_plugged) && state.current_ua <= CHARGE_FLOW_UA ? 500000 : 2000000);
+		    (usbin_plugged && state.current_ua <= CHARGE_FLOW_UA ? 500000 : 2000000);
 	}
 	state.charge_uah = values[4] * 1000;
 	state.full_uah = values[5] * 1000;

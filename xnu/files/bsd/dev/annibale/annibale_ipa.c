@@ -514,6 +514,8 @@ annibale_tz_smc(uint64_t fn, uint64_t arg_cnt, uint64_t a0, uint64_t a1, uint64_
 	return -1;
 }
 
+extern bool redwood_ufs_fat16_fw_read(const char *name, uint64_t *size_out, volatile void *dst_buf, uint64_t dst_cap);
+
 int64_t
 annibale_tz_pas_auth_reset(uint32_t pas_id)
 {
@@ -533,41 +535,52 @@ annibale_read_fw_file(const char *name, uint64_t *size_out, bool *needs_free_out
 	if (img_data != NULL && *size_out > 0) {
 		return __DECONST(uint8_t *, img_data);
 	}
-	if (rootvnode == NULLVP) {
-		return NULL;
-	}
-	ctx = vfs_context_kernel();
-	for (unsigned d = 0; d < sizeof(fw_dirs) / sizeof(fw_dirs[0]); d++) {
-		char path[96];
-		vnode_t vp = NULLVP;
-		struct vnode_attr va;
-		uint8_t *buf;
-		int resid = 0, err;
+	if (rootvnode != NULLVP) {
+		ctx = vfs_context_kernel();
+		for (unsigned d = 0; d < sizeof(fw_dirs) / sizeof(fw_dirs[0]); d++) {
+			char path[96];
+			vnode_t vp = NULLVP;
+			struct vnode_attr va;
+			uint8_t *buf;
+			int resid = 0, err;
 
-		snprintf(path, sizeof(path), "%s/%s", fw_dirs[d], name);
-		if (vnode_lookup(path, 0, &vp, ctx) != 0) {
-			continue;
-		}
-		VATTR_INIT(&va);
-		VATTR_WANTED(&va, va_data_size);
-		if (vnode_getattr(vp, &va, ctx) != 0 || va.va_data_size == 0 || va.va_data_size > 0x0f600000ULL) {
+			snprintf(path, sizeof(path), "%s/%s", fw_dirs[d], name);
+			if (vnode_lookup(path, 0, &vp, ctx) != 0) {
+				continue;
+			}
+			VATTR_INIT(&va);
+			VATTR_WANTED(&va, va_data_size);
+			if (vnode_getattr(vp, &va, ctx) != 0 || va.va_data_size == 0 || va.va_data_size > 0x0f600000ULL) {
+				vnode_put(vp);
+				continue;
+			}
+			buf = kalloc_data(va.va_data_size, Z_WAITOK);
+			if (buf == NULL) {
+				vnode_put(vp);
+				return NULL;
+			}
+			err = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)va.va_data_size, 0, UIO_SYSSPACE, 0,
+			    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
 			vnode_put(vp);
-			continue;
+			if (err == 0 && resid == 0) {
+				*size_out = va.va_data_size;
+				*needs_free_out = true;
+				return buf;
+			}
+			kfree_data(buf, va.va_data_size);
 		}
-		buf = kalloc_data(va.va_data_size, Z_WAITOK);
-		if (buf == NULL) {
-			vnode_put(vp);
-			return NULL;
+	}
+	uint64_t fat_sz = 0;
+	if (redwood_ufs_fat16_fw_read(name, &fat_sz, NULL, 0) && fat_sz > 0 && fat_sz <= 0x400000ULL) {
+		uint8_t *buf = kalloc_data(fat_sz, Z_WAITOK);
+		if (buf != NULL) {
+			if (redwood_ufs_fat16_fw_read(name, &fat_sz, buf, fat_sz)) {
+				*size_out = fat_sz;
+				*needs_free_out = true;
+				return buf;
+			}
+			kfree_data(buf, fat_sz);
 		}
-		err = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)va.va_data_size, 0, UIO_SYSSPACE, 0,
-		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
-		vnode_put(vp);
-		if (err == 0 && resid == 0) {
-			*size_out = va.va_data_size;
-			*needs_free_out = true;
-			return buf;
-		}
-		kfree_data(buf, va.va_data_size);
 	}
 	return NULL;
 }
@@ -577,6 +590,9 @@ annibale_fw_exists(const char *name)
 {
 	uint64_t sz = 0;
 	bool need_free = false;
+	if (redwood_ufs_fat16_fw_read(name, &sz, NULL, 0) && sz > 0) {
+		return true;
+	}
 	uint8_t *buf = annibale_read_fw_file(name, &sz, &need_free);
 
 	if (buf == NULL) {

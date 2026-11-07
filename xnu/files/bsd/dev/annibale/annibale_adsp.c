@@ -38,6 +38,7 @@ extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 extern uint64_t kvtophys(vm_offset_t va);
 extern kern_return_t thread_terminate(thread_t thread);
 extern const uint8_t *redwood_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+extern bool redwood_ufs_fat16_fw_read(const char *name, uint64_t *size_out, volatile void *dst_buf, uint64_t dst_cap);
 
 extern lck_mtx_t redwood_aop_mailbox_lock;
 extern lck_mtx_t redwood_smem_alloc_lock;
@@ -59,6 +60,9 @@ extern lck_mtx_t redwood_smem_alloc_lock;
 #define ITEM_GLINK_OUR_Q          479u
 #define ITEM_GLINK_THEIR_Q        480u
 #define SMP2P_MAGIC               0x504d5324u
+#define SMP2P_VERSION             1u
+#define SMP2P_SSR_ACK             (1u << 0)
+#define SSR_ACK                   (1u << 0)
 #define DSP_READY                 (1u << 1)
 #define CMD_DB_PHYS               0x81c60000UL
 #define CMD_DB_SIZE               0x00020000UL
@@ -90,6 +94,7 @@ extern lck_mtx_t redwood_smem_alloc_lock;
 #define IPCC_CLIENT_AOP           0u
 #define IPCC_CLIENT_LPASS         3u
 #define IPCC_SIGNAL_GLINK         0u
+#define IPCC_SIGNAL_SMP2P         2u
 #define ADSP_DTB_MEMORY           0x9ed80000u
 #define ADSP_DTB_MEMORY_SIZE      0x00080000u
 #define PAS_ADSP_DTB              0x24u
@@ -115,6 +120,7 @@ extern lck_mtx_t redwood_smem_alloc_lock;
 #define GLINK_TX_DATA             9u
 #define GLINK_CLOSE_ACK           11u
 #define GLINK_TX_DATA_CONT        12u
+#define GLINK_DONE_REUSE          14u
 #define APM_CMD_GET_SPF_STATE     0x01001021u
 #define APM_CMD_RSP_GET_SPF_STATE 0x02001007u
 #define GPR_BASIC_RSP_RESULT      0x02001005u
@@ -183,7 +189,7 @@ struct fw_image {
 	uint64_t       header_size;
 	bool           from_root;
 	struct {
-		uint32_t       at, file_size, memory_size;
+		uint32_t       at, file_size, memory_size, seg_idx;
 		const uint8_t *file;
 		bool           from_root;
 	} segment[MAX_SEGMENTS];
@@ -219,8 +225,10 @@ static uint32_t aoss_our_box;
 static bool adsp_inited, adsp_hw_up, adsp_sim_mode;
 static uint16_t glink_gpr_our_cid, glink_gpr_their_cid;
 static uint16_t glink_pmic_our_cid, glink_pmic_their_cid;
+static uint32_t glink_gpr_their_iid = 1u, glink_pmic_their_iid = 1u;
 static uint32_t glink_our_read_at, glink_our_write_at, glink_their_read_at, glink_their_write_at;
-static uint32_t glink_our_q, glink_their_q, glink_our_q_size, glink_their_q_size;
+static uint32_t glink_our_q, glink_their_q, glink_our_q_size, glink_their_q_size, glink_tx_write_pos;
+static uint32_t smp2p_our_val;
 
 static annibale_gpr_event_fn gpr_event_handler;
 static uint32_t waited_token, waited_opcode, waited_words[32], waited_word_count;
@@ -295,12 +303,16 @@ static uint32_t smem_partition_find(uint16_t host0, uint16_t host1, uint32_t *pa
 	struct smem_table table;
 	struct smem_table_entry entry;
 	struct smem_partition part;
+	uint32_t toc_off = SMEM_SIZE - 0x1000u;
 
-	if (!smem_peek(0, &table, sizeof(table)) || memcmp(table.magic, "$TOC", 4) != 0) {
-		return 0;
+	if (!smem_peek(toc_off, &table, sizeof(table)) || memcmp(table.magic, "$TOC", 4) != 0) {
+		toc_off = 0;
+		if (!smem_peek(toc_off, &table, sizeof(table)) || memcmp(table.magic, "$TOC", 4) != 0) {
+			return 0;
+		}
 	}
 	for (uint32_t i = 0; i < table.count && i < 64; i++) {
-		if (!smem_peek(sizeof(table) + i * sizeof(entry), &entry, sizeof(entry))) {
+		if (!smem_peek(toc_off + sizeof(table) + i * sizeof(entry), &entry, sizeof(entry))) {
 			return 0;
 		}
 		if (entry.offset == 0 || entry.size == 0 || entry.offset + entry.size > SMEM_SIZE) {
@@ -352,12 +364,15 @@ static uint32_t smem_item_in_partition(uint16_t host0, uint16_t host1, uint32_t 
 			    e.size > at - part.free_cached) {
 				break;
 			}
-			uint32_t data = part_off + ((at - e.size) & ~(cacheline - 1u));
+			uint32_t data = part_off + at - e.padding_header - e.size;
 			if (e.item == wanted) {
 				if (size_out != NULL) *size_out = e.size - e.padding_data;
 				return data;
 			}
-			at = ((at - e.size) & ~(cacheline - 1u)) - e.padding_header - (uint32_t)sizeof(e);
+			if (at < e.padding_header + e.size + cacheline) {
+				break;
+			}
+			at = at - e.padding_header - e.size - cacheline;
 		}
 	}
 	return 0;
@@ -584,176 +599,7 @@ static bool aoss_send_msg(const char *msg)
 	return ok;
 }
 
-/* ---- TrustZone PAS SMC calls & Firmware Loader ----------------------------------------------- */
-
-static int scm_pas_call(uint64_t fn, uint64_t arginfo, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t *res1)
-{
-	uint64_t x0 = fn, x1 = arginfo, x2 = a0, x3 = a1, x4 = a2, r1 = 0;
-	for (unsigned tries = 0; tries < 2000; tries++) {
-		register uint64_t rx0 __asm__("x0") = x0, rx1 __asm__("x1") = x1;
-		register uint64_t rx2 __asm__("x2") = x2, rx3 __asm__("x3") = x3, rx4 __asm__("x4") = x4;
-		__asm__ volatile("smc #0"
-		    : "+r"(rx0), "+r"(rx1), "+r"(rx2), "+r"(rx3), "+r"(rx4)
-		    : : "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
-		if (rx0 == 1) { x0 = rx0; x1 = rx1; sleep_ms(1); continue; }
-		if (rx0 == 6) { sleep_ms(1); continue; }
-		r1 = rx1;
-		x0 = rx0;
-		break;
-	}
-	if (res1 != NULL) *res1 = r1;
-	return (int)(int64_t)x0;
-}
-
-static const uint8_t *fw_read_file(const char *name, uint64_t *size_out, bool *from_root_out)
-{
-	*from_root_out = false;
-	const uint8_t *img = redwood_image_file("fw", name, size_out, NULL);
-	if (img != NULL || rootvnode == NULLVP) return img;
-	static const char *const prefixes[] = { "/fw", "/redwood/fw" };
-	vfs_context_t ctx = vfs_context_kernel();
-	for (unsigned p = 0; p < 2; p++) {
-		char path[80];
-		vnode_t vp = NULLVP;
-		struct vnode_attr va;
-		snprintf(path, sizeof(path), "%s/%s", prefixes[p], name);
-		if (vnode_lookup(path, 0, &vp, ctx) != 0) continue;
-		VATTR_INIT(&va);
-		VATTR_WANTED(&va, va_data_size);
-		if (vnode_getattr(vp, &va, ctx) != 0 || va.va_data_size == 0 || va.va_data_size > ADSP_MEMORY_SIZE) {
-			vnode_put(vp);
-			continue;
-		}
-		uint8_t *buf = kalloc_data(va.va_data_size, Z_WAITOK);
-		if (buf == NULL) { vnode_put(vp); return NULL; }
-		int resid = 0;
-		int err = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)va.va_data_size, 0, UIO_SYSSPACE, 0,
-		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
-		vnode_put(vp);
-		if (err != 0 || resid != 0) {
-			kfree_data(buf, va.va_data_size);
-			continue;
-		}
-		*size_out = va.va_data_size;
-		*from_root_out = true;
-		return buf;
-	}
-	return NULL;
-}
-
-static void fw_release(struct fw_image *fw)
-{
-	if (fw->header != NULL && fw->from_root) {
-		void *p = __DECONST(void *, fw->header);
-		kfree_data(p, fw->header_size);
-	}
-	for (unsigned i = 0; i < fw->segments; i++) {
-		if (fw->segment[i].file != NULL && fw->segment[i].from_root) {
-			void *p = __DECONST(void *, fw->segment[i].file);
-			kfree_data(p, fw->segment[i].file_size);
-		}
-	}
-	bzero(fw, sizeof(*fw));
-}
-
-static bool fw_load_mdt(const char *stem, uint32_t region_base, uint32_t region_size, struct fw_image *fw)
-{
-	char mdt_name[32];
-	uint64_t sz = 0;
-	bool from_root = false;
-
-	bzero(fw, sizeof(*fw));
-	snprintf(mdt_name, sizeof(mdt_name), "%s.mdt", stem);
-	fw->header = fw_read_file(mdt_name, &sz, &from_root);
-	if (fw->header == NULL) return false;
-	fw->header_size = sz;
-	fw->from_root = from_root;
-
-	uint32_t count = sz >= 52 + 2 * 32 ? (uint32_t)(fw->header[44] | (fw->header[45] << 8)) : 0;
-	if (memcmp(fw->header, "\177ELF\1", 5) != 0 || count < 3 || count > MAX_SEGMENTS ||
-	    52 + 32 * count > sz || sz > PAGE_SIZE * 4) {
-		fw_release(fw);
-		return false;
-	}
-
-	uint32_t min_paddr = ~0u;
-	bool reloc = false;
-	for (uint32_t i = 0; i < count; i++) {
-		struct elf_segment seg;
-		memcpy(&seg, fw->header + 52 + 32 * i, sizeof(seg));
-		if (seg.type != 1 || MDT_HASH(seg.flags) || seg.memory_size == 0) continue;
-		if (MDT_RELOCATABLE(seg.flags)) reloc = true;
-		if (seg.paddr < min_paddr) min_paddr = seg.paddr;
-	}
-	uint32_t base_paddr = reloc ? min_paddr : region_base, highest = 0;
-	for (uint32_t i = 0; i < count; i++) {
-		struct elf_segment seg;
-		memcpy(&seg, fw->header + 52 + 32 * i, sizeof(seg));
-		if (seg.type != 1 || MDT_HASH(seg.flags) || seg.memory_size == 0) continue;
-		if (seg.paddr < base_paddr || seg.file_size > seg.memory_size ||
-		    (uint64_t)(seg.paddr - base_paddr) + seg.memory_size > region_size) {
-			fw_release(fw);
-			return false;
-		}
-		uint32_t at = seg.paddr - base_paddr;
-		fw->segment[fw->segments].at = at;
-		fw->segment[fw->segments].file_size = seg.file_size;
-		fw->segment[fw->segments].memory_size = seg.memory_size;
-		if (seg.file_size != 0) {
-			char bname[32];
-			uint64_t bsz = 0;
-			bool broot = false;
-			snprintf(bname, sizeof(bname), "%s.b%02u", stem, i);
-			fw->segment[fw->segments].file = fw_read_file(bname, &bsz, &broot);
-			fw->segment[fw->segments].from_root = broot;
-			if (fw->segment[fw->segments].file == NULL || bsz != seg.file_size) {
-				fw_release(fw);
-				return false;
-			}
-		}
-		if (at + seg.memory_size > highest) highest = at + seg.memory_size;
-		fw->segments++;
-	}
-	fw->size = highest;
-	return fw->segments > 0;
-}
-
-static bool pas_stage_and_setup(uint32_t pas_id, uint32_t region_base, uint32_t region_size, const struct fw_image *fw)
-{
-	vm_offset_t page = 0;
-	if (kmem_alloc(kernel_map, &page, PAGE_SIZE * 4, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) return false;
-	bzero((void *)page, PAGE_SIZE * 4);
-	memcpy((void *)page, fw->header, fw->header_size);
-	for (uint32_t off = 0; off < PAGE_SIZE * 4; off += 64) {
-		uintptr_t line = page + off;
-		__asm__ volatile("dc civac, %0" : : "r"(line) : "memory");
-	}
-	__builtin_arm_dsb(0xf);
-
-	uint64_t res1 = 0;
-	int rc = scm_pas_call(SCM_PAS_INIT_IMAGE, 2u | (2u << 4), pas_id, kvtophys(page), 0, &res1);
-	kmem_free(kernel_map, page, PAGE_SIZE * 4);
-	if (rc != 0 || res1 != 0) {
-		say("PAS_INIT_IMAGE(pas=%#x) returned %d/%#llx\n", pas_id, rc, res1);
-		return false;
-	}
-	rc = scm_pas_call(SCM_PAS_MEM_SETUP, 3u, pas_id, region_base, fw->size, &res1);
-	if (rc != 0 || res1 != 0) {
-		say("PAS_MEM_SETUP(pas=%#x) returned %d/%#llx\n", pas_id, rc, res1);
-		return false;
-	}
-	volatile uint8_t *carveout = (volatile uint8_t *)ml_io_map_unmappable(region_base, region_size, VM_WIMG_WCOMB);
-	if (carveout == NULL) return false;
-	for (unsigned s = 0; s < fw->segments; s++) {
-		uint32_t at = fw->segment[s].at, fsz = fw->segment[s].file_size, msz = fw->segment[s].memory_size;
-		const uint8_t *src = fw->segment[s].file;
-		for (uint32_t i = 0; i < fsz; i++) carveout[at + i] = src[i];
-		for (uint32_t i = fsz; i < msz; i++) carveout[at + i] = 0;
-	}
-	__builtin_arm_dsb(0xf);
-	ml_io_unmap((vm_offset_t)carveout, region_size);
-	return true;
-}
+#include "annibale_adsp_fw.inc"
 
 /* ---- GLINK & GPR Transport ------------------------------------------------------------------- */
 
@@ -785,7 +631,7 @@ static void glink_q_write(uint32_t q_off, uint32_t q_sz, uint32_t *write_at, con
 static void glink_send_cmd2(uint16_t cmd, uint16_t p1, uint32_t p2)
 {
 	uint32_t words[2] = { cmd | ((uint32_t)p1 << 16), p2 };
-	glink_q_write(glink_our_q, glink_our_q_size, &glink_our_read_at, words, sizeof(words));
+	glink_q_write(glink_our_q, glink_our_q_size, &glink_tx_write_pos, words, sizeof(words));
 }
 
 static void glink_send_open(uint16_t cid, const char *name)
@@ -796,14 +642,14 @@ static void glink_send_open(uint16_t cid, const char *name)
 	memcpy(pkt + 2, &cid, 2);
 	memcpy(pkt + 4, &nlen, 2);
 	memcpy(pkt + 8, name, nlen);
-	glink_q_write(glink_our_q, glink_our_q_size, &glink_our_read_at, pkt, 8u + nlen);
+	glink_q_write(glink_our_q, glink_our_q_size, &glink_tx_write_pos, pkt, 8u + nlen);
 }
 
 static void glink_queue_intents(uint16_t cid)
 {
 	for (uint32_t id = 1; id <= 8; id++) {
 		uint32_t pkt[4] = { GLINK_INTENT | ((uint32_t)cid << 16), 1u, 2048u, id };
-		glink_q_write(glink_our_q, glink_our_q_size, &glink_our_read_at, pkt, sizeof(pkt));
+		glink_q_write(glink_our_q, glink_our_q_size, &glink_tx_write_pos, pkt, sizeof(pkt));
 	}
 }
 
@@ -845,20 +691,23 @@ static int adsp_pmic_glink_tx(const void *data, uint32_t len)
 	}
 	uint8_t tx[560];
 	uint32_t w0 = GLINK_TX_DATA | ((uint32_t)glink_pmic_our_cid << 16);
-	uint32_t iid = 1u, left = 0;
+	uint32_t iid = glink_pmic_their_iid, left = 0;
 	memcpy(tx + 0, &w0, 4);
 	memcpy(tx + 4, &iid, 4);
 	memcpy(tx + 8, &len, 4);
 	memcpy(tx + 12, &left, 4);
 	memcpy(tx + 16, data, len);
-	glink_q_write(glink_our_q, glink_our_q_size, &glink_our_read_at, tx, 16u + len);
+	glink_q_write(glink_our_q, glink_our_q_size, &glink_tx_write_pos, tx, 16u + len);
 	return 0;
 }
 
 static void glink_poll_rx(void)
 {
-	if (glink_their_q == 0 || glink_their_q_size == 0) {
-		return;
+	if (glink_their_q == 0) {
+		glink_their_q = smem_item(ITEM_GLINK_THEIR_Q, &glink_their_q_size);
+		if (glink_their_q == 0 || glink_their_q_size == 0) {
+			return;
+		}
 	}
 	uint32_t r = 0, w = 0;
 	smem_peek(glink_their_read_at, &r, 4);
@@ -906,6 +755,11 @@ static void glink_poll_rx(void)
 				glink_queue_intents(glink_pmic_our_cid);
 			}
 		} else if (cmd == GLINK_INTENT) {
+			if (w1 > 0) {
+				uint32_t iid = glink_q_read32(glink_their_q, glink_their_q_size, r + 12);
+				if (param == glink_pmic_their_cid) glink_pmic_their_iid = iid;
+				else if (param == glink_gpr_their_cid) glink_gpr_their_iid = iid;
+			}
 			step_bytes = (8u + 8u * w1 + 7u) & ~7u;
 		} else if (cmd == GLINK_TX_DATA || cmd == GLINK_TX_DATA_CONT) {
 			uint32_t chunk = glink_q_read32(glink_their_q, glink_their_q_size, r + 8);
@@ -925,7 +779,7 @@ static void glink_poll_rx(void)
 			if (left == 0) {
 				uint16_t our_cid = (param == glink_pmic_their_cid) ? glink_pmic_our_cid : glink_gpr_our_cid;
 				if (our_cid != 0) {
-					glink_send_cmd2(GLINK_RX_DONE, our_cid, w1);
+					glink_send_cmd2(GLINK_DONE_REUSE, our_cid, w1);
 				}
 			}
 		}
@@ -950,7 +804,10 @@ static bool glink_init_queues(void)
 	glink_their_write_at = desc + 12;
 	glink_our_q = our_q;
 	glink_our_q_size = GLINK_QUEUE_SIZE;
+	glink_tx_write_pos = 0;
+	smem_peek(glink_our_write_at, &glink_tx_write_pos, 4);
 	glink_their_q = smem_item(ITEM_GLINK_THEIR_Q, &glink_their_q_size);
+	glink_send_cmd2(GLINK_VERSION, 1, 1);
 	return true;
 }
 
@@ -1027,13 +884,13 @@ bool annibale_adsp_gpr_send(const void *pkt, uint32_t len, uint32_t wait_ms,
 		uint8_t tx[560];
 		if (16u + len <= sizeof(tx)) {
 			uint32_t w0 = GLINK_TX_DATA | ((uint32_t)glink_gpr_our_cid << 16);
-			uint32_t iid = (token & 7u) + 1u, left = 0;
+			uint32_t iid = glink_gpr_their_iid, left = 0;
 			memcpy(tx + 0, &w0, 4);
 			memcpy(tx + 4, &iid, 4);
 			memcpy(tx + 8, &len, 4);
 			memcpy(tx + 12, &left, 4);
 			memcpy(tx + 16, bytes, len);
-			glink_q_write(glink_our_q, glink_our_q_size, &glink_our_read_at, tx, 16u + len);
+			glink_q_write(glink_our_q, glink_our_q_size, &glink_tx_write_pos, tx, 16u + len);
 		}
 	} else {
 		simulate_gpr_response(bytes, len);
@@ -1094,6 +951,32 @@ bool annibale_adsp_is_hw_up(void) { return adsp_hw_up; }
 
 /* ---- Background ADSP boot & GLINK poll thread ------------------------------------------------ */
 
+static void smp2p_init_ours(void)
+{
+	lck_mtx_lock(&redwood_smem_alloc_lock);
+	uint32_t at = smem_alloc_item(ITEM_SMP2P_OURS, sizeof(struct smp2p_item));
+	lck_mtx_unlock(&redwood_smem_alloc_lock);
+	if (at == 0) return;
+	struct smp2p_item ours;
+	if (!smem_peek(at, &ours, sizeof(ours)) || ours.magic != SMP2P_MAGIC) {
+		smem_poke(at + 0, SMP2P_MAGIC);
+		smem_poke(at + 4, SMP2P_VERSION);
+		smem_poke(at + 8, (uint32_t)SMEM_US | ((uint32_t)SMEM_ADSP << 16));
+		smem_poke(at + 12, 16u | (1u << 16));
+		smem_poke(at + 16, SMP2P_SSR_ACK);
+		char name[16] = "master-kernel";
+		for (unsigned w = 0; w < 4; w++) {
+			uint32_t nw = 0;
+			memcpy(&nw, name + 4 * w, 4);
+			smem_poke(at + 20 + 4 * w, nw);
+		}
+		smem_poke(at + 36, 0);
+		smp2p_our_val = 0;
+		__builtin_arm_dmb(0xf);
+		ipcc_ring(IPCC_CLIENT_LPASS, IPCC_SIGNAL_SMP2P);
+	}
+}
+
 static bool check_smp2p_ready(void)
 {
 	uint32_t sz = 0, at = smem_item(ITEM_SMP2P_THEIRS, &sz);
@@ -1103,7 +986,17 @@ static bool check_smp2p_ready(void)
 	}
 	for (unsigned i = 0; i < item.valid && i < 16; i++) {
 		if (strncmp(item.entry[i].name, "slave-kernel", 16) == 0) {
-			return (item.entry[i].value & DSP_READY) != 0;
+			uint32_t val = item.entry[i].value;
+			if (((val ^ smp2p_our_val) & SSR_ACK) != 0) {
+				smp2p_our_val ^= SSR_ACK;
+				uint32_t our_sz = 0, our_at = smem_item(ITEM_SMP2P_OURS, &our_sz);
+				if (our_at != 0) {
+					smem_poke(our_at + 36, smp2p_our_val);
+					__builtin_arm_dmb(0xf);
+					ipcc_ring(IPCC_CLIENT_LPASS, IPCC_SIGNAL_SMP2P);
+				}
+			}
+			return (val & DSP_READY) != 0;
 		}
 	}
 	return false;
@@ -1111,57 +1004,63 @@ static bool check_smp2p_ready(void)
 
 static void annibale_adsp_boot_thread(void *arg __unused, wait_result_t w __unused)
 {
+	smp2p_init_ours();
 	if (check_smp2p_ready()) {
 		say("SM8750 LPASS ADSP already running in SMEM (SMP2P slave-kernel READY)\n");
 		(void)glink_init_queues();
 		adsp_hw_up = true;
 		adsp_sim_mode = false;
-		thread_terminate(current_thread());
-		return;
-	}
-
-	uint32_t try_boot = 1;
-	PE_parse_boot_argn("annibale_adsp", &try_boot, sizeof(try_boot));
-	if (try_boot != 0) {
-		for (unsigned wait = 0; wait < 25 && rootvnode == NULLVP; wait++) {
-			sleep_ms(100);
-		}
-		struct fw_image dtb_fw, main_fw;
-		if (fw_load_mdt("adsp_dtb", ADSP_DTB_MEMORY, ADSP_DTB_MEMORY_SIZE, &dtb_fw) &&
-		    fw_load_mdt("adsp", ADSP_MEMORY, ADSP_MEMORY_SIZE, &main_fw)) {
-			say("loaded adsp_dtb.mdt (%u segs, %#x B) and adsp.mdt (%u segs, %#x B)\n",
-			    dtb_fw.segments, dtb_fw.size, main_fw.segments, main_fw.size);
-			(void)vote_adsp_rails(384);
-			(void)aoss_send_msg("{class: image, res: load_state, name: adsp, val: on}");
-			if (pas_stage_and_setup(PAS_ADSP_DTB, ADSP_DTB_MEMORY, ADSP_DTB_MEMORY_SIZE, &dtb_fw) &&
-			    pas_stage_and_setup(PAS_ADSP, ADSP_MEMORY, ADSP_MEMORY_SIZE, &main_fw)) {
-				uint64_t r1 = 0;
-				(void)scm_pas_call(SCM_PAS_AUTH_AND_RESET, 1u, PAS_ADSP_DTB, 0, 0, &r1);
-				if (scm_pas_call(SCM_PAS_AUTH_AND_RESET, 1u, PAS_ADSP, 0, 0, &r1) == 0 && r1 == 0) {
-					for (unsigned ms = 0; ms < 3000; ms += 20) {
-						if (check_smp2p_ready()) {
-							adsp_hw_up = true;
-							adsp_sim_mode = false;
-							(void)glink_init_queues();
-							say("SM8750 LPASS ADSP authenticated and READY in %u ms\n", ms);
-							break;
+	} else {
+		uint32_t try_boot = 1;
+		PE_parse_boot_argn("annibale_adsp", &try_boot, sizeof(try_boot));
+		if (try_boot != 0) {
+			uint64_t probe_sz = 0;
+			for (unsigned wait = 0; wait < 50 && rootvnode == NULLVP &&
+			    !redwood_ufs_fat16_fw_read("adsp_dtb.mdt", &probe_sz, NULL, 0); wait++) {
+				sleep_ms(100);
+			}
+			struct fw_image dtb_fw, main_fw;
+			if (fw_load_mdt("adsp_dtb", ADSP_DTB_MEMORY, ADSP_DTB_MEMORY_SIZE, &dtb_fw) &&
+			    fw_load_mdt("adsp", ADSP_MEMORY, ADSP_MEMORY_SIZE, &main_fw)) {
+				say("loaded adsp_dtb.mdt (%u segs, %#x B) and adsp.mdt (%u segs, %#x B)\n",
+				    dtb_fw.segments, dtb_fw.size, main_fw.segments, main_fw.size);
+				(void)vote_adsp_rails(384);
+				(void)aoss_send_msg("{class: image, res: load_state, name: adsp, val: on}");
+				if (pas_stage_and_setup("adsp_dtb", PAS_ADSP_DTB, ADSP_DTB_MEMORY, ADSP_DTB_MEMORY_SIZE, &dtb_fw) &&
+				    pas_stage_and_setup("adsp", PAS_ADSP, ADSP_MEMORY, ADSP_MEMORY_SIZE, &main_fw)) {
+					uint64_t r1 = 0;
+					(void)scm_pas_call(SCM_PAS_AUTH_AND_RESET, 1u, PAS_ADSP_DTB, 0, 0, &r1);
+					if (scm_pas_call(SCM_PAS_AUTH_AND_RESET, 1u, PAS_ADSP, 0, 0, &r1) == 0 && r1 == 0) {
+						(void)glink_init_queues();
+						for (unsigned ms = 0; ms < 3000; ms += 20) {
+							if (check_smp2p_ready()) {
+								adsp_hw_up = true;
+								adsp_sim_mode = false;
+								say("SM8750 LPASS ADSP authenticated and READY in %u ms\n", ms);
+								break;
+							}
+							sleep_ms(20);
 						}
-						sleep_ms(20);
 					}
 				}
+				fw_release(&dtb_fw);
+				fw_release(&main_fw);
+			} else {
+				fw_release(&dtb_fw);
+				fw_release(&main_fw);
 			}
-			fw_release(&dtb_fw);
-			fw_release(&main_fw);
-		} else {
-			fw_release(&dtb_fw);
-			fw_release(&main_fw);
 		}
 	}
 
 	if (!adsp_hw_up) {
-		say("ADSP firmware not present in root image; running in direct LPASS shmem + GPR responder mode\n");
+		say("ADSP firmware not present; running in direct LPASS shmem + GPR responder mode\n");
+		thread_terminate(current_thread());
+		return;
 	}
-	thread_terminate(current_thread());
+	for (;;) {
+		glink_poll_rx();
+		sleep_ms(20);
+	}
 }
 
 void annibale_adsp_init(void)

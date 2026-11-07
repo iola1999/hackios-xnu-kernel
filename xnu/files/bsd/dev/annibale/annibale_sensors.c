@@ -605,13 +605,15 @@ static const struct cdevsw sensors_cdevsw = {
 static void
 sensors_thread(__unused void *parameter, __unused wait_result_t result)
 {
-	gcc_base = ml_io_map(GCC_BASE_PHYS, GCC_MAP_SIZE);
 	tlmm_base = ml_io_map(TLMM_BASE_PHYS, TLMM_MAP_SIZE);
-	se10_base = ml_io_map(QUPV3_SE10_PHYS, QUPV3_SE_SIZE);
-	se12_base = ml_io_map(QUPV3_SE12_PHYS, QUPV3_SE_SIZE);
+	if (hw_i2c_mode > 0) {
+		gcc_base = ml_io_map(GCC_BASE_PHYS, GCC_MAP_SIZE);
+		se10_base = ml_io_map(QUPV3_SE10_PHYS, QUPV3_SE_SIZE);
+		se12_base = ml_io_map(QUPV3_SE12_PHYS, QUPV3_SE_SIZE);
+	}
 
-	bool se12_clk = qup_se_clock_ready(GCC_QUPV3_WRAP2_S4_CBCR);
-	bool se10_clk = qup_se_clock_ready(GCC_QUPV3_WRAP2_S2_CBCR);
+	bool se12_clk = (hw_i2c_mode > 0) ? qup_se_clock_ready(GCC_QUPV3_WRAP2_S4_CBCR) : false;
+	bool se10_clk = (hw_i2c_mode > 0) ? qup_se_clock_ready(GCC_QUPV3_WRAP2_S2_CBCR) : false;
 	uint32_t gpio163_cfg = tlmm_base ? rd(tlmm_base + TLMM_GPIO_CFG(ANNIBALE_GLS6151_IRQ_GPIO)) : 0;
 	uint32_t gpio35_cfg = tlmm_base ? rd(tlmm_base + TLMM_GPIO_CFG(ANNIBALE_STK6A2X_IRQ_GPIO)) : 0;
 

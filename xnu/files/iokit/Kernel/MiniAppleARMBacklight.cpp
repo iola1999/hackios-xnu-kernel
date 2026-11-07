@@ -251,11 +251,12 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 	char who[24] = "?", shown[32];
 	size_t used;
 
+	bool slider_moved = false;
 	if (value_key != NULL && nits == NULL && value == NULL) {
 		nits = OSDynamicCast(OSNumber, dict->getObject("DisplayBrightnessNitsNVRAM"));
 	}
 	if (value_key != NULL) {
-		nanoseconds_to_absolutetime(500 * NSEC_PER_MSEC, &active_win);
+		nanoseconds_to_absolutetime(400 * NSEC_PER_MSEC, &active_win);
 		OSNumber * slider = OSDynamicCast(OSNumber, dict->getObject("DisplayBrightnessSliderPosition"));
 		if (slider != NULL) {
 			uint64_t pos = slider->unsigned64BitValue();
@@ -264,9 +265,10 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 				bl.last_slider_pos = pos;
 			} else {
 				uint64_t diff = pos > bl.last_slider_pos ? pos - bl.last_slider_pos : bl.last_slider_pos - pos;
-				if (diff >= 32 || (now <= bl.user_until && diff > 0)) {
+				if (diff >= 128 || (now <= bl.user_until && diff > 0)) {
 					bl.user_until = now + active_win;
 					bl.last_slider_pos = pos;
+					slider_moved = true;
 				}
 			}
 		}
@@ -327,9 +329,9 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 		bl_log();
 		return;
 	}
-	if (now > bl.user_until) {
+	if (bl.initialized && !slider_moved) {
 		snprintf(bl.line + used, sizeof(bl.line) - used,
-		    "; autonomous update ignored (no slider active), keeping %llu nits",
+		    "; autonomous update ignored (no slider move), keeping %llu nits",
 		    last_millinits / 1000);
 		bl_log();
 		return;

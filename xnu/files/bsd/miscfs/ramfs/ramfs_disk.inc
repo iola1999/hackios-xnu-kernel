@@ -467,8 +467,11 @@ ramfs_disk_sync_impl(struct ramfs_mount *rm)
 		void *new_buf;
 
 		if (new_cap > RDWFS_SLOT_MAX) {
-			lck_mtx_unlock(&rm->rm_lock);
-			return ENOSPC;
+			if (old_cap >= RDWFS_SLOT_MAX) {
+				lck_mtx_unlock(&rm->rm_lock);
+				return ENOSPC;
+			}
+			new_cap = RDWFS_SLOT_MAX;
 		}
 		rm->rm_meta_syncing = true;
 		lck_mtx_unlock(&rm->rm_lock);
@@ -489,6 +492,10 @@ ramfs_disk_sync_impl(struct ramfs_mount *rm)
 		}
 	}
 
+	if (node_count < 1000 && rm->rm_meta_gen > 0) {
+		lck_mtx_unlock(&rm->rm_lock);
+		return EINVAL;
+	}
 	rm->rm_meta_dirty = false;
 	rm->rm_meta_syncing = true;
 	gen = ++rm->rm_meta_gen;
@@ -1077,19 +1084,23 @@ ramfs_disk_mount(struct ramfs_mount *rm)
 		ok1 = true;
 	}
 	if (ok0 && (!ok1 || sup0->generation >= sup1->generation)) {
-		if (ramfs_disk_read_slot(rm, RDWFS_SLOT0_OFFSET, win_sup)) {
-			loaded = ramfs_disk_unpack(rm, win_sup);
+		if (ramfs_disk_read_slot(rm, RDWFS_SLOT0_OFFSET, win_sup) &&
+		    ramfs_disk_unpack(rm, win_sup)) {
+			loaded = true;
 			win_slot = 0;
-		} else if (ok1 && ramfs_disk_read_slot(rm, RDWFS_SLOT1_OFFSET, win_sup)) {
-			loaded = ramfs_disk_unpack(rm, win_sup);
+		} else if (ok1 && ramfs_disk_read_slot(rm, RDWFS_SLOT1_OFFSET, win_sup) &&
+		    ramfs_disk_unpack(rm, win_sup)) {
+			loaded = true;
 			win_slot = 1;
 		}
 	} else if (ok1) {
-		if (ramfs_disk_read_slot(rm, RDWFS_SLOT1_OFFSET, win_sup)) {
-			loaded = ramfs_disk_unpack(rm, win_sup);
+		if (ramfs_disk_read_slot(rm, RDWFS_SLOT1_OFFSET, win_sup) &&
+		    ramfs_disk_unpack(rm, win_sup)) {
+			loaded = true;
 			win_slot = 1;
-		} else if (ok0 && ramfs_disk_read_slot(rm, RDWFS_SLOT0_OFFSET, win_sup)) {
-			loaded = ramfs_disk_unpack(rm, win_sup);
+		} else if (ok0 && ramfs_disk_read_slot(rm, RDWFS_SLOT0_OFFSET, win_sup) &&
+		    ramfs_disk_unpack(rm, win_sup)) {
+			loaded = true;
 			win_slot = 0;
 		}
 	}

@@ -300,7 +300,10 @@ smem_find_partition(uint16_t host_a, uint16_t host_b, uint32_t *size_out)
 	if (smem_base == NULL) {
 		return 0;
 	}
-	ptable_off = smem_rd(0x0c) + smem_rd(0x10);
+	ptable_off = SM8750_SMEM_SIZE - 0x1000u;
+	if (smem_rd(ptable_off) != 0x434f5424u) {
+		ptable_off = smem_rd(0x0c) + smem_rd(0x10);
+	}
 	if (ptable_off == 0 || ptable_off + 4 + 16 * 32 > SM8750_SMEM_SIZE || smem_rd(ptable_off) != 0x434f5424u) {
 		return 0;
 	}
@@ -955,16 +958,6 @@ modem_worker_thread(__unused void *arg, __unused wait_result_t wres)
 	}
 
 	smem_base = (volatile uint32_t *)ml_io_map_unmappable(SM8750_SMEM_PHYS, SM8750_SMEM_SIZE, VM_WIMG_WCOMB);
-	if (smem_base != NULL && smem_rd(16) != 12) {
-		vm_offset_t alt = ml_io_map_unmappable(SM8750_SMEM_ALT_PHYS, SM8750_SMEM_SIZE, VM_WIMG_WCOMB);
-		if (alt != 0 && ((volatile uint32_t *)alt)[4] == 12) {
-			ml_io_unmap((vm_offset_t)smem_base, SM8750_SMEM_SIZE);
-			smem_base = (volatile uint32_t *)alt;
-			smem_phys_active = SM8750_SMEM_ALT_PHYS;
-		} else if (alt != 0) {
-			ml_io_unmap(alt, SM8750_SMEM_SIZE);
-		}
-	}
 	ipcc_base = ml_io_map(SM8750_IPCC_MPROC_PHYS, SM8750_IPCC_MPROC_SIZE);
 	tcsr_lock_base = ml_io_map(SM8750_TCSR_SPINLOCK_PHYS, 0x1000);
 

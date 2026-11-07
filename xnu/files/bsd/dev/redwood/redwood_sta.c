@@ -127,6 +127,15 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 			redwood_apple80211_event(REDWOOD_STA_LINK, 0);
 		} else if (do_join) {
 			error = ops->join(&join);
+			if (error != 0 && !asked_leave && !asked_power) {
+				delay_for_interval(150, NSEC_PER_MSEC);
+				error = ops->join(&join);
+			}
+			lck_mtx_lock(&sta_lock);
+			if (error == 0 && standing.ssid_length == 0) {
+				standing = join;
+			}
+			lck_mtx_unlock(&sta_lock);
 			bzero(&join, sizeof(join));
 			redwood_apple80211_event(REDWOOD_STA_JOIN_DONE, error);
 			if (error == 0) {
@@ -257,8 +266,10 @@ redwood_sta_ask_scan(const struct redwood_sta_scan *what)
 		lck_mtx_unlock(&sta_lock);
 		return sta_ops == NULL ? ENXIO : ENETDOWN;
 	}
-	asked_scan_what = *what;
-	asked_scan = true;
+	if (!asked_join) {
+		asked_scan_what = *what;
+		asked_scan = true;
+	}
 	lck_mtx_unlock(&sta_lock);
 	thread_wakeup((event_t)&sta_ops);
 	return 0;
@@ -291,6 +302,7 @@ redwood_sta_ask_join(const struct redwood_sta_join *what)
 	bzero(&standing, sizeof(standing));     /* (whoever asks for a network now has the say) */
 	asked_join_what = *what;
 	asked_join = true;
+	asked_scan = false;
 	asked_leave = false;
 	lck_mtx_unlock(&sta_lock);
 	thread_wakeup((event_t)&sta_ops);

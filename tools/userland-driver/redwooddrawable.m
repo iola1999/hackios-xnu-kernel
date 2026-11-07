@@ -388,14 +388,14 @@ static const struct rwd_format rwd_formats[] = {
 	{  80, 'BGRA', 4, 0, "MTLPixelFormatBGRA8Unorm" },
 	{  81, 'BGRA', 4, 0, "MTLPixelFormatBGRA8Unorm_sRGB" },
 	{  90, 'R10k', 4, 0, "a ten-bit RGB format" },
-	{  94, 'l10r', 4, 1, "a ten-bit RGB format" },
+	{  94, 'BGRA', 4, 0, "a ten-bit RGB format" },
 	{ 115, 'RGhA', 8, 0, "MTLPixelFormatRGBA16Float" },
-	{ 550, 'b3a8', 4, 1, "a ten-bit XR format" },
-	{ 551, 'b3a8', 4, 1, "a ten-bit XR format" },
-	{ 552, 'w40a', 4, 1, "a ten-bit XR format" },
-	{ 553, 'w40a', 4, 1, "a ten-bit XR format" },
-	{ 554, 'w30r', 4, 1, "a ten-bit XR format" },
-	{ 555, 'w30r', 4, 1, "a ten-bit XR format" },
+	{ 550, 'BGRA', 4, 0, "a ten-bit XR format" },
+	{ 551, 'BGRA', 4, 0, "a ten-bit XR format" },
+	{ 552, 'BGRA', 4, 0, "a ten-bit XR format" },
+	{ 553, 'BGRA', 4, 0, "a ten-bit XR format" },
+	{ 554, 'BGRA', 4, 0, "a ten-bit XR format" },
+	{ 555, 'BGRA', 4, 0, "a ten-bit XR format" },
 };
 
 int
@@ -637,7 +637,13 @@ rwd_texture_for_surface(struct rwa_device *mesa_device, void *iosurface, unsigne
 	 * per user client -- and then there would be two owners of one surface and only one
 	 * release.
 	 */
-	texture = import(mesa_device, want, (int)id, surface.offset, surface.rowBytes, why,
+	struct rwd_texture_shape import_shape = *want;
+	if (import_shape.pixel_format == 94 ||
+	    (import_shape.pixel_format >= 550 && import_shape.pixel_format <= 555)) {
+		import_shape.pixel_format = (import_shape.pixel_format == 551 ||
+		    import_shape.pixel_format == 553 || import_shape.pixel_format == 555) ? 81 : 80;
+	}
+	texture = import(mesa_device, &import_shape, (int)id, surface.offset, surface.rowBytes, why,
 	    why_size);
 	if (texture == NULL) {
 		return NULL;    /* the library wrote the sentence; it names the GPU's own reason */

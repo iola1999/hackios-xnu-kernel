@@ -194,6 +194,15 @@ struct rwa_texture *rwd_texture_for_surface(struct rwa_device *mesa_device, void
  * decides whether a drawable can exist in this boot. Said once, by the first caller. */
 int rwd_import_available(void);
 
+static inline unsigned
+rwd_canonical_pixel_format(unsigned fmt)
+{
+	if (fmt == 94 || (fmt >= 550 && fmt <= 555)) {
+		return (fmt == 551 || fmt == 553 || fmt == 555) ? 81u : 80u;
+	}
+	return fmt;
+}
+
 #ifdef __cplusplus
 }
 #endif

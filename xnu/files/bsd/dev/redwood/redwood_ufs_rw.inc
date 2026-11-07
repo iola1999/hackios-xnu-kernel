@@ -541,6 +541,163 @@ redwood_ufs_var_io(bool write, uint64_t offset, void *buf, uint64_t len)
 	return ufs_read((uint32_t)part, offset, (uint8_t *)buf, len);
 }
 
+int
+redwood_ufs_part_read(const char *part_name, uint64_t offset, void *buf, uint64_t len)
+{
+	if (!ufs_ready || part_name == NULL || buf == NULL || len == 0) {
+		return ENXIO;
+	}
+	for (uint32_t i = 0; i < ufs_parts; i++) {
+		if ((ufs_page->part[i].flags & BLOCK_PART_UNIT) == 0 &&
+		    strcmp(ufs_page->part[i].name, part_name) == 0) {
+			uint64_t pbytes = ufs_part_bytes(i);
+			if (offset >= pbytes || len > pbytes - offset) {
+				return EINVAL;
+			}
+			return ufs_read(i, offset, (uint8_t *)buf, len);
+		}
+	}
+	return ENOENT;
+}
+
+static bool
+ufs_fat83_name(const char *name, char out11[11])
+{
+	memset(out11, ' ', 11);
+	const char *dot = strchr(name, '.');
+	size_t base_len = dot ? (size_t)(dot - name) : strlen(name);
+	if (base_len == 0 || base_len > 8) return false;
+	for (size_t i = 0; i < base_len; i++) {
+		char c = name[i];
+		out11[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+	}
+	if (dot != NULL) {
+		const char *ext = dot + 1;
+		size_t ext_len = strlen(ext);
+		if (ext_len > 3) return false;
+		for (size_t i = 0; i < ext_len; i++) {
+			char c = ext[i];
+			out11[8 + i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+		}
+	}
+	return true;
+}
+
+bool
+redwood_ufs_fat16_fw_read(const char *name, uint64_t *size_out, volatile void *dst_buf, uint64_t dst_cap)
+{
+	static const char *const parts[2] = { "modem_a", "modem_b" };
+	char target11[11], image11[11] = { 'I','M','A','G','E',' ',' ',' ',' ',' ',' ' };
+	if (!ufs_fat83_name(name, target11)) return false;
+
+	uint8_t *sec = kalloc_data(4096, Z_WAITOK);
+	if (sec == NULL) return false;
+
+	for (unsigned p = 0; p < 2; p++) {
+		if (redwood_ufs_part_read(parts[p], 0, sec, 512) != 0) continue;
+		uint16_t bps = (uint16_t)(sec[11] | (sec[12] << 8));
+		uint8_t spc = sec[13];
+		uint16_t rsvd = (uint16_t)(sec[14] | (sec[15] << 8));
+		uint8_t nfats = sec[16];
+		uint16_t root_ents = (uint16_t)(sec[17] | (sec[18] << 8));
+		uint16_t spf = (uint16_t)(sec[22] | (sec[23] << 8));
+		if (bps != 512 || spc == 0 || nfats == 0 || root_ents == 0 || spf == 0) continue;
+
+		uint32_t fat_off = (uint32_t)rsvd * bps;
+		uint32_t root_off = fat_off + (uint32_t)nfats * spf * bps;
+		uint32_t root_sz = (uint32_t)root_ents * 32u;
+		uint32_t data_off = root_off + ((root_sz + bps - 1u) & ~(bps - 1u));
+		uint32_t csize = (uint32_t)spc * bps;
+
+		uint16_t img_clus = 0;
+		for (uint32_t off = 0; off < root_sz && img_clus == 0; off += 4096) {
+			uint32_t ask = root_sz - off > 4096 ? 4096 : root_sz - off;
+			if (redwood_ufs_part_read(parts[p], root_off + off, sec, ask) != 0) break;
+			for (uint32_t e = 0; e < ask; e += 32) {
+				if (sec[e] == 0x00) break;
+				if ((sec[e + 11] & 0x10) && memcmp(sec + e, image11, 11) == 0) {
+					img_clus = (uint16_t)(sec[e + 26] | (sec[e + 27] << 8));
+					break;
+				}
+			}
+		}
+		if (img_clus < 2) continue;
+
+		uint16_t file_clus = 0;
+		uint32_t file_sz = 0;
+		uint16_t cur = img_clus;
+		for (unsigned hop = 0; hop < 256 && cur >= 2 && cur < 0xfff8 && file_clus == 0; hop++) {
+			uint64_t clus_off = data_off + (uint64_t)(cur - 2u) * csize;
+			for (uint32_t off = 0; off < csize && file_clus == 0; off += 4096) {
+				uint32_t ask = csize - off > 4096 ? 4096 : csize - off;
+				if (redwood_ufs_part_read(parts[p], clus_off + off, sec, ask) != 0) break;
+				for (uint32_t e = 0; e < ask; e += 32) {
+					if (sec[e] == 0x00) { cur = 0xffff; break; }
+					if (sec[e] == 0xe5 || (sec[e + 11] & 0x18) != 0) continue;
+					if (memcmp(sec + e, target11, 11) == 0) {
+						file_clus = (uint16_t)(sec[e + 26] | (sec[e + 27] << 8));
+						memcpy(&file_sz, sec + e + 28, 4);
+						break;
+					}
+				}
+			}
+			if (file_clus != 0 || cur >= 0xfff8) break;
+			uint8_t fe[2];
+			if (redwood_ufs_part_read(parts[p], fat_off + (uint32_t)cur * 2u, fe, 2) != 0) break;
+			cur = (uint16_t)(fe[0] | (fe[1] << 8));
+		}
+		if (file_clus < 2 || file_sz == 0) continue;
+		if (size_out != NULL) *size_out = file_sz;
+		if (dst_buf == NULL) {
+			kfree_data(sec, 4096);
+			return true;
+		}
+		if (file_sz > dst_cap) break;
+
+		uint32_t rem = file_sz, written = 0;
+		cur = file_clus;
+		volatile uint8_t *out = (volatile uint8_t *)dst_buf;
+		for (unsigned hop = 0; hop < 8192 && rem > 0 && cur >= 2 && cur < 0xfff8; hop++) {
+			uint32_t run = 1;
+			uint16_t nxt = cur;
+			while (rem > run * csize && run < 64) {
+				uint8_t fe[2];
+				if (redwood_ufs_part_read(parts[p], fat_off + (uint32_t)nxt * 2u, fe, 2) != 0) break;
+				uint16_t c2 = (uint16_t)(fe[0] | (fe[1] << 8));
+				if (c2 != nxt + 1) { nxt = c2; break; }
+				nxt = c2;
+				run++;
+			}
+			if (run == 1 || nxt == cur + run - 1) {
+				uint8_t fe[2];
+				if (redwood_ufs_part_read(parts[p], fat_off + (uint32_t)nxt * 2u, fe, 2) == 0) {
+					nxt = (uint16_t)(fe[0] | (fe[1] << 8));
+				} else {
+					nxt = 0xffff;
+				}
+			}
+			uint32_t chunk = run * csize;
+			if (chunk > rem) chunk = rem;
+			uint64_t disk_off = data_off + (uint64_t)(cur - 2u) * csize;
+			for (uint32_t off = 0; off < chunk; off += 4096) {
+				uint32_t ask = chunk - off > 4096 ? 4096 : chunk - off;
+				if (redwood_ufs_part_read(parts[p], disk_off + off, sec, ask) != 0) { rem = 1; cur = 0xffff; break; }
+				for (uint32_t b = 0; b < ask; b++) out[written + off + b] = sec[b];
+			}
+			if (cur == 0xffff) break;
+			written += chunk;
+			rem -= chunk;
+			cur = nxt;
+		}
+		if (rem == 0) {
+			kfree_data(sec, 4096);
+			return true;
+		}
+	}
+	kfree_data(sec, 4096);
+	return false;
+}
+
 static const struct bdevsw ufs_bdevsw = {
 	.d_open     = ufs_open,
 	.d_close    = ufs_close,
