@@ -365,6 +365,11 @@ parse_payload(struct payload_info *pi, int verbose)
 				bad = 1;
 				break;
 			}
+			if (PLAT == &platform_annibale) {
+				print("rdfile is disabled on annibale: mount the system volume from UFS\n");
+				bad = 1;
+				break;
+			}
 			pi->resident_source = 2;
 			pi->resident_rd = pi->rdfile_size;    /* same delivery path as QEMU's rdres */
 		} else if (str_eq(e->name, "rdimage")) {

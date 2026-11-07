@@ -348,14 +348,12 @@ int main(void) {
     struct payload_info pi;
     const char *names[] = {"rdres", "rdfile"};
     const char *values[] = {"4000001", "darwin:67108865"};
-    for (unsigned i = 0; i < 2; i++) {
-        make_payload(names[i], values[i]); assert(parse_payload(&pi, 0));
-        assert(!deliver(pi)); assert(!disk_reads && !memory_writes);
-    }
+    make_payload(names[0], values[0]); assert(parse_payload(&pi, 0));
+    assert(!deliver(pi)); assert(!disk_reads && !memory_writes);
     make_payload("rdres", "4000000"); assert(parse_payload(&pi, 0));
     assert(deliver(pi)); assert(!disk_reads && memory_writes == 1);
-    make_payload("rdfile", "darwin:67108864"); assert(parse_payload(&pi, 0));
-    assert(deliver(pi)); assert(disk_reads == 1 && memory_writes == 1);
+    make_payload("rdfile", "darwin:67108864");
+    assert(!parse_payload(&pi, 0)); assert(!disk_reads && !memory_writes);
     make_payload("rdimage", "boot bytes"); assert(parse_payload(&pi, 0));
     assert(pi.resident_image_size == 11 && !memcmp(pi.resident_image, "boot bytes", 11));
     assert(deliver(pi)); assert(!disk_reads && memory_writes == 3);
