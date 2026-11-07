@@ -553,21 +553,11 @@ slot_detect(void)
 	uint64_t attr_a = ea ? *(uint64_t *)(ea + 48) : 0;
 	uint64_t attr_b = eb ? *(uint64_t *)(eb + 48) : 0;
 
-	int a_unbootable = (attr_a & 0x0080000000000000ULL) != 0;
-	int b_unbootable = (attr_b & 0x0080000000000000ULL) != 0;
-	int a_active = (attr_a & 0x0004000000000000ULL) != 0;
-	int b_active = (attr_b & 0x0004000000000000ULL) != 0;
+	loader_slot = 'a';
+	android_slot = 'b';
 
-	if (!b_unbootable && (a_unbootable || (b_active && !a_active))) {
-		loader_slot = 'b';
-		android_slot = 'a';
-	} else {
-		loader_slot = 'a';
-		android_slot = 'b';
-	}
-
-	print("slot: detected loader_slot=%s, android_slot=%s (attr_a=%x attr_b=%x)\n",
-	    loader_slot == 'b' ? "b" : "a", android_slot == 'b' ? "b" : "a", attr_a, attr_b);
+	print("slot: loader_slot=a (boot_a), android_slot=b (boot_b) (attr_a=%x attr_b=%x)\n",
+	    attr_a, attr_b);
 	slot_update_menu_text();
 }
 
@@ -879,8 +869,13 @@ gpt_sync_lun(efi_block_io *bio)
 }
 
 static uint32_t
-gpt_swap_ab_type_guids(uint8_t *entries, uint32_t num_entries, uint32_t entry_size)
+gpt_swap_ab_type_guids(uint8_t *entries, uint32_t num_entries, uint32_t entry_size, char target_slot)
 {
+	/* Qualcomm inactive slot PartitionTypeGUID: 77036cd4-03d5-42bb-8ed1-37e5a88baa34 */
+	static const uint8_t inactive_guid[16] = {
+		0xd4, 0x6c, 0x03, 0x77, 0xd5, 0x03, 0xbb, 0x42,
+		0x8e, 0xd1, 0x37, 0xe5, 0xa8, 0x8b, 0xaa, 0x34
+	};
 	uint32_t swapped = 0;
 	for (uint32_t i = 0; i < num_entries; i++) {
 		uint8_t *ei = entries + i * entry_size;
@@ -900,11 +895,20 @@ gpt_swap_ab_type_guids(uint8_t *entries, uint32_t num_entries, uint32_t entry_si
 				continue;
 			}
 			if (memcmp(pi, pj, (len - 2) * 2) == 0) {
-				uint8_t tmp[16];
-				memcpy(tmp, ei, 16);
-				memcpy(ei, ej, 16);
-				memcpy(ej, tmp, 16);
-				swapped++;
+				uint8_t *et = (target_slot == 'b') ? ej : ei;
+				uint8_t *eo = (target_slot == 'b') ? ei : ej;
+				/* Only swap A/B pairs where the target slot currently holds the inactive GUID. */
+				if (memcmp(et, inactive_guid, 16) == 0 && memcmp(eo, inactive_guid, 16) != 0) {
+					uint8_t tmp[16];
+					memcpy(tmp, ei, 16);
+					memcpy(ei, ej, 16);
+					memcpy(ej, tmp, 16);
+					swapped++;
+				}
+				/* Update Qualcomm LUN 4 active/inactive slot attributes on all A/B pairs. */
+				int is_boot = (len == 6 && pi[0] == 'b' && pi[2] == 'o' && pi[4] == 'o' && pi[6] == 't');
+				*(uint64_t *)(et + 48) = is_boot ? 0x006f000000000000ULL : 0x007f000000000000ULL;
+				*(uint64_t *)(eo + 48) = is_boot ? 0x006a000000000000ULL : 0x00c0000000000000ULL;
 				break;
 			}
 		}
@@ -935,18 +939,13 @@ slot_apply_active(char target_slot)
 	if (EFI_ERROR(safe_read_blocks(bio, entries_lba, num_blocks, bs, ufs_buffer))) return;
 
 	const char *target_name = (target_slot == 'b') ? "boot_b" : "boot_a";
-	const char *target_abl = (target_slot == 'b') ? "abl_b" : "abl_a";
 	const char *other_name = (target_slot == 'b') ? "boot_a" : "boot_b";
 	uint8_t *entry = gpt_find_entry(ufs_buffer, num_entries, entry_size, target_name);
-	uint8_t *abl = gpt_find_entry(ufs_buffer, num_entries, entry_size, target_abl);
 	uint8_t *entry_other = gpt_find_entry(ufs_buffer, num_entries, entry_size, other_name);
 	if (!entry) return;
 
-	/* Qualcomm LinuxLoader ValidateSlotGuids requires active slot partitions to hold distinct
-	 * PartitionTypeGUIDs rather than the shared inactive GUID (77036cd4-03d5-42bb-8ed1-37e5a88baa34). */
-	int need_guid_swap = (abl != NULL && memcmp(entry, abl, 16) == 0);
-	if (need_guid_swap) {
-		uint32_t n4 = gpt_swap_ab_type_guids(ufs_buffer, num_entries, entry_size);
+	uint32_t n4 = gpt_swap_ab_type_guids(ufs_buffer, num_entries, entry_size, target_slot);
+	if (n4 > 0) {
 		print("slot: swapped %d A/B PartitionTypeGUID pairs on LUN 4 for Slot %s\n",
 		    (uint64_t)n4, target_slot == 'b' ? "b" : "a");
 	}
@@ -958,25 +957,6 @@ slot_apply_active(char target_slot)
 	if (EFI_ERROR(safe_write_blocks(bio, entries_lba, num_blocks, bs, ufs_buffer))) return;
 	gpt_sync_lun(bio);
 
-	if (need_guid_swap) {
-		efi_block_io *bio0 = lun_get_bio(0, "userdata");
-		if (bio0 && bio0->media && bio0->media->block_size == bs &&
-		    !EFI_ERROR(bio0->read_blocks(bio0, bio0->media->media_id, 1, bs, hdr)) &&
-		    memcmp(hdr, "EFI PART", 8) == 0) {
-			uint64_t elba0 = *(uint64_t *)(hdr + 72);
-			uint32_t nent0 = *(uint32_t *)(hdr + 80);
-			uint32_t esz0 = *(uint32_t *)(hdr + 84);
-			uint64_t tbytes0 = (uint64_t)nent0 * esz0;
-			uint64_t nblk0 = (tbytes0 + bs - 1) / bs;
-			if (tbytes0 > 0 && tbytes0 <= sizeof(ufs_buffer) &&
-			    !EFI_ERROR(safe_read_blocks(bio0, elba0, nblk0, bs, ufs_buffer))) {
-				uint32_t n0 = gpt_swap_ab_type_guids(ufs_buffer, nent0, esz0);
-				if (n0 > 0 && !EFI_ERROR(safe_write_blocks(bio0, elba0, nblk0, bs, ufs_buffer))) {
-					gpt_sync_lun(bio0);
-				}
-			}
-		}
-	}
 	print("slot: Slot %s (%s) active=0x006f000000000000 (%s=0x006a000000000000)\n",
 	    target_slot == 'b' ? "b" : "a", target_name, other_name);
 }
@@ -1000,9 +980,10 @@ static void __attribute__((unused)) slot_set_active_b(void) { slot_set_active_ot
 static const char *
 slot_flash_boot_image(uint64_t bytes)
 {
-	static const char16 want_a[] = u"boot_a", want_b[] = u"boot_b";
-	const char16 *want = (loader_slot == 'b') ? want_b : want_a;
-	efi_block_io *bio = find_partition_named(want, 7);
+	static const char16 want_a[] = u"boot_a";
+	loader_slot = 'a';
+	android_slot = 'b';
+	efi_block_io *bio = find_partition_named(want_a, 7);
 	if (bio == NULL || bio->media == NULL || bio->media->block_size == 0) {
 		return "boot partition not found";
 	}

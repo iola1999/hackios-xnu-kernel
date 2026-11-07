@@ -86,14 +86,28 @@ static vm_offset_t arb_core, arb_cnfg, arb_obsrvr;
 #define BATTMGR_OP_BATTERY_GET  0x0030u
 #define BATTMGR_OP_USB_GET      0x0032u
 
-#define MCA_PROP_CHG_STATUS     0x2001u         /* 1=charging, 2=discharging, 3=not_charging, 4=full */
+#define MCA_PROP_CHG_STATUS     0x2001u         /* 1=charging, 2=discharging, 3=not_charging, 5=full */
 #define MCA_PROP_CHG_TYPE       0x2002u
-#define MCA_PROP_CHG_ENABLE     0x2003u
-#define MCA_PROP_INPUT_CURR     0x2004u         /* input current limit in mA */
-#define MCA_PROP_PACK_VBAT      0x2026u         /* mV */
-#define MCA_PROP_PACK_IBAT      0x2027u         /* mA */
-#define MCA_PROP_PACK_TBAT      0x202au         /* deg C or 0.1 C */
-#define MCA_PROP_VBUS_UV        0x20002u        /* uV (> 4000000 means VBUS present) */
+#define MCA_PROP_CHG_ENABLE     0x2003u         /* 1B: 1=enable, 0=disable */
+#define MCA_PROP_BUCK_FSW       0x2004u         /* 4B: buck switching freq (do not overwrite with ICL) */
+#define MCA_PROP_ICHG           0x2005u         /* 4B: fast charge current limit in mA */
+#define MCA_PROP_ITERM          0x2006u         /* 4B: termination current in mA */
+#define MCA_PROP_VTERM          0x2007u         /* 4B: termination voltage in mV */
+#define MCA_PROP_INPUT_CURR     0x2008u         /* 4B: USB input current limit (ICL) in mA */
+#define MCA_PROP_INPUT_VOLT     0x2009u         /* 4B: USB input voltage limit (IVL) in mV */
+#define MCA_PROP_AICL_EN        0x2012u         /* 1B: 1=enable */
+#define MCA_PROP_AICL_CONT_THD  0x2013u         /* 4B: AICL threshold in mV */
+#define MCA_PROP_ADC_ENABLE     0x2015u         /* 1B: 1=enable */
+#define MCA_PROP_INPUT_SUSPEND  0x2019u         /* 1B: 0=unsuspend, 1=suspend */
+#define MCA_PROP_OTG_CFG        0x201au         /* 16B: int32_t[4] = {2, 1, -1, -1} */
+#define MCA_PROP_CP_PRESENT     0x201cu         /* 1B: 0=absent */
+#define MCA_PROP_PACK_VBAT      0x2026u         /* 4B: mV */
+#define MCA_PROP_PACK_IBAT      0x2027u         /* 4B: mA */
+#define MCA_PROP_EU_MODEL       0x2028u         /* 1B: 0 */
+#define MCA_PROP_PACK_TBAT      0x202au         /* 4B: deg C or 0.1 C */
+#define MCA_PROP_VBUS_UV        0x20002u        /* 4B: uV (> 4000000 means VBUS present) */
+#define MCA_PROP_IBUS_UA        0x20004u        /* 4B: uA */
+#define MCA_PROP_USB_REAL_TYPE  0x2000cu        /* 4B: real charger type */
 
 struct pmic_mca_request {
 	uint32_t owner;
@@ -468,10 +482,13 @@ annibale_pmic_glink_rx(const void *data, uint32_t len)
 		}
 		switch (prop) {
 		case MCA_PROP_CHG_STATUS:
-			pmic_glink_state.chg_status = val;
+			pmic_glink_state.chg_status = (val == 5) ? 4 : val;
 			break;
 		case MCA_PROP_CHG_TYPE:
-			pmic_glink_state.chg_type = val;
+		case MCA_PROP_USB_REAL_TYPE:
+			if (val > 0) {
+				pmic_glink_state.chg_type = val;
+			}
 			break;
 		case MCA_PROP_PACK_VBAT:
 			pmic_glink_state.vbat_mv = val;
@@ -485,6 +502,9 @@ annibale_pmic_glink_rx(const void *data, uint32_t len)
 		case MCA_PROP_VBUS_UV:
 			pmic_glink_state.vbus_uv = val;
 			break;
+		case MCA_PROP_IBUS_UA:
+			pmic_glink_state.ibus_ua = val;
+			break;
 		default:
 			break;
 		}
@@ -492,7 +512,7 @@ annibale_pmic_glink_rx(const void *data, uint32_t len)
 }
 
 static void
-pmic_glink_mca_send(uint32_t opcode, uint32_t property, uint32_t write_val)
+pmic_glink_mca_send_buf(uint32_t opcode, uint32_t property, const void *buf, uint32_t buf_len)
 {
 	struct pmic_mca_request req;
 
@@ -505,42 +525,66 @@ pmic_glink_mca_send(uint32_t opcode, uint32_t property, uint32_t write_val)
 	req.opcode = opcode;
 	req.property = property;
 	req.seq = ++pmic_glink_state.seq;
-	if (opcode == BATTMGR_OP_CHG_CTRL) {
-		memcpy(req.data, &write_val, sizeof(write_val));
+	if (opcode == BATTMGR_OP_CHG_CTRL && buf != NULL && buf_len > 0 && buf_len <= sizeof(req.data)) {
+		memcpy(req.data, buf, buf_len);
 	}
 	(void)pmic_glink_state.tx_fn(&req, sizeof(req));
+}
+
+static void
+pmic_glink_mca_send(uint32_t opcode, uint32_t property, uint32_t write_val)
+{
+	pmic_glink_mca_send_buf(opcode, property, &write_val, sizeof(write_val));
 }
 
 static void
 pmic_glink_poll_and_control(bool enable_charging)
 {
 	static const uint32_t mca_poll_props[] = {
-		MCA_PROP_CHG_STATUS, MCA_PROP_CHG_TYPE, MCA_PROP_PACK_VBAT,
-		MCA_PROP_PACK_IBAT, MCA_PROP_PACK_TBAT, MCA_PROP_VBUS_UV
+		MCA_PROP_CHG_STATUS, MCA_PROP_CHG_TYPE, MCA_PROP_USB_REAL_TYPE,
+		MCA_PROP_PACK_VBAT, MCA_PROP_PACK_IBAT, MCA_PROP_VBUS_UV, MCA_PROP_IBUS_UA
 	};
+	static uint32_t poll_tick = 0;
 
 	if (pmic_glink_state.tx_fn == NULL) {
 		return;
 	}
 	if (!pmic_glink_state.notify_enabled) {
-		uint32_t notify_msg[7] = { BATTMGR_OWNER, BATTMGR_TYPE_NOTIFY, BATTMGR_OP_NOTIFY_EN, 0, 0, 0, 0 };
-		uint32_t info_msg[4]   = { BATTMGR_OWNER, BATTMGR_TYPE_REQ, BATTMGR_OP_BAT_INFO, 0 };
+		static const int32_t otg_cfg[4] = { 2, 1, -1, -1 };
+		uint8_t zero_u8 = 0, one_u8 = 1;
 
-		(void)pmic_glink_state.tx_fn(notify_msg, sizeof(notify_msg));
-		(void)pmic_glink_state.tx_fn(info_msg, sizeof(info_msg));
+		pmic_glink_mca_send_buf(BATTMGR_OP_CHG_CTRL, MCA_PROP_CP_PRESENT, &zero_u8, 1);
+		pmic_glink_mca_send_buf(BATTMGR_OP_CHG_CTRL, MCA_PROP_OTG_CFG, otg_cfg, sizeof(otg_cfg));
+		pmic_glink_mca_send_buf(BATTMGR_OP_CHG_CTRL, MCA_PROP_EU_MODEL, &zero_u8, 1);
+		pmic_glink_mca_send_buf(BATTMGR_OP_CHG_CTRL, MCA_PROP_ADC_ENABLE, &one_u8, 1);
+		pmic_glink_mca_send_buf(BATTMGR_OP_CHG_CTRL, MCA_PROP_AICL_EN, &one_u8, 1);
+		pmic_glink_mca_send(BATTMGR_OP_CHG_CTRL, MCA_PROP_AICL_CONT_THD, 4100u);
+		pmic_glink_mca_send(BATTMGR_OP_CHG_CTRL, MCA_PROP_INPUT_VOLT, 4500u);
+		pmic_glink_mca_send(BATTMGR_OP_CHG_CTRL, MCA_PROP_VTERM, 4450u);
+		pmic_glink_mca_send(BATTMGR_OP_CHG_CTRL, MCA_PROP_ITERM, 250u);
 		pmic_glink_state.notify_enabled = true;
 	}
-	if (pmic_glink_state.last_chg_enable != (int)enable_charging) {
-		uint32_t ctrl_msg[6] = {
-			BATTMGR_OWNER, BATTMGR_TYPE_REQ, BATTMGR_OP_CHG_CTRL,
-			0, enable_charging ? 1u : 0u, enable_charging ? 3000u : 500u
-		};
-		(void)pmic_glink_state.tx_fn(ctrl_msg, sizeof(ctrl_msg));
-		pmic_glink_mca_send(BATTMGR_OP_CHG_CTRL, MCA_PROP_CHG_ENABLE, enable_charging ? 1u : 0u);
-		pmic_glink_mca_send(BATTMGR_OP_CHG_CTRL, MCA_PROP_INPUT_CURR, enable_charging ? 3000u : 500u);
-		pmic_glink_state.last_chg_enable = (int)enable_charging;
-		printf("battery: PMIC_RTR_ADSP_APPS charging %s (MCA 0x2003/0x2004 ICL=%u mA)\n",
-		    enable_charging ? "enabled" : "standby", enable_charging ? 3000u : 500u);
+	poll_tick++;
+	if (pmic_glink_state.last_chg_enable != (int)enable_charging ||
+	    (enable_charging && (poll_tick % 3) == 1)) {
+		uint8_t susp_u8 = 0;
+		uint8_t chg_en_u8 = enable_charging ? 1u : 0u;
+		uint8_t adc_en_u8 = enable_charging ? 1u : 0u;
+		uint32_t icl_ma = enable_charging ? 2500u : 500u;
+		uint32_t ichg_ma = enable_charging ? 3000u : 500u;
+
+		pmic_glink_mca_send_buf(BATTMGR_OP_CHG_CTRL, MCA_PROP_ADC_ENABLE, &adc_en_u8, 1);
+		pmic_glink_mca_send_buf(BATTMGR_OP_CHG_CTRL, MCA_PROP_INPUT_SUSPEND, &susp_u8, 1);
+		pmic_glink_mca_send(BATTMGR_OP_CHG_CTRL, MCA_PROP_INPUT_VOLT, 4500u);
+		pmic_glink_mca_send(BATTMGR_OP_CHG_CTRL, MCA_PROP_INPUT_CURR, icl_ma);
+		pmic_glink_mca_send(BATTMGR_OP_CHG_CTRL, MCA_PROP_ICHG, ichg_ma);
+		pmic_glink_mca_send(BATTMGR_OP_CHG_CTRL, MCA_PROP_VTERM, 4450u);
+		pmic_glink_mca_send_buf(BATTMGR_OP_CHG_CTRL, MCA_PROP_CHG_ENABLE, &chg_en_u8, 1);
+		if (pmic_glink_state.last_chg_enable != (int)enable_charging) {
+			pmic_glink_state.last_chg_enable = (int)enable_charging;
+			printf("battery: PMIC_RTR_ADSP_APPS MCA charging %s (0x2019=0 0x2003=%u 0x2008 ICL=%u mA 0x2005 ICHG=%u mA)\n",
+			    enable_charging ? "enabled" : "standby", chg_en_u8, icl_ma, ichg_ma);
+		}
 	}
 	for (unsigned i = 0; i < sizeof(mca_poll_props) / sizeof(mca_poll_props[0]); i++) {
 		pmic_glink_mca_send(BATTMGR_OP_BAT_INFO, mca_poll_props[i], 0);
