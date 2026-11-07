@@ -402,8 +402,16 @@ MiniIOMobileFramebufferPowerOff(void)
 		flip_point(0);
 		flip_taken(40000, false);
 		flip.ready = false;
-	} else if (vinfo.v_baseaddr != 0 && vinfo.v_height != 0 && vinfo.v_rowbytes != 0) {
-		bzero((void *) vinfo.v_baseaddr, (size_t) vinfo.v_rowbytes * vinfo.v_height);
+	} else {
+		if (flip.va[0] != NULL && flip.bytes != 0) {
+			bzero(flip.va[0], flip.bytes);
+		}
+		if (flip.va[1] != NULL && flip.bytes != 0) {
+			bzero(flip.va[1], flip.bytes);
+		}
+		if (vinfo.v_baseaddr != 0 && vinfo.v_height != 0 && vinfo.v_rowbytes != 0) {
+			bzero((void *) vinfo.v_baseaddr, (size_t) vinfo.v_rowbytes * vinfo.v_height);
+		}
 	}
 }
 

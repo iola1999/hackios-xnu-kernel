@@ -1018,9 +1018,23 @@ lx_scan(struct lx_radio *radio, const uint8_t *name, unsigned name_length, bool 
 	if (what != NULL && what->dwell_ms != 0) {
 		request->req.duration = what->dwell_ms;
 	}
-	radio->scan = 1;
-	radio->frames = radio->others = radio->heard_count = radio->heard_lost = 0;
 	began = lx_os_nanoseconds();
+	lx_os_lock();
+	radio->scan = 1;
+	radio->frames = radio->others = radio->heard_lost = 0;
+	{
+		unsigned keep = 0;
+		for (unsigned i = 0; i < radio->heard_count; i++) {
+			if (began <= radio->heard[i].last || began - radio->heard[i].last <= 60000000000ull) {
+				if (keep != i) {
+					radio->heard[keep] = radio->heard[i];
+				}
+				keep++;
+			}
+		}
+		radio->heard_count = keep;
+	}
+	lx_os_unlock();
 	mutex_lock(&hw->wiphy->mtx);
 	ret = radio->ops->hw_scan(hw, radio->vif, request);
 	mutex_unlock(&hw->wiphy->mtx);

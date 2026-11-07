@@ -2,7 +2,7 @@ diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
 index 07143d539042..966e8ef38d3a 100644
 --- a/osfmk/arm64/machine_routines.c
 +++ b/osfmk/arm64/machine_routines.c
-@@ -907,17 +907,28 @@ ml_get_machine_mem(void)
+@@ -907,17 +907,30 @@ ml_get_machine_mem(void)
  	return machine_info.memory_size;
  }
  
@@ -12,11 +12,15 @@ index 07143d539042..966e8ef38d3a 100644
 +extern void redwood_wifi_stop(void);
 +extern void redwood_adsp_stop(void);
 +extern void MiniIOMobileFramebufferPowerOff(void);
++extern boolean_t redwood_halting_poweroff;
 +
  __attribute__((noreturn))
  void
  halt_all_cpus(boolean_t reboot)
  {
++	if (!reboot) {
++		redwood_halting_poweroff = TRUE;
++	}
 +	redwood_var_save_on_return();
 +	redwood_adreno_stop();
 +	redwood_wifi_stop();

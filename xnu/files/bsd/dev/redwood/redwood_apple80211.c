@@ -198,6 +198,12 @@ struct apple80211_link_changed {
 	uint8_t unused_3[4];
 };
 
+/* the association-done event's data (IO80211 _dispatchAsyncAssocEvent reads +0x1c0, +0x1c4, +0x1c8) */
+struct apple80211_assoc_done {
+	uint8_t unused[0x1c0];
+	uint32_t status, result, flags;
+};
+
 _Static_assert(sizeof(struct apple80211_assoc) == 592 && offsetof(struct apple80211_assoc, key) == 0x48,
     "the association request as iOS 16.5 has it");
 _Static_assert(sizeof(struct apple80211_assoc_26) == 908 && offsetof(struct apple80211_assoc_26, ssid_length) == 0x10 &&
@@ -205,6 +211,8 @@ _Static_assert(sizeof(struct apple80211_assoc_26) == 908 && offsetof(struct appl
     offsetof(struct apple80211_assoc_26, key) == 0x4c, "the association request as iOS 26 has it");
 _Static_assert(sizeof(struct apple80211_link_changed) == 32 && offsetof(struct apple80211_link_changed, reason) == 0x14,
     "the link event as iOS 16.5 reads it");
+_Static_assert(sizeof(struct apple80211_assoc_done) == 0x1cc && offsetof(struct apple80211_assoc_done, result) == 0x1c4 &&
+    offsetof(struct apple80211_assoc_done, flags) == 0x1c8, "the association event as iOS 26 reads it");
 _Static_assert(sizeof(struct apple80211_channels) == 4824, "the channel list as iOS 16.5 has it");
 _Static_assert(sizeof(struct apple80211_channels_info) == 10016 && offsetof(struct apple80211_channels_info, number) == 0x32e &&
     offsetof(struct apple80211_channels_info, flags) == 0x12d0, "the channels' description as iOS 16.5 has it");
@@ -348,9 +356,37 @@ get(struct apple80211req *request)
 
 		return give(request, &answer, sizeof(answer));
 	}
+	case 14: {                              /* PHY_MODE: 802.11a/b/g/n/ac/ax */
+		struct {
+			uint32_t version, supported, active;
+		} answer = { .version = 1, .supported = 0x1fcu, .active = 0x80u };
+
+		request->req_val = 0x80;
+		return give(request, &answer, sizeof(answer));
+	}
 	case 15:                                /* the mode: a station (APPLE80211_M_STA) */
 		request->req_val = 1;
 		return 0;
+	case 51: {                              /* COUNTRY_CODE */
+		static const char cc[4] = "CN";
+
+		return give(request, cc, sizeof(cc));
+	}
+	case 55:                                /* GUARD_INTERVAL */
+		request->req_val = 1;
+		return 0;
+	case 57:                                /* MCS */
+		request->req_val = 7;
+		return 0;
+	case 87:                                /* BTCOEX_MODE */
+		request->req_val = 0;
+		return 0;
+	case 353: {                             /* 802.11ax/be state */
+		uint8_t zero[16] = { 0 };
+
+		request->req_val = 0;
+		return give(request, zero, sizeof(zero));
+	}
 	case 27:
 	case 254: {                             /* the channels the radio may tune to */
 		struct apple80211_channels *answer;
@@ -652,6 +688,9 @@ set(const struct apple80211req *request, char *said, size_t said_size)
 	}
 	case 10:
 		return set_scan(request, said, said_size);
+	case 51:
+	case 87:
+		return 0;
 	default:
 		return EOPNOTSUPP;
 	}
@@ -697,12 +736,18 @@ redwood_apple80211_event(enum redwood_sta_event event, int status)
 		lck_mtx_unlock(&apple80211_lock);
 		post(EVENT_SCAN_DONE, NULL, 0);
 		break;
-	case REDWOOD_STA_JOIN_DONE:
+	case REDWOOD_STA_JOIN_DONE: {
+		struct apple80211_assoc_done done = { 0 };
+
 		lck_mtx_lock(&apple80211_lock);
 		join_result = status == 0 ? 1 : status == EAUTH ? 21 : status == ETIMEDOUT ? 9 : 2;
+		done.status = join_result;
+		done.result = join_result;
+		done.flags = 0;
 		lck_mtx_unlock(&apple80211_lock);
-		post(EVENT_ASSOC_DONE, NULL, 0);
+		post(EVENT_ASSOC_DONE, &done, sizeof(done));
 		break;
+	}
 	case REDWOOD_STA_LINK: {
 		struct apple80211_link_changed link = { .down = status != 1, .involuntary = status != 1 && status != 0,
 			                                .reason = status != 1 && status != 0 ? 4 : 0 };      /* (4: gone, not asked) */

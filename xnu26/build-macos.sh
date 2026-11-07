@@ -48,6 +48,12 @@ export KERNEL_UUID=${KERNEL_UUID:-c71f02b3-2965-3ecc-9398-8915830464c4}
 # The Wi-Fi driver's object (tools/mk-ath12k.sh) is linked into the kernel when it is there; make does not see it
 # change, so the linked kernel is thrown away when it has (as xnu-build.sh does for ath11k's).
 LX=$XNU26_ROOT/xnu-deps/build/ath12k/out/ath12k.o
+if [ -d "$XNU26_ROOT/wifi/lx" ] && [ -f "$LX" ]; then
+  if [ -n "$(find "$XNU26_ROOT/wifi/lx" -type f -newer "$LX" 2>/dev/null | head -1)" ]; then
+    echo "build-macos.sh: wifi/lx changed since $LX was built, running tools/mk-ath12k.sh..."
+    bash "$XNU26_ROOT/tools/mk-ath12k.sh" || exit 1
+  fi
+fi
 if [ -f "$LX" ]; then now="$LX $(stat -f %m "$LX")"; else LX= now=; fi
 if [ -d BUILD/obj ] && [ "$(cat BUILD/obj/redwood-objects 2>/dev/null)" != "$now" ]; then
   rm -f BUILD/obj/*/mach.*.unstripped BUILD/obj/*/mach.*.unstripped.noctf    # (the link's output, and its copy)

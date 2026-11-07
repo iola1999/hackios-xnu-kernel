@@ -185,8 +185,11 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 				redwood_apple80211_event(REDWOOD_STA_LINK, 0);
 			}
 			redwood_apple80211_event(REDWOOD_STA_POWER, error == 0 ? power_on : !power_on);
+			if (error == 0 && power_on && was_joined) {
+				redwood_apple80211_event(REDWOOD_STA_LINK, 1);
+			}
 			lck_mtx_lock(&sta_lock);
-			if (error == 0 && power_on && standing.ssid_length != 0 && !asked_join) {
+			if (error == 0 && power_on && !was_joined && standing.ssid_length != 0 && !asked_join) {
 				asked_join_what = standing;
 				asked_join = true;
 			}
@@ -222,12 +225,24 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 			bzero(&fallback, sizeof(fallback));
 			lck_mtx_unlock(&sta_lock);
 		} else if (do_scan) {
+			struct redwood_sta_state *state;
+			bool is_joined = false;
+
 			error = ops->scan(&scan);
 			lck_mtx_lock(&sta_lock);
 			heard_count = 0;
 			lck_mtx_unlock(&sta_lock);
 			ops->heard(heard_one, NULL);
 			redwood_apple80211_event(REDWOOD_STA_SCAN_DONE, error);
+			state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
+			if (state != NULL) {
+				ops->state(state);
+				is_joined = state->phase == REDWOOD_STA_JOINED;
+				kfree_data(state, sizeof(*state));
+			}
+			if (is_joined) {
+				redwood_apple80211_event(REDWOOD_STA_LINK, 1);
+			}
 		}
 
 		lck_mtx_lock(&sta_lock);

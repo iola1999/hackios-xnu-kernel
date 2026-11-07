@@ -15,6 +15,21 @@ static FILE *rw_console;
  * keeps at most 200 said lines a second, and a REDWOOD_THUMBS sample prints 33 lines at once, so
  * each line waits 5 ms. */
 static int
+rw_is_noisy_line(const char *line, size_t length)
+{
+	while (length > 0 && (line[0] == ' ' || line[0] == '\t')) {
+		line++;
+		length--;
+	}
+	if (length >= 9 && (!memcmp(line, "rwa bind:", 9) || !memcmp(line, "rwa draw:", 9) || !memcmp(line, "rwa state", 9) ||
+	    !memcmp(line, "ir3q job:", 9)))
+		return 1;
+	if (length >= 13 && (!memcmp(line, "fd draw calls", 13) || !memcmp(line, "fd draw vbos ", 13)))
+		return 1;
+	return 0;
+}
+
+static int
 rw_say_write(void *cookie, const char *bytes, int count)
 {
 	static char line[256];
@@ -25,7 +40,7 @@ rw_say_write(void *cookie, const char *bytes, int count)
 		if (bytes[i] != '\n')
 			line[length++] = bytes[i];
 		if (bytes[i] == '\n' || length == sizeof(line) - 1) {
-			if (length > 0) {
+			if (length > 0 && !rw_is_noisy_line(line, length)) {
 				sysctlbyname("kern.redwood.say", NULL, NULL, line, length);
 				usleep(5000);
 			}
@@ -49,11 +64,13 @@ rw_console_write(void *cookie, const char *bytes, int count)
 			line[length++] = bytes[i];
 		if (bytes[i] != '\n' && length < sizeof(line) - 1)
 			continue;
-		fputs(who, rw_console);
-		fwrite(line, 1, length, rw_console);
-		if (line[length - 1] != '\n')
-			fputc('\n', rw_console);
-		fflush(rw_console);
+		if (!rw_is_noisy_line(line, length)) {
+			fputs(who, rw_console);
+			fwrite(line, 1, length, rw_console);
+			if (line[length - 1] != '\n')
+				fputc('\n', rw_console);
+			fflush(rw_console);
+		}
 		length = 0;
 	}
 	return count;

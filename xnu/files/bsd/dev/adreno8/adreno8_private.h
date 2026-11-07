@@ -423,9 +423,9 @@ void
 adreno8_speed_state(uint32_t *mhz, uint32_t *changes);
 bool
 adreno8_step_last_look(void);
-bool
-adreno8_context_test(void);
-bool
-adreno8_step_service(void);
+bool adreno8_context_test(void);
+bool adreno8_step_service(void);
+void adreno8_quiesce(void);
+void adreno8_return_quiesce(void);
 
 #endif /* _DEV_ADRENO8_PRIVATE_H */

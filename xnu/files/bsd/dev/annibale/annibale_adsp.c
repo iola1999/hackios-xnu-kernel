@@ -1052,6 +1052,11 @@ void annibale_adsp_set_gpr_event(annibale_gpr_event_fn handler)
 
 bool annibale_adsp_ready(void) { return adsp_inited; }
 bool annibale_adsp_is_hw_up(void) { return adsp_hw_up; }
+bool annibale_adsp_gpr_ready(void)
+{
+	return adsp_hw_up && glink_our_q != 0 && glink_gpr_our_cid != 0 && glink_gpr_their_cid != 0 &&
+	    glink_gpr_intents.list[0].size != 0;
+}
 
 /* ---- Background ADSP boot & GLINK poll thread ------------------------------------------------ */
 
@@ -1168,7 +1173,7 @@ static void annibale_adsp_boot_thread(void *arg __unused, wait_result_t w __unus
 	}
 	for (;;) {
 		glink_poll_rx();
-		sleep_ms(20);
+		sleep_ms(glink_gpr_our_cid == 0 ? 5 : 20);
 	}
 }
 

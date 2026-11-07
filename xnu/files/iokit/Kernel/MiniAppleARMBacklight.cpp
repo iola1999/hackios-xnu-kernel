@@ -265,12 +265,14 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 			if (!bl.slider_initialized) {
 				bl.slider_initialized = true;
 				bl.last_slider_pos = slider_pos;
-				bl.user_until = now + active_win;
-				slider_moved = true;
-			} else if (slider_pos != bl.last_slider_pos) {
-				bl.user_until = now + active_win;
-				bl.last_slider_pos = slider_pos;
-				slider_moved = true;
+			} else {
+				uint64_t diff = slider_pos > bl.last_slider_pos ?
+				    slider_pos - bl.last_slider_pos : bl.last_slider_pos - slider_pos;
+				if (diff >= 64) {
+					bl.user_until = now + active_win;
+					bl.last_slider_pos = slider_pos;
+					slider_moved = true;
+				}
 			}
 		}
 	}

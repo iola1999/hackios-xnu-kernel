@@ -28,6 +28,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 
 extern void annibale_adsp_init(void);
+extern bool annibale_adsp_gpr_ready(void);
 extern bool annibale_adsp_gpr_send(const void *pkt, uint32_t len, uint32_t wait_ms,
     uint32_t *rsp_opcode, uint32_t *rsp_words, uint32_t max_words);
 extern bool annibale_audio_amp_probe(void);
@@ -386,7 +387,7 @@ annibale_audio_reach_send_cmd(const void *raw_pkt, uint32_t raw_len, const char 
 	p.len = raw_len;
 
 	lck_mtx_lock(cmd_oob_lock);
-	if (p.len > 128) {
+	if (p.len > 512) {
 		uint32_t payload_len = p.len - 40;
 		if (map_handle != 0 && payload_len <= BUFFER_BYTES - CMD_OFFSET) {
 			for (uint32_t i = 0; i < payload_len; i++) {
@@ -411,7 +412,7 @@ annibale_audio_reach_send_cmd(const void *raw_pkt, uint32_t raw_len, const char 
 		__builtin_arm_dsb(0xf);
 	}
 
-	uint32_t wait_ms = (descr != NULL && strcmp(descr, "WRITE (AUDIO_PERIOD)") == 0) ? 0u : 25u;
+	uint32_t wait_ms = (descr != NULL && strcmp(descr, "WRITE (AUDIO_PERIOD)") == 0) ? 0u : 250u;
 	uint32_t rop = 0;
 	uint32_t rwords[8] = { 0 };
 	bool ok = annibale_adsp_gpr_send(p.buf, p.len, wait_ms, &rop, rwords, 8);
@@ -652,9 +653,26 @@ reach_feeder_thread(void *arg __unused, wait_result_t w __unused)
 	uint32_t last_vol_gen = 0;
 	uint32_t vol_below = 18 * 8;
 	bool vol_muted = false;
+	bool graphs_built_on_hw = false;
 
-	say("feeder thread running\n");
+	say("feeder thread running, waiting for LPASS ADSP GPR channel...\n");
+	for (unsigned wait = 0; wait < 240 && !annibale_adsp_gpr_ready(); wait++) {
+		delay_for_interval(50, NSEC_PER_MSEC);
+	}
+	if (annibale_adsp_gpr_ready()) {
+		say("LPASS ADSP GPR channel ready; building AudioReach graphs on hardware\n");
+		build_audioreach_graphs();
+		graphs_built_on_hw = true;
+	} else {
+		say("LPASS ADSP GPR not ready after 12 s; building initial AudioReach graphs\n");
+		build_audioreach_graphs();
+	}
 	for (;;) {
+		if (!graphs_built_on_hw && annibale_adsp_gpr_ready()) {
+			say("LPASS ADSP GPR channel became ready; rebuilding AudioReach graphs on hardware\n");
+			build_audioreach_graphs();
+			graphs_built_on_hw = true;
+		}
 		uint32_t cur_below = 0, cur_gen = 0;
 		bool cur_muted = false;
 		if (redwood_audio_volume(&cur_below, &cur_muted, &cur_gen) && cur_gen != last_vol_gen) {
@@ -823,13 +841,10 @@ annibale_audio_reach_init(void)
 	/* 6. Probe Smart Amplifiers on I2C */
 	(void)annibale_audio_amp_probe();
 
-	/* 7. Build AudioReach graphs */
-	build_audioreach_graphs();
-
-	/* 8. Register Redwood Audio sink */
+	/* 7. Register Redwood Audio sink (AudioReach graphs are built by feeder once ADSP GLINK is ready) */
 	redwood_audio_set_sink("annibale-reach", reach_audio_sink);
 
-	/* 9. Launch feeder thread */
+	/* 8. Launch feeder thread */
 	thread_t th;
 	if (kernel_thread_start(reach_feeder_thread, NULL, &th) == KERN_SUCCESS) {
 		thread_set_thread_name(th, "reach-audio-feeder");

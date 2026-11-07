@@ -56,6 +56,7 @@ extern void redwood_adreno_quiesce(void);
 extern void redwood_adreno_stop(void);
 extern void redwood_adreno_minute(void);
 extern void adreno8_quiesce(void);      /* bsd/dev/adreno8.c: the Adreno 830's stepper on the other phone */
+extern void adreno8_return_quiesce(void);
 extern void redwood_wifi_stop(void);
 extern void redwood_wifi_quiesce(void);
 extern void redwood_adsp_stop(void);
@@ -68,6 +69,8 @@ extern void annibale_torch_quiesce(void);
 extern void redwood_camera_quiesce(void);
 extern void redwood_mic_quiesce(void);
 extern void MiniIOMobileFramebufferQuiesce(void);   /* iokit/Kernel/MiniFramebufferFlip.inc */
+extern void MiniIOMobileFramebufferPowerOff(void);
+boolean_t redwood_halting_poweroff = FALSE;
 extern void redwood_ufs_quiesce(void);
 extern void redwood_var_save_on_return(void);   /* bsd/dev/redwood_ufs.c: the data volume into the flash */
 extern int redwood_ufs_var_io(bool write, uint64_t offset, void *buf, uint64_t len);
@@ -617,7 +620,7 @@ loader_return(void)
 
 	redwood_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
 	redwood_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
-	adreno8_quiesce();              /* the other phone's GMU, if its stepper ran, back in reset, and its translation off */
+	adreno8_return_quiesce();       /* the other phone's GMU back in reset and its translation off without parking */
 	redwood_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
 	redwood_adsp_quiesce();         /* nor the audio DSP */
 	redwood_ddr_quiesce();          /* and the vote for the memory's bandwidth taken away */
@@ -627,7 +630,11 @@ loader_return(void)
 	annibale_torch_quiesce();       /* or the other phone's, lit on its PMIC's flash module */
 	redwood_camera_quiesce();       /* the camera powered down, if it was powered up */
 	redwood_mic_quiesce();          /* (what the microphones' path did, said again: it happens in the log's middle) */
-	MiniIOMobileFramebufferQuiesce();       /* the display back on the boot framebuffer, the last frame in it (fb_flip) */
+	if (redwood_halting_poweroff) {
+		MiniIOMobileFramebufferPowerOff();
+	} else {
+		MiniIOMobileFramebufferQuiesce();       /* the display back on the boot framebuffer, the last frame in it (fb_flip) */
+	}
 
 	hv_wdt_pet_NOW();
 	loader_jump(0, 0);

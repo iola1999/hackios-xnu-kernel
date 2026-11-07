@@ -514,3 +514,19 @@ adreno8_quiesce(void)
 		}
 	}
 }
+
+void
+adreno8_return_quiesce(void)
+{
+	if (adreno8_gmu.base != 0 && adreno8_gmu_runs) {
+		adreno8_wr(adreno8_gmu.base + GMU_GMU2HOST_MASK, ~0u);
+		adreno8_wr(adreno8_gmu.base + GMU_AHB_FENCE_CLR, ~0u);
+		adreno8_wr(adreno8_gmu.base + GMU_CM3_SYSRESET, 1);
+		adreno8_gmu_runs = false;
+	}
+	if (adreno8_gmu_space.is_on) {
+		adreno8_quiet = true;
+		adreno8_space_off(&adreno8_gmu_space, GMU_MATCH);
+		adreno8_quiet = false;
+	}
+}

@@ -524,6 +524,13 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
 		lx_tell("lx: a network without WPA2 and a passphrase is asked for: that is not built\n");
 		return (ENOTSUP);
 	}
+	if (radio->sta != NULL && radio->joined && radio->want_length == name_length &&
+	    memcmp(radio->want, name, name_length) == 0 &&
+	    (is_zero_ether_addr(what->bssid) || memcmp(what->bssid, radio->target.address, ETH_ALEN) == 0)) {
+		lx_tell("lx: already joined to the requested network; keeping active connection\n");
+		lx_os_net_link(1);
+		return (0);
+	}
 	if (radio->sta != NULL) {
 		station_leave(radio);
 		lx_tell("lx: the network joined before is left\n");
