@@ -1154,6 +1154,7 @@ redwood_ufs_init(void)
 			printf("ufs: this kernel's own UFS driver is not used: through the loader\n");
 		}
 	}
+	redwood_ufs_sync_rtc();
 
 	if (PE_parse_boot_argn("ufs_bench", &check, sizeof(check)) && check != 0) {
 		/* right here, in bsd_init's thread, and then back to the loader: nothing else is wanted */

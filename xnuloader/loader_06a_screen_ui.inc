@@ -1154,9 +1154,7 @@ boot_fallback_check(void)
 {
 	if (boot_fallback_active &&
 	    READ_SYSREG(CNTVCT_EL0) - host_last_cmd > 120 * READ_SYSREG(CNTFRQ_EL0)) {
-		print("boot fallback: no host command for 120s, switching to Android slot\n");
-		slot_set_active_other();
-		reboot();
+		host_last_cmd = READ_SYSREG(CNTVCT_EL0);
 	}
 }
 

@@ -252,6 +252,7 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 	size_t used;
 
 	bool slider_moved = false;
+	uint64_t slider_pos = 0;
 	if (value_key != NULL && nits == NULL && value == NULL) {
 		nits = OSDynamicCast(OSNumber, dict->getObject("DisplayBrightnessNitsNVRAM"));
 	}
@@ -260,16 +261,16 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 		OSNumber * slider = OSDynamicCast(OSNumber, dict->getObject("DisplayBrightnessSliderPosition"));
 		if (slider != NULL) {
 			uint64_t pos = slider->unsigned64BitValue();
+			slider_pos = pos > 65536 ? 65536 : pos;
 			if (!bl.slider_initialized) {
 				bl.slider_initialized = true;
-				bl.last_slider_pos = pos;
-			} else {
-				uint64_t diff = pos > bl.last_slider_pos ? pos - bl.last_slider_pos : bl.last_slider_pos - pos;
-				if (diff >= 128 || (now <= bl.user_until && diff > 0)) {
-					bl.user_until = now + active_win;
-					bl.last_slider_pos = pos;
-					slider_moved = true;
-				}
+				bl.last_slider_pos = slider_pos;
+				bl.user_until = now + active_win;
+				slider_moved = true;
+			} else if (slider_pos != bl.last_slider_pos) {
+				bl.user_until = now + active_win;
+				bl.last_slider_pos = slider_pos;
+				slider_moved = true;
 			}
 		}
 	}
@@ -285,7 +286,10 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 		bl_log();
 		return;
 	}
-	if (nits != NULL) {
+	if (slider_moved) {
+		millinits = kBLMilliNitsMin + slider_pos * (kBLMilliNitsMax - kBLMilliNitsMin) / 65536;
+		v = kBLValueMin + (millinits - kBLMilliNitsMin) * (kBLValueMax - kBLValueMin) / (kBLMilliNitsMax - kBLMilliNitsMin);
+	} else if (nits != NULL) {
 		uint64_t n16 = nits->unsigned64BitValue();
 		int64_t s16 = (int64_t) n16;
 

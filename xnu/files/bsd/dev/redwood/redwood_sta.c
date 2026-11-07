@@ -24,14 +24,19 @@
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <sys/errno.h>
+#include <sys/fcntl.h>
+#include <sys/kauth.h>
 #include <sys/redwood_input.h>
 #include <sys/redwood_sta.h>
 #include <sys/systm.h>
+#include <sys/vnode.h>
+#include <sys/vnode_internal.h>
 
 extern void thread_set_thread_name(thread_t thread, const char *name);
 
 #define HEARD_MOST      128
 #define CHANNELS_MOST   96
+#define STANDING_PATH   "/private/var/db/wifi.standing"
 
 static LCK_GRP_DECLARE(sta_lock_group, "redwood-sta");
 static LCK_MTX_DECLARE(sta_lock, &sta_lock_group);
@@ -66,10 +71,44 @@ heard_one(const struct redwood_sta_bss *bss, __unused void *context)
 }
 
 static void
+sta_save_standing(const struct redwood_sta_join *what)
+{
+	if (what == NULL || what->ssid_length == 0 || what->ssid_length > sizeof(what->ssid)) {
+		return;
+	}
+	vfs_context_t ctx = vfs_context_kernel();
+	vnode_t vp = NULLVP;
+	if (vnode_open(STANDING_PATH, FWRITE | O_CREAT | O_TRUNC, 0600, 0, &vp, ctx) != 0) {
+		return;
+	}
+	int resid = 0;
+	(void)vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)what, (int)sizeof(*what), 0,
+	    UIO_SYSSPACE, IO_SYNC, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
+	(void)vnode_close(vp, FWASWRITTEN, ctx);
+}
+
+static bool
+sta_load_standing(struct redwood_sta_join *out)
+{
+	vfs_context_t ctx = vfs_context_kernel();
+	vnode_t vp = NULLVP;
+	if (vnode_open(STANDING_PATH, FREAD, 0, 0, &vp, ctx) != 0) {
+		return false;
+	}
+	int resid = 0;
+	int err = vn_rdwr(UIO_READ, vp, (caddr_t)out, (int)sizeof(*out), 0,
+	    UIO_SYSSPACE, 0, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
+	(void)vnode_close(vp, 0, ctx);
+	return err == 0 && resid == 0 && out->ssid_length > 0 && out->ssid_length <= sizeof(out->ssid);
+}
+
+static void
 sta_runs(__unused void *parameter, __unused wait_result_t result)
 {
 	static struct redwood_sta_scan scan;
 	static struct redwood_sta_join join;
+	bool standing_checked = false;
+	unsigned standing_tries = 0;
 
 	for (;;) {
 		const struct redwood_sta_ops *ops;
@@ -78,6 +117,36 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 
 		lck_mtx_lock(&sta_lock);
 		while (sta_ops == NULL || !(asked_power || asked_leave || asked_join || asked_scan)) {
+			if (sta_ops != NULL && !standing_checked && standing.ssid_length == 0 && !asked_join) {
+				lck_mtx_unlock(&sta_lock);
+				vfs_context_t ctx = vfs_context_kernel();
+				vnode_t dvp = NULLVP;
+				if (vnode_lookup("/private/var/db", 0, &dvp, ctx) == 0) {
+					vnode_put(dvp);
+					standing_checked = true;
+					struct redwood_sta_join saved;
+					bzero(&saved, sizeof(saved));
+					if (sta_load_standing(&saved)) {
+						lck_mtx_lock(&sta_lock);
+						if (standing.ssid_length == 0) {
+							standing = saved;
+							if (!asked_join) {
+								asked_join_what = standing;
+								asked_join = true;
+							}
+						}
+						lck_mtx_unlock(&sta_lock);
+						redwood_wifi_tell("wifi: loaded standing network \"%.*s\" from " STANDING_PATH "\n",
+						    (int)saved.ssid_length, (const char *)saved.ssid);
+					}
+				} else if (++standing_tries < 30) {
+					delay_for_interval(500, NSEC_PER_MSEC);
+				} else {
+					standing_checked = true;
+				}
+				lck_mtx_lock(&sta_lock);
+				continue;
+			}
 			lck_mtx_sleep(&sta_lock, LCK_SLEEP_DEFAULT, (event_t)&sta_ops, THREAD_UNINT);
 		}
 		ops = sta_ops;
@@ -127,15 +196,18 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 			redwood_apple80211_event(REDWOOD_STA_LINK, 0);
 		} else if (do_join) {
 			error = ops->join(&join);
-			if (error != 0 && !asked_leave && !asked_power) {
-				delay_for_interval(150, NSEC_PER_MSEC);
+			for (unsigned r = 0; r < 2 && error != 0 && !asked_leave && !asked_power; r++) {
+				delay_for_interval(350, NSEC_PER_MSEC);
 				error = ops->join(&join);
 			}
 			lck_mtx_lock(&sta_lock);
-			if (error == 0 && standing.ssid_length == 0) {
+			if (error == 0) {
 				standing = join;
 			}
 			lck_mtx_unlock(&sta_lock);
+			if (error == 0) {
+				sta_save_standing(&join);
+			}
 			bzero(&join, sizeof(join));
 			redwood_apple80211_event(REDWOOD_STA_JOIN_DONE, error);
 			if (error == 0) {

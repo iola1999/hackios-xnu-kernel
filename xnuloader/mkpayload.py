@@ -17,9 +17,8 @@ validated (1..15 ASCII bytes, no NUL, unique, not a flag-owned name) because
 struct.pack truncates char name[16] silently and the loader binds names with
 strcmp semantics: a stored NUL aliases the prefix and the last duplicate
 entry wins. --require-cmd demands an exact boot-arg token, --forbid-cmd
-rejects an exact boot-arg key (bare or with =value), --exact-cmd demands the approved token set with
-only the epoch value differing; while --exact-cmd is in use epoch values must
-be non-negative decimal, and no boot-arg string may contain NUL.
+rejects an exact boot-arg key (bare or with =value), --exact-cmd demands the approved token set;
+no boot-arg string may contain NUL.
 --forbid-entry NAME (repeatable) refuses any payload entry, item- or
 flag-derived; an approved experiment command uses it to forbid rdfile/rdres or
 any other out-of-scope entry explicitly. Validation failures exit before
@@ -28,8 +27,8 @@ left damaged. The payload's sha256 is printed so the run record can bind it.
 
 Compatibility: builds that relied on duplicate item names (last-wins), item
 names of 16+ bytes (silently truncated), NUL-bearing names, items colliding
-with the cmdline/physbase/rdres/rdfile/usb/checkpoint flags, non-decimal epoch
-values, or NUL bytes in boot-arg strings are rejected now; ordinary
+with the cmdline/physbase/rdres/rdfile/usb/checkpoint flags, or NUL bytes in
+boot-arg strings are rejected now; ordinary
 kernel=/ramdisk= items plus flags build unchanged.
 """
 import argparse, hashlib, struct, sys
@@ -54,7 +53,7 @@ ap.add_argument('--require-cmd', action='append', default=[], metavar='TOKEN',
 ap.add_argument('--forbid-cmd', action='append', default=[], metavar='TOKEN',
                 help='refuse to build if the cmdline carries this exact boot-arg key, bare or with =value; a key merely starting with TOKEN does not match')
 ap.add_argument('--exact-cmd', default='', metavar='CMDLINE',
-                help='refuse to build unless the cmdline is the approved string; only the epoch value may differ')
+                help='refuse to build unless the cmdline is the approved string')
 ap.add_argument('--forbid-entry', action='append', default=[], metavar='NAME',
                 help='refuse to build if the payload would carry an entry with this name (item or flag)')
 ap.add_argument('items', nargs='*')
@@ -105,23 +104,8 @@ for bad in args.forbid_cmd:
     if hit:
         sys.exit(f'forbid-cmd: cmdline carries {hit[0]}')
 if args.exact_cmd:
-    def norm(ts):
-        keep, epoch = [], None
-        for t in ts:
-            if t.startswith('epoch='):
-                if epoch is not None:
-                    sys.exit(f'exact-cmd: duplicate token {t}')
-                value = t[len('epoch='):]
-                if not (value.isascii() and value.isdigit()):
-                    sys.exit(f'exact-cmd: epoch value must be non-negative decimal: {t!r}')
-                epoch = t
-            else:
-                keep.append(t)
-        return keep, epoch
-    want, wepoch = norm(args.exact_cmd.split())
-    got, gepoch = norm(tokens)
-    if wepoch is None or gepoch is None:
-        sys.exit('exact-cmd: both the approved string and the cmdline need one epoch token')
+    want = args.exact_cmd.split()
+    got = tokens
     if sorted(got) != sorted(want):
         extra = sorted(set(got) - set(want))
         missing = sorted(set(want) - set(got))

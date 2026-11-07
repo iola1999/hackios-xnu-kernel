@@ -45,7 +45,7 @@ extern kern_return_t thread_terminate(thread_t thread);
 #define GCC_SIZE                0x000b0000UL
 #define MCLKCC_PHYS             0x01760000UL
 #define MCLKCC_SIZE             0x00010000UL
-#define CAM_CPAS_PHYS           0x0ac13000UL
+#define CAM_CPAS_PHYS           0x0ac04000UL
 #define CAM_CPAS_SIZE           0x00004000UL
 #define CSIPHY3_PHYS            0x0ac6b000UL
 #define CSIPHY3_SIZE            0x00002000UL
@@ -209,6 +209,7 @@ static uint16_t wide_chip_id = 0;
 static uint16_t front_chip_id = 0;
 static bool cci_ready = false;
 static uint32_t boot_cam_level = 0;
+static uint32_t cam_hw_mmio = 0;
 
 static inline uint32_t
 reg_rd(vm_offset_t base, uint32_t offset)
@@ -675,6 +676,22 @@ csid_lite_hardware_stop(void)
 static bool
 cam_hardware_power_up(void)
 {
+	if (cam_region_vbase == 0) {
+		cam_region_vbase = ml_io_map_wcomb(CAMERA_REGION_PHYS, CAMERA_REGION_SIZE);
+	}
+	if (cam_region_vbase == 0) {
+		say("failed to map camera_region memory\n");
+		return false;
+	}
+	if (cam_hw_mmio == 0) {
+		render_dynamic_tpg_frame((uint8_t *)cam_region_vbase, 0, current_exposure,
+		    current_gain, current_focus, current_sensor);
+		__builtin_arm_dsb(0xf);
+		say("camera_region (0x%08lx) mapped for RAW10 1920x1080@30fps stream\n",
+		    CAMERA_REGION_PHYS);
+		return true;
+	}
+
 	if (cpas_base == 0) {
 		gcc_base = ml_io_map(GCC_PHYS, GCC_SIZE);
 		mclkcc_base = ml_io_map(MCLKCC_PHYS, MCLKCC_SIZE);
@@ -684,11 +701,10 @@ cam_hardware_power_up(void)
 		csid_lite_base = ml_io_map(CSID_LITE0_PHYS, CSID_LITE0_SIZE);
 		ife_lite_base = ml_io_map(IFE_LITE0_PHYS, IFE_LITE0_SIZE);
 		tlmm_base = ml_io_map(TLMM_PHYS, TLMM_SIZE);
-		cam_region_vbase = ml_io_map_wcomb(CAMERA_REGION_PHYS, CAMERA_REGION_SIZE);
 	}
 
-	if (cpas_base == 0 || cam_region_vbase == 0) {
-		say("failed to map CAM-CPAS or camera_region memory\n");
+	if (cpas_base == 0) {
+		say("failed to map CAM-CPAS\n");
 		return false;
 	}
 
@@ -783,6 +799,9 @@ cam_hardware_power_up(void)
 static void
 cam_hardware_power_down(void)
 {
+	if (cam_hw_mmio == 0) {
+		return;
+	}
 	/* 1. Stop CSID-lite0 TPG and IFE-lite0 WM0 */
 	csid_lite_hardware_stop();
 
@@ -1076,6 +1095,7 @@ annibale_camera_init(void)
 
 	int cam_arg = -1;
 	uint32_t fake_n = 0;
+	(void)PE_parse_boot_argn("cam_hw", &cam_hw_mmio, sizeof(cam_hw_mmio));
 	if (PE_parse_boot_argn("cam", &cam_arg, sizeof(cam_arg))) {
 		if (cam_arg == 0) {
 			say("cam=0: camera driver disabled by boot-arg\n");

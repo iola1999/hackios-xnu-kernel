@@ -225,7 +225,11 @@ static uint32_t aoss_our_box;
 static bool adsp_inited, adsp_hw_up, adsp_sim_mode;
 static uint16_t glink_gpr_our_cid, glink_gpr_their_cid;
 static uint16_t glink_pmic_our_cid, glink_pmic_their_cid;
-static uint32_t glink_gpr_their_iid = 1u, glink_pmic_their_iid = 1u;
+#define GLINK_MAX_INTENTS 16
+struct glink_intent_pool {
+	struct { uint32_t id, size; bool free; } list[GLINK_MAX_INTENTS];
+};
+static struct glink_intent_pool glink_gpr_intents, glink_pmic_intents;
 static uint32_t glink_our_read_at, glink_our_write_at, glink_their_read_at, glink_their_write_at;
 static uint32_t glink_our_q, glink_their_q, glink_our_q_size, glink_their_q_size, glink_tx_write_pos;
 static uint32_t smp2p_our_val;
@@ -684,14 +688,68 @@ static void handle_incoming_gpr(const uint8_t *data, uint32_t len)
 	}
 }
 
+static void glink_add_their_intent(struct glink_intent_pool *pool, uint32_t id, uint32_t size)
+{
+	for (unsigned i = 0; i < GLINK_MAX_INTENTS; i++) {
+		if (pool->list[i].free && pool->list[i].id == id) {
+			pool->list[i].size = size;
+			return;
+		}
+	}
+	for (unsigned i = 0; i < GLINK_MAX_INTENTS; i++) {
+		if (!pool->list[i].free) {
+			pool->list[i].id = id;
+			pool->list[i].size = size;
+			pool->list[i].free = true;
+			return;
+		}
+	}
+}
+
+static void glink_poll_rx(void);
+
+static bool glink_take_their_intent(struct glink_intent_pool *pool, uint16_t our_cid, uint32_t need, uint32_t *id_out)
+{
+	for (unsigned attempt = 0; attempt < 2; attempt++) {
+		for (unsigned i = 0; i < GLINK_MAX_INTENTS; i++) {
+			if (pool->list[i].free && pool->list[i].size >= need) {
+				pool->list[i].free = false;
+				*id_out = pool->list[i].id;
+				return true;
+			}
+		}
+		if (attempt == 0 && our_cid != 0) {
+			glink_send_cmd2(GLINK_RX_INTENT_REQ, our_cid, need);
+			uint64_t t0 = now_us();
+			while (now_us() - t0 < 50000ULL) {
+				glink_poll_rx();
+				for (unsigned i = 0; i < GLINK_MAX_INTENTS; i++) {
+					if (pool->list[i].free && pool->list[i].size >= need) {
+						pool->list[i].free = false;
+						*id_out = pool->list[i].id;
+						return true;
+					}
+				}
+				sleep_us(200);
+			}
+		}
+	}
+	return false;
+}
+
 static int adsp_pmic_glink_tx(const void *data, uint32_t len)
 {
 	if (!adsp_hw_up || glink_our_q == 0 || glink_pmic_our_cid == 0 || data == NULL || len == 0 || len > 512) {
 		return -1;
 	}
+	glink_poll_rx();
+	uint32_t iid = 0;
+	if (!glink_take_their_intent(&glink_pmic_intents, glink_pmic_our_cid, len, &iid)) {
+		return -1;
+	}
 	uint8_t tx[560];
 	uint32_t w0 = GLINK_TX_DATA | ((uint32_t)glink_pmic_our_cid << 16);
-	uint32_t iid = glink_pmic_their_iid, left = 0;
+	uint32_t left = 0;
 	memcpy(tx + 0, &w0, 4);
 	memcpy(tx + 4, &iid, 4);
 	memcpy(tx + 8, &len, 4);
@@ -734,14 +792,23 @@ static void glink_poll_rx(void)
 				if (glink_gpr_our_cid == 0) {
 					glink_gpr_our_cid = 2;
 					glink_send_open(glink_gpr_our_cid, name);
+				} else {
+					glink_queue_intents(glink_gpr_our_cid);
 				}
-				glink_queue_intents(glink_gpr_our_cid);
 			} else if (strcmp(name, "PMIC_RTR_ADSP_APPS") == 0) {
 				glink_pmic_their_cid = param;
 				if (glink_pmic_our_cid == 0) {
 					glink_pmic_our_cid = 3;
 					glink_send_open(glink_pmic_our_cid, name);
+				} else {
+					glink_queue_intents(glink_pmic_our_cid);
+					annibale_pmic_glink_set_tx(adsp_pmic_glink_tx);
 				}
+			}
+		} else if (cmd == GLINK_OPEN_ACK) {
+			if (param == glink_gpr_our_cid && glink_gpr_their_cid != 0) {
+				glink_queue_intents(glink_gpr_our_cid);
+			} else if (param == glink_pmic_our_cid && glink_pmic_their_cid != 0) {
 				glink_queue_intents(glink_pmic_our_cid);
 				annibale_pmic_glink_set_tx(adsp_pmic_glink_tx);
 			}
@@ -755,12 +822,26 @@ static void glink_poll_rx(void)
 				glink_queue_intents(glink_pmic_our_cid);
 			}
 		} else if (cmd == GLINK_INTENT) {
-			if (w1 > 0) {
-				uint32_t iid = glink_q_read32(glink_their_q, glink_their_q_size, r + 12);
-				if (param == glink_pmic_their_cid) glink_pmic_their_iid = iid;
-				else if (param == glink_gpr_their_cid) glink_gpr_their_iid = iid;
+			uint32_t count = w1;
+			if (count > 64) count = 0;
+			for (uint32_t i = 0; i < count; i++) {
+				uint32_t sz = glink_q_read32(glink_their_q, glink_their_q_size, r + 8 + 8 * i);
+				uint32_t iid = glink_q_read32(glink_their_q, glink_their_q_size, r + 12 + 8 * i);
+				if (param == glink_pmic_their_cid) {
+					glink_add_their_intent(&glink_pmic_intents, iid, sz);
+				} else if (param == glink_gpr_their_cid) {
+					glink_add_their_intent(&glink_gpr_intents, iid, sz);
+				}
 			}
 			step_bytes = (8u + 8u * w1 + 7u) & ~7u;
+		} else if (cmd == GLINK_RX_DONE || cmd == GLINK_DONE_REUSE) {
+			if (cmd == GLINK_DONE_REUSE) {
+				if (param == glink_pmic_their_cid) {
+					glink_add_their_intent(&glink_pmic_intents, w1, 2048u);
+				} else if (param == glink_gpr_their_cid) {
+					glink_add_their_intent(&glink_gpr_intents, w1, 2048u);
+				}
+			}
 		} else if (cmd == GLINK_TX_DATA || cmd == GLINK_TX_DATA_CONT) {
 			uint32_t chunk = glink_q_read32(glink_their_q, glink_their_q_size, r + 8);
 			uint32_t left = glink_q_read32(glink_their_q, glink_their_q_size, r + 12);
@@ -789,7 +870,7 @@ static void glink_poll_rx(void)
 	}
 }
 
-static bool glink_init_queues(void)
+static bool glink_init_queues(bool cold_boot)
 {
 	lck_mtx_lock(&redwood_smem_alloc_lock);
 	uint32_t desc = smem_alloc_item(ITEM_GLINK_DESC, 32);
@@ -804,8 +885,14 @@ static bool glink_init_queues(void)
 	glink_their_write_at = desc + 12;
 	glink_our_q = our_q;
 	glink_our_q_size = GLINK_QUEUE_SIZE;
-	glink_tx_write_pos = 0;
-	smem_peek(glink_our_write_at, &glink_tx_write_pos, 4);
+	if (cold_boot) {
+		smem_poke(glink_our_write_at, 0);
+		smem_poke(glink_their_read_at, 0);
+		glink_tx_write_pos = 0;
+	} else {
+		glink_tx_write_pos = 0;
+		smem_peek(glink_our_write_at, &glink_tx_write_pos, 4);
+	}
 	glink_their_q = smem_item(ITEM_GLINK_THEIR_Q, &glink_their_q_size);
 	glink_send_cmd2(GLINK_VERSION, 1, 1);
 	return true;
@@ -882,9 +969,11 @@ bool annibale_adsp_gpr_send(const void *pkt, uint32_t len, uint32_t wait_ms,
 
 	if (adsp_hw_up && glink_our_q != 0 && glink_gpr_our_cid != 0) {
 		uint8_t tx[560];
-		if (16u + len <= sizeof(tx)) {
+		uint32_t iid = 0;
+		if (16u + len <= sizeof(tx) &&
+		    glink_take_their_intent(&glink_gpr_intents, glink_gpr_our_cid, len, &iid)) {
 			uint32_t w0 = GLINK_TX_DATA | ((uint32_t)glink_gpr_our_cid << 16);
-			uint32_t iid = glink_gpr_their_iid, left = 0;
+			uint32_t left = 0;
 			memcpy(tx + 0, &w0, 4);
 			memcpy(tx + 4, &iid, 4);
 			memcpy(tx + 8, &len, 4);
@@ -1007,7 +1096,7 @@ static void annibale_adsp_boot_thread(void *arg __unused, wait_result_t w __unus
 	smp2p_init_ours();
 	if (check_smp2p_ready()) {
 		say("SM8750 LPASS ADSP already running in SMEM (SMP2P slave-kernel READY)\n");
-		(void)glink_init_queues();
+		(void)glink_init_queues(false);
 		adsp_hw_up = true;
 		adsp_sim_mode = false;
 	} else {
@@ -1015,7 +1104,7 @@ static void annibale_adsp_boot_thread(void *arg __unused, wait_result_t w __unus
 		PE_parse_boot_argn("annibale_adsp", &try_boot, sizeof(try_boot));
 		if (try_boot != 0) {
 			uint64_t probe_sz = 0;
-			for (unsigned wait = 0; wait < 50 && rootvnode == NULLVP &&
+			for (unsigned wait = 0; wait < 50 &&
 			    !redwood_ufs_fat16_fw_read("adsp_dtb.mdt", &probe_sz, NULL, 0); wait++) {
 				sleep_ms(100);
 			}
@@ -1029,9 +1118,9 @@ static void annibale_adsp_boot_thread(void *arg __unused, wait_result_t w __unus
 				if (pas_stage_and_setup("adsp_dtb", PAS_ADSP_DTB, ADSP_DTB_MEMORY, ADSP_DTB_MEMORY_SIZE, &dtb_fw) &&
 				    pas_stage_and_setup("adsp", PAS_ADSP, ADSP_MEMORY, ADSP_MEMORY_SIZE, &main_fw)) {
 					uint64_t r1 = 0;
+					(void)glink_init_queues(true);
 					(void)scm_pas_call(SCM_PAS_AUTH_AND_RESET, 1u, PAS_ADSP_DTB, 0, 0, &r1);
 					if (scm_pas_call(SCM_PAS_AUTH_AND_RESET, 1u, PAS_ADSP, 0, 0, &r1) == 0 && r1 == 0) {
-						(void)glink_init_queues();
 						for (unsigned ms = 0; ms < 3000; ms += 20) {
 							if (check_smp2p_ready()) {
 								adsp_hw_up = true;

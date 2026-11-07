@@ -13,21 +13,20 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-import time
 
 DEFAULT_RDFILE = "darwin:5917904896:0"
 DEFAULT_IDENTITY = "v57"
 DEFAULT_MEMSIZE = "300000000"
 DEFAULT_CMDLINE = (
-    f"debug=0x10e rootdev=md0 launchd_unsecure_cache=1 cpus=4 bootcpu=7 "
-    f"small_cores_after=0 epoch={int(time.time())} adreno8=23 adreno8_pause=0 adreno8_fine=0 adreno8_watch=0 "
+    "debug=0x10e rootdev=md0 launchd_unsecure_cache=1 cpus=4 bootcpu=7 "
+    "small_cores_after=0 adreno8=23 adreno8_pause=0 adreno8_fine=0 adreno8_watch=0 "
     "adreno8_keep=1 adreno8_return=0 adreno8_speed=14 adreno8_secure_preflight=4 "
     "touchscreen=2 buttons=1 battery=1 gpu_log=0 metal=1 cpufreq=1 fb_threads=2 "
     "touch_lat=0 gpu_coherent=1 fb_flip=2 fb_beat=0 fb_hz=120 fb_ca_hz=120 dl_max=1 "
     "touch_poll_us=4000 pcie=10 pcie_power=1 pcie_sleep_clock=board pcie_bdf=bd_p11.elf "
     "pcie_smps_hpm=1 pcie_bt_en=1 pcie_aop_pdc=1 pcie_rddm=1 wifi_mlo=1 "
     "wifi_mac=02:4b:39:30:00:01 wifi_station=1 ufs=2 ufs_native=1 ufs_write=1 "
-    "var_store=1 var_save_ms=60000 bt=4 fbwidth=1206 fbheight=2622 fbpitch=460"
+    "var_store=1 var_save_ms=60000 bt=4 cam=5 torch=1 fbwidth=1206 fbheight=2622 fbpitch=460"
 )
 
 

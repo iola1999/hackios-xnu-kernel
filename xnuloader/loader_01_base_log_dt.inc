@@ -781,7 +781,7 @@ firmware_epoch(void)
 	uint64_t days;
 
 	if (ST->rt == NULL || ST->rt->get_time == NULL || EFI_ERROR(ST->rt->get_time(&t, NULL)) ||
-	    t.year < 2024 || t.year > 2099 || t.month < 1 || t.month > 12) {
+	    t.year < 1970 || t.year > 2099 || t.month < 1 || t.month > 12) {
 		return 0;
 	}
 	days = (uint64_t)(t.year - 1970) * 365 + (t.year - 1969) / 4 + before_month[t.month - 1] + (t.day - 1);

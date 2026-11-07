@@ -334,11 +334,8 @@ GenericARMPE::start(IOService * provider)
 }
 
 /*
- * The time of day. There is no driver for a real-time clock here; whoever started the kernel
- * says what time it was then -- the boot-arg epoch= (seconds since 1970, put there by the
- * host scripts) or, failing that, the property boot-epoch of /chosen (the loader, from the
- * firmware's clock) -- and the kernel's own timer counts from there. Without either the
- * calendar starts in 1970, as before.
+ * The time of day. On hardware the calendar clock is synced from the PMIC RTC and persist
+ * partition by redwood_ufs_sync_rtc(); otherwise /chosen boot-epoch sets the starting offset.
  */
 static long gBootEpoch;         /* the calendar time at which the system timer read zero */
 static bool gBootEpochKnown;
@@ -352,15 +349,13 @@ findBootEpoch(void)
 		return;
 	}
 	gBootEpochKnown = true;
-	if (!PE_parse_boot_argn("epoch", &epoch, sizeof(epoch)) || epoch == 0) {
-		IORegistryEntry * chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
-		OSData * data = chosen ? OSDynamicCast(OSData, chosen->getProperty("boot-epoch")) : NULL;
+	IORegistryEntry * chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
+	OSData * data = chosen ? OSDynamicCast(OSData, chosen->getProperty("boot-epoch")) : NULL;
 
-		if (data != NULL && data->getLength() == sizeof(epoch)) {
-			memcpy(&epoch, data->getBytesNoCopy(), sizeof(epoch));
-		}
-		OSSafeReleaseNULL(chosen);
+	if (data != NULL && data->getLength() == sizeof(epoch)) {
+		memcpy(&epoch, data->getBytesNoCopy(), sizeof(epoch));
 	}
+	OSSafeReleaseNULL(chosen);
 	if (epoch != 0) {
 		clock_sec_t secs;
 		clock_usec_t usecs;
