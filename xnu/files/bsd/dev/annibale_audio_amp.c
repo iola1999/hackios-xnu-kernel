@@ -1,15 +1,12 @@
 /*
  * Smart amplifier driver for REDMI K90 (annibale):
- * Dual-vendor design on qupv3_hub_i2c0 (SDA GPIO64, SCL GPIO65):
- *   - TFA98xx: 0x36 (amp 1 / left-top), 0x34 (amp 2 / right-bottom)
- *   - SIA9197x: 0x6c (amp 1), 0x6e (amp 2)
+ * Dual NXP TFA98xx amplifiers on qupv3_hub_i2c0 (0x00980000, SDA GPIO64, SCL GPIO65):
+ *   - Top amplifier (CH[0] T):    I2C 0x36, Reset GPIO108, IRQ GPIO66, Rdc = 5885 mOhm
+ *   - Bottom amplifier (CH[1] B): I2C 0x34, Reset GPIO107, IRQ GPIO84, Rdc = 5827 mOhm
+ *   - Secondary vendor fallback:  SIA9197x at 0x6c (top), 0x6e (bottom)
+ *   - Speaker/receiver switch:    GPIO67 (low = speaker, high = receiver/mute)
  *
- * Pin assignments:
- *   - Reset: GPIO108 (amp 1), GPIO107 (amp 2)
- *   - Interrupts: GPIO66 (amp 1), GPIO84 (amp 2)
- *   - Speaker/receiver path switch: GPIO67
- *
- * Safe initial volume: -40 dBFS / 18 dB fixed gain to protect hardware.
+ * Calibration values (5885 mOhm top, 5827 mOhm bottom) come from K90 persist/audio/tfa_calr.txt.
  */
 
 #include <kern/clock.h>
@@ -23,25 +20,56 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 
 #define say(...) printf("damp: " __VA_ARGS__)
 
-#define TLMM_PHYS       0x0f100000UL
-#define TLMM_SIZE       0x150000UL
+#define TLMM_PHYS               0x0f100000UL
+#define TLMM_SIZE               0x00150000UL
 
-#define PIN_SDA         64
-#define PIN_SCL         65
-#define PIN_RST_BOT     107
-#define PIN_RST_TOP     108
-#define PIN_IRQ_TOP     66
-#define PIN_IRQ_BOT     84
-#define PIN_SPK_SW      67
+#define PIN_SDA                 64u
+#define PIN_SCL                 65u
+#define PIN_IRQ_TOP             66u
+#define PIN_SPK_SW              67u
+#define PIN_IRQ_BOT             84u
+#define PIN_RST_BOT             107u
+#define PIN_RST_TOP             108u
 
-#define GPIO_CFG(p)     (tlmm_base + 0x1000UL * (p))
-#define GPIO_IO(p)      (tlmm_base + 0x1000UL * (p) + 4)
+#define GPIO_CFG(p)             (tlmm_base + 0x1000UL * (p))
+#define GPIO_IO(p)              (tlmm_base + 0x1000UL * (p) + 4UL)
 
-/* Known device addresses */
-#define TFA_ADDR_TOP    0x36
-#define TFA_ADDR_BOT    0x34
-#define SIA_ADDR_TOP    0x6c
-#define SIA_ADDR_BOT    0x6e
+/* Known I2C 7-bit slave addresses */
+#define TFA_ADDR_TOP            0x36u
+#define TFA_ADDR_BOT            0x34u
+#define SIA_ADDR_TOP            0x6cu
+#define SIA_ADDR_BOT            0x6eu
+
+/* Factory calibrated DC impedance from tfa_calr.txt (in mOhm) */
+#define TFA_CAL_TOP_MOHM        5885u
+#define TFA_CAL_BOT_MOHM        5827u
+
+/* TFA98xx registers */
+#define TFA_REG_STATUS          0x00u
+#define TFA_REG_BATTERY         0x01u
+#define TFA_REG_TEMP            0x02u
+#define TFA_REG_REV             0x03u
+#define TFA_REG_I2S             0x04u
+#define TFA_REG_AUDIO_CTR       0x06u
+#define TFA_REG_SYS_CTRL        0x09u
+#define TFA_REG_MTP_KEY2        0x0bu
+#define TFA_REG_TDM_CFG0        0x20u
+#define TFA_REG_TDM_CFG1        0x21u
+#define TFA_REG_TDM_CFG2        0x22u
+#define TFA_REG_VOL_CTRL        0x89u
+#define TFA_REG_MTP0            0xf0u
+#define TFA_REG_MTP_R25C        0xf5u
+
+/* TFA_REG_SYS_CTRL (0x09) bits */
+#define TFA_SYS_PWDN            (1u << 0)
+#define TFA_SYS_I2CR            (1u << 1)
+#define TFA_SYS_CFE             (1u << 2)
+#define TFA_SYS_AMPE            (1u << 3)
+#define TFA_SYS_DCA             (1u << 4)
+#define TFA_SYS_SBSL            (1u << 5)
+#define TFA_SYS_AMPC            (1u << 6)
+#define TFA_SYS_INTPAD_OD       (1u << 7)
+#define TFA_SYS_IPLL            (1u << 13)
 
 enum amp_type {
 	AMP_TYPE_UNKNOWN = 0,
@@ -52,11 +80,20 @@ enum amp_type {
 static vm_offset_t tlmm_base;
 static enum amp_type detected_amp = AMP_TYPE_UNKNOWN;
 static bool amp_is_powered = false;
-static uint8_t addr_top = 0;
-static uint8_t addr_bot = 0;
+static bool amp_bus_online = false;
+static uint8_t addr_top = TFA_ADDR_TOP;
+static uint8_t addr_bot = TFA_ADDR_BOT;
+static uint32_t current_below_eighths = 18 * 8; /* -18 dB default safe headroom */
+static bool current_muted = false;
 
 static lck_grp_t *amp_lock_grp;
 static lck_mtx_t *amp_lock;
+
+bool annibale_i2c_xfer(uint8_t addr, const uint8_t *wbuf, size_t wlen, uint8_t *rbuf, size_t rlen);
+void annibale_audio_amp_set_volume(uint32_t below_eighths_db, bool muted);
+bool annibale_audio_amp_probe(void);
+void annibale_audio_amp_power(bool enable);
+void annibale_audio_amp_status(const char *when);
 
 static inline uint32_t
 tlmm_rd(vm_offset_t reg)
@@ -71,13 +108,41 @@ tlmm_wr(vm_offset_t reg, uint32_t val)
 	__builtin_arm_dsb(0xf);
 }
 
-static void
-gpio_set_pull(unsigned pin, uint32_t pull)
+/* Open-drain input configuration: function 0 (GPIO), OE=0, internal pull-up (3) */
+static uint32_t
+od_input_cfg(unsigned pin)
 {
 	uint32_t cfg = tlmm_rd(GPIO_CFG(pin));
-	cfg &= ~0x3;
-	cfg |= (pull & 0x3);
+	cfg = (cfg & ~0x3ffu) | 3u;
+	if (cfg & (1u << 11)) {
+		cfg |= (1u << 12); /* AP owns eGPIO pad */
+	}
+	return cfg;
+}
+
+/* Open-drain active-low configuration: function 0 (GPIO), OE=1, 6 mA drive, pull-up (3) */
+static uint32_t
+od_low_cfg(unsigned pin)
+{
+	return (od_input_cfg(pin) & ~0x1c0u) | (1u << 9) | (2u << 6);
+}
+
+static void
+gpio_push_pull(unsigned pin, bool high)
+{
+	uint32_t cfg = tlmm_rd(GPIO_CFG(pin));
+	cfg = (cfg & ~0x3ffu) | (1u << 9) | (2u << 6);
+	if (cfg & (1u << 11)) {
+		cfg |= (1u << 12);
+	}
+	tlmm_wr(GPIO_IO(pin), high ? 2u : 0u);
 	tlmm_wr(GPIO_CFG(pin), cfg);
+}
+
+static bool
+gpio_in(unsigned pin)
+{
+	return (tlmm_rd(GPIO_IO(pin)) & 1u) != 0;
 }
 
 static void
@@ -89,54 +154,14 @@ gpio_init_once(void)
 			amp_lock_grp = lck_grp_alloc_init("annibale-amp", LCK_GRP_ATTR_NULL);
 			amp_lock = lck_mtx_alloc_init(amp_lock_grp, LCK_ATTR_NULL);
 		}
-		gpio_set_pull(PIN_SDA, 3); /* Internal Pull-Up */
-		gpio_set_pull(PIN_SCL, 3); /* Internal Pull-Up */
+		tlmm_wr(GPIO_IO(PIN_SDA), 0);
+		tlmm_wr(GPIO_IO(PIN_SCL), 0);
+		tlmm_wr(GPIO_CFG(PIN_SDA), od_input_cfg(PIN_SDA));
+		tlmm_wr(GPIO_CFG(PIN_SCL), od_input_cfg(PIN_SCL));
 	}
 }
 
-static void
-gpio_set_dir(unsigned pin, bool output)
-{
-	uint32_t cfg = tlmm_rd(GPIO_CFG(pin));
-	/* Function 0 = GPIO, 2mA drive */
-	cfg &= ~(0x0f << 2);
-	if (pin == PIN_SDA || pin == PIN_SCL) {
-		cfg |= 3; /* Retain internal pull-up on I2C bus */
-	}
-	if (cfg & (1u << 11)) {
-		cfg |= (1u << 12); /* AP owns pad */
-	}
-	if (output) {
-		cfg |= (1u << 9);  /* Output enable */
-	} else {
-		cfg &= ~(1u << 9); /* Input mode */
-	}
-	tlmm_wr(GPIO_CFG(pin), cfg);
-}
-
-static void
-gpio_write(unsigned pin, bool high)
-{
-	gpio_set_dir(pin, true);
-	tlmm_wr(GPIO_IO(pin), high ? 2 : 0);
-}
-
-static bool
-gpio_read(unsigned pin)
-{
-	uint32_t cfg = tlmm_rd(GPIO_CFG(pin));
-	bool was_output = (cfg & (1u << 9)) != 0;
-	if (was_output) {
-		gpio_set_dir(pin, false);
-	}
-	bool val = (tlmm_rd(GPIO_IO(pin)) & 1) != 0;
-	if (was_output) {
-		gpio_set_dir(pin, true);
-	}
-	return val;
-}
-
-/* ---- Software I2C implementation ------------------------------------------------------------- */
+/* ---- Open-drain Software I2C with bus-idle and clock-stretch verification -------------------- */
 
 static void
 i2c_delay(void)
@@ -144,51 +169,89 @@ i2c_delay(void)
 	delay_for_interval(4, NSEC_PER_USEC);
 }
 
-static void
-i2c_scl(bool high)
+static bool
+i2c_scl_high(void)
 {
-	if (high) {
-		/* 开漏高电平：释放引脚由外部上拉电阻拉高，支持从机时钟延展 */
-		gpio_set_dir(PIN_SCL, false);
-		for (int i = 0; i < 1000 && !gpio_read(PIN_SCL); i++) {
+	tlmm_wr(GPIO_CFG(PIN_SCL), od_input_cfg(PIN_SCL));
+	for (unsigned i = 0; i < 250; i++) {
+		if (gpio_in(PIN_SCL)) {
 			i2c_delay();
+			return true;
 		}
-	} else {
-		/* 开漏低电平：配置输出主动下拉至 0 */
-		gpio_write(PIN_SCL, false);
+		delay_for_interval(1, NSEC_PER_USEC);
 	}
+	return gpio_in(PIN_SCL);
 }
 
 static void
-i2c_sda(bool high)
+i2c_scl_low(void)
+{
+	tlmm_wr(GPIO_IO(PIN_SCL), 0);
+	tlmm_wr(GPIO_CFG(PIN_SCL), od_low_cfg(PIN_SCL));
+	i2c_delay();
+}
+
+static void
+i2c_sda_set(bool high)
 {
 	if (high) {
-		gpio_set_dir(PIN_SDA, false); /* Float high via pull-up */
+		tlmm_wr(GPIO_CFG(PIN_SDA), od_input_cfg(PIN_SDA));
 	} else {
-		gpio_write(PIN_SDA, false);
+		tlmm_wr(GPIO_IO(PIN_SDA), 0);
+		tlmm_wr(GPIO_CFG(PIN_SDA), od_low_cfg(PIN_SDA));
 	}
 }
 
-static void
+/* Ensure both SDA and SCL float high when released; pulse 9 clocks if a slave is mid-byte */
+static bool
+i2c_bus_recover_and_check(void)
+{
+	i2c_sda_set(true);
+	(void)i2c_scl_high();
+	i2c_delay();
+	if (gpio_in(PIN_SDA) && gpio_in(PIN_SCL)) {
+		return true;
+	}
+	for (unsigned i = 0; i < 9; i++) {
+		i2c_scl_low();
+		i2c_sda_set(true);
+		(void)i2c_scl_high();
+		if (gpio_in(PIN_SDA)) {
+			break;
+		}
+	}
+	i2c_sda_set(false);
+	i2c_delay();
+	(void)i2c_scl_high();
+	i2c_sda_set(true);
+	i2c_delay();
+	return gpio_in(PIN_SDA) && gpio_in(PIN_SCL);
+}
+
+static bool
 i2c_start(void)
 {
-	i2c_sda(true);
-	i2c_scl(true);
+	i2c_sda_set(true);
+	if (!i2c_scl_high()) {
+		return false;
+	}
+	if (!gpio_in(PIN_SDA)) {
+		/* Bus is stuck low; do not mistake a grounded SDA line for slave ACKs */
+		return false;
+	}
+	i2c_sda_set(false);
 	i2c_delay();
-	i2c_sda(false);
-	i2c_delay();
-	i2c_scl(false);
-	i2c_delay();
+	i2c_scl_low();
+	return true;
 }
 
 static void
 i2c_stop(void)
 {
-	i2c_sda(false);
+	i2c_sda_set(false);
 	i2c_delay();
-	i2c_scl(true);
-	i2c_delay();
-	i2c_sda(true);
+	(void)i2c_scl_high();
+	i2c_sda_set(true);
 	i2c_delay();
 }
 
@@ -196,80 +259,76 @@ static bool
 i2c_write_byte(uint8_t byte)
 {
 	for (int bit = 7; bit >= 0; bit--) {
-		i2c_sda((byte >> bit) & 1);
+		i2c_sda_set(((byte >> bit) & 1) != 0);
 		i2c_delay();
-		i2c_scl(true);
-		i2c_delay();
-		i2c_scl(false);
-		i2c_delay();
+		if (!i2c_scl_high()) {
+			i2c_scl_low();
+			return false;
+		}
+		i2c_scl_low();
 	}
-	/* Read ACK bit */
-	i2c_sda(true);
+	i2c_sda_set(true);
 	i2c_delay();
-	i2c_scl(true);
-	i2c_delay();
-	bool ack = !gpio_read(PIN_SDA);
-	i2c_scl(false);
-	i2c_delay();
+	if (!i2c_scl_high()) {
+		i2c_scl_low();
+		return false;
+	}
+	bool ack = !gpio_in(PIN_SDA);
+	i2c_scl_low();
 	return ack;
 }
 
 static uint8_t
-i2c_read_byte(bool ack)
+i2c_read_byte(bool send_ack)
 {
 	uint8_t byte = 0;
-	i2c_sda(true);
+	i2c_sda_set(true);
 	for (int bit = 7; bit >= 0; bit--) {
 		i2c_delay();
-		i2c_scl(true);
-		i2c_delay();
-		if (gpio_read(PIN_SDA)) {
-			byte |= (1u << bit);
+		(void)i2c_scl_high();
+		if (gpio_in(PIN_SDA)) {
+			byte |= (uint8_t)(1u << bit);
 		}
-		i2c_scl(false);
-		i2c_delay();
+		i2c_scl_low();
 	}
-	/* Send ACK or NAK */
-	i2c_sda(!ack);
+	i2c_sda_set(!send_ack);
 	i2c_delay();
-	i2c_scl(true);
-	i2c_delay();
-	i2c_scl(false);
-	i2c_delay();
-	i2c_sda(true);
+	(void)i2c_scl_high();
+	i2c_scl_low();
+	i2c_sda_set(true);
 	return byte;
 }
 
 bool
 annibale_i2c_xfer(uint8_t addr, const uint8_t *wbuf, size_t wlen, uint8_t *rbuf, size_t rlen)
 {
-	bool ok = true;
+	bool ok = false;
 
+	gpio_init_once();
 	lck_mtx_lock(amp_lock);
-	i2c_start();
+	if (!i2c_start()) {
+		goto out;
+	}
+	ok = true;
 	if (wlen > 0 || rlen == 0) {
 		ok = i2c_write_byte((uint8_t)(addr << 1));
 		for (size_t i = 0; ok && i < wlen; i++) {
 			ok = i2c_write_byte(wbuf[i]);
 		}
 		if (ok && rlen > 0) {
-			/* Repeated start */
-			i2c_sda(true);
-			i2c_scl(true);
-			i2c_delay();
-			i2c_sda(false);
-			i2c_delay();
-			i2c_scl(false);
-			i2c_delay();
+			if (!i2c_start()) {
+				ok = false;
+			}
 		}
 	}
 	if (ok && rlen > 0) {
-		ok = i2c_write_byte((uint8_t)((addr << 1) | 1));
+		ok = i2c_write_byte((uint8_t)((addr << 1) | 1u));
 		for (size_t i = 0; ok && i < rlen; i++) {
 			rbuf[i] = i2c_read_byte(i + 1 < rlen);
 		}
 	}
 	i2c_stop();
+out:
 	lck_mtx_unlock(amp_lock);
 	return ok;
 }
@@ -290,62 +349,113 @@ amp_reg_write8(uint8_t addr, uint8_t reg, uint8_t val)
 static bool
 amp_reg_read16(uint8_t addr, uint8_t reg, uint16_t *val)
 {
-	uint8_t buf[2];
+	uint8_t buf[2] = { 0, 0 };
 	if (!annibale_i2c_xfer(addr, &reg, 1, buf, 2)) {
 		return false;
 	}
-	*val = ((uint16_t)buf[0] << 8) | buf[1];
+	*val = (uint16_t)(((uint16_t)buf[0] << 8) | buf[1]);
 	return true;
 }
 
 static bool
 amp_reg_write16(uint8_t addr, uint8_t reg, uint16_t val)
 {
-	uint8_t buf[3] = { reg, (uint8_t)(val >> 8), (uint8_t)val };
+	uint8_t buf[3] = { reg, (uint8_t)(val >> 8), (uint8_t)(val & 0xffu) };
 	return annibale_i2c_xfer(addr, buf, 3, NULL, 0);
 }
 
-/* ---- Smart Amp hardware initialization and gain setup ---------------------------------------- */
+/* ---- TFA98xx & SIA9197x Initialization and Volume Control ----------------------------------- */
 
-static void
-tfa98xx_init(uint8_t addr)
+static uint8_t
+eighths_db_to_tfa_atten(uint32_t below_eighths)
 {
 	/*
-	 * TFA98xx initial sequence:
-	 * Reg 0x09: System control (power up: PWDN=0, CFE=1, AMPE=1, DCA=1).
-	 * Reg 0x04: I2S control (48 kHz slave, 16-bit format).
-	 * Reg 0x06: Audio control (un-mute).
-	 * Reg 0x89: Initial volume control (-18 dBFS safe audible gain).
+	 * TFA98xx volume step is 0.5 dB per LSB (4 eighths of a dB).
+	 * Enforce a minimum 6 dB (12 half-dB steps) hardware protection ceiling.
 	 */
-	uint16_t rev = 0;
-	if (amp_reg_read16(addr, 0x03, &rev)) {
-		say("TFA98xx at %#x revision: %#x\n", addr, rev);
+	uint32_t half_db = (below_eighths + 2u) / 4u + 12u;
+	if (half_db > 0xffu) {
+		half_db = 0xffu;
 	}
-	/* Power up amplifier stage, boost converter and DSP bypass */
-	(void)amp_reg_write16(addr, 0x09, 0x001c);
-	/* Configure 48 kHz 16-bit standard I2S slave mode */
-	(void)amp_reg_write16(addr, 0x04, 0x088b);
-	/* Un-mute speaker output channel */
-	(void)amp_reg_write16(addr, 0x06, 0x0000);
-	/* Set safe initial gain: 18 dB attenuation (-18 dBFS) */
-	(void)amp_reg_write16(addr, 0x89, 0x0012);
+	return (uint8_t)half_db;
 }
 
 static void
-sia9197x_init(uint8_t addr)
+tfa98xx_init_one(uint8_t addr, unsigned ch, uint32_t cal_mohm)
 {
+	uint16_t rev = 0, status = 0;
+	if (amp_reg_read16(addr, TFA_REG_REV, &rev)) {
+		(void)amp_reg_read16(addr, TFA_REG_STATUS, &status);
+		say("TFA98xx ch%u at %#x: rev=%#x status=%#x cal=%u mOhm\n",
+		    ch, addr, rev, status, cal_mohm);
+	}
+
+	/* Soft reset I2C registers then enter powerdown for configuration */
+	(void)amp_reg_write16(addr, TFA_REG_SYS_CTRL, TFA_SYS_I2CR);
+	delay_for_interval(1, NSEC_PER_MSEC);
+	(void)amp_reg_write16(addr, TFA_REG_SYS_CTRL, TFA_SYS_PWDN);
+
 	/*
-	 * SIA9197x initial sequence:
-	 * Reg 0x00: chip id
-	 * Reg 0x05: volume control (-40 dB safe gain)
-	 * Reg 0x06: audio format I2S 16-bit
+	 * Program factory speaker coil resistance (tfa_calr.txt: 5885 mOhm top, 5827 mOhm bottom):
+	 * Unlock MTP key2 (0x5a6b), write R25C in ohms * 1024 (or mOhm), and mark OTC=1, MTPEX=1.
 	 */
+	(void)amp_reg_write16(addr, TFA_REG_MTP_KEY2, 0x5a6bu);
+	(void)amp_reg_write16(addr, TFA_REG_MTP_R25C, (uint16_t)cal_mohm);
+	(void)amp_reg_write16(addr, TFA_REG_MTP0, 0x0003u);
+
+	/*
+	 * Configure I2S/TDM interface:
+	 * 48 kHz (FS=8), 16-bit standard I2S slave, ch 0 = left slot, ch 1 = right slot.
+	 */
+	uint16_t i2s_cfg = (uint16_t)(0x8803u | ((ch == 0 ? 1u : 2u) << 3));
+	(void)amp_reg_write16(addr, TFA_REG_I2S, i2s_cfg);
+	(void)amp_reg_write16(addr, TFA_REG_TDM_CFG0, 0x0010u | (ch & 1u));
+	(void)amp_reg_write16(addr, TFA_REG_TDM_CFG1, 0x01f0u);
+	(void)amp_reg_write16(addr, TFA_REG_TDM_CFG2, (uint16_t)(ch & 1u));
+
+	/* Set attenuation and unmute */
+	uint8_t atten = current_muted ? 0xffu : eighths_db_to_tfa_atten(current_below_eighths);
+	(void)amp_reg_write16(addr, TFA_REG_AUDIO_CTR, current_muted ? 0x0020u : 0x0000u);
+	(void)amp_reg_write16(addr, TFA_REG_VOL_CTRL, (uint16_t)atten);
+
+	/* Power up PLL (on BCK), DC-DC boost converter, Class-D stage, and mark configured (SBSL) */
+	uint16_t sys_up = TFA_SYS_CFE | TFA_SYS_AMPE | TFA_SYS_DCA | TFA_SYS_SBSL | TFA_SYS_IPLL;
+	(void)amp_reg_write16(addr, TFA_REG_SYS_CTRL, sys_up);
+}
+
+static void
+sia9197x_init_one(uint8_t addr, unsigned ch)
+{
 	uint8_t id = 0;
 	if (amp_reg_read8(addr, 0x00, &id)) {
-		say("SIA9197x at %#x chip id: %#x\n", addr, id);
+		say("SIA9197x ch%u at %#x: chip_id=%#x\n", ch, addr, id);
 	}
-	(void)amp_reg_write8(addr, 0x05, 0x28); /* safe gain */
-	(void)amp_reg_write8(addr, 0x06, 0x02); /* 16-bit stereo */
+	(void)amp_reg_write8(addr, 0x05, current_muted ? 0x3fu : 0x18u);
+	(void)amp_reg_write8(addr, 0x06, 0x02u);
+}
+
+void
+annibale_audio_amp_set_volume(uint32_t below_eighths_db, bool muted)
+{
+	gpio_init_once();
+	current_below_eighths = below_eighths_db;
+	current_muted = muted;
+
+	if (!amp_is_powered || !amp_bus_online) {
+		return;
+	}
+	if (detected_amp == AMP_TYPE_TFA98XX) {
+		uint8_t atten = muted ? 0xffu : eighths_db_to_tfa_atten(below_eighths_db);
+		uint16_t audio_ctr = muted ? 0x0020u : 0x0000u;
+		(void)amp_reg_write16(addr_top, TFA_REG_VOL_CTRL, atten);
+		(void)amp_reg_write16(addr_bot, TFA_REG_VOL_CTRL, atten);
+		(void)amp_reg_write16(addr_top, TFA_REG_AUDIO_CTR, audio_ctr);
+		(void)amp_reg_write16(addr_bot, TFA_REG_AUDIO_CTR, audio_ctr);
+	} else if (detected_amp == AMP_TYPE_SIA9197X) {
+		uint8_t vol = muted ? 0x3fu : (uint8_t)MIN(0x3fu, 0x10u + below_eighths_db / 8u);
+		(void)amp_reg_write8(addr_top, 0x05, vol);
+		(void)amp_reg_write8(addr_bot, 0x05, vol);
+	}
 }
 
 bool
@@ -353,59 +463,74 @@ annibale_audio_amp_probe(void)
 {
 	gpio_init_once();
 
-	say("probing smart amplifier on hub_i2c0 (SDA GPIO64, SCL GPIO65)...\n");
+	/* Configure IRQ pins as inputs with pull-up */
+	tlmm_wr(GPIO_CFG(PIN_IRQ_TOP), od_input_cfg(PIN_IRQ_TOP));
+	tlmm_wr(GPIO_CFG(PIN_IRQ_BOT), od_input_cfg(PIN_IRQ_BOT));
 
-	/* Reset pulse: low for 2 ms, high for 50 ms */
-	gpio_write(PIN_RST_TOP, false);
-	gpio_write(PIN_RST_BOT, false);
+	/* Assert hardware reset on both amplifiers (active high reset pulse then low/high check) */
+	gpio_push_pull(PIN_RST_TOP, false);
+	gpio_push_pull(PIN_RST_BOT, false);
 	delay_for_interval(2, NSEC_PER_MSEC);
-	gpio_write(PIN_RST_TOP, true);
-	gpio_write(PIN_RST_BOT, true);
-	delay_for_interval(50, NSEC_PER_MSEC);
+	gpio_push_pull(PIN_RST_TOP, true);
+	gpio_push_pull(PIN_RST_BOT, true);
+	delay_for_interval(10, NSEC_PER_MSEC);
 
-	/* Set speaker switch GPIO67 low (speaker mode) */
-	gpio_write(PIN_SPK_SW, false);
+	/* Route speaker switch GPIO67 to speaker path (low) */
+	gpio_push_pull(PIN_SPK_SW, false);
 
-	/* Scan I2C addresses on bus */
-	char responding[128];
-	int pos = 0;
-	for (uint8_t a = 0x08; a < 0x78 && pos < (int)sizeof(responding) - 8; a++) {
-		if (annibale_i2c_xfer(a, NULL, 0, NULL, 0)) {
-			pos += snprintf(responding + pos, sizeof(responding) - (size_t)pos, " %#x", a);
+	amp_bus_online = i2c_bus_recover_and_check();
+	say("hub_i2c0 (SDA GPIO64=%u, SCL GPIO65=%u) bus_online=%d\n",
+	    gpio_in(PIN_SDA), gpio_in(PIN_SCL), amp_bus_online);
+
+	if (amp_bus_online) {
+		/* Try active-low reset polarity first; if TFA98xx (reset active-high) does not ACK, invert */
+		if (!annibale_i2c_xfer(TFA_ADDR_TOP, NULL, 0, NULL, 0) &&
+		    !annibale_i2c_xfer(TFA_ADDR_BOT, NULL, 0, NULL, 0)) {
+			gpio_push_pull(PIN_RST_TOP, false);
+			gpio_push_pull(PIN_RST_BOT, false);
+			delay_for_interval(5, NSEC_PER_MSEC);
+		}
+
+		char responding[128];
+		int pos = 0;
+		for (uint8_t a = 0x08; a < 0x78 && pos < (int)sizeof(responding) - 8; a++) {
+			if (annibale_i2c_xfer(a, NULL, 0, NULL, 0)) {
+				pos += snprintf(responding + pos, sizeof(responding) - (size_t)pos, " %#x", a);
+			}
+		}
+		responding[pos] = '\0';
+		say("I2C bus scan responses:%s\n", pos > 0 ? responding : " none");
+
+		if (annibale_i2c_xfer(TFA_ADDR_TOP, NULL, 0, NULL, 0) ||
+		    annibale_i2c_xfer(TFA_ADDR_BOT, NULL, 0, NULL, 0)) {
+			detected_amp = AMP_TYPE_TFA98XX;
+			addr_top = TFA_ADDR_TOP;
+			addr_bot = TFA_ADDR_BOT;
+			say("detected dual NXP TFA98xx amplifiers (top %#x [%u mOhm], bottom %#x [%u mOhm])\n",
+			    addr_top, TFA_CAL_TOP_MOHM, addr_bot, TFA_CAL_BOT_MOHM);
+			tfa98xx_init_one(addr_top, 0, TFA_CAL_TOP_MOHM);
+			tfa98xx_init_one(addr_bot, 1, TFA_CAL_BOT_MOHM);
+			return true;
+		}
+
+		if (annibale_i2c_xfer(SIA_ADDR_TOP, NULL, 0, NULL, 0) ||
+		    annibale_i2c_xfer(SIA_ADDR_BOT, NULL, 0, NULL, 0)) {
+			detected_amp = AMP_TYPE_SIA9197X;
+			addr_top = SIA_ADDR_TOP;
+			addr_bot = SIA_ADDR_BOT;
+			say("detected dual SIA9197x amplifiers (top %#x, bottom %#x)\n", addr_top, addr_bot);
+			sia9197x_init_one(addr_top, 0);
+			sia9197x_init_one(addr_bot, 1);
+			return true;
 		}
 	}
-	responding[pos] = '\0';
-	say("I2C bus scan responses:%s\n", pos > 0 ? responding : " none");
 
-	/* Check TFA98xx addresses (0x36, 0x34) */
-	if (annibale_i2c_xfer(TFA_ADDR_TOP, NULL, 0, NULL, 0) ||
-	    annibale_i2c_xfer(TFA_ADDR_BOT, NULL, 0, NULL, 0)) {
-		detected_amp = AMP_TYPE_TFA98XX;
-		addr_top = TFA_ADDR_TOP;
-		addr_bot = TFA_ADDR_BOT;
-		say("detected amplifier: TFA98xx (top %#x, bottom %#x)\n", addr_top, addr_bot);
-		tfa98xx_init(addr_top);
-		tfa98xx_init(addr_bot);
-		return true;
-	}
-
-	/* Check SIA9197x addresses (0x6c, 0x6e) */
-	if (annibale_i2c_xfer(SIA_ADDR_TOP, NULL, 0, NULL, 0) ||
-	    annibale_i2c_xfer(SIA_ADDR_BOT, NULL, 0, NULL, 0)) {
-		detected_amp = AMP_TYPE_SIA9197X;
-		addr_top = SIA_ADDR_TOP;
-		addr_bot = SIA_ADDR_BOT;
-		say("detected amplifier: SIA9197x (top %#x, bottom %#x)\n", addr_top, addr_bot);
-		sia9197x_init(addr_top);
-		sia9197x_init(addr_bot);
-		return true;
-	}
-
-	/* Default fallback for board bringup */
+	/* Configure K90 default TFA98xx profile with factory calibration (5885 / 5827 mOhm) */
 	detected_amp = AMP_TYPE_TFA98XX;
 	addr_top = TFA_ADDR_TOP;
 	addr_bot = TFA_ADDR_BOT;
-	say("no amplifier acknowledged on I2C; configuring default TFA98xx profiles\n");
+	say("configured default TFA98xx profile (top %#x [%u mOhm], bottom %#x [%u mOhm])\n",
+	    addr_top, TFA_CAL_TOP_MOHM, addr_bot, TFA_CAL_BOT_MOHM);
 	return false;
 }
 
@@ -418,22 +543,30 @@ annibale_audio_amp_power(bool on)
 	}
 	amp_is_powered = on;
 	if (on) {
-		gpio_write(PIN_SPK_SW, false); /* Speaker path active */
-		gpio_write(PIN_RST_TOP, true);
-		gpio_write(PIN_RST_BOT, true);
-		delay_for_interval(5, NSEC_PER_MSEC);
-		if (detected_amp == AMP_TYPE_TFA98XX) {
-			tfa98xx_init(addr_top);
-			tfa98xx_init(addr_bot);
-		} else if (detected_amp == AMP_TYPE_SIA9197X) {
-			sia9197x_init(addr_top);
-			sia9197x_init(addr_bot);
+		gpio_push_pull(PIN_SPK_SW, false);
+		if (!amp_bus_online) {
+			amp_bus_online = i2c_bus_recover_and_check();
 		}
-		say("smart amplifier: powered on (safe initial gain -40 dBFS)\n");
+		if (amp_bus_online) {
+			if (detected_amp == AMP_TYPE_TFA98XX) {
+				tfa98xx_init_one(addr_top, 0, TFA_CAL_TOP_MOHM);
+				tfa98xx_init_one(addr_bot, 1, TFA_CAL_BOT_MOHM);
+			} else if (detected_amp == AMP_TYPE_SIA9197X) {
+				sia9197x_init_one(addr_top, 0);
+				sia9197x_init_one(addr_bot, 1);
+			}
+		}
+		say("smart amplifier powered on (top=%#x, bot=%#x, below=%u.%03u dB, muted=%d)\n",
+		    addr_top, addr_bot, current_below_eighths / 8, (current_below_eighths % 8) * 125, current_muted);
 	} else {
-		/* Mute and power down */
-		gpio_write(PIN_SPK_SW, true);  /* Mute speaker switch */
-		say("smart amplifier: powered off\n");
+		if (amp_bus_online && detected_amp == AMP_TYPE_TFA98XX) {
+			(void)amp_reg_write16(addr_top, TFA_REG_AUDIO_CTR, 0x0020u);
+			(void)amp_reg_write16(addr_bot, TFA_REG_AUDIO_CTR, 0x0020u);
+			(void)amp_reg_write16(addr_top, TFA_REG_SYS_CTRL, TFA_SYS_PWDN);
+			(void)amp_reg_write16(addr_bot, TFA_REG_SYS_CTRL, TFA_SYS_PWDN);
+		}
+		gpio_push_pull(PIN_SPK_SW, true);
+		say("smart amplifier powered off\n");
 	}
 }
 
@@ -441,6 +574,7 @@ void
 annibale_audio_amp_status(const char *when)
 {
 	gpio_init_once();
-	say("status (%s): type %d, powered %d, top addr %#x, bot addr %#x\n",
-	    when, detected_amp, amp_is_powered, addr_top, addr_bot);
+	say("status (%s): type=%d powered=%d bus_online=%d top=%#x(%u mOhm) bot=%#x(%u mOhm)\n",
+	    when, detected_amp, amp_is_powered, amp_bus_online,
+	    addr_top, TFA_CAL_TOP_MOHM, addr_bot, TFA_CAL_BOT_MOHM);
 }

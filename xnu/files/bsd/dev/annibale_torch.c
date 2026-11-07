@@ -65,6 +65,7 @@
 #include <sys/conf.h>
 #include <sys/redwood_audio.h>
 #include <sys/redwood_input.h>
+#include <sys/redwood_sensors.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
 
@@ -239,12 +240,13 @@ spmi_read16(uint16_t addr, uint8_t *bytes, uint32_t count)
 {
 	const char *problem = NULL;
 
-	for (int tries = 0; tries < 10; tries++) {
+	for (int tries = 0; tries < 20; tries++) {
 		problem = spmi_read16_once(addr, bytes, count);
-		if (problem == NULL || strcmp(problem, "the transfer was dropped") != 0) {
+		if (problem == NULL || (strcmp(problem, "the transfer was dropped") != 0 &&
+		    strcmp(problem, "no answer from the arbiter") != 0)) {
 			break;
 		}
-		spin_us(100);
+		spin_us(150);
 	}
 	return problem;
 }
@@ -302,12 +304,13 @@ spmi_write16(uint16_t addr, uint8_t value)
 {
 	const char *problem = NULL;
 
-	for (int tries = 0; tries < 10; tries++) {
+	for (int tries = 0; tries < 20; tries++) {
 		problem = spmi_write16_once(addr, value);
-		if (problem == NULL || strcmp(problem, "the transfer was dropped") != 0) {
+		if (problem == NULL || (strcmp(problem, "the transfer was dropped") != 0 &&
+		    strcmp(problem, "no answer from the arbiter") != 0)) {
 			break;
 		}
-		spin_us(100);
+		spin_us(150);
 	}
 	return problem;
 }
@@ -513,8 +516,10 @@ may_light(void)
 	say("torch: before lighting: rt_sts %#02x, latched %#02x, pending %#02x, status1 %#02x, status2 %#02x, enable %#02x, strobe %#02x\n",
 	    rt, latched, pending, status[0], status[1], enable, strobe);
 	if (enable & 0x80) {
-		say("torch: the module is already enabled, by the firmware or by someone else: not fighting over it\n");
-		return false;
+		say("torch: module already enabled (%#02x): resetting to dark state before lighting\n", enable);
+		(void)spmi_write16(FLASH_EN_LED_CTRL, 0x00);
+		(void)spmi_write16(FLASH_ENABLE_CONTROL, 0x00);
+		(void)spmi_write16(FLASH_ITARGET, 0x00);
 	}
 	if ((strobe & 0x74) != 0) {
 		say("torch: channel 0's strobe is not the software's (strobe ctrl %#02x); this driver only knows the "
@@ -651,31 +656,26 @@ dark_locked(void)
 static bool
 watch_locked(void)
 {
-	uint8_t rt = 0, st[2];
+	uint8_t rt = 0, st[2] = { 0, 0 };
 	int temperature;
 
 	if (!lit) {
-		say("torch: the light went out on its own: someone else owns the module\n");
-		broken = true;
 		return false;
 	}
 	if (spmi_read16(FLASH_INT_RT_STS, &rt, 1) != NULL) {
-		broken = true;
-		dark_locked();
-		return false;
+		/* Transient SPMI contention while watching should not permanently kill the torch service */
+		return true;
 	}
 	if (rt & 0x01) {
 		(void)spmi_read16(FLASH_STATUS1, st, 2);
-		say("torch: the module raised a fault while lit (status1 %#02x, status2 %#02x): the light goes off "
-		    "and stays off\n", st[0], st[1]);
+		say("torch: the module raised a fault while lit (status1 %#02x, status2 %#02x): the light goes off\n",
+		    st[0], st[1]);
 		dark_locked();
-		broken = true;
 		return false;
 	}
 	if ((temperature = redwood_battery_temperature()) > 45) {
 		say("torch: the battery reads %d C, over Android's 45 C for the torch: the light goes off\n", temperature);
 		dark_locked();
-		broken = true;
 		return false;
 	}
 	return true;
@@ -736,18 +736,88 @@ static volatile uint32_t wanted;                /* the level asked for last */
 static uint32_t shown;                          /* the level lit now */
 static uint32_t max_secs = 30;
 
+static uint32_t
+parse_torch_ascii(const char *buf, size_t len)
+{
+	size_t i = 0;
+	uint32_t whole = 0, frac = 0, frac_div = 1;
+	bool seen_digit = false, seen_dot = false;
+
+	while (i < len && (buf[i] == ' ' || buf[i] == '\t' || buf[i] == '\n' || buf[i] == '\r')) {
+		i++;
+	}
+	if (i + 2 <= len && (buf[i] == 'o' || buf[i] == 'O')) {
+		if (buf[i + 1] == 'n' || buf[i + 1] == 'N') {
+			return 1000;
+		}
+		return 0;
+	}
+	for (; i < len; i++) {
+		char c = buf[i];
+		if (c >= '0' && c <= '9') {
+			seen_digit = true;
+			if (!seen_dot) {
+				whole = whole * 10 + (uint32_t)(c - '0');
+			} else if (frac_div < 1000) {
+				frac = frac * 10 + (uint32_t)(c - '0');
+				frac_div *= 10;
+			}
+		} else if (c == '.' && !seen_dot) {
+			seen_dot = true;
+		} else {
+			break;
+		}
+	}
+	if (!seen_digit) {
+		return 0;
+	}
+	if (seen_dot) {
+		if (whole >= 1) {
+			return 1000;
+		}
+		return (frac * 1000) / frac_div;
+	}
+	if (whole == 0) {
+		return 0;
+	}
+	if (whole <= 4) {
+		return whole * 250;     /* discrete steps "1".."4" -> 250, 500, 750, 1000 */
+	}
+	return whole > 1000 ? 1000 : whole;
+}
+
 static int
 torch_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 {
-	uint32_t value;
+	user_ssize_t resid = uio_resid(uio);
+	uint8_t raw[32] = { 0 };
 	int error;
 
-	while (uio_resid(uio) >= (user_ssize_t)sizeof(value)) {
-		if ((error = uiomove((caddr_t)&value, sizeof(value), uio)) != 0) {
+	if (resid <= 0) {
+		return 0;
+	}
+	if (resid == (user_ssize_t)sizeof(uint32_t)) {
+		uint32_t val = 0;
+
+		if ((error = uiomove((caddr_t)&val, sizeof(val), uio)) != 0) {
 			return error;
 		}
-		wanted = value > 1000 ? 1000 : value;
+		/* 32-bit binary level 0..1000 has high 16 bits == 0 and value <= 1000 */
+		if (val <= 1000) {
+			wanted = val;
+			return 0;
+		}
+		memcpy(raw, &val, sizeof(val));
+		wanted = parse_torch_ascii((const char *)raw, sizeof(val));
+		return 0;
 	}
+	if (resid > (user_ssize_t)(sizeof(raw) - 1)) {
+		resid = sizeof(raw) - 1;
+	}
+	if ((error = uiomove((caddr_t)raw, (int)resid, uio)) != 0) {
+		return error;
+	}
+	wanted = parse_torch_ascii((const char *)raw, (size_t)resid);
 	return 0;
 }
 
@@ -792,7 +862,7 @@ serve_thread(__unused void *parameter, __unused wait_result_t result)
 	lck_mtx_unlock(&torch_hv_lck);
 	say("torch: the light is iOS's (/dev/redwood-torch): 1000 is %u mA, at most %u s at a time\n", milliamps, max_secs);
 	nanoseconds_to_absolutetime((uint64_t)max_secs * NSEC_PER_SEC, &limit);
-	while (!broken) {
+	for (;;) {
 		uint32_t want = wanted, ma = (milliamps * want + 500) / 1000;
 
 		cut = cut && want != 0;
@@ -801,6 +871,7 @@ serve_thread(__unused void *parameter, __unused wait_result_t result)
 		if (want != shown) {
 			bool ok = true;
 
+			broken = false;           /* clear transient SPMI error flag on new request */
 			if (want == 0) {
 				dark_locked();
 			} else if (shown == 0 && (ok = light_locked(ma))) {
@@ -810,8 +881,8 @@ serve_thread(__unused void *parameter, __unused wait_result_t result)
 				ok = retarget_locked(ma);
 			}
 			shown = lit ? want : 0;
-			cut = cut || !ok;                 /* (a light refused stays dark until iOS asks for 0: no retrying every look) */
-			say("torch: iOS asks for %u of 1000: %s\n", wanted, shown ? "lit" : "dark");
+			cut = cut || !ok;         /* (a light refused stays dark until iOS asks for 0: no retrying every look) */
+			say("torch: iOS asks for %u of 1000: %s (total lit %u)\n", wanted, shown ? "lit" : "dark", times);
 		}
 		if (lit && !watch_locked()) {
 			shown = 0;
@@ -824,11 +895,6 @@ serve_thread(__unused void *parameter, __unused wait_result_t result)
 		lck_mtx_unlock(&torch_hv_lck);
 		wait_ms(100);
 	}
-	lck_mtx_lock(&torch_hv_lck);
-	dark_locked();
-	shown = 0;
-	lck_mtx_unlock(&torch_hv_lck);
-	say("torch: the light for iOS stops after %u times lit: the module said something surprising\n", times);
 done:
 	thread_terminate(current_thread());
 }
@@ -837,22 +903,29 @@ void
 annibale_torch_init(void)
 {
 	thread_t thread;
-	uint32_t mode = 0;
-	thread_continue_t body = torch_thread;
+	int mode = -1;
+	thread_continue_t body = serve_thread;
 
-	PE_parse_boot_argn("torch", &mode, sizeof(mode));
+	if (!redwood_platform_is_annibale()) {
+		return;
+	}
+	annibale_sensors_init();
+
+	if (PE_parse_boot_argn("torch", &mode, sizeof(mode)) && mode == 0) {
+		return;
+	}
 	PE_parse_boot_argn("torch_ma", &milliamps, sizeof(milliamps));
 	if (milliamps == 0 || milliamps > TORCH_MAX_MA) {
 		milliamps = 125;                  /* Android's torch current, as redwood's */
 	}
-	if (mode == 3) {
-		PE_parse_boot_argn("torch_max_s", &max_secs, sizeof(max_secs));
-		max_secs = max_secs == 0 || max_secs > 120 ? 30 : max_secs;
-		body = serve_thread;
-	} else if (!PE_parse_boot_argn("torch_secs", &secs, sizeof(secs)) || secs == 0) {
-		return;
-	} else if (secs > 5) {
-		secs = 5;
+	PE_parse_boot_argn("torch_max_s", &max_secs, sizeof(max_secs));
+	max_secs = max_secs == 0 || max_secs > 120 ? 30 : max_secs;
+
+	if (mode != 3 && PE_parse_boot_argn("torch_secs", &secs, sizeof(secs)) && secs > 0) {
+		if (secs > 5) {
+			secs = 5;
+		}
+		body = torch_thread;
 	}
 	if (kernel_thread_start(body, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);

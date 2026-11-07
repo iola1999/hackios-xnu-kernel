@@ -1,0 +1,1184 @@
+/*
+ * SM8750 (annibale) LPASS ADSP loader, RPMh rail/regulator voter, and GLINK/GPR transport.
+ *
+ * Hardware map (SM8750 / REDMI K90):
+ *   - SMEM:        0x81d00000 (size 0x00200000), remote PID 2 (SMEM_ADSP)
+ *                  SMP2P items: 443 (theirs, "slave-kernel"), 429 (ours, "master-kernel")
+ *                  Crash reason: 423
+ *                  GLINK items: 478 (descriptor), 479 (tx queue), 480 (rx queue)
+ *   - CMD DB:      0x81c60000 (size 0x00020000)
+ *   - Apps RSC:    0x16520000 (DRV 2, v3 TCS layout)
+ *   - AOSS QMP:    0x0c300000 (size 0x00000400)
+ *   - IPCC:        0x00406000 (client 3 = LPASS, signal 0 = GLINK, signal 2 = SMP2P)
+ *   - ADSP DTB:    0x9ed80000 (size 0x00080000), PAS ID 0x24 (adsp_dtb.mdt + .b00..b02)
+ *   - ADSP Image:  0x9ee00000 (size 0x04580000), PAS ID 1 (adsp.mdt + .b00..b56)
+ */
+
+#include <kern/clock.h>
+#include <kern/kalloc.h>
+#include <kern/locks.h>
+#include <kern/thread.h>
+#include <libkern/libkern.h>
+#include <mach/mach_types.h>
+#include <mach/vm_param.h>
+#include <pexpert/pexpert.h>
+#include <sys/errno.h>
+#include <sys/kauth.h>
+#include <sys/redwood_audio.h>
+#include <sys/systm.h>
+#include <sys/vnode.h>
+#include <sys/vnode_internal.h>
+#include <vm/memory_types.h>
+#include <vm/vm_kern.h>
+
+extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
+extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
+extern uint64_t kvtophys(vm_offset_t va);
+extern kern_return_t thread_terminate(thread_t thread);
+extern const uint8_t *redwood_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+
+extern lck_mtx_t redwood_aop_mailbox_lock;
+extern lck_mtx_t redwood_smem_alloc_lock;
+
+#define say(...) printf("aadsp: " __VA_ARGS__)
+
+/* ---- Hardware addresses & constants ---------------------------------------------------------- */
+
+#define SMEM_PHYS                 0x81d00000UL
+#define SMEM_SIZE                 0x00200000u
+#define SMEM_US                   0u
+#define SMEM_ADSP                 2u
+#define SMEM_GLOBAL               0xfffeu
+#define SMEM_CANARY               0xa5a5u
+#define ITEM_SMP2P_OURS           429u
+#define ITEM_SMP2P_THEIRS         443u
+#define ITEM_CRASH_REASON         423u
+#define ITEM_GLINK_DESC           478u
+#define ITEM_GLINK_OUR_Q          479u
+#define ITEM_GLINK_THEIR_Q        480u
+#define SMP2P_MAGIC               0x504d5324u
+#define DSP_READY                 (1u << 1)
+#define CMD_DB_PHYS               0x81c60000UL
+#define CMD_DB_SIZE               0x00020000UL
+#define RSC_PHYS                  0x16520000UL
+#define RSC_SIZE                  0x00010000UL
+#define RSC_TCS_BASE              0x0d00u
+#define RSC_IRQ_STATUS            (RSC_TCS_BASE + 0x04u)
+#define RSC_IRQ_CLEAR             (RSC_TCS_BASE + 0x08u)
+#define RSC_TCS(n)                (RSC_TCS_BASE + 0x2a0u * (n))
+#define TCS_ACTIVE_MODE           (1u << 16)
+#define TCS_TRIGGER               (1u << 24)
+#define MSGID_WRITE_WAITED        (8u | (1u << 8) | (1u << 16))
+#define AOSS_PHYS                 0x0c300000UL
+#define AOSS_SIZE                 0x00000400UL
+#define QMP_MAGIC_VALUE           0x4d41494cu
+#define QMP_THEIR_CHANNEL         0x14u
+#define QMP_THEIR_CHANNEL_ACK     0x18u
+#define QMP_OUR_LINK              0x24u
+#define QMP_OUR_LINK_ACK          0x28u
+#define QMP_OUR_CHANNEL           0x2cu
+#define QMP_OUR_CHANNEL_ACK       0x30u
+#define QMP_OUR_BOX_SIZE          0x34u
+#define QMP_OUR_BOX               0x38u
+#define QMP_UP                    0x0000ffffu
+#define QMP_MESSAGE               64u
+#define IPCC_PHYS                 0x00406000UL
+#define IPCC_SIZE                 0x00001000UL
+#define IPCC_SEND                 0x0cu
+#define IPCC_CLIENT_AOP           0u
+#define IPCC_CLIENT_LPASS         3u
+#define IPCC_SIGNAL_GLINK         0u
+#define ADSP_DTB_MEMORY           0x9ed80000u
+#define ADSP_DTB_MEMORY_SIZE      0x00080000u
+#define PAS_ADSP_DTB              0x24u
+#define ADSP_MEMORY               0x9ee00000u
+#define ADSP_MEMORY_SIZE          0x04580000u
+#define PAS_ADSP                  1u
+#define SCM_PAS_INIT_IMAGE        0x42000201UL
+#define SCM_PAS_MEM_SETUP         0x42000202UL
+#define SCM_PAS_AUTH_AND_RESET    0x42000205UL
+#define MDT_HASH(flags)           ((((flags) >> 24) & 7u) == 2u)
+#define MDT_RELOCATABLE(flags)    (((flags) & (1u << 27)) != 0)
+#define MAX_SEGMENTS              64u
+#define GLINK_QUEUE_SIZE          0x4000u
+#define GLINK_VERSION             0u
+#define GLINK_VERSION_ACK         1u
+#define GLINK_OPEN                2u
+#define GLINK_CLOSE               3u
+#define GLINK_OPEN_ACK            4u
+#define GLINK_INTENT              5u
+#define GLINK_RX_DONE             6u
+#define GLINK_RX_INTENT_REQ       7u
+#define GLINK_RX_INTENT_REQ_ACK   8u
+#define GLINK_TX_DATA             9u
+#define GLINK_CLOSE_ACK           11u
+#define GLINK_TX_DATA_CONT        12u
+#define APM_CMD_GET_SPF_STATE     0x01001021u
+#define APM_CMD_RSP_GET_SPF_STATE 0x02001007u
+#define GPR_BASIC_RSP_RESULT      0x02001005u
+#define OP_MEM_MAP                0x0100100cu
+#define OP_MEM_MAP_DONE           0x02001001u
+#define OP_WRITE                  0x0400100au
+#define OP_WRITE_DONE             0x05001004u
+#define OP_READ_BUF               0x0400100bu
+#define OP_READ_BUF_DONE          0x05001005u
+
+struct smem_table_entry {
+	uint32_t offset, size, flags;
+	uint16_t host0, host1;
+	uint32_t cacheline, reserved[7];
+};
+
+struct smem_table {
+	uint8_t  magic[4];
+	uint32_t version, count, reserved[5];
+};
+
+struct smem_partition {
+	uint8_t  magic[4];
+	uint16_t host0, host1;
+	uint32_t size, free_uncached, free_cached, reserved[3];
+};
+
+struct smem_entry {
+	uint16_t canary, item;
+	uint32_t size;
+	uint16_t padding_data, padding_header;
+	uint32_t reserved;
+};
+
+struct smp2p_item {
+	uint32_t magic, version;
+	uint16_t local, remote, total, valid;
+	uint32_t flags;
+	struct { char name[16]; uint32_t value; } entry[16];
+};
+
+struct cmd_db_slave {
+	uint16_t id, header_offset, data_offset, count, version, reserved[3];
+};
+
+struct cmd_db_header {
+	uint32_t version;
+	uint8_t  magic[4];
+	struct cmd_db_slave slave[8];
+	uint32_t checksum, reserved;
+	uint8_t  data[];
+};
+
+struct cmd_db_entry {
+	char     id[8];
+	uint32_t priority[2], address;
+	uint16_t length, offset;
+};
+
+struct elf_segment {
+	uint32_t type, offset, vaddr, paddr, file_size, memory_size, flags, align;
+};
+
+struct fw_image {
+	const uint8_t *header;
+	uint64_t       header_size;
+	bool           from_root;
+	struct {
+		uint32_t       at, file_size, memory_size;
+		const uint8_t *file;
+		bool           from_root;
+	} segment[MAX_SEGMENTS];
+	unsigned       segments;
+	uint32_t       size;
+};
+
+typedef bool (*annibale_gpr_event_fn)(uint32_t src_port, uint32_t dst_port, uint32_t opcode,
+    uint32_t token, const void *payload, uint32_t len);
+
+void annibale_adsp_init(void);
+bool annibale_adsp_ready(void);
+bool annibale_adsp_is_hw_up(void);
+bool annibale_adsp_gpr_send(const void *pkt, uint32_t len, uint32_t wait_ms,
+    uint32_t *rsp_opcode, uint32_t *rsp_words, uint32_t max_words);
+void annibale_adsp_set_gpr_event(annibale_gpr_event_fn handler);
+bool annibale_rpmh_regulator(const char *name, uint32_t mv, bool enable, uint32_t mode);
+extern void annibale_pmic_glink_set_tx(int (*tx_fn)(const void *data, uint32_t len));
+extern void annibale_pmic_glink_rx(const void *data, uint32_t len);
+
+/* ---- State ----------------------------------------------------------------------------------- */
+
+static LCK_GRP_DECLARE(aadsp_lck_grp, "annibale-adsp");
+static LCK_MTX_DECLARE(aadsp_lock, &aadsp_lck_grp);
+static LCK_MTX_DECLARE(aadsp_rsc_lock, &aadsp_lck_grp);
+static LCK_MTX_DECLARE(aadsp_gpr_lock, &aadsp_lck_grp);
+
+static volatile uint8_t *smem_base;
+static const struct cmd_db_header *cmd_db_base;
+static vm_offset_t rsc_base, aoss_base, ipcc_base;
+static uint32_t aoss_our_box;
+
+static bool adsp_inited, adsp_hw_up, adsp_sim_mode;
+static uint16_t glink_gpr_our_cid, glink_gpr_their_cid;
+static uint16_t glink_pmic_our_cid, glink_pmic_their_cid;
+static uint32_t glink_our_read_at, glink_our_write_at, glink_their_read_at, glink_their_write_at;
+static uint32_t glink_our_q, glink_their_q, glink_our_q_size, glink_their_q_size;
+
+static annibale_gpr_event_fn gpr_event_handler;
+static uint32_t waited_token, waited_opcode, waited_words[32], waited_word_count;
+static bool waited_done;
+
+/* ---- Low-level MMIO & timing helpers --------------------------------------------------------- */
+
+static inline uint32_t mmio_rd(vm_offset_t addr)
+{
+	uint32_t v = *(volatile uint32_t *)addr;
+	__builtin_arm_dsb(0xf);
+	return v;
+}
+
+static inline void mmio_wr(vm_offset_t addr, uint32_t val)
+{
+	__builtin_arm_dsb(0xf);
+	*(volatile uint32_t *)addr = val;
+	__builtin_arm_dsb(0xf);
+}
+
+static uint64_t now_us(void)
+{
+	uint64_t ns = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns / 1000ULL;
+}
+
+static inline void sleep_us(uint32_t us) { delay_for_interval(us, NSEC_PER_USEC); }
+static inline void sleep_ms(uint32_t ms) { delay_for_interval(ms, NSEC_PER_MSEC); }
+
+static void ipcc_ring(uint32_t client, uint32_t signal)
+{
+	if (ipcc_base == 0) {
+		ipcc_base = ml_io_map(IPCC_PHYS, IPCC_SIZE);
+	}
+	if (ipcc_base != 0) {
+		mmio_wr(ipcc_base + IPCC_SEND, (client << 16) | signal);
+	}
+}
+
+/* ---- SMEM access & lookup -------------------------------------------------------------------- */
+
+static bool smem_ensure(void)
+{
+	if (smem_base == NULL) {
+		smem_base = (volatile uint8_t *)ml_io_map_unmappable(SMEM_PHYS, SMEM_SIZE, VM_WIMG_WCOMB);
+	}
+	return smem_base != NULL;
+}
+
+static bool smem_peek(uint32_t offset, void *to, uint32_t size)
+{
+	if (!smem_ensure() || offset + size > SMEM_SIZE) {
+		return false;
+	}
+	for (uint32_t i = 0; i < size; i++) {
+		((uint8_t *)to)[i] = smem_base[offset + i];
+	}
+	return true;
+}
+
+static void smem_poke(uint32_t offset, uint32_t val)
+{
+	if (smem_ensure() && offset + 4 <= SMEM_SIZE) {
+		mmio_wr((vm_offset_t)(smem_base + offset), val);
+	}
+}
+
+static uint32_t smem_partition_find(uint16_t host0, uint16_t host1, uint32_t *part_size, uint32_t *cacheline)
+{
+	struct smem_table table;
+	struct smem_table_entry entry;
+	struct smem_partition part;
+
+	if (!smem_peek(0, &table, sizeof(table)) || memcmp(table.magic, "$TOC", 4) != 0) {
+		return 0;
+	}
+	for (uint32_t i = 0; i < table.count && i < 64; i++) {
+		if (!smem_peek(sizeof(table) + i * sizeof(entry), &entry, sizeof(entry))) {
+			return 0;
+		}
+		if (entry.offset == 0 || entry.size == 0 || entry.offset + entry.size > SMEM_SIZE) {
+			continue;
+		}
+		if (!((entry.host0 == host0 && entry.host1 == host1) ||
+		      (entry.host0 == host1 && entry.host1 == host0))) {
+			continue;
+		}
+		if (!smem_peek(entry.offset, &part, sizeof(part)) || memcmp(part.magic, "$PRT", 4) != 0) {
+			return 0;
+		}
+		if (part_size != NULL) *part_size = part.size;
+		if (cacheline != NULL) *cacheline = entry.cacheline;
+		return entry.offset;
+	}
+	return 0;
+}
+
+static uint32_t smem_item_in_partition(uint16_t host0, uint16_t host1, uint32_t wanted, uint32_t *size_out)
+{
+	uint32_t part_off, part_size = 0, cacheline = 0;
+	struct smem_partition part;
+	struct smem_entry e;
+
+	part_off = smem_partition_find(host0, host1, &part_size, &cacheline);
+	if (part_off == 0 || !smem_peek(part_off, &part, sizeof(part)) ||
+	    part.free_uncached > part_size || part.free_cached > part_size ||
+	    part.free_uncached > part.free_cached) {
+		return 0;
+	}
+	for (uint32_t at = sizeof(part); at + sizeof(e) <= part.free_uncached; ) {
+		if (!smem_peek(part_off + at, &e, sizeof(e)) || e.canary != SMEM_CANARY) {
+			break;
+		}
+		uint32_t data = part_off + at + sizeof(e) + e.padding_header;
+		if (e.size > part_size || data + e.size > part_off + part.free_uncached) {
+			break;
+		}
+		if (e.item == wanted) {
+			if (size_out != NULL) *size_out = e.size - e.padding_data;
+			return data;
+		}
+		at += sizeof(e) + e.padding_header + e.size;
+	}
+	if (cacheline != 0) {
+		for (uint32_t at = part_size - cacheline; at >= part.free_cached && at < part_size; ) {
+			if (!smem_peek(part_off + at, &e, sizeof(e)) || e.canary != SMEM_CANARY ||
+			    e.size > at - part.free_cached) {
+				break;
+			}
+			uint32_t data = part_off + ((at - e.size) & ~(cacheline - 1u));
+			if (e.item == wanted) {
+				if (size_out != NULL) *size_out = e.size - e.padding_data;
+				return data;
+			}
+			at = ((at - e.size) & ~(cacheline - 1u)) - e.padding_header - (uint32_t)sizeof(e);
+		}
+	}
+	return 0;
+}
+
+static uint32_t smem_item(uint32_t wanted, uint32_t *size_out)
+{
+	uint32_t at = smem_item_in_partition(SMEM_US, SMEM_ADSP, wanted, size_out);
+	return at != 0 ? at : smem_item_in_partition(SMEM_GLOBAL, SMEM_GLOBAL, wanted, size_out);
+}
+
+static uint32_t smem_alloc_item(uint32_t item, uint32_t size)
+{
+	uint32_t existing_sz = 0, at = smem_item(item, &existing_sz);
+	if (at != 0) {
+		return existing_sz >= size ? at : 0;
+	}
+	uint32_t part_off = smem_partition_find(SMEM_US, SMEM_ADSP, NULL, NULL);
+	struct smem_partition part;
+	uint32_t padded = (size + 7u) & ~7u;
+
+	if (part_off == 0 || !smem_peek(part_off, &part, sizeof(part)) ||
+	    part.free_uncached + sizeof(struct smem_entry) + padded > part.free_cached) {
+		return 0;
+	}
+	uint32_t hdr = part_off + part.free_uncached;
+	uint32_t data = hdr + (uint32_t)sizeof(struct smem_entry);
+	for (uint32_t i = 0; i < padded; i += 4) {
+		smem_poke(data + i, 0);
+	}
+	smem_poke(hdr + 0, SMEM_CANARY | (item << 16));
+	smem_poke(hdr + 4, padded);
+	smem_poke(hdr + 8, (uint16_t)(padded - size));
+	smem_poke(hdr + 12, 0);
+	__builtin_arm_dmb(0xf);
+	smem_poke(part_off + 12, part.free_uncached + (uint32_t)sizeof(struct smem_entry) + padded);
+	return data;
+}
+
+/* ---- RPMh CMD DB & RSC v3 Voter -------------------------------------------------------------- */
+
+static uint32_t cmd_db_find_addr(const char *name, const uint8_t **data_out, uint32_t *len_out)
+{
+	char id[8] = { 0 };
+	if (cmd_db_base == NULL) {
+		cmd_db_base = (const struct cmd_db_header *)ml_io_map_wcomb(CMD_DB_PHYS, CMD_DB_SIZE);
+		if (cmd_db_base == NULL) return 0;
+	}
+	if (cmd_db_base->magic[0] != 0xdb || cmd_db_base->magic[1] != 0x30 ||
+	    cmd_db_base->magic[2] != 0x03 || cmd_db_base->magic[3] != 0x0c) {
+		return 0;
+	}
+	strlcpy(id, name, sizeof(id));
+	for (unsigned s = 0; s < 8; s++) {
+		const struct cmd_db_slave *slv = &cmd_db_base->slave[s];
+		const struct cmd_db_entry *ent = (const struct cmd_db_entry *)(const void *)(cmd_db_base->data + slv->header_offset);
+		if (slv->id == 0 || slv->count > 512) continue;
+		for (unsigned i = 0; i < slv->count; i++) {
+			if (memcmp(ent[i].id, id, sizeof(id)) != 0) continue;
+			if ((uint32_t)slv->data_offset + ent[i].offset + ent[i].length > CMD_DB_SIZE - 0x1000) return 0;
+			if (data_out != NULL) *data_out = cmd_db_base->data + slv->data_offset + ent[i].offset;
+			if (len_out != NULL) *len_out = ent[i].length;
+			return ent[i].address;
+		}
+	}
+	return 0;
+}
+
+static bool rpmh_tcs_send(const uint32_t *addrs, const uint32_t *vals, unsigned count)
+{
+	if (count == 0 || count > 8) return false;
+	lck_mtx_lock(&aadsp_rsc_lock);
+	if (rsc_base == 0) {
+		rsc_base = ml_io_map(RSC_PHYS, RSC_SIZE);
+		if (rsc_base == 0) {
+			lck_mtx_unlock(&aadsp_rsc_lock);
+			return false;
+		}
+	}
+	uint32_t major = (mmio_rd(rsc_base) >> 16) & 0xff;
+	uint32_t off_wait = major >= 3 ? 0x20u : 0x10u, off_ctrl = major >= 3 ? 0x24u : 0x14u;
+	uint32_t off_stat = major >= 3 ? 0x28u : 0x18u, off_en = major >= 3 ? 0x2cu : 0x1cu;
+	uint32_t off_cmd = major >= 3 ? 0x34u : 0x30u, stride = major >= 3 ? 24u : 20u;
+
+	unsigned tcs = 0;
+	bool found = false;
+	for (unsigned n = 0; n < 3; n++) {
+		if (mmio_rd(rsc_base + RSC_TCS(n) + off_stat) != 0) {
+			tcs = n;
+			found = true;
+			break;
+		}
+	}
+	if (!found) {
+		lck_mtx_unlock(&aadsp_rsc_lock);
+		return false;
+	}
+	uint32_t mask = (1u << count) - 1u;
+	mmio_wr(rsc_base + RSC_IRQ_CLEAR, 1u << tcs);
+	for (unsigned i = 0; i < count; i++) {
+		uint32_t cbase = RSC_TCS(tcs) + off_cmd + i * stride;
+		mmio_wr(rsc_base + cbase + 0, MSGID_WRITE_WAITED);
+		mmio_wr(rsc_base + cbase + 4, addrs[i]);
+		mmio_wr(rsc_base + cbase + 8, vals[i]);
+	}
+	mmio_wr(rsc_base + RSC_TCS(tcs) + off_wait, mask);
+	mmio_wr(rsc_base + RSC_TCS(tcs) + off_en, mask);
+	uint32_t ctrl = mmio_rd(rsc_base + RSC_TCS(tcs) + off_ctrl) & ~TCS_TRIGGER;
+	mmio_wr(rsc_base + RSC_TCS(tcs) + off_ctrl, ctrl);
+	mmio_wr(rsc_base + RSC_TCS(tcs) + off_ctrl, ctrl | TCS_ACTIVE_MODE);
+	mmio_wr(rsc_base + RSC_TCS(tcs) + off_ctrl, ctrl | TCS_ACTIVE_MODE | TCS_TRIGGER);
+
+	uint64_t t0 = now_us();
+	uint32_t done = 0;
+	while (now_us() - t0 < 50000) {
+		done = mmio_rd(rsc_base + RSC_IRQ_STATUS) & (1u << tcs);
+		if (done != 0) break;
+		sleep_us(25);
+	}
+	mmio_wr(rsc_base + RSC_IRQ_CLEAR, 1u << tcs);
+	ctrl = mmio_rd(rsc_base + RSC_TCS(tcs) + off_ctrl);
+	mmio_wr(rsc_base + RSC_TCS(tcs) + off_ctrl, ctrl & ~(TCS_TRIGGER | TCS_ACTIVE_MODE));
+	mmio_wr(rsc_base + RSC_TCS(tcs) + off_en, 0);
+	lck_mtx_unlock(&aadsp_rsc_lock);
+	return done != 0;
+}
+
+static bool vote_adsp_rails(uint32_t level)
+{
+	static const char *const rails[2] = { "lcx.lvl", "lmx.lvl" };
+	uint32_t addrs[2] = { 0, 0 }, vals[2] = { 0, 0 };
+
+	for (unsigned r = 0; r < 2; r++) {
+		const uint8_t *data = NULL;
+		uint32_t len = 0;
+		addrs[r] = cmd_db_find_addr(rails[r], &data, &len);
+		if (addrs[r] == 0 || data == NULL) return false;
+		if (level == 0) {
+			vals[r] = 0;
+			continue;
+		}
+		bool matched = false;
+		for (unsigned i = 0; i < len / 2u && i < 16; i++) {
+			uint32_t lv = (uint32_t)(data[2 * i] | (data[2 * i + 1] << 8));
+			if (lv >= level) {
+				vals[r] = i;
+				matched = true;
+				break;
+			}
+		}
+		if (!matched) return false;
+	}
+	return rpmh_tcs_send(addrs, vals, 2);
+}
+
+bool annibale_rpmh_regulator(const char *name, uint32_t mv, bool enable, uint32_t mode)
+{
+	uint32_t base_addr = cmd_db_find_addr(name, NULL, NULL);
+	if (base_addr == 0) return false;
+	uint32_t addrs[3], vals[3];
+	unsigned n = 0;
+	if (mv != 0) { addrs[n] = base_addr + 0x0; vals[n++] = mv; }
+	if (mode != 0) { addrs[n] = base_addr + 0x8; vals[n++] = mode; }
+	addrs[n] = base_addr + 0x4;
+	vals[n++] = enable ? 1u : 0u;
+	return rpmh_tcs_send(addrs, vals, n);
+}
+
+/* ---- AOSS QMP Mailbox ------------------------------------------------------------------------ */
+
+static bool aoss_send_msg(const char *msg)
+{
+	uint32_t words[QMP_MESSAGE / 4] = { 0 };
+	bool ok = false;
+
+	lck_mtx_lock(&redwood_aop_mailbox_lock);
+	if (aoss_base == 0) {
+		aoss_base = ml_io_map(AOSS_PHYS, AOSS_SIZE);
+		if (aoss_base == 0) {
+			lck_mtx_unlock(&redwood_aop_mailbox_lock);
+			return false;
+		}
+	}
+	if (aoss_our_box == 0) {
+		if (mmio_rd(aoss_base) != QMP_MAGIC_VALUE) {
+			lck_mtx_unlock(&redwood_aop_mailbox_lock);
+			return false;
+		}
+		mmio_wr(aoss_base + QMP_OUR_LINK, QMP_UP);
+		ipcc_ring(IPCC_CLIENT_AOP, 0);
+		for (unsigned i = 0; i < 200 && mmio_rd(aoss_base + QMP_OUR_LINK_ACK) != QMP_UP; i++) sleep_ms(1);
+		mmio_wr(aoss_base + QMP_OUR_CHANNEL, QMP_UP);
+		if (mmio_rd(aoss_base + QMP_THEIR_CHANNEL) == QMP_UP) {
+			mmio_wr(aoss_base + QMP_THEIR_CHANNEL_ACK, QMP_UP);
+		}
+		ipcc_ring(IPCC_CLIENT_AOP, 0);
+		for (unsigned i = 0; i < 200 && mmio_rd(aoss_base + QMP_OUR_CHANNEL_ACK) != QMP_UP; i++) sleep_ms(1);
+		uint32_t box = mmio_rd(aoss_base + QMP_OUR_BOX), bsz = mmio_rd(aoss_base + QMP_OUR_BOX_SIZE);
+		if (box >= AOSS_SIZE || bsz < QMP_MESSAGE) {
+			lck_mtx_unlock(&redwood_aop_mailbox_lock);
+			return false;
+		}
+		aoss_our_box = box;
+	}
+	if (mmio_rd(aoss_base + aoss_our_box) != 0) {
+		lck_mtx_unlock(&redwood_aop_mailbox_lock);
+		return false;
+	}
+	strlcpy((char *)words, msg, sizeof(words));
+	for (unsigned i = 0; i < QMP_MESSAGE / 4; i++) {
+		mmio_wr(aoss_base + aoss_our_box + 4 + 4 * i, words[i]);
+	}
+	mmio_wr(aoss_base + aoss_our_box, QMP_MESSAGE);
+	ipcc_ring(IPCC_CLIENT_AOP, 0);
+	for (unsigned i = 0; i < 500; i++) {
+		if (mmio_rd(aoss_base + aoss_our_box) == 0) {
+			ok = true;
+			break;
+		}
+		sleep_ms(2);
+	}
+	if (!ok) mmio_wr(aoss_base + aoss_our_box, 0);
+	lck_mtx_unlock(&redwood_aop_mailbox_lock);
+	return ok;
+}
+
+/* ---- TrustZone PAS SMC calls & Firmware Loader ----------------------------------------------- */
+
+static int scm_pas_call(uint64_t fn, uint64_t arginfo, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t *res1)
+{
+	uint64_t x0 = fn, x1 = arginfo, x2 = a0, x3 = a1, x4 = a2, r1 = 0;
+	for (unsigned tries = 0; tries < 2000; tries++) {
+		register uint64_t rx0 __asm__("x0") = x0, rx1 __asm__("x1") = x1;
+		register uint64_t rx2 __asm__("x2") = x2, rx3 __asm__("x3") = x3, rx4 __asm__("x4") = x4;
+		__asm__ volatile("smc #0"
+		    : "+r"(rx0), "+r"(rx1), "+r"(rx2), "+r"(rx3), "+r"(rx4)
+		    : : "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
+		if (rx0 == 1) { x0 = rx0; x1 = rx1; sleep_ms(1); continue; }
+		if (rx0 == 6) { sleep_ms(1); continue; }
+		r1 = rx1;
+		x0 = rx0;
+		break;
+	}
+	if (res1 != NULL) *res1 = r1;
+	return (int)(int64_t)x0;
+}
+
+static const uint8_t *fw_read_file(const char *name, uint64_t *size_out, bool *from_root_out)
+{
+	*from_root_out = false;
+	const uint8_t *img = redwood_image_file("fw", name, size_out, NULL);
+	if (img != NULL || rootvnode == NULLVP) return img;
+	static const char *const prefixes[] = { "/fw", "/redwood/fw" };
+	vfs_context_t ctx = vfs_context_kernel();
+	for (unsigned p = 0; p < 2; p++) {
+		char path[80];
+		vnode_t vp = NULLVP;
+		struct vnode_attr va;
+		snprintf(path, sizeof(path), "%s/%s", prefixes[p], name);
+		if (vnode_lookup(path, 0, &vp, ctx) != 0) continue;
+		VATTR_INIT(&va);
+		VATTR_WANTED(&va, va_data_size);
+		if (vnode_getattr(vp, &va, ctx) != 0 || va.va_data_size == 0 || va.va_data_size > ADSP_MEMORY_SIZE) {
+			vnode_put(vp);
+			continue;
+		}
+		uint8_t *buf = kalloc_data(va.va_data_size, Z_WAITOK);
+		if (buf == NULL) { vnode_put(vp); return NULL; }
+		int resid = 0;
+		int err = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)va.va_data_size, 0, UIO_SYSSPACE, 0,
+		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
+		vnode_put(vp);
+		if (err != 0 || resid != 0) {
+			kfree_data(buf, va.va_data_size);
+			continue;
+		}
+		*size_out = va.va_data_size;
+		*from_root_out = true;
+		return buf;
+	}
+	return NULL;
+}
+
+static void fw_release(struct fw_image *fw)
+{
+	if (fw->header != NULL && fw->from_root) {
+		void *p = __DECONST(void *, fw->header);
+		kfree_data(p, fw->header_size);
+	}
+	for (unsigned i = 0; i < fw->segments; i++) {
+		if (fw->segment[i].file != NULL && fw->segment[i].from_root) {
+			void *p = __DECONST(void *, fw->segment[i].file);
+			kfree_data(p, fw->segment[i].file_size);
+		}
+	}
+	bzero(fw, sizeof(*fw));
+}
+
+static bool fw_load_mdt(const char *stem, uint32_t region_base, uint32_t region_size, struct fw_image *fw)
+{
+	char mdt_name[32];
+	uint64_t sz = 0;
+	bool from_root = false;
+
+	bzero(fw, sizeof(*fw));
+	snprintf(mdt_name, sizeof(mdt_name), "%s.mdt", stem);
+	fw->header = fw_read_file(mdt_name, &sz, &from_root);
+	if (fw->header == NULL) return false;
+	fw->header_size = sz;
+	fw->from_root = from_root;
+
+	uint32_t count = sz >= 52 + 2 * 32 ? (uint32_t)(fw->header[44] | (fw->header[45] << 8)) : 0;
+	if (memcmp(fw->header, "\177ELF\1", 5) != 0 || count < 3 || count > MAX_SEGMENTS ||
+	    52 + 32 * count > sz || sz > PAGE_SIZE * 4) {
+		fw_release(fw);
+		return false;
+	}
+
+	uint32_t min_paddr = ~0u;
+	bool reloc = false;
+	for (uint32_t i = 0; i < count; i++) {
+		struct elf_segment seg;
+		memcpy(&seg, fw->header + 52 + 32 * i, sizeof(seg));
+		if (seg.type != 1 || MDT_HASH(seg.flags) || seg.memory_size == 0) continue;
+		if (MDT_RELOCATABLE(seg.flags)) reloc = true;
+		if (seg.paddr < min_paddr) min_paddr = seg.paddr;
+	}
+	uint32_t base_paddr = reloc ? min_paddr : region_base, highest = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		struct elf_segment seg;
+		memcpy(&seg, fw->header + 52 + 32 * i, sizeof(seg));
+		if (seg.type != 1 || MDT_HASH(seg.flags) || seg.memory_size == 0) continue;
+		if (seg.paddr < base_paddr || seg.file_size > seg.memory_size ||
+		    (uint64_t)(seg.paddr - base_paddr) + seg.memory_size > region_size) {
+			fw_release(fw);
+			return false;
+		}
+		uint32_t at = seg.paddr - base_paddr;
+		fw->segment[fw->segments].at = at;
+		fw->segment[fw->segments].file_size = seg.file_size;
+		fw->segment[fw->segments].memory_size = seg.memory_size;
+		if (seg.file_size != 0) {
+			char bname[32];
+			uint64_t bsz = 0;
+			bool broot = false;
+			snprintf(bname, sizeof(bname), "%s.b%02u", stem, i);
+			fw->segment[fw->segments].file = fw_read_file(bname, &bsz, &broot);
+			fw->segment[fw->segments].from_root = broot;
+			if (fw->segment[fw->segments].file == NULL || bsz != seg.file_size) {
+				fw_release(fw);
+				return false;
+			}
+		}
+		if (at + seg.memory_size > highest) highest = at + seg.memory_size;
+		fw->segments++;
+	}
+	fw->size = highest;
+	return fw->segments > 0;
+}
+
+static bool pas_stage_and_setup(uint32_t pas_id, uint32_t region_base, uint32_t region_size, const struct fw_image *fw)
+{
+	vm_offset_t page = 0;
+	if (kmem_alloc(kernel_map, &page, PAGE_SIZE * 4, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) return false;
+	bzero((void *)page, PAGE_SIZE * 4);
+	memcpy((void *)page, fw->header, fw->header_size);
+	for (uint32_t off = 0; off < PAGE_SIZE * 4; off += 64) {
+		uintptr_t line = page + off;
+		__asm__ volatile("dc civac, %0" : : "r"(line) : "memory");
+	}
+	__builtin_arm_dsb(0xf);
+
+	uint64_t res1 = 0;
+	int rc = scm_pas_call(SCM_PAS_INIT_IMAGE, 2u | (2u << 4), pas_id, kvtophys(page), 0, &res1);
+	kmem_free(kernel_map, page, PAGE_SIZE * 4);
+	if (rc != 0 || res1 != 0) {
+		say("PAS_INIT_IMAGE(pas=%#x) returned %d/%#llx\n", pas_id, rc, res1);
+		return false;
+	}
+	rc = scm_pas_call(SCM_PAS_MEM_SETUP, 3u, pas_id, region_base, fw->size, &res1);
+	if (rc != 0 || res1 != 0) {
+		say("PAS_MEM_SETUP(pas=%#x) returned %d/%#llx\n", pas_id, rc, res1);
+		return false;
+	}
+	volatile uint8_t *carveout = (volatile uint8_t *)ml_io_map_unmappable(region_base, region_size, VM_WIMG_WCOMB);
+	if (carveout == NULL) return false;
+	for (unsigned s = 0; s < fw->segments; s++) {
+		uint32_t at = fw->segment[s].at, fsz = fw->segment[s].file_size, msz = fw->segment[s].memory_size;
+		const uint8_t *src = fw->segment[s].file;
+		for (uint32_t i = 0; i < fsz; i++) carveout[at + i] = src[i];
+		for (uint32_t i = fsz; i < msz; i++) carveout[at + i] = 0;
+	}
+	__builtin_arm_dsb(0xf);
+	ml_io_unmap((vm_offset_t)carveout, region_size);
+	return true;
+}
+
+/* ---- GLINK & GPR Transport ------------------------------------------------------------------- */
+
+static uint32_t glink_q_read32(uint32_t q_off, uint32_t q_sz, uint32_t at)
+{
+	uint32_t v = 0;
+	smem_peek(q_off + (at % q_sz), &v, 4);
+	return v;
+}
+
+static void glink_q_write(uint32_t q_off, uint32_t q_sz, uint32_t *write_at, const void *buf, uint32_t len)
+{
+	const uint8_t *bytes = (const uint8_t *)buf;
+	uint32_t aligned = (len + 7u) & ~7u, pos = *write_at;
+	for (uint32_t i = 0; i < aligned; i += 4) {
+		uint32_t w = 0;
+		for (uint32_t b = 0; b < 4 && (i + b) < len; b++) {
+			w |= (uint32_t)bytes[i + b] << (8 * b);
+		}
+		smem_poke(q_off + (pos % q_sz), w);
+		pos = (pos + 4) % q_sz;
+	}
+	__builtin_arm_dmb(0xf);
+	*write_at = pos;
+	smem_poke(glink_our_write_at, pos);
+	ipcc_ring(IPCC_CLIENT_LPASS, IPCC_SIGNAL_GLINK);
+}
+
+static void glink_send_cmd2(uint16_t cmd, uint16_t p1, uint32_t p2)
+{
+	uint32_t words[2] = { cmd | ((uint32_t)p1 << 16), p2 };
+	glink_q_write(glink_our_q, glink_our_q_size, &glink_our_read_at, words, sizeof(words));
+}
+
+static void glink_send_open(uint16_t cid, const char *name)
+{
+	uint8_t pkt[32] = { 0 };
+	uint16_t nlen = (uint16_t)(strlen(name) + 1), cmd = GLINK_OPEN;
+	memcpy(pkt + 0, &cmd, 2);
+	memcpy(pkt + 2, &cid, 2);
+	memcpy(pkt + 4, &nlen, 2);
+	memcpy(pkt + 8, name, nlen);
+	glink_q_write(glink_our_q, glink_our_q_size, &glink_our_read_at, pkt, 8u + nlen);
+}
+
+static void glink_queue_intents(uint16_t cid)
+{
+	for (uint32_t id = 1; id <= 8; id++) {
+		uint32_t pkt[4] = { GLINK_INTENT | ((uint32_t)cid << 16), 1u, 2048u, id };
+		glink_q_write(glink_our_q, glink_our_q_size, &glink_our_read_at, pkt, sizeof(pkt));
+	}
+}
+
+static void handle_incoming_gpr(const uint8_t *data, uint32_t len)
+{
+	if (len < 24) {
+		return;
+	}
+	uint32_t src_port, dst_port, token, opcode;
+	memcpy(&src_port, data + 8, 4);
+	memcpy(&dst_port, data + 12, 4);
+	memcpy(&token, data + 16, 4);
+	memcpy(&opcode, data + 20, 4);
+	const uint8_t *payload = data + 24;
+	uint32_t plen = len - 24;
+
+	lck_mtx_lock(&aadsp_gpr_lock);
+	if (waited_token != 0 && token == waited_token) {
+		waited_opcode = opcode;
+		waited_word_count = MIN(plen / 4u, 32u);
+		if (waited_word_count > 0) {
+			memcpy(waited_words, payload, waited_word_count * 4u);
+		}
+		waited_done = true;
+		lck_mtx_unlock(&aadsp_gpr_lock);
+		return;
+	}
+	annibale_gpr_event_fn fn = gpr_event_handler;
+	lck_mtx_unlock(&aadsp_gpr_lock);
+	if (fn != NULL) {
+		(void)fn(src_port, dst_port, opcode, token, payload, plen);
+	}
+}
+
+static int adsp_pmic_glink_tx(const void *data, uint32_t len)
+{
+	if (!adsp_hw_up || glink_our_q == 0 || glink_pmic_our_cid == 0 || data == NULL || len == 0 || len > 512) {
+		return -1;
+	}
+	uint8_t tx[560];
+	uint32_t w0 = GLINK_TX_DATA | ((uint32_t)glink_pmic_our_cid << 16);
+	uint32_t iid = 1u, left = 0;
+	memcpy(tx + 0, &w0, 4);
+	memcpy(tx + 4, &iid, 4);
+	memcpy(tx + 8, &len, 4);
+	memcpy(tx + 12, &left, 4);
+	memcpy(tx + 16, data, len);
+	glink_q_write(glink_our_q, glink_our_q_size, &glink_our_read_at, tx, 16u + len);
+	return 0;
+}
+
+static void glink_poll_rx(void)
+{
+	if (glink_their_q == 0 || glink_their_q_size == 0) {
+		return;
+	}
+	uint32_t r = 0, w = 0;
+	smem_peek(glink_their_read_at, &r, 4);
+	smem_peek(glink_their_write_at, &w, 4);
+
+	while (r != w && r < glink_their_q_size && w < glink_their_q_size) {
+		uint32_t w0 = glink_q_read32(glink_their_q, glink_their_q_size, r);
+		uint32_t w1 = glink_q_read32(glink_their_q, glink_their_q_size, r + 4);
+		uint16_t cmd = (uint16_t)(w0 & 0xffffu), param = (uint16_t)(w0 >> 16);
+		uint32_t step_bytes = 8;
+
+		if (cmd == GLINK_VERSION) {
+			glink_send_cmd2(GLINK_VERSION_ACK, param, w1 & 1u);
+		} else if (cmd == GLINK_OPEN) {
+			char name[32] = { 0 };
+			uint16_t nlen = (uint16_t)(w1 & 0xffffu);
+			for (uint16_t i = 0; i < nlen && i < sizeof(name) - 1; i++) {
+				smem_peek(glink_their_q + ((r + 8 + i) % glink_their_q_size), &name[i], 1);
+			}
+			step_bytes = (8u + nlen + 7u) & ~7u;
+			glink_send_cmd2(GLINK_OPEN_ACK, param, 0);
+			if (strcmp(name, "adsp_apps") == 0 || strcmp(name, "apr_audio_svc") == 0) {
+				glink_gpr_their_cid = param;
+				if (glink_gpr_our_cid == 0) {
+					glink_gpr_our_cid = 2;
+					glink_send_open(glink_gpr_our_cid, name);
+				}
+				glink_queue_intents(glink_gpr_our_cid);
+			} else if (strcmp(name, "PMIC_RTR_ADSP_APPS") == 0) {
+				glink_pmic_their_cid = param;
+				if (glink_pmic_our_cid == 0) {
+					glink_pmic_our_cid = 3;
+					glink_send_open(glink_pmic_our_cid, name);
+				}
+				glink_queue_intents(glink_pmic_our_cid);
+				annibale_pmic_glink_set_tx(adsp_pmic_glink_tx);
+			}
+		} else if (cmd == GLINK_CLOSE) {
+			glink_send_cmd2(GLINK_CLOSE_ACK, param, 0);
+		} else if (cmd == GLINK_RX_INTENT_REQ) {
+			glink_send_cmd2(GLINK_RX_INTENT_REQ_ACK, param, 1);
+			if (param == glink_gpr_their_cid && glink_gpr_our_cid != 0) {
+				glink_queue_intents(glink_gpr_our_cid);
+			} else if (param == glink_pmic_their_cid && glink_pmic_our_cid != 0) {
+				glink_queue_intents(glink_pmic_our_cid);
+			}
+		} else if (cmd == GLINK_INTENT) {
+			step_bytes = (8u + 8u * w1 + 7u) & ~7u;
+		} else if (cmd == GLINK_TX_DATA || cmd == GLINK_TX_DATA_CONT) {
+			uint32_t chunk = glink_q_read32(glink_their_q, glink_their_q_size, r + 8);
+			uint32_t left = glink_q_read32(glink_their_q, glink_their_q_size, r + 12);
+			step_bytes = (16u + chunk + 7u) & ~7u;
+			if ((param == glink_gpr_their_cid || param == glink_pmic_their_cid) && chunk <= 512) {
+				uint8_t buf[512];
+				for (uint32_t i = 0; i < chunk; i++) {
+					smem_peek(glink_their_q + ((r + 16 + i) % glink_their_q_size), &buf[i], 1);
+				}
+				if (param == glink_gpr_their_cid) {
+					handle_incoming_gpr(buf, chunk);
+				} else {
+					annibale_pmic_glink_rx(buf, chunk);
+				}
+			}
+			if (left == 0) {
+				uint16_t our_cid = (param == glink_pmic_their_cid) ? glink_pmic_our_cid : glink_gpr_our_cid;
+				if (our_cid != 0) {
+					glink_send_cmd2(GLINK_RX_DONE, our_cid, w1);
+				}
+			}
+		}
+		r = (r + step_bytes) % glink_their_q_size;
+		smem_poke(glink_their_read_at, r);
+		smem_peek(glink_their_write_at, &w, 4);
+	}
+}
+
+static bool glink_init_queues(void)
+{
+	lck_mtx_lock(&redwood_smem_alloc_lock);
+	uint32_t desc = smem_alloc_item(ITEM_GLINK_DESC, 32);
+	uint32_t our_q = smem_alloc_item(ITEM_GLINK_OUR_Q, GLINK_QUEUE_SIZE);
+	lck_mtx_unlock(&redwood_smem_alloc_lock);
+	if (desc == 0 || our_q == 0) {
+		return false;
+	}
+	glink_our_read_at = desc + 0;
+	glink_our_write_at = desc + 4;
+	glink_their_read_at = desc + 8;
+	glink_their_write_at = desc + 12;
+	glink_our_q = our_q;
+	glink_our_q_size = GLINK_QUEUE_SIZE;
+	glink_their_q = smem_item(ITEM_GLINK_THEIR_Q, &glink_their_q_size);
+	return true;
+}
+
+/* ---- Simulated / Loopback GPR responder when ADSP firmware is absent ------------------------- */
+
+static void simulate_gpr_response(const uint8_t *pkt, uint32_t len)
+{
+	if (len < 24) {
+		return;
+	}
+	uint32_t src_port, dst_port, token, opcode;
+	memcpy(&src_port, pkt + 8, 4);
+	memcpy(&dst_port, pkt + 12, 4);
+	memcpy(&token, pkt + 16, 4);
+	memcpy(&opcode, pkt + 20, 4);
+
+	uint8_t rsp[64] = { 0 };
+	uint32_t rlen = 24, rop = GPR_BASIC_RSP_RESULT, word0 = 0;
+	if (opcode == APM_CMD_GET_SPF_STATE) {
+		rop = APM_CMD_RSP_GET_SPF_STATE;
+		word0 = 1u;
+		memcpy(rsp + 24, &word0, 4);
+		rlen = 28;
+	} else if (opcode == OP_MEM_MAP) {
+		rop = OP_MEM_MAP_DONE;
+		word0 = 0x1001u;
+		memcpy(rsp + 24, &word0, 4);
+		rlen = 28;
+	} else if (opcode == OP_WRITE) {
+		rop = OP_WRITE_DONE;
+		rlen = 28;
+	} else if (opcode == OP_READ_BUF) {
+		rop = OP_READ_BUF_DONE;
+		if (len >= 40) {
+			memcpy(rsp + 28, pkt + 24, 16);
+			rlen = 44;
+		}
+	} else {
+		memcpy(rsp + 24, &opcode, 4);
+		rlen = 32;
+	}
+	uint32_t hdr0 = (6u << 4) | (rlen << 8), hdr1 = 3u | (2u << 8);
+	memcpy(rsp + 0, &hdr0, 4);
+	memcpy(rsp + 4, &hdr1, 4);
+	memcpy(rsp + 8, &dst_port, 4);
+	memcpy(rsp + 12, &src_port, 4);
+	memcpy(rsp + 16, &token, 4);
+	memcpy(rsp + 20, &rop, 4);
+	handle_incoming_gpr(rsp, rlen);
+}
+
+bool annibale_adsp_gpr_send(const void *pkt, uint32_t len, uint32_t wait_ms,
+    uint32_t *rsp_opcode, uint32_t *rsp_words, uint32_t max_words)
+{
+	if (pkt == NULL || len < 24) {
+		return false;
+	}
+	const uint8_t *bytes = (const uint8_t *)pkt;
+	uint32_t token = 0;
+	memcpy(&token, bytes + 16, 4);
+
+	lck_mtx_lock(&aadsp_gpr_lock);
+	if (wait_ms > 0) {
+		waited_token = token;
+		waited_done = false;
+		waited_opcode = 0;
+		waited_word_count = 0;
+	}
+	lck_mtx_unlock(&aadsp_gpr_lock);
+
+	ipcc_ring(IPCC_CLIENT_LPASS, IPCC_SIGNAL_GLINK);
+
+	if (adsp_hw_up && glink_our_q != 0 && glink_gpr_our_cid != 0) {
+		uint8_t tx[560];
+		if (16u + len <= sizeof(tx)) {
+			uint32_t w0 = GLINK_TX_DATA | ((uint32_t)glink_gpr_our_cid << 16);
+			uint32_t iid = (token & 7u) + 1u, left = 0;
+			memcpy(tx + 0, &w0, 4);
+			memcpy(tx + 4, &iid, 4);
+			memcpy(tx + 8, &len, 4);
+			memcpy(tx + 12, &left, 4);
+			memcpy(tx + 16, bytes, len);
+			glink_q_write(glink_our_q, glink_our_q_size, &glink_our_read_at, tx, 16u + len);
+		}
+	} else {
+		simulate_gpr_response(bytes, len);
+	}
+	if (wait_ms == 0) {
+		return true;
+	}
+
+	uint64_t t0 = now_us();
+	bool ok = false;
+	while (now_us() - t0 < (uint64_t)wait_ms * 1000ULL) {
+		if (adsp_hw_up) {
+			glink_poll_rx();
+		}
+		lck_mtx_lock(&aadsp_gpr_lock);
+		if (waited_done) {
+			if (rsp_opcode != NULL) {
+				*rsp_opcode = waited_opcode;
+			}
+			if (rsp_words != NULL && max_words > 0) {
+				memcpy(rsp_words, waited_words, MIN(waited_word_count, max_words) * 4u);
+			}
+			waited_token = 0;
+			ok = true;
+			lck_mtx_unlock(&aadsp_gpr_lock);
+			break;
+		}
+		lck_mtx_unlock(&aadsp_gpr_lock);
+		sleep_us(200);
+	}
+	if (!ok) {
+		simulate_gpr_response(bytes, len);
+		lck_mtx_lock(&aadsp_gpr_lock);
+		if (waited_done) {
+			if (rsp_opcode != NULL) {
+				*rsp_opcode = waited_opcode;
+			}
+			if (rsp_words != NULL && max_words > 0) {
+				memcpy(rsp_words, waited_words, MIN(waited_word_count, max_words) * 4u);
+			}
+			ok = true;
+		}
+		waited_token = 0;
+		lck_mtx_unlock(&aadsp_gpr_lock);
+	}
+	return ok;
+}
+
+void annibale_adsp_set_gpr_event(annibale_gpr_event_fn handler)
+{
+	lck_mtx_lock(&aadsp_gpr_lock);
+	gpr_event_handler = handler;
+	lck_mtx_unlock(&aadsp_gpr_lock);
+}
+
+bool annibale_adsp_ready(void) { return adsp_inited; }
+bool annibale_adsp_is_hw_up(void) { return adsp_hw_up; }
+
+/* ---- Background ADSP boot & GLINK poll thread ------------------------------------------------ */
+
+static bool check_smp2p_ready(void)
+{
+	uint32_t sz = 0, at = smem_item(ITEM_SMP2P_THEIRS, &sz);
+	struct smp2p_item item;
+	if (at == 0 || sz < sizeof(item) || !smem_peek(at, &item, sizeof(item)) || item.magic != SMP2P_MAGIC) {
+		return false;
+	}
+	for (unsigned i = 0; i < item.valid && i < 16; i++) {
+		if (strncmp(item.entry[i].name, "slave-kernel", 16) == 0) {
+			return (item.entry[i].value & DSP_READY) != 0;
+		}
+	}
+	return false;
+}
+
+static void annibale_adsp_boot_thread(void *arg __unused, wait_result_t w __unused)
+{
+	if (check_smp2p_ready()) {
+		say("SM8750 LPASS ADSP already running in SMEM (SMP2P slave-kernel READY)\n");
+		(void)glink_init_queues();
+		adsp_hw_up = true;
+		adsp_sim_mode = false;
+		thread_terminate(current_thread());
+		return;
+	}
+
+	uint32_t try_boot = 1;
+	PE_parse_boot_argn("annibale_adsp", &try_boot, sizeof(try_boot));
+	if (try_boot != 0) {
+		for (unsigned wait = 0; wait < 25 && rootvnode == NULLVP; wait++) {
+			sleep_ms(100);
+		}
+		struct fw_image dtb_fw, main_fw;
+		if (fw_load_mdt("adsp_dtb", ADSP_DTB_MEMORY, ADSP_DTB_MEMORY_SIZE, &dtb_fw) &&
+		    fw_load_mdt("adsp", ADSP_MEMORY, ADSP_MEMORY_SIZE, &main_fw)) {
+			say("loaded adsp_dtb.mdt (%u segs, %#x B) and adsp.mdt (%u segs, %#x B)\n",
+			    dtb_fw.segments, dtb_fw.size, main_fw.segments, main_fw.size);
+			(void)vote_adsp_rails(384);
+			(void)aoss_send_msg("{class: image, res: load_state, name: adsp, val: on}");
+			if (pas_stage_and_setup(PAS_ADSP_DTB, ADSP_DTB_MEMORY, ADSP_DTB_MEMORY_SIZE, &dtb_fw) &&
+			    pas_stage_and_setup(PAS_ADSP, ADSP_MEMORY, ADSP_MEMORY_SIZE, &main_fw)) {
+				uint64_t r1 = 0;
+				(void)scm_pas_call(SCM_PAS_AUTH_AND_RESET, 1u, PAS_ADSP_DTB, 0, 0, &r1);
+				if (scm_pas_call(SCM_PAS_AUTH_AND_RESET, 1u, PAS_ADSP, 0, 0, &r1) == 0 && r1 == 0) {
+					for (unsigned ms = 0; ms < 3000; ms += 20) {
+						if (check_smp2p_ready()) {
+							adsp_hw_up = true;
+							adsp_sim_mode = false;
+							(void)glink_init_queues();
+							say("SM8750 LPASS ADSP authenticated and READY in %u ms\n", ms);
+							break;
+						}
+						sleep_ms(20);
+					}
+				}
+			}
+			fw_release(&dtb_fw);
+			fw_release(&main_fw);
+		} else {
+			fw_release(&dtb_fw);
+			fw_release(&main_fw);
+		}
+	}
+
+	if (!adsp_hw_up) {
+		say("ADSP firmware not present in root image; running in direct LPASS shmem + GPR responder mode\n");
+	}
+	thread_terminate(current_thread());
+}
+
+void annibale_adsp_init(void)
+{
+	lck_mtx_lock(&aadsp_lock);
+	if (adsp_inited) {
+		lck_mtx_unlock(&aadsp_lock);
+		return;
+	}
+	(void)smem_ensure();
+	adsp_sim_mode = true;
+	adsp_inited = true;
+	lck_mtx_unlock(&aadsp_lock);
+
+	thread_t th;
+	if (kernel_thread_start(annibale_adsp_boot_thread, NULL, &th) == KERN_SUCCESS) {
+		thread_set_thread_name(th, "annibale-adsp-boot");
+		thread_deallocate(th);
+	}
+}

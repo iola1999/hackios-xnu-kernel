@@ -126,14 +126,14 @@ audio_report(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 static void
 audio_record(const int16_t *frames, uint32_t count)
 {
-	struct rec_header *header = (struct rec_header *)rec_base;
+	struct rec_header *header = (struct rec_header *)(void *)rec_base;
 	struct rec_block *block;
 	uint64_t bytes = (uint64_t)count * REDWOOD_AUDIO_FRAME;
 
 	if (rec_base == NULL || rec_frames >= rec_frames_max || rec_used + sizeof(*block) + bytes > rec_size) {
 		return;
 	}
-	block = (struct rec_block *)(rec_base + rec_used);
+	block = (struct rec_block *)(void *)(rec_base + rec_used);
 	absolutetime_to_nanoseconds(mach_absolute_time(), &block->nanoseconds);
 	block->frames = count;
 	block->reserved = 0;
@@ -259,7 +259,7 @@ static bool volume_muted;
 static int
 audio_ioctl(__unused dev_t dev, u_long command, caddr_t data, __unused int flags, __unused struct proc *p)
 {
-	const struct redwood_audio_volume *volume = (const struct redwood_audio_volume *)data;
+	const struct redwood_audio_volume *volume = (const struct redwood_audio_volume *)(const void *)data;
 
 	if (command != REDWOOD_AUDIO_SET_VOLUME) {
 		return ENOTTY;
@@ -285,8 +285,16 @@ redwood_audio_volume(uint32_t *below, bool *muted, uint32_t *generation)
 	return *generation != 0;
 }
 
+extern int annibale_mic_read(struct uio *uio, int ioflag);
+
+static int
+audio_read(__unused dev_t dev, struct uio *uio, int ioflag)
+{
+	return annibale_mic_read(uio, ioflag);
+}
+
 static const struct cdevsw audio_cdevsw = {
-	.d_open = audio_open, .d_close = audio_close, .d_read = eno_rdwrt, .d_write = audio_write,
+	.d_open = audio_open, .d_close = audio_close, .d_read = audio_read, .d_write = audio_write,
 	.d_ioctl = audio_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
 	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
 };
@@ -356,10 +364,14 @@ redwood_audio_init(void)
 	annibale_buttons_init();
 	annibale_battery_init();
 	annibale_torch_init();
+	extern void annibale_adsp_init(void);
 	extern void annibale_audio_reach_init(void);
+	extern void annibale_mic_init(void);
 	extern void annibale_camera_init(void);
 	extern void annibale_iris_init(void);
+	annibale_adsp_init();
 	annibale_audio_reach_init();
+	annibale_mic_init();
 	annibale_camera_init();
 	annibale_iris_init();
 	mhi_pcie_init();

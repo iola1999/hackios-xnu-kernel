@@ -64,12 +64,36 @@ static uint32_t qrtr_next_port = QRTR_FIRST_PORT, qrtr_in, qrtr_out, qrtr_hellos
 static thread_t calling_thread;                 /* the link's thread, while it holds qrtr_calling */
 static int (*link_send)(const void *data, uint32_t length);
 
+#define QRTR_MAX_LINKS          4
+static struct {
+	uint32_t node;
+	bool active;
+	bool hello_answered;
+	int (*send)(const void *data, uint32_t length);
+} qrtr_links[QRTR_MAX_LINKS];
+
+static int (*qrtr_find_send(uint32_t to_node))(const void *data, uint32_t length)
+{
+	int (*fn)(const void *data, uint32_t length) = link_send;
+
+	lck_mtx_lock(&qrtr_lock);
+	for (unsigned i = 0; i < QRTR_MAX_LINKS; i++) {
+		if (qrtr_links[i].active && qrtr_links[i].node == to_node && qrtr_links[i].send != NULL) {
+			fn = qrtr_links[i].send;
+			break;
+		}
+	}
+	lck_mtx_unlock(&qrtr_lock);
+	return fn;
+}
+
 /* One datagram out, of any type. */
 static int
 qrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to_port, const void *data, uint32_t length)
 {
 	uint32_t padded = (length + 3) & ~3u;
 	struct qrtr_header *packet;
+	int (*send_fn)(const void *data, uint32_t length);
 	int error;
 
 	if (length == 0 || length > REDWOOD_QRTR_MAX) {
@@ -87,7 +111,8 @@ qrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to
 	packet->to_node = to_node;
 	packet->to_port = to_port;
 	memcpy(packet + 1, data, length);
-	error = link_send != NULL ? link_send(packet, (uint32_t)sizeof(*packet) + padded) : ENOTCONN;
+	send_fn = qrtr_find_send(to_node);
+	error = send_fn != NULL ? send_fn(packet, (uint32_t)sizeof(*packet) + padded) : ENOTCONN;
 	kfree_data(packet, sizeof(*packet) + padded);
 	qrtr_out += error == 0;
 	return error;
@@ -136,13 +161,25 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
 	int found = -1, error;
 
 	switch (control->command) {
-	case QRTR_HELLO:
-		if (qrtr_hellos++ != 0) {
-			break;                                  /* (answered once: two that answer every hello never end) */
+	case QRTR_HELLO: {
+		bool already = false;
+
+		lck_mtx_lock(&qrtr_lock);
+		for (unsigned i = 0; i < QRTR_MAX_LINKS; i++) {
+			if (qrtr_links[i].active && qrtr_links[i].node == header->from_node) {
+				already = qrtr_links[i].hello_answered;
+				qrtr_links[i].hello_answered = true;
+				break;
+			}
+		}
+		lck_mtx_unlock(&qrtr_lock);
+		if (already || qrtr_hellos++ > 8) {
+			break;                                  /* (answered once per peer node) */
 		}
 		error = qrtr_out_packet(QRTR_HELLO, QRTR_CONTROL, header->from_node, QRTR_CONTROL, &hello, sizeof(hello));
 		printf("qrtr: HELLO FROM NODE %u; ours to it: %s\n", header->from_node, error == 0 ? "SENT" : "NOT SENT");
 		break;
+	}
 	case QRTR_NEW_SERVER:
 		lck_mtx_lock(&qrtr_lock);
 		for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
@@ -377,9 +414,53 @@ redwood_qrtr_attach(int (*send)(const void *data, uint32_t length))
 {
 	lck_mtx_lock(&qrtr_lock);
 	link_send = send;
-	bzero(qrtr_servers, sizeof(qrtr_servers));
+	if (send == NULL) {
+		for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
+			if (qrtr_servers[i].node == qrtr_peer) {
+				qrtr_servers[i].there = false;
+			}
+		}
+	}
 	qrtr_peer = qrtr_hellos = qrtr_in = qrtr_out = 0;
 	lck_mtx_unlock(&qrtr_lock);
+}
+
+void
+redwood_qrtr_attach_node(uint32_t peer_node, int (*send)(const void *data, uint32_t length))
+{
+	struct qrtr_control hello = { .command = QRTR_HELLO };
+	int slot = -1;
+
+	lck_mtx_lock(&qrtr_lock);
+	for (unsigned i = 0; i < QRTR_MAX_LINKS; i++) {
+		if (qrtr_links[i].active && qrtr_links[i].node == peer_node) {
+			slot = (int)i;
+			break;
+		}
+		if (!qrtr_links[i].active && slot < 0) {
+			slot = (int)i;
+		}
+	}
+	if (slot >= 0) {
+		qrtr_links[slot].node = peer_node;
+		qrtr_links[slot].send = send;
+		qrtr_links[slot].active = (send != NULL);
+		qrtr_links[slot].hello_answered = false;
+	}
+	if (link_send == NULL && send != NULL) {
+		link_send = send;
+	}
+	if (send == NULL) {
+		for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
+			if (qrtr_servers[i].node == peer_node) {
+				qrtr_servers[i].there = false;
+			}
+		}
+	}
+	lck_mtx_unlock(&qrtr_lock);
+	if (send != NULL) {
+		qrtr_out_packet(QRTR_HELLO, QRTR_CONTROL, peer_node, QRTR_CONTROL, &hello, sizeof(hello));
+	}
 }
 
 void

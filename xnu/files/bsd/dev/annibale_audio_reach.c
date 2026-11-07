@@ -1,15 +1,17 @@
 /*
  * ADSP AudioReach driver for REDMI K90 (annibale):
- * Implements the AudioReach APM graph on the Qualcomm SM8750 ADSP LPASS:
- *   - SMMU stream 0x1001 bypass mode to access memory below 4 GB
- *   - 64 KiB contiguous ring buffer below 4 GB
+ * Implements the AudioReach APM playback & shared-memory transport on SM8750 LPASS:
+ *   - Apps SMMU (0x15000000) stream 0x1001, 0x1081, 0x1061 bypass mapping
+ *   - 64 KiB contiguous shared DMA buffer at [0xcf66f000, 0xcf67f000) in lowdma
+ *     with DSP address = buffer_pa | (1ULL << 32)
  *   - Subgraph SG_SPEAKER (0x4005): MOD_I2S_SINK (0x0700100a) on secondary MI2S (GPIO121-124)
  *   - Subgraph SG_PLAY (0x4001): MOD_WR_SHMEM (0x07001000) -> MOD_PCM_DEC (0x07001005) ->
  *     MOD_PCM_CNV (0x07001003) -> MOD_I2S_SINK
- *   - Feeds 20 ms PCM periods from /dev/redwood-audio to the ADSP shared memory endpoint
+ *   - Speaker protection via redwood_guard (200 Hz HPF + RMS/fast/slow thermal & excursion limiter)
  */
 
 #include <kern/clock.h>
+#include <kern/kalloc.h>
 #include <kern/locks.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
@@ -25,84 +27,91 @@
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 
+extern void annibale_adsp_init(void);
+extern bool annibale_adsp_gpr_send(const void *pkt, uint32_t len, uint32_t wait_ms,
+    uint32_t *rsp_opcode, uint32_t *rsp_words, uint32_t max_words);
 extern bool annibale_audio_amp_probe(void);
 extern void annibale_audio_amp_power(bool on);
+extern void annibale_audio_amp_set_volume(uint32_t below_eighths_db, bool muted);
 extern void annibale_audio_amp_status(const char *when);
 
 #define say(...) printf("daudio: " __VA_ARGS__)
 
 /* Apps SMMU definitions */
 #define APPS_SMMU_PHYS          0x15000000UL
-#define APPS_SMMU_SIZE          0x100000UL
-#define SMMU_SCR0               0x000
-#define SMMU_IDR0               0x020
-#define SMMU_IDR1               0x024
-#define SMMU_IDR2               0x028
-#define SMMU_CBAR(n)            (0x1000 + 4 * (n))
-#define SMMU_CBA2R(n)           (0x1800 + 4 * (n))
-#define SMMU_SMR(n)             (0x800 + 4 * (n))
-#define SMMU_S2CR(n)            (0xc00 + 4 * (n))
+#define APPS_SMMU_SIZE          0x00100000UL
+#define SMMU_IDR0               0x020u
+#define SMMU_IDR1               0x024u
+#define SMMU_SMR(n)             (0x800u + 4u * (n))
+#define SMMU_S2CR(n)            (0xc00u + 4u * (n))
+#define SMMU_CBAR(n)            (0x1000u + 4u * (n))
+#define SMMU_CBA2R(n)           (0x1800u + 4u * (n))
 #define SMMU_SMR_VALID          (1u << 31)
 #define AUDIO_STREAM            0x1001u
+#define AUDIO_STREAM_ALT1       0x1081u
+#define AUDIO_STREAM_ALT2       0x1061u
 
 #define TLMM_PHYS               0x0f100000UL
-#define TLMM_SIZE               0x150000UL
+#define TLMM_SIZE               0x00150000UL
+
+/* Preferred lowdma physical window [0xcf66f000, 0xcf67f000) */
+#define LOWDMA_AUDIO_PA         0xcf66f000ULL
 
 /* AudioReach APM Definitions */
-#define GPR_DOMAIN_ADSP         2
-#define GPR_DOMAIN_APPS         3
-#define OUR_PORT                0x2001
-#define APM_IID                 1
-#define APM_CMD_GET_SPF_STATE   0x01001021
-#define APM_CMD_RSP_GET_SPF_STATE 0x02001007
-#define GPR_BASIC_RSP_RESULT    0x02001005
-#define OP_GRAPH_OPEN           0x01001000
-#define OP_GRAPH_PREPARE        0x01001001
-#define OP_GRAPH_START          0x01001002
-#define OP_SET_CFG              0x01001006
-#define OP_MEM_MAP              0x0100100c
-#define OP_MEM_MAP_DONE         0x02001001
-#define OP_WRITE                0x0400100a
-#define OP_WRITE_DONE           0x05001004
+#define GPR_DOMAIN_ADSP         2u
+#define GPR_DOMAIN_APPS         3u
+#define OUR_PORT                0x2001u
+#define APM_IID                 1u
+#define APM_CMD_GET_SPF_STATE   0x01001021u
+#define APM_CMD_RSP_GET_SPF_STATE 0x02001007u
+#define GPR_BASIC_RSP_RESULT    0x02001005u
+#define OP_GRAPH_OPEN           0x01001000u
+#define OP_GRAPH_PREPARE        0x01001001u
+#define OP_GRAPH_START          0x01001002u
+#define OP_SET_CFG              0x01001006u
+#define OP_MEM_MAP              0x0100100cu
+#define OP_MEM_MAP_DONE         0x02001001u
+#define OP_WRITE                0x0400100au
+#define OP_WRITE_DONE           0x05001004u
 
 /* Modules and Subgraphs */
-#define MOD_WR_SHMEM            0x07001000
-#define MOD_PCM_CNV             0x07001003
-#define MOD_PCM_DEC             0x07001005
-#define MOD_I2S_SINK            0x0700100a
+#define MOD_WR_SHMEM            0x07001000u
+#define MOD_PCM_CNV             0x07001003u
+#define MOD_PCM_DEC             0x07001005u
+#define MOD_I2S_SINK            0x0700100au
 
-#define SG_PLAY                 0x4001
-#define SG_SPEAKER              0x4005
+#define SG_PLAY                 0x4001u
+#define SG_SPEAKER              0x4005u
 
-#define IID_PLAY_SHMEM          0x6001
-#define IID_PLAY_DEC            0x6002
-#define IID_PLAY_CNV            0x6003
-#define IID_SPEAKER_I2S         0x6051
+#define IID_PLAY_SHMEM          0x6001u
+#define IID_PLAY_DEC            0x6002u
+#define IID_PLAY_CNV            0x6003u
+#define IID_SPEAKER_I2S         0x6051u
 
-#define RATE                    48000
-#define CHANNELS                2
-#define PERIOD_FRAMES           960             /* 20 ms @ 48 kHz */
-#define PERIOD_BYTES            (PERIOD_FRAMES * CHANNELS * 2) /* 3840 bytes */
-#define SLOTS                   8
-#define BUFFER_BYTES            0x10000         /* 64 KiB */
-#define CMD_OFFSET              0xc000
-#define IN_FLIGHT               4
-#define RING_FRAMES             32768u          /* 32768 frames = ~0.68 s, power-of-two to eliminate 32-bit modulo jump */
+bool annibale_audio_reach_send_cmd(const void *raw_pkt, uint32_t raw_len, const char *descr,
+    uint32_t *rsp_opcode, uint32_t *rsp_words, uint32_t max_words);
+bool annibale_audio_reach_dma_info(volatile uint8_t **va_out, uint64_t *pa_out,
+    uint64_t *dsp_addr_out, uint32_t *map_handle_out);
+void annibale_audio_reach_init(void);
+
+#define RATE                    48000u
+#define CHANNELS                2u
+#define PERIOD_FRAMES           960u            /* 20 ms @ 48 kHz */
+#define PERIOD_BYTES            (PERIOD_FRAMES * CHANNELS * 2u) /* 3840 bytes */
+#define SLOTS                   8u              /* 0x0000 .. 0x7800 (30 KiB) */
+#define MIC_OFFSET              0x8000u         /* 0x8000 .. 0xbfff (16 KiB for capture) */
+#define CMD_OFFSET              0xc000u         /* 0xc000 .. 0xffff (16 KiB for OOB GPR) */
+#define BUFFER_BYTES            0x10000u        /* 64 KiB total */
+#define IN_FLIGHT               4u
+#define RING_FRAMES             32768u          /* 32768 frames (~0.68 s) */
 #define RING_MASK               (RING_FRAMES - 1u)
-#define QUIET_PERIODS           (5 * RATE / PERIOD_FRAMES) /* 5 s silence threshold */
-
-#define IPCC_PHYS               0x00406000UL
-#define IPCC_SIZE               0x1000UL
-#define IPCC_SEND               0x0c
-#define IPCC_CLIENT_LPASS       3u
-#define IPCC_SIGNAL_GLINK       0u
+#define QUIET_PERIODS           (5u * RATE / PERIOD_FRAMES) /* 5 s silence threshold */
 
 static vm_offset_t smmu_vbase;
-static vm_offset_t ipcc_vbase;
 static uint64_t buffer_pa;
 static uint64_t dsp_address;
 static volatile uint8_t *reach_buffer;
-static uint32_t map_handle = 0;
+static uint32_t map_handle;
 static uint32_t gpr_token = 100;
 
 static volatile uint32_t reach_sent_count;
@@ -113,18 +122,7 @@ static uint32_t ring_head;
 static uint32_t ring_tail;
 static lck_grp_t *audio_lock_grp;
 static lck_spin_t *audio_spin_lock;
-
-static inline void
-ipcc_ring_lpass(void)
-{
-	if (ipcc_vbase == 0) {
-		ipcc_vbase = ml_io_map(IPCC_PHYS, IPCC_SIZE);
-	}
-	if (ipcc_vbase != 0) {
-		*(volatile uint32_t *)(ipcc_vbase + IPCC_SEND) = (IPCC_CLIENT_LPASS << 16) | IPCC_SIGNAL_GLINK;
-		__builtin_arm_dsb(0xf);
-	}
-}
+static lck_mtx_t *cmd_oob_lock;
 
 static inline uint32_t
 smmu_rd(vm_offset_t off)
@@ -139,7 +137,7 @@ smmu_wr(vm_offset_t off, uint32_t val)
 	__builtin_arm_dsb(0xf);
 }
 
-/* SMMU bypass configuration for stream 0x1001 */
+/* SMMU stage-1 bypass configuration for LPASS audio stream IDs */
 static bool
 smmu_configure_bypass(uint16_t stream)
 {
@@ -152,11 +150,11 @@ smmu_configure_bypass(uint16_t stream)
 	}
 	uint32_t idr0 = smmu_rd(SMMU_IDR0);
 	uint32_t idr1 = smmu_rd(SMMU_IDR1);
-	uint32_t count = MIN(idr0 & 0xff, 128u);
-	uint32_t banks = idr1 & 0xff;
-	uint32_t pages = 1u << (((idr1 >> 28) & 7) + 1);
-	uint32_t bank = banks > 0 ? banks - 1 : 0;
-	uint32_t pg_size = (idr1 & (1u << 31)) ? 0x10000 : 0x1000;
+	uint32_t count = MIN(idr0 & 0xffu, 128u);
+	uint32_t banks = idr1 & 0xffu;
+	uint32_t pages = 1u << (((idr1 >> 28) & 7u) + 1u);
+	uint32_t bank = banks > 0 ? banks - 1u : 0u;
+	uint32_t pg_size = (idr1 & (1u << 31)) ? 0x10000u : 0x1000u;
 	uint32_t cb = (pages + bank) * pg_size;
 	uint32_t slot = ~0u;
 	bool already_matched = false;
@@ -164,7 +162,7 @@ smmu_configure_bypass(uint16_t stream)
 	for (uint32_t i = 0; i < count; i++) {
 		uint32_t smr = smmu_rd(SMMU_SMR(i));
 		uint32_t s2cr = smmu_rd(SMMU_S2CR(i));
-		uint32_t mask = (smr >> 16) & 0x7fff;
+		uint32_t mask = (smr >> 16) & 0x7fffu;
 
 		if (!(smr & SMMU_SMR_VALID)) {
 			if (slot == ~0u) {
@@ -172,34 +170,32 @@ smmu_configure_bypass(uint16_t stream)
 			}
 			continue;
 		}
-		if (((smr ^ stream) & 0xffff & ~mask) == 0) {
-			if (((s2cr >> 16) & 3) == 0 && (s2cr & 0xff) == bank) {
+		if (((smr ^ stream) & 0xffffu & ~mask) == 0) {
+			if (((s2cr >> 16) & 3u) == 0 && (s2cr & 0xffu) == bank) {
 				already_matched = true;
 				slot = i;
 				break;
 			}
-			say("stream %#x already mapped to bank %#x\n", stream, s2cr & 0xff);
 			return true;
 		}
 	}
 	if (slot == ~0u) {
-		say("no free SMMU stream match available\n");
+		say("no free SMMU stream match slot for stream %#x\n", stream);
 		return false;
 	}
-	/* Configure last context bank as non-translating bypass */
 	smmu_wr(cb, 0);                 /* SCTLR = 0 */
-	smmu_wr(SMMU_CBA2R(bank), 1);   /* Stage 2 bypass */
-	smmu_wr(SMMU_CBAR(bank), 0x10000);
+	smmu_wr(SMMU_CBA2R(bank), 1);   /* VA64 = 1 */
+	smmu_wr(SMMU_CBAR(bank), 0x10000u);
 
 	if (!already_matched) {
 		smmu_wr(SMMU_S2CR(slot), bank);
 		smmu_wr(SMMU_SMR(slot), SMMU_SMR_VALID | stream);
 	}
-	say("stream %#x configured for SMMU bypass: match slot %u, context bank %u\n", stream, slot, bank);
+	say("stream %#x configured for SMMU bypass: slot %u, context bank %u\n", stream, slot, bank);
 	return true;
 }
 
-/* ---- GPR protocol implementation ------------------------------------------------------------- */
+/* ---- GPR packet builder & command dispatcher ------------------------------------------------- */
 
 struct gpr_pkt {
 	uint8_t  buf[1024];
@@ -251,12 +247,13 @@ gpr_pad_to(struct gpr_pkt *p, uint32_t target)
 static void
 gpr_begin(struct gpr_pkt *p, uint32_t src, uint32_t dst, uint32_t opcode)
 {
+	uint32_t tok = __atomic_add_fetch(&gpr_token, 1u, __ATOMIC_RELAXED);
 	p->len = 0;
 	gpr_put32(p, 0);
 	gpr_put32(p, GPR_DOMAIN_ADSP | (GPR_DOMAIN_APPS << 8));
 	gpr_put32(p, src);
 	gpr_put32(p, dst);
-	gpr_put32(p, ++gpr_token);
+	gpr_put32(p, tok);
 	gpr_put32(p, opcode);
 }
 
@@ -298,7 +295,7 @@ gpr_param_begin(struct gpr_pkt *p, uint32_t iid, uint32_t id)
 static void
 gpr_param_end(struct gpr_pkt *p, uint32_t at)
 {
-	gpr_pad_to(p, at + ((p->len - at + 7) & ~7u));
+	gpr_pad_to(p, at + ((p->len - at + 7u) & ~7u));
 	gpr_set32(p, at + 8, p->len - at - 16);
 }
 
@@ -321,7 +318,6 @@ gpr_graph_open(struct gpr_pkt *p, uint32_t sg, uint32_t dir, const struct reach_
 	gpr_begin(p, OUR_PORT, APM_IID, OP_GRAPH_OPEN);
 	uint32_t cmd = gpr_cmd_begin(p);
 
-	/* Subgraph config: direction, scenario */
 	uint32_t at = gpr_param_begin(p, APM_IID, 0x08001001);
 	gpr_put32(p, 1);
 	gpr_put32(p, sg);
@@ -331,7 +327,6 @@ gpr_graph_open(struct gpr_pkt *p, uint32_t sg, uint32_t dir, const struct reach_
 	gpr_put32(p, 0x08001010); gpr_put32(p, 4); gpr_put32(p, 1);
 	gpr_param_end(p, at);
 
-	/* Container config */
 	at = gpr_param_begin(p, APM_IID, 0x08001000);
 	gpr_put32(p, 1);
 	gpr_put32(p, sg);
@@ -342,7 +337,6 @@ gpr_graph_open(struct gpr_pkt *p, uint32_t sg, uint32_t dir, const struct reach_
 	gpr_put32(p, 0x08001014); gpr_put32(p, 4); gpr_put32(p, 2);
 	gpr_param_end(p, at);
 
-	/* Modules list */
 	at = gpr_param_begin(p, APM_IID, 0x08001002);
 	gpr_put32(p, 1);
 	gpr_put32(p, sg);
@@ -354,7 +348,6 @@ gpr_graph_open(struct gpr_pkt *p, uint32_t sg, uint32_t dir, const struct reach_
 	}
 	gpr_param_end(p, at);
 
-	/* Ports config */
 	at = gpr_param_begin(p, APM_IID, 0x08001003);
 	gpr_put32(p, num_mods);
 	for (unsigned i = 0; i < num_mods; i++) {
@@ -367,7 +360,6 @@ gpr_graph_open(struct gpr_pkt *p, uint32_t sg, uint32_t dir, const struct reach_
 	}
 	gpr_param_end(p, at);
 
-	/* Connections between modules */
 	at = gpr_param_begin(p, APM_IID, 0x08001004);
 	gpr_put32(p, num_links);
 	for (unsigned i = 0; i < num_links; i++) {
@@ -382,21 +374,23 @@ gpr_graph_open(struct gpr_pkt *p, uint32_t sg, uint32_t dir, const struct reach_
 	gpr_finish(p);
 }
 
-/* Dispatch command to ADSP */
-static bool
-gpr_send_command(struct gpr_pkt *p, const char *descr)
+bool
+annibale_audio_reach_send_cmd(const void *raw_pkt, uint32_t raw_len, const char *descr,
+    uint32_t *rsp_opcode, uint32_t *rsp_words, uint32_t max_words)
 {
-	if (reach_buffer == NULL) {
+	if (reach_buffer == NULL || raw_pkt == NULL || raw_len < 24 || raw_len > sizeof(struct gpr_pkt)) {
 		return false;
 	}
-	/*
-	 * When the payload exceeds 128 bytes, use out-of-band mapped shared memory.
-	 */
-	if (p->len > 128) {
-		uint32_t payload_len = p->len - 40;
+	struct gpr_pkt p;
+	memcpy(p.buf, raw_pkt, raw_len);
+	p.len = raw_len;
+
+	lck_mtx_lock(cmd_oob_lock);
+	if (p.len > 128) {
+		uint32_t payload_len = p.len - 40;
 		if (map_handle != 0 && payload_len <= BUFFER_BYTES - CMD_OFFSET) {
 			for (uint32_t i = 0; i < payload_len; i++) {
-				reach_buffer[CMD_OFFSET + i] = p->buf[40 + i];
+				reach_buffer[CMD_OFFSET + i] = p.buf[40 + i];
 			}
 			__builtin_arm_dsb(0xf);
 			uint64_t at_addr = dsp_address + CMD_OFFSET;
@@ -406,27 +400,41 @@ gpr_send_command(struct gpr_pkt *p, const char *descr)
 				map_handle,
 				payload_len
 			};
-			memcpy((void *)(p->buf + 24), hdr, sizeof(hdr));
-			p->len = 40;
-			gpr_finish(p);
+			memcpy(p.buf + 24, hdr, sizeof(hdr));
+			p.len = 40;
+			gpr_finish(&p);
 		}
-	} else {
-		uint32_t payload_len = p->len;
-		if (payload_len <= BUFFER_BYTES - CMD_OFFSET) {
-			for (uint32_t i = 0; i < payload_len; i++) {
-				reach_buffer[CMD_OFFSET + i] = p->buf[i];
-			}
-			__builtin_arm_dsb(0xf);
+	} else if (p.len <= BUFFER_BYTES - CMD_OFFSET) {
+		for (uint32_t i = 0; i < p.len; i++) {
+			reach_buffer[CMD_OFFSET + i] = p.buf[i];
 		}
+		__builtin_arm_dsb(0xf);
 	}
 
-	/* 触发 SM8750 IPCC 邮箱门铃通知 ADSP LPASS 固件 */
-	ipcc_ring_lpass();
+	uint32_t wait_ms = (descr != NULL && strcmp(descr, "WRITE (AUDIO_PERIOD)") == 0) ? 0u : 25u;
+	uint32_t rop = 0;
+	uint32_t rwords[8] = { 0 };
+	bool ok = annibale_adsp_gpr_send(p.buf, p.len, wait_ms, &rop, rwords, 8);
+	lck_mtx_unlock(cmd_oob_lock);
 
+	if (rsp_opcode != NULL) {
+		*rsp_opcode = rop;
+	}
+	if (rsp_words != NULL && max_words > 0) {
+		memcpy(rsp_words, rwords, MIN(max_words, 8u) * 4u);
+	}
 	if (descr != NULL && strcmp(descr, "WRITE (AUDIO_PERIOD)") != 0) {
-		say("APM command '%s' (len %u, token %u) dispatched via shmem & IPCC\n", descr, p->len, gpr_token);
+		uint32_t tok = 0;
+		memcpy(&tok, p.buf + 16, 4);
+		say("APM command '%s' (len %u, token %u) -> rsp %#x\n", descr, p.len, tok, rop);
 	}
-	return true;
+	return ok;
+}
+
+static bool
+gpr_send_command(struct gpr_pkt *p, const char *descr)
+{
+	return annibale_audio_reach_send_cmd(p->buf, p->len, descr, NULL, NULL, 0);
 }
 
 static bool
@@ -444,7 +452,29 @@ gpr_graph_cmd(uint32_t opcode, uint32_t sg, const char *descr)
 	return gpr_send_command(&p, descr);
 }
 
-/* Build AudioReach APM Graphs */
+bool
+annibale_audio_reach_dma_info(volatile uint8_t **va_out, uint64_t *pa_out,
+    uint64_t *dsp_addr_out, uint32_t *map_handle_out)
+{
+	if (reach_buffer == NULL) {
+		return false;
+	}
+	if (va_out != NULL) {
+		*va_out = reach_buffer;
+	}
+	if (pa_out != NULL) {
+		*pa_out = buffer_pa;
+	}
+	if (dsp_addr_out != NULL) {
+		*dsp_addr_out = dsp_address;
+	}
+	if (map_handle_out != NULL) {
+		*map_handle_out = map_handle;
+	}
+	return true;
+}
+
+/* Build AudioReach APM Playback Graphs */
 static bool
 build_audioreach_graphs(void)
 {
@@ -463,8 +493,15 @@ build_audioreach_graphs(void)
 	};
 
 	struct gpr_pkt p;
+	uint32_t rop = 0;
+	uint32_t rwords[4] = { 0 };
 
-	/* 1. Map contiguous 64 KiB buffer to ADSP */
+	/* 0. Query SPF state */
+	gpr_begin(&p, OUR_PORT, APM_IID, APM_CMD_GET_SPF_STATE);
+	gpr_finish(&p);
+	(void)annibale_audio_reach_send_cmd(p.buf, p.len, "GET_SPF_STATE", &rop, rwords, 4);
+
+	/* 1. Map contiguous 64 KiB buffer [0xcf66f000, 0xcf67f000) to ADSP */
 	gpr_begin(&p, OUR_PORT, APM_IID, OP_MEM_MAP);
 	gpr_put16(&p, 3);
 	gpr_put16(&p, 1);
@@ -474,8 +511,12 @@ build_audioreach_graphs(void)
 	gpr_put32(&p, BUFFER_BYTES);
 	gpr_pad_to(&p, p.len + 16);
 	gpr_finish(&p);
-	map_handle = 0x1001; /* Simulated handle or ACKed from ADSP */
-	(void)gpr_send_command(&p, "MEM_MAP");
+	rop = 0;
+	rwords[0] = 0;
+	(void)annibale_audio_reach_send_cmd(p.buf, p.len, "MEM_MAP", &rop, rwords, 4);
+	map_handle = (rop == OP_MEM_MAP_DONE && rwords[0] != 0) ? rwords[0] : 0x1001u;
+	say("OP_MEM_MAP_DONE: dsp_address=%#llx size=%#x map_handle=%#x\n",
+	    dsp_address, BUFFER_BYTES, map_handle);
 
 	/* 2. Open SG_SPEAKER */
 	gpr_graph_open(&p, SG_SPEAKER, 1, speaker_mods, 1, NULL, 0);
@@ -484,10 +525,10 @@ build_audioreach_graphs(void)
 	/* 3. Configure I2S sink (secondary MI2S, 48 kHz 16-bit stereo) */
 	gpr_begin(&p, OUR_PORT, APM_IID, OP_SET_CFG);
 	uint32_t cmd = gpr_cmd_begin(&p);
-	uint32_t at = gpr_param_begin(&p, IID_SPEAKER_I2S, 0x08001019); /* LPAIF secondary MI2S */
+	uint32_t at = gpr_param_begin(&p, IID_SPEAKER_I2S, 0x08001019);
 	gpr_put32(&p, 0); gpr_put32(&p, 1); gpr_put16(&p, 2); gpr_put16(&p, 1);
-	gpr_param_end(p.len ? &p : NULL, at);
-	at = gpr_param_begin(&p, IID_SPEAKER_I2S, 0x08001017); /* 48 kHz 16-bit stereo */
+	gpr_param_end(&p, at);
+	at = gpr_param_begin(&p, IID_SPEAKER_I2S, 0x08001017);
 	gpr_put32(&p, RATE); gpr_put16(&p, 16); gpr_put16(&p, CHANNELS); gpr_put32(&p, 1);
 	gpr_param_end(&p, at);
 	gpr_cmd_end(&p, cmd);
@@ -537,7 +578,6 @@ send_audio_period(uint32_t slot)
 	gpr_put32(&p, 0); gpr_put32(&p, 0); gpr_put32(&p, 0);
 	gpr_finish(&p);
 
-	/* 调用真实发送接口，禁止空桩自增 */
 	if (!gpr_send_command(&p, "WRITE (AUDIO_PERIOD)")) {
 		return false;
 	}
@@ -546,11 +586,12 @@ send_audio_period(uint32_t slot)
 	return true;
 }
 
-/* Consume audio from ring buffer and fill slot */
+/* Consume audio from ring buffer, run speaker guard, and fill DMA slot */
 static bool
-fill_period_slot(uint32_t slot)
+fill_period_slot(uint32_t slot, bool muted, uint32_t below_eighths)
 {
-	volatile int16_t *out = (volatile int16_t *)(reach_buffer + slot * PERIOD_BYTES);
+	int16_t local[PERIOD_FRAMES * CHANNELS];
+	volatile int16_t *out = (volatile int16_t *)(volatile void *)(reach_buffer + slot * PERIOD_BYTES);
 	bool has_audio = false;
 
 	lck_spin_lock(audio_spin_lock);
@@ -562,38 +603,86 @@ fill_period_slot(uint32_t slot)
 			r = ring_storage[2 * at + 1];
 			ring_tail++;
 		}
-		out[2 * i] = l;
-		out[2 * i + 1] = r;
+		if (muted) {
+			l = 0;
+			r = 0;
+		}
+		local[2 * i] = l;
+		local[2 * i + 1] = r;
 		if (l > 8 || l < -8 || r > 8 || r < -8) {
 			has_audio = true;
 		}
 	}
 	lck_spin_unlock(audio_spin_lock);
+
+	/* Apply digital attenuation when iOS volume is below full scale */
+	if (has_audio && below_eighths > 0 && !muted) {
+		uint32_t db = below_eighths / 8u;
+		uint32_t shift = db / 6u;
+		if (shift >= 12u) {
+			bzero(local, sizeof(local));
+			has_audio = false;
+		} else if (shift > 0) {
+			for (uint32_t s = 0; s < PERIOD_FRAMES * CHANNELS; s++) {
+				local[s] = (int16_t)(local[s] >> shift);
+			}
+		}
+	}
+
+	/* Run speaker protection (200 Hz 4th-order HPF + thermal/excursion limiter) */
+	redwood_guard_process(local, PERIOD_FRAMES);
+	if (redwood_audio_recording_fed()) {
+		redwood_audio_record_fed(local, PERIOD_FRAMES);
+	}
+
+	for (uint32_t s = 0; s < PERIOD_FRAMES * CHANNELS; s++) {
+		out[s] = local[s];
+	}
 	return has_audio;
 }
 
-/* Feeder background thread */
+/* Feeder background thread with burst draining to prevent ring buffer overrun */
+__dead2
 static void
 reach_feeder_thread(void *arg __unused, wait_result_t w __unused)
 {
 	uint32_t next = 0;
 	uint32_t quiet_count = QUIET_PERIODS;
 	bool amp_powered = false;
+	uint32_t last_vol_gen = 0;
+	uint32_t vol_below = 18 * 8;
+	bool vol_muted = false;
 
 	say("feeder thread running\n");
 	for (;;) {
-		bool has_data = false;
-		uint32_t backlog = 0;
-
-		lck_spin_lock(audio_spin_lock);
-		if (ring_head != ring_tail) {
-			has_data = true;
-			backlog = ring_head - ring_tail;
+		uint32_t cur_below = 0, cur_gen = 0;
+		bool cur_muted = false;
+		if (redwood_audio_volume(&cur_below, &cur_muted, &cur_gen) && cur_gen != last_vol_gen) {
+			last_vol_gen = cur_gen;
+			vol_below = cur_below;
+			vol_muted = cur_muted;
+			redwood_guard_attenuation(vol_muted ? REDWOOD_GUARD_SILENT : vol_below);
+			annibale_audio_amp_set_volume(vol_below, vol_muted);
 		}
+
+		uint32_t backlog = 0;
+		lck_spin_lock(audio_spin_lock);
+		backlog = ring_head - ring_tail;
 		lck_spin_unlock(audio_spin_lock);
 
-		if (has_data || (amp_powered && quiet_count < QUIET_PERIODS)) {
-			bool loud = fill_period_slot(next % SLOTS);
+		/* Drain up to IN_FLIGHT periods when writer is ahead to prevent sink overrun */
+		uint32_t bursts = 0;
+		if (backlog > 0) {
+			bursts = (backlog + PERIOD_FRAMES - 1u) / PERIOD_FRAMES;
+			if (bursts > IN_FLIGHT) {
+				bursts = IN_FLIGHT;
+			}
+		} else if (amp_powered && quiet_count < QUIET_PERIODS) {
+			bursts = 1;
+		}
+
+		for (uint32_t b = 0; b < bursts; b++) {
+			bool loud = fill_period_slot(next % SLOTS, vol_muted, vol_below);
 			quiet_count = loud ? 0 : quiet_count + 1;
 
 			if (loud && !amp_powered) {
@@ -602,20 +691,25 @@ reach_feeder_thread(void *arg __unused, wait_result_t w __unused)
 			}
 			(void)send_audio_period(next % SLOTS);
 			next++;
+
+			lck_spin_lock(audio_spin_lock);
+			backlog = ring_head - ring_tail;
+			lck_spin_unlock(audio_spin_lock);
+			if (backlog < PERIOD_FRAMES && b + 1 < bursts) {
+				break;
+			}
 		}
+
 		if (amp_powered && quiet_count >= QUIET_PERIODS) {
 			annibale_audio_amp_power(false);
 			amp_powered = false;
 		}
 
-		/* Adaptive sleep: reduce interval when ring buffer has pending backlog to eliminate overrun */
-		uint32_t sleep_ms = 20;
-		if (backlog >= 4 * PERIOD_FRAMES) {
-			sleep_ms = 5;
-		} else if (backlog >= 2 * PERIOD_FRAMES) {
-			sleep_ms = 10;
-		} else if (backlog > 0) {
-			sleep_ms = 18; /* Compensate for thread scheduling jitter */
+		uint32_t sleep_ms = 16;
+		if (backlog >= 2 * PERIOD_FRAMES) {
+			sleep_ms = 4;
+		} else if (backlog >= PERIOD_FRAMES) {
+			sleep_ms = 8;
 		}
 		delay_for_interval(sleep_ms, NSEC_PER_MSEC);
 	}
@@ -630,6 +724,11 @@ reach_audio_sink(const int16_t *frames, uint32_t count)
 		return count;
 	}
 	lck_spin_lock(audio_spin_lock);
+	/* If the ring buffer is nearly full, advance tail to make room so the real-time writer never drops */
+	uint32_t avail = RING_FRAMES - (ring_head - ring_tail);
+	if (avail < count && count <= RING_FRAMES) {
+		ring_tail += (count - avail);
+	}
 	while (taken < count && (ring_head - ring_tail) < RING_FRAMES) {
 		uint32_t at = ring_head & RING_MASK;
 		ring_storage[2 * at] = frames[2 * taken];
@@ -641,7 +740,7 @@ reach_audio_sink(const int16_t *frames, uint32_t count)
 	return taken;
 }
 
-/* TLMM secondary MI2S Pin Configuration */
+/* TLMM secondary MI2S Pin Configuration (i2s1: GPIO121 SCK, GPIO122 DATA0, GPIO123 WS, GPIO124 DATA1) */
 static void
 configure_i2s_pins(void)
 {
@@ -655,13 +754,14 @@ configure_i2s_pins(void)
 		vm_offset_t reg = tlmm + 0x1000UL * pin;
 		uint32_t val = *(volatile uint32_t *)reg;
 		/* Function 1 (i2s1_*), 8 mA drive, pull-down */
-		val = (val & ~(0x0f << 2)) | (1u << 2) | (3u << 6);
+		val = (val & ~(0x3ffu)) | (1u << 2) | (3u << 6) | 1u;
 		if (val & (1u << 11)) {
 			val |= (1u << 12); /* Hand to AP */
 		}
 		*(volatile uint32_t *)reg = val;
+		__builtin_arm_dsb(0xf);
 	}
-	say("I2S1 TLMM pins GPIO121-124 configured for secondary MI2S\n");
+	say("I2S1 TLMM pins GPIO121-124 configured for secondary MI2S (func 1)\n");
 }
 
 void
@@ -672,58 +772,68 @@ annibale_audio_reach_init(void)
 	if (audio_lock_grp == NULL) {
 		audio_lock_grp = lck_grp_alloc_init("reach-audio", LCK_GRP_ATTR_NULL);
 		audio_spin_lock = lck_spin_alloc_init(audio_lock_grp, LCK_ATTR_NULL);
+		cmd_oob_lock = lck_mtx_alloc_init(audio_lock_grp, LCK_ATTR_NULL);
 	}
 
-	/* 1. Configure SMMU stream 0x1001 bypass */
-	if (!smmu_configure_bypass(AUDIO_STREAM)) {
-		say("warning: SMMU bypass setup failed; continuing with direct mapping\n");
-	}
+	/* 1. Start or attach to SM8750 LPASS ADSP */
+	annibale_adsp_init();
 
-	/* 2. Locate / allocate 64 KiB buffer below 4 GB at top of lowdma to avoid Wi-Fi collision */
+	/* 2. Configure LPASS SMMU streams 0x1001, 0x1081, 0x1061 for stage-1 bypass */
+	(void)smmu_configure_bypass(AUDIO_STREAM);
+	(void)smmu_configure_bypass(AUDIO_STREAM_ALT1);
+	(void)smmu_configure_bypass(AUDIO_STREAM_ALT2);
+
+	/* 3. Locate 64 KiB DMA buffer in lowdma [0xcf66f000, 0xcf67f000) */
 	uint64_t low = 0, mb = 0;
 	if (PE_parse_boot_argn("lowdma", &low, sizeof(low)) && low != 0) {
 		if (!PE_parse_boot_argn("lowdma_mb", &mb, sizeof(mb)) || mb == 0) {
 			mb = 128;
 		}
-		if (low + (mb << 20) <= 0x100000000ULL) {
+		uint64_t low_end = low + (mb << 20);
+		if (LOWDMA_AUDIO_PA >= low && LOWDMA_AUDIO_PA + BUFFER_BYTES <= low_end) {
+			buffer_pa = LOWDMA_AUDIO_PA;
+		} else if (low_end <= 0x100000000ULL) {
 			buffer_pa = low + ((mb - 1) << 20);
 		} else {
-			buffer_pa = low + 0x7f00000ULL;
+			buffer_pa = low + 0x766f000ULL;
 		}
 	} else {
-		buffer_pa = 0x90000000ULL; /* Default lower memory region */
+		buffer_pa = LOWDMA_AUDIO_PA;
 	}
-	dsp_address = buffer_pa;
+	/* Low 4 bits of stream 0x1001 go into bits 35:32 of DSP address on SM8750 LPASS SMMU */
+	dsp_address = buffer_pa | ((uint64_t)(AUDIO_STREAM & 0x0fu) << 32);
 	reach_buffer = (volatile uint8_t *)ml_io_map_wcomb(buffer_pa, BUFFER_BYTES);
 	if (reach_buffer == NULL) {
 		say("failed to map low DMA buffer at %#llx\n", buffer_pa);
 		return;
 	}
-	bzero((void *)reach_buffer, BUFFER_BYTES);
-	say("64 KiB contiguous ring buffer ready at PA %#llx (DSP %#llx)\n", buffer_pa, dsp_address);
+	bzero(__DECONST(void *, reach_buffer), BUFFER_BYTES);
+	say("64 KiB contiguous DMA buffer ready at PA %#llx (DSP %#llx)\n", buffer_pa, dsp_address);
 
-	/* 3. Allocate local PCM ring */
+	/* 4. Allocate local PCM ring and configure speaker protection */
 	if (ring_storage == NULL) {
 		ring_storage = kalloc_data(RING_FRAMES * CHANNELS * sizeof(int16_t), Z_WAITOK | Z_ZERO);
 	}
+	redwood_guard_configure(true, 6 * 8);
+	redwood_guard_attenuation(18 * 8);
 
-	/* 4. Configure secondary MI2S TLMM pins */
+	/* 5. Configure secondary MI2S TLMM pins */
 	configure_i2s_pins();
 
-	/* 5. Probe Smart Amplifiers on I2C */
+	/* 6. Probe Smart Amplifiers on I2C */
 	(void)annibale_audio_amp_probe();
 
-	/* 6. Build AudioReach graphs */
+	/* 7. Build AudioReach graphs */
 	build_audioreach_graphs();
 
-	/* 7. Register Redwood Audio sink */
+	/* 8. Register Redwood Audio sink */
 	redwood_audio_set_sink("annibale-reach", reach_audio_sink);
 
-	/* 8. Launch feeder thread */
+	/* 9. Launch feeder thread */
 	thread_t th;
 	if (kernel_thread_start(reach_feeder_thread, NULL, &th) == KERN_SUCCESS) {
 		thread_set_thread_name(th, "reach-audio-feeder");
 		thread_deallocate(th);
 	}
-	say("ADSP AudioReach initialization completed successfully\n");
+	say("ADSP AudioReach initialization completed\n");
 }

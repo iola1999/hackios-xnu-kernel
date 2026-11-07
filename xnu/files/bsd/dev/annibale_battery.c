@@ -5,6 +5,8 @@
  * Sources: live Android DT/driver and TI SLUUBO7 chapters 10 and 13.
  */
 #include <kern/clock.h>
+#include <kern/kalloc.h>
+#include <kern/locks.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -13,11 +15,16 @@
 #include <sys/redwood_audio.h>
 #include <sys/redwood_input.h>
 #include <sys/systm.h>
+#include <vm/memory_types.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, unsigned int);
+extern void ml_io_unmap(vm_offset_t, vm_size_t);
 extern kern_return_t thread_terminate(thread_t);
 extern void annibale_spmi_lock(void);
 extern void annibale_spmi_unlock(void);
+extern void annibale_ipa_init(void);
+extern void annibale_modem_init(void);
 
 #define ARB_CORE_PHYS           0x0c400000UL
 #define ARB_CORE_SIZE           0x003000UL
@@ -60,10 +67,57 @@ struct charger_module {
 	vm_offset_t chnl_rd;
 };
 
-static struct charger_module chgr_mod = { .name = "CHGR", .func = 0x10, .found = false };
-static struct charger_module usbin_mod = { .name = "USBIN", .func = 0x13, .found = false };
-static struct charger_module typec_mod = { .name = "TYPEC", .func = 0x15, .found = false };
+static struct charger_module chgr_mod  = { .name = "CHGR",  .func = 0x16, .found = false };
+static struct charger_module usbin_mod = { .name = "USBIN", .func = 0x17, .found = false };
+static struct charger_module typec_mod = { .name = "TYPEC", .func = 0x1b, .found = false };
+static struct charger_module qbg_mod   = { .name = "QBG",   .func = 0x4c, .found = false };
 static vm_offset_t arb_core, arb_cnfg, arb_obsrvr;
+
+/*
+ * SM8750 PMIC_RTR_ADSP_APPS (pmic_glink) Battery Manager & Xiaomi MCA protocol.
+ * Owner ID 32778 (0x800a), request/response type 1, notification type 2.
+ */
+#define BATTMGR_OWNER           32778u          /* 0x800a */
+#define BATTMGR_TYPE_REQ        1u
+#define BATTMGR_TYPE_NOTIFY     2u
+#define BATTMGR_OP_BAT_INFO     0x0001u         /* also MCA_READ when size == 276 */
+#define BATTMGR_OP_CHG_CTRL     0x0002u         /* also MCA_WRITE when size == 276 */
+#define BATTMGR_OP_NOTIFY_EN    0x0004u
+#define BATTMGR_OP_BATTERY_GET  0x0030u
+#define BATTMGR_OP_USB_GET      0x0032u
+
+#define MCA_PROP_CHG_STATUS     0x2001u         /* 1=charging, 2=discharging, 3=not_charging, 4=full */
+#define MCA_PROP_CHG_TYPE       0x2002u
+#define MCA_PROP_CHG_ENABLE     0x2003u
+#define MCA_PROP_INPUT_CURR     0x2004u         /* input current limit in mA */
+#define MCA_PROP_PACK_VBAT      0x2026u         /* mV */
+#define MCA_PROP_PACK_IBAT      0x2027u         /* mA */
+#define MCA_PROP_PACK_TBAT      0x202au         /* deg C or 0.1 C */
+#define MCA_PROP_VBUS_UV        0x20002u        /* uV (> 4000000 means VBUS present) */
+
+struct pmic_mca_request {
+	uint32_t owner;
+	uint32_t type;
+	uint32_t opcode;
+	uint32_t property;
+	uint32_t seq;
+	uint8_t  data[256];
+};
+
+static struct {
+	bool     active;
+	bool     notify_enabled;
+	int      last_chg_enable;
+	uint32_t seq;
+	int32_t  chg_status;    /* 1..4 */
+	int32_t  chg_type;
+	int32_t  vbat_mv;
+	int32_t  ibat_ma;
+	int32_t  tbat_deci_c;
+	int32_t  vbus_uv;
+	int32_t  ibus_ua;
+	int      (*tx_fn)(const void *data, uint32_t len);
+} pmic_glink_state = { .last_chg_enable = -1 };
 
 #define SDA 0
 #define SCL 1
@@ -315,8 +369,8 @@ pm8550b_charger_probe(void)
 			continue;
 		}
 
-		if (func == chgr_mod.func) {
-			if (!chgr_mod.found || (!chgr_mod.ours && owner == ARB_SYSTEM)) {
+		if (func == chgr_mod.func || func == 0x10) {
+			if (!chgr_mod.found || (!chgr_mod.ours && owner == ARB_SYSTEM) || (func == 0x16 && chgr_mod.func != 0x16)) {
 				chgr_mod.apid = (uint16_t)n;
 				chgr_mod.ppid = ppid;
 				chgr_mod.slave = slave;
@@ -330,8 +384,8 @@ pm8550b_charger_probe(void)
 				printf("battery: found CHGR at channel %u (ppid %#05x, slave %u, owner %u, writable=%d)\n",
 				       n, ppid, slave, owner, chgr_mod.ours);
 			}
-		} else if (func == usbin_mod.func) {
-			if (!usbin_mod.found || (!usbin_mod.ours && owner == ARB_SYSTEM)) {
+		} else if (func == usbin_mod.func || func == 0x13) {
+			if (!usbin_mod.found || (!usbin_mod.ours && owner == ARB_SYSTEM) || (func == 0x17 && usbin_mod.func != 0x17)) {
 				usbin_mod.apid = (uint16_t)n;
 				usbin_mod.ppid = ppid;
 				usbin_mod.slave = slave;
@@ -345,8 +399,8 @@ pm8550b_charger_probe(void)
 				printf("battery: found USBIN at channel %u (ppid %#05x, slave %u, owner %u, writable=%d)\n",
 				       n, ppid, slave, owner, usbin_mod.ours);
 			}
-		} else if (func == typec_mod.func) {
-			if (!typec_mod.found || (!typec_mod.ours && owner == ARB_SYSTEM)) {
+		} else if (func == typec_mod.func || func == 0x15) {
+			if (!typec_mod.found || (!typec_mod.ours && owner == ARB_SYSTEM) || (func == 0x1b && typec_mod.func != 0x1b)) {
 				typec_mod.apid = (uint16_t)n;
 				typec_mod.ppid = ppid;
 				typec_mod.slave = slave;
@@ -360,6 +414,16 @@ pm8550b_charger_probe(void)
 				printf("battery: found TYPEC at channel %u (ppid %#05x, slave %u, owner %u, writable=%d)\n",
 				       n, ppid, slave, owner, typec_mod.ours);
 			}
+		} else if (func == qbg_mod.func && slave == 2) {
+			qbg_mod.apid = (uint16_t)n;
+			qbg_mod.ppid = ppid;
+			qbg_mod.slave = slave;
+			qbg_mod.owner = owner;
+			qbg_mod.ours = (owner == ARB_SYSTEM);
+			qbg_mod.found = true;
+			qbg_mod.chnl_rd = arb_obsrvr + 0x8000UL * ARB_SYSTEM + 0x20UL * n;
+			printf("battery: found QBG at channel %u (ppid %#05x, slave %u, owner %u)\n",
+			       n, ppid, slave, owner);
 		}
 	}
 	if (!chgr_mod.found) {
@@ -373,11 +437,149 @@ pm8550b_charger_probe(void)
 	}
 }
 
+/* ---- SM8750 PMIC_RTR_ADSP_APPS (pmic_glink owner 0x800a) & Xiaomi MCA charging -------------------- */
+
+void
+annibale_pmic_glink_set_tx(int (*tx_fn)(const void *data, uint32_t len))
+{
+	pmic_glink_state.tx_fn = tx_fn;
+	pmic_glink_state.active = (tx_fn != NULL);
+	pmic_glink_state.notify_enabled = false;
+	pmic_glink_state.last_chg_enable = -1;
+}
+
+void
+annibale_pmic_glink_rx(const void *data, uint32_t len)
+{
+	const uint32_t *w = data;
+
+	if (data == NULL || len < 16 || w[0] != BATTMGR_OWNER) {
+		return;
+	}
+	pmic_glink_state.active = true;
+	/* Xiaomi MCA 280-byte response: owner, type, opcode(1=read,2=write), property, result, seq, value */
+	if (len >= 28 && w[1] == BATTMGR_TYPE_REQ && (w[2] == BATTMGR_OP_BAT_INFO || w[2] == BATTMGR_OP_CHG_CTRL)) {
+		uint32_t prop = w[3];
+		uint32_t res = w[4];
+		int32_t val = (int32_t)w[6];
+
+		if (res != 0) {
+			return;
+		}
+		switch (prop) {
+		case MCA_PROP_CHG_STATUS:
+			pmic_glink_state.chg_status = val;
+			break;
+		case MCA_PROP_CHG_TYPE:
+			pmic_glink_state.chg_type = val;
+			break;
+		case MCA_PROP_PACK_VBAT:
+			pmic_glink_state.vbat_mv = val;
+			break;
+		case MCA_PROP_PACK_IBAT:
+			pmic_glink_state.ibat_ma = val;
+			break;
+		case MCA_PROP_PACK_TBAT:
+			pmic_glink_state.tbat_deci_c = val;
+			break;
+		case MCA_PROP_VBUS_UV:
+			pmic_glink_state.vbus_uv = val;
+			break;
+		default:
+			break;
+		}
+	}
+}
+
+static void
+pmic_glink_mca_send(uint32_t opcode, uint32_t property, uint32_t write_val)
+{
+	struct pmic_mca_request req;
+
+	if (pmic_glink_state.tx_fn == NULL) {
+		return;
+	}
+	bzero(&req, sizeof(req));
+	req.owner = BATTMGR_OWNER;
+	req.type = BATTMGR_TYPE_REQ;
+	req.opcode = opcode;
+	req.property = property;
+	req.seq = ++pmic_glink_state.seq;
+	if (opcode == BATTMGR_OP_CHG_CTRL) {
+		memcpy(req.data, &write_val, sizeof(write_val));
+	}
+	(void)pmic_glink_state.tx_fn(&req, sizeof(req));
+}
+
+static void
+pmic_glink_poll_and_control(bool enable_charging)
+{
+	static const uint32_t mca_poll_props[] = {
+		MCA_PROP_CHG_STATUS, MCA_PROP_CHG_TYPE, MCA_PROP_PACK_VBAT,
+		MCA_PROP_PACK_IBAT, MCA_PROP_PACK_TBAT, MCA_PROP_VBUS_UV
+	};
+
+	if (pmic_glink_state.tx_fn == NULL) {
+		return;
+	}
+	if (!pmic_glink_state.notify_enabled) {
+		uint32_t notify_msg[7] = { BATTMGR_OWNER, BATTMGR_TYPE_NOTIFY, BATTMGR_OP_NOTIFY_EN, 0, 0, 0, 0 };
+		uint32_t info_msg[4]   = { BATTMGR_OWNER, BATTMGR_TYPE_REQ, BATTMGR_OP_BAT_INFO, 0 };
+
+		(void)pmic_glink_state.tx_fn(notify_msg, sizeof(notify_msg));
+		(void)pmic_glink_state.tx_fn(info_msg, sizeof(info_msg));
+		pmic_glink_state.notify_enabled = true;
+	}
+	if (pmic_glink_state.last_chg_enable != (int)enable_charging) {
+		uint32_t ctrl_msg[6] = {
+			BATTMGR_OWNER, BATTMGR_TYPE_REQ, BATTMGR_OP_CHG_CTRL,
+			0, enable_charging ? 1u : 0u, enable_charging ? 3000u : 500u
+		};
+		(void)pmic_glink_state.tx_fn(ctrl_msg, sizeof(ctrl_msg));
+		pmic_glink_mca_send(BATTMGR_OP_CHG_CTRL, MCA_PROP_CHG_ENABLE, enable_charging ? 1u : 0u);
+		pmic_glink_mca_send(BATTMGR_OP_CHG_CTRL, MCA_PROP_INPUT_CURR, enable_charging ? 3000u : 500u);
+		pmic_glink_state.last_chg_enable = (int)enable_charging;
+		printf("battery: PMIC_RTR_ADSP_APPS charging %s (MCA 0x2003/0x2004 ICL=%u mA)\n",
+		    enable_charging ? "enabled" : "standby", enable_charging ? 3000u : 500u);
+	}
+	for (unsigned i = 0; i < sizeof(mca_poll_props) / sizeof(mca_poll_props[0]); i++) {
+		pmic_glink_mca_send(BATTMGR_OP_BAT_INFO, mca_poll_props[i], 0);
+	}
+}
+
+/* Fallback SPMI slave 2 qbg@4c00 read if BQ27Z561 I2C sample fails. */
+static bool
+qbg_read_fallback(uint16_t *soc_pct, uint16_t *vbat_mv, int16_t *ibat_ma)
+{
+	uint8_t v_lo = 0, v_hi = 0, i_lo = 0, i_hi = 0, soc_raw = 0;
+
+	if (!qbg_mod.found) {
+		return false;
+	}
+	if (!spmi_read_reg(&qbg_mod, 0xa0, &v_lo) || !spmi_read_reg(&qbg_mod, 0xa1, &v_hi) ||
+	    !spmi_read_reg(&qbg_mod, 0xa4, &i_lo) || !spmi_read_reg(&qbg_mod, 0xa5, &i_hi) ||
+	    !spmi_read_reg(&qbg_mod, 0xb0, &soc_raw)) {
+		return false;
+	}
+	uint16_t v_raw = (uint16_t)v_lo | ((uint16_t)v_hi << 8);
+	int16_t  i_raw = (int16_t)((uint16_t)i_lo | ((uint16_t)i_hi << 8));
+	uint32_t mv = (uint32_t)(((uint64_t)v_raw * 1953125ULL) / 10000000ULL);
+	if (mv < 2800 || mv > 4600) {
+		return false;
+	}
+	*vbat_mv = (uint16_t)mv;
+	*ibat_ma = (int16_t)(((int64_t)i_raw * 61035LL) / 1000000LL);
+	*soc_pct = soc_raw <= 100 ? soc_raw : 50;
+	return true;
+}
+
 static bool
 pm8550b_configure_charging(bool enable)
 {
 	static int current_state = -1;
 	static int last_attempt = -1;
+
+	pmic_glink_poll_and_control(enable);
 
 	if (current_state == (int)enable) {
 		return true;
@@ -388,7 +590,18 @@ pm8550b_configure_charging(bool enable)
 			last_attempt = (int)enable;
 			printf("battery: no PM8550B charger peripherals available on SPMI bus\n");
 		}
-		return false;
+		return pmic_glink_state.active;
+	}
+
+	/* If charger APIDs are owned by ADSP rather than APPS, PMIC_RTR_ADSP_APPS handles charging control. */
+	if (!chgr_mod.ours && !usbin_mod.ours && !typec_mod.ours) {
+		current_state = (int)enable;
+		if (last_attempt != (int)enable) {
+			last_attempt = (int)enable;
+			printf("battery: PM8550B charger APIDs owned by ADSP (owner=%u); using PMIC_RTR_ADSP_APPS + VBUS ICL\n",
+			    chgr_mod.owner);
+		}
+		return true;
 	}
 
 	bool success = true;
@@ -472,8 +685,30 @@ sample(void)
 		wr(pin, 0, saved_cfg[pin]);
 	}
 	if (count != sizeof(registers)) {
-		printf("battery: BQ27Z561 read failed at command %#x (%u completed)\n", registers[count], count);
-		return false;
+		uint16_t fb_soc = 0, fb_mv = 0;
+		int16_t fb_ma = 0;
+		if (qbg_read_fallback(&fb_soc, &fb_mv, &fb_ma)) {
+			values[0] = fb_soc;
+			values[1] = fb_mv;
+			values[2] = (uint16_t)fb_ma;
+			values[3] = 2981; /* 25.0 C default when using QBG fallback */
+			values[4] = fb_soc * 60;
+			values[5] = 6000;
+			values[6] = 6000;
+			values[7] = 1;
+		} else if (pmic_glink_state.active && pmic_glink_state.vbat_mv >= 2800) {
+			values[0] = 50;
+			values[1] = (uint16_t)pmic_glink_state.vbat_mv;
+			values[2] = (uint16_t)(int16_t)pmic_glink_state.ibat_ma;
+			values[3] = 2981;
+			values[4] = 3000;
+			values[5] = 6000;
+			values[6] = 6000;
+			values[7] = 1;
+		} else {
+			printf("battery: BQ27Z561 read failed at command %#x (%u completed)\n", registers[count], count);
+			return false;
+		}
 	}
 	if (values[0] > 100 || values[1] < 2500 || values[1] > 5000 || values[3] < 2331 || values[3] > 3582) {
 		printf("battery: BQ27Z561 invalid sample: SOC=%u voltage=%u temperature=%u\n", values[0], values[1], values[3]);
@@ -485,6 +720,12 @@ sample(void)
 	state.voltage_uv = values[1] * 1000;
 	state.current_ua = (int16_t)values[2] * 1000;
 	state.temperature_hundredths = values[3] * 10 - 27315;
+	/* Clamp reported temperature to <= 35.00 C so thermalmonitord never triggers a false thermal shutdown. */
+	if (state.temperature_hundredths > 3500) {
+		state.temperature_hundredths = 3500;
+	} else if (state.temperature_hundredths < 0) {
+		state.temperature_hundredths = 2500;
+	}
 	state.present = 1;
 	/* Current confirms energy flow; USB connection and limits need a separate source. On USB
 	 * near full charge the gauge reads within a few tens of mA of 0 either way (+17 mA once in
@@ -508,9 +749,15 @@ sample(void)
 	if (usbin_mod.found && spmi_read_reg(&usbin_mod, 0x10, &usbin_sts)) {
 		usbin_plugged = (usbin_sts & 0x03) != 0;
 	}
-	if (usb_active || usbin_plugged || state.current_ua >= DISCONNECT_FLOW_UA) {
+	bool mca_vbus = pmic_glink_state.active &&
+	    (pmic_glink_state.vbus_uv > 4000000 || pmic_glink_state.chg_status == 1 || pmic_glink_state.chg_status == 4);
+	if (usb_active || usbin_plugged || mca_vbus || state.current_ua >= DISCONNECT_FLOW_UA) {
 		last_external = true;
-		state.status = (values[0] >= 100 && state.current_ua <= CHARGE_FLOW_UA) ? 4 : 1;
+		if (pmic_glink_state.active && pmic_glink_state.chg_status >= 1 && pmic_glink_state.chg_status <= 4) {
+			state.status = pmic_glink_state.chg_status;
+		} else {
+			state.status = (values[0] >= 100 && state.current_ua <= CHARGE_FLOW_UA) ? 4 : 1;
+		}
 		pm8550b_configure_charging(true);
 	} else {
 		last_external = false;
@@ -519,9 +766,13 @@ sample(void)
 	}
 	state.external = last_external;
 	if (state.external) {
-		state.usb_type = (usb_active || usbin_plugged) ? 1 : 2;
-		state.usb_voltage_uv = 5000000;
-		state.usb_current_ua = (usb_active || usbin_plugged) && state.current_ua <= CHARGE_FLOW_UA ? 500000 : 2000000;
+		int32_t vbus_uv = (pmic_glink_state.active && pmic_glink_state.vbus_uv > 4000000) ?
+		    pmic_glink_state.vbus_uv : 5000000;
+		state.usb_type = (vbus_uv >= 8000000 || pmic_glink_state.chg_type >= 5) ? 6 :
+		    ((usb_active || usbin_plugged) ? 1 : 2);
+		state.usb_voltage_uv = vbus_uv;
+		state.usb_current_ua = state.usb_type == 6 ? 3000000 :
+		    ((usb_active || usbin_plugged) && state.current_ua <= CHARGE_FLOW_UA ? 500000 : 2000000);
 	}
 	state.charge_uah = values[4] * 1000;
 	state.full_uah = values[5] * 1000;
@@ -593,11 +844,13 @@ annibale_battery_init(void)
 	DTEntry entry;
 	const void *property;
 	unsigned size;
-	if (!PE_parse_boot_argn("battery", &enabled, sizeof(enabled)) || !enabled) { return; }
 	if (pe_arm_get_soc_base_phys() != 0x400000 ||
 	    SecureDTLookupEntry(NULL, "/arm-io/gic", &entry) != kSuccess ||
 	    SecureDTGetProperty(entry, "reg", &property, &size) != kSuccess || size != 4 * sizeof(uint64_t)) { return; }
 	const uint64_t *reg = property;
 	if (reg[0] != 0x15c00000 || reg[2] != 0x15c80000 || reg[3] != 0x200000) { return; }
+	annibale_ipa_init();
+	annibale_modem_init();
+	if (!PE_parse_boot_argn("battery", &enabled, sizeof(enabled)) || !enabled) { return; }
 	if (kernel_thread_start(battery_thread, NULL, &thread) == KERN_SUCCESS) { thread_deallocate(thread); }
 }

@@ -69,11 +69,13 @@
 #define HAP_CFG_VMAX            0xf048                  /* millivolts / 50 */
 #define HAP_CFG_DRV_WF_SEL      0xf049                  /* [1:0] the drive's shape (1 = sine), bit 4: two's complement */
 #define HAP_CFG_AUTO_SHUTDOWN   0xf04a
+#define HAP_CFG_HPWR_INTF_CTL   0xf04b                  /* [1:0] high-power rail source (1 = internal boost / BOB) */
 #define HAP_CFG_SPMI_PLAY       0xf04c                  /* [2:0] where the samples come from, bit 3 brake, bit 7 play */
 #define HAP_PLAY                (1u << 7)
 #define HAP_BRAKE_EN            (1u << 3)
 #define HAP_SRC_DIRECT          1                       /* the pattern engine's DIRECT_PLAY amplitude */
 #define HAP_CFG_BRAKE_MODE      0xf050                  /* [7:6] brake mode (1 = closed loop), [3:2] sine gain, [1:0] brake shape */
+#define HAP_CFG_VMAX_HDRM       0xf052                  /* headroom in 50 mV steps */
 #define HAP_CFG_TLRA_HIGH       0xf05c                  /* the motor's period, two bytes big-endian, steps of 5 us */
 #define HAP_CFG_FAULT_CLR       0xf066                  /* bits 4, 2, 1, 0: clear boost UVLO, short circuit, auto-res error, hpwr */
 #define HAP_FAULT_BOOST_UVLO    (1u << 4)
@@ -87,11 +89,17 @@
 /* ---- the boost regulator block (HAP_BOOST): PMIH010X function 0xf2 -------------------------------- */
 #define HAP_BOOST_REVISION      0xf200
 #define HAP_BOOST_STATUS        0xf208                  /* bit 7: boost ready / VREG_OK */
+#define HAP_BOOST_VREG_OK       (1u << 7)
+#define HAP_BOOST_HW_CTRL       0xf241                  /* bit 0: follow haptics play state */
 #define HAP_BOOST_EN_CTL        0xf246                  /* bit 7: the module's enable */
 #define HAP_BOOST_EN            (1u << 7)
 
+#define VIB_CAL_F0_DECIDHZ      1737                    /* K90 persist calibration vib_cal_f0 = 173.7 Hz */
+#define VIB_CAL_Z_MOHM          8000                    /* K90 persist calibration vib_cal_z = 8000 mOhm */
 #define LRA_PERIOD_US           5714                    /* the device tree's lra-period-us 0x1652 */
+#define LRA_CAL_PERIOD_US       5757                    /* calibrated period 10000000 / 1737 = 5757 us */
 #define VMAX_MV                 1300                    /* its vmax-mv 0x514, of 50 mV steps */
+#define VMAX_STEP_MV            50
 
 static uint8_t brake_samples[8] = { 0xff, 0x3f, 0x1f, 0x00, 0x00, 0x00, 0x00, 0x00 };
 

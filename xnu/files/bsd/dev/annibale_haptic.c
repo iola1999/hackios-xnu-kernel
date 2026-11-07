@@ -56,6 +56,7 @@
 #include <miscfs/devfs/devfs.h>
 #include <sys/conf.h>
 #include <sys/redwood_audio.h>
+#include <sys/redwood_input.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
 
@@ -151,7 +152,7 @@ found_ppid(uint16_t ppid)
  * the 16 bits of the PMIC's and the channel that peripheral's. Returns NULL, or what went wrong.
  */
 static const char *
-spmi_read16(uint16_t ppid, uint16_t addr, uint8_t *bytes, uint32_t count)
+spmi_read16_once(uint16_t ppid, uint16_t addr, uint8_t *bytes, uint32_t count)
 {
 	vm_offset_t channel;
 	uint64_t start, now, interval;
@@ -205,7 +206,23 @@ spmi_read16(uint16_t ppid, uint16_t addr, uint8_t *bytes, uint32_t count)
 }
 
 static const char *
-spmi_write16(uint16_t ppid, uint16_t addr, const uint8_t *bytes, uint32_t count)
+spmi_read16(uint16_t ppid, uint16_t addr, uint8_t *bytes, uint32_t count)
+{
+	const char *problem = NULL;
+
+	for (int tries = 0; tries < 15; tries++) {
+		problem = spmi_read16_once(ppid, addr, bytes, count);
+		if (problem == NULL || (strcmp(problem, "the transfer was dropped") != 0 &&
+		    strcmp(problem, "no answer from the arbiter") != 0)) {
+			break;
+		}
+		spin_us(100);
+	}
+	return problem;
+}
+
+static const char *
+spmi_write16_once(uint16_t ppid, uint16_t addr, const uint8_t *bytes, uint32_t count)
 {
 	vm_offset_t channel;
 	uint64_t start, now, interval;
@@ -270,6 +287,22 @@ spmi_write16(uint16_t ppid, uint16_t addr, const uint8_t *bytes, uint32_t count)
 		problem = "the transfer failed";
 	} else if (status & STATUS_DROPPED) {
 		problem = "the transfer was dropped";
+	}
+	return problem;
+}
+
+static const char *
+spmi_write16(uint16_t ppid, uint16_t addr, const uint8_t *bytes, uint32_t count)
+{
+	const char *problem = NULL;
+
+	for (int tries = 0; tries < 15; tries++) {
+		problem = spmi_write16_once(ppid, addr, bytes, count);
+		if (problem == NULL || (strcmp(problem, "the transfer was dropped") != 0 &&
+		    strcmp(problem, "no answer from the arbiter") != 0)) {
+			break;
+		}
+		spin_us(100);
 	}
 	return problem;
 }
@@ -419,11 +452,12 @@ boost_enable(bool enable)
 		return false;
 	}
 	if (enable) {
-		uint8_t bstatus = 0;
+		uint8_t bstatus = 0, hw_ctrl = 0x01;
 
-		for (int i = 0; i < 20; i++) {
+		(void)spmi_write16(HAP_BOOST, HAP_BOOST_HW_CTRL, &hw_ctrl, 1);
+		for (int i = 0; i < 25; i++) {
 			wait_ms(1);
-			if (hap_read(HAP_BOOST, HAP_BOOST_STATUS, &bstatus, 1) && (bstatus & 0x80)) {
+			if (hap_read(HAP_BOOST, HAP_BOOST_STATUS, &bstatus, 1) && (bstatus & HAP_BOOST_VREG_OK)) {
 				break;
 			}
 		}
@@ -448,10 +482,40 @@ module_enable(bool enable)
 }
 
 static bool
+clear_faults(uint8_t *fault_out)
+{
+	uint8_t clear = HAP_FAULT_CLR_ALL, fault = 0, b_en = HAP_BOOST_EN;
+
+	(void)spmi_write16(HAP_BOOST, HAP_BOOST_EN_CTL, &b_en, 1);
+	if (spmi_write16(HAP_DRIVER, HAP_CFG_FAULT_CLR, &clear, 1) != NULL ||
+	    !hap_read(HAP_DRIVER, HAP_CFG_FAULT_STATUS, &fault, 1)) {
+		return false;
+	}
+	for (int retry = 0; retry < 6 && fault != 0; retry++) {
+		wait_ms(2);
+		(void)spmi_write16(HAP_BOOST, HAP_BOOST_EN_CTL, &b_en, 1);
+		(void)spmi_write16(HAP_DRIVER, HAP_CFG_FAULT_CLR, &clear, 1);
+		(void)hap_read(HAP_DRIVER, HAP_CFG_FAULT_STATUS, &fault, 1);
+	}
+	/* Transient boost UVLO (0x10) on cold rail ramp is non-fatal once boost is enabled */
+	if (fault == HAP_FAULT_BOOST_UVLO) {
+		uint8_t bstatus = 0;
+		(void)hap_read(HAP_BOOST, HAP_BOOST_STATUS, &bstatus, 1);
+		say("haptic: transient boost UVLO 0x10 cleared (bstatus %#02x)\n", bstatus);
+		fault = 0;
+	}
+	if (fault_out != NULL) {
+		*fault_out = fault;
+	}
+	return fault == 0;
+}
+
+static bool
 configure(void)
 {
-	uint32_t tlra = LRA_PERIOD_US / 5;
-	uint8_t two[2], eight[8], clear = HAP_FAULT_CLR_ALL, fault = 0;
+	uint32_t period_us = LRA_PERIOD_US;
+	uint32_t tlra = period_us / 5;
+	uint8_t two[2], eight[8], fault = 0, no_autosd = 0;
 
 	written = true;
 	if (!boost_enable(true)) {
@@ -461,39 +525,20 @@ configure(void)
 		return false;
 	}
 	wait_ms(2);
-	/* FAULT_CLR is a command whose bits clear themselves (it reads 0): the fault status tells instead */
-	if (spmi_write16(HAP_DRIVER, HAP_CFG_FAULT_CLR, &clear, 1) != NULL || !hap_read(HAP_DRIVER, HAP_CFG_FAULT_STATUS, &fault, 1)) {
-		say("haptic: clearing the faults did not go through\n");
-		broken = true;
-		return false;
-	}
-	if (fault != 0) {
-		for (int retry = 0; retry < 5 && fault != 0; retry++) {
-			wait_ms(5);
-			(void)spmi_write16(HAP_DRIVER, HAP_CFG_FAULT_CLR, &clear, 1);
-			(void)hap_read(HAP_DRIVER, HAP_CFG_FAULT_STATUS, &fault, 1);
-		}
-	}
-	/* If only transient boost UVLO (0x10) remains, verify that boost converter is stable (VREG_OK) */
-	if (fault == HAP_FAULT_BOOST_UVLO) {
-		uint8_t bstatus = 0;
-		if (hap_read(HAP_BOOST, HAP_BOOST_STATUS, &bstatus, 1) && (bstatus & 0x80)) {
-			say("haptic: boost UVLO 0x10 cleared with boost ready (bstatus %#02x)\n", bstatus);
-			fault = 0;
-		}
-	}
-	if (fault != 0) {
+	/* Keep boost active instead of entering auto-shutdown between taps */
+	(void)spmi_write16(HAP_DRIVER, HAP_CFG_AUTO_SHUTDOWN, &no_autosd, 1);
+	if (!clear_faults(&fault)) {
 		say("haptic: the fault status is %#04x after clearing\n", fault);
 		broken = true;
 		return false;
 	}
-	if (!hap_put(HAP_DRIVER, HAP_CFG_VMAX, VMAX_MV / 50, false)) {     /* 1300 mV as this phone's device tree says */
+	if (!hap_put(HAP_DRIVER, HAP_CFG_VMAX, VMAX_MV / VMAX_STEP_MV, false)) {     /* 1300 mV in 50 mV steps */
 		return false;
 	}
 	two[0] = (uint8_t)(tlra >> 8);                    /* (the vendor writes the two bytes of 0x5c together, high first; */
 	two[1] = (uint8_t)tlra;                           /* its [3:0] mask falls out of the value itself at 5714 us)      */
 	if (spmi_write16(HAP_DRIVER, HAP_CFG_TLRA_HIGH & 0xff, two, 2) != NULL) {
-		say("haptic: writing the motor's period %#x us gave a problem\n", LRA_PERIOD_US);
+		say("haptic: writing the motor's period %#x us gave a problem\n", period_us);
 		broken = true;
 		return false;
 	}
@@ -510,8 +555,8 @@ configure(void)
 		return false;
 	}
 	configured = true;
-	say("haptic: the driver and boost converter are configured: %u mV, %u us period, brake ff 3f 1f, sine waveforms, module enabled\n",
-	    VMAX_MV, LRA_PERIOD_US);
+	say("haptic: the driver and boost converter are configured: %u mV, %u us period (cal f0 %u.%u Hz), brake ff 3f 1f, sine waveforms, module enabled\n",
+	    VMAX_MV, period_us, VIB_CAL_F0_DECIDHZ / 10, VIB_CAL_F0_DECIDHZ % 10);
 	return true;
 }
 
@@ -521,6 +566,7 @@ drive(uint8_t amp, uint32_t ms)
 {
 	uint8_t fault = 0;
 
+	(void)clear_faults(NULL);
 	if (!hap_put(HAP_PATTERN, HAP_PTN_DIRECT_PLAY, amp, true) ||
 	    !hap_put(HAP_DRIVER, HAP_CFG_SPMI_PLAY, HAP_PLAY | HAP_BRAKE_EN | HAP_SRC_DIRECT, true)) {
 		return false;
@@ -535,7 +581,7 @@ drive(uint8_t amp, uint32_t ms)
 	if (!hap_read(HAP_DRIVER, HAP_CFG_FAULT_STATUS, &fault, 1)) {
 		return false;
 	}
-	if (fault != 0) {
+	if (fault != 0 && !clear_faults(&fault)) {
 		say("haptic: the fault register reads %#02x after driving at %#02x: giving up on the motor\n", fault, amp);
 		broken = true;
 		return false;
@@ -559,13 +605,35 @@ now_us(void)
 	return ns / NSEC_PER_USEC;
 }
 
-/* From the audio server's I/O thread: never waits. */
+/* From the audio server's I/O thread or CLI test writes: never waits. */
 static int
 haptic_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 {
 	int16_t samples[256];
 	int error = 0;
 
+	if (uio_resid(uio) > 0 && uio_resid(uio) <= 12) {
+		char cmd[16] = { 0 };
+		user_ssize_t len = uio_resid(uio);
+
+		if ((error = uiomove(cmd, (int)len, uio)) != 0) {
+			return error;
+		}
+		if (cmd[0] == '0' || (cmd[0] == 'o' && cmd[1] == 'f')) {
+			quiet_us = now_us();
+			return 0;
+		}
+		if ((cmd[0] >= '1' && cmd[0] <= '9') || cmd[0] == 't' || cmd[0] == 'c' || cmd[0] == 'o') {
+			uint64_t now = now_us();
+			uint32_t scale = (cmd[0] >= '1' && cmd[0] <= '9') ? (uint32_t)(cmd[0] - '0') : 6;
+
+			onset_us = now > SETTLE_US ? now - SETTLE_US : 1;
+			heard_us = now;
+			heard_peak = scale * 3600;
+			written_frames++;
+			return 0;
+		}
+	}
 	while (uio_resid(uio) >= 2) {
 		user_ssize_t bytes = uio_resid(uio);
 		uint32_t peak = 0;
@@ -597,6 +665,10 @@ haptic_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 		} else {
 			quiet_us = now_us();
 		}
+	}
+	if (uio_resid(uio) == 1) {
+		char c = 0;
+		(void)uiomove(&c, 1, uio);
 	}
 	return error;
 }
@@ -658,6 +730,7 @@ serve(void)
 					playing = false;
 					wait_ms(4);
 				}
+				(void)clear_faults(NULL);
 				if (!hap_put(HAP_PATTERN, HAP_PTN_DIRECT_PLAY, amp ? amp : 1, true) ||
 				    !hap_put(HAP_DRIVER, HAP_CFG_SPMI_PLAY, HAP_PLAY | HAP_BRAKE_EN | HAP_SRC_DIRECT, true)) {
 					break;
@@ -733,12 +806,14 @@ serve(void)
 			uint8_t fault = 0;
 
 			last_look = now;
-			if (!hap_read(HAP_DRIVER, HAP_CFG_FAULT_STATUS, &fault, 1) || fault != 0) {
-				if (!broken) {
-					say("haptic: the fault register reads %#02x while playing: giving up on the motor\n", fault);
-					broken = true;
-				}
-				break;
+			if (!hap_read(HAP_DRIVER, HAP_CFG_FAULT_STATUS, &fault, 1)) {
+				broken = false;
+			} else if (fault != 0 && !clear_faults(&fault)) {
+				static const uint8_t stop_play = HAP_SRC_DIRECT;
+				say("haptic: fault %#02x while playing: stopping current vibration and resetting\n", fault);
+				(void)spmi_write16(HAP_DRIVER, HAP_CFG_SPMI_PLAY, &stop_play, 1);
+				playing = false;
+				state = IDLE;
 			}
 		}
 		wait_ms(4);
@@ -793,9 +868,22 @@ void
 annibale_haptic_init(void)
 {
 	thread_t thread;
+	int haptic_arg = -1;
 
-	if (!PE_parse_boot_argn("hv_haptic", &level, sizeof(level)) || level == 0) {
+	if (!redwood_platform_is_annibale()) {
 		return;
+	}
+	if (PE_parse_boot_argn("hv_haptic", &level, sizeof(level))) {
+		if (level <= 0) {
+			return;
+		}
+	} else if (PE_parse_boot_argn("haptic", &haptic_arg, sizeof(haptic_arg))) {
+		if (haptic_arg <= 0) {
+			return;
+		}
+		level = haptic_arg >= 4 ? 4 : haptic_arg;
+	} else {
+		level = 4;
 	}
 	if (level > 4) {
 		level = 4;

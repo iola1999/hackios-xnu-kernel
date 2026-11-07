@@ -955,3 +955,238 @@ redwood_qmi_txn_wait_ms(struct qmi_txn *txn, uint64_t milliseconds)
 	os_unlock(&s->lock);
 	return result;
 }
+
+/*
+ * Cellular QMI message codecs for SM8750 MPSS (UIM 0x0b, DMS 0x02, NAS 0x03, WDS 0x01,
+ * Voice 0x09, WMS 0x05). Subscriber and device serial TLVs (IMEI/IMSI/ICCID/MSISDN) are
+ * never decoded into logs or persisted in kernel state.
+ */
+static inline void put_16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
+static inline uint16_t get_16(const uint8_t *p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
+static inline uint32_t get_32(const uint8_t *p) { return (uint32_t)get_16(p) | ((uint32_t)get_16(p + 2) << 16); }
+
+size_t
+redwood_qmi_encode_msg(uint8_t *buf, size_t cap, uint8_t flags, uint16_t txn_id, uint16_t msg_id,
+    const void *tlvs, uint16_t tlv_len)
+{
+	if (buf == NULL || cap < (size_t)7 + tlv_len) {
+		return 0;
+	}
+	buf[0] = flags;
+	put_16(buf + 1, txn_id);
+	put_16(buf + 3, msg_id);
+	put_16(buf + 5, tlv_len);
+	if (tlv_len > 0 && tlvs != NULL) {
+		memcpy(buf + 7, tlvs, tlv_len);
+	}
+	return (size_t)7 + tlv_len;
+}
+
+const uint8_t *
+redwood_qmi_find_tlv(const uint8_t *tlvs, size_t tlvs_len, uint8_t type, uint16_t *out_len)
+{
+	size_t off = 0;
+
+	while (off + 3 <= tlvs_len) {
+		uint8_t t = tlvs[off];
+		uint16_t l = get_16(tlvs + off + 1);
+
+		if (off + 3 + l > tlvs_len) {
+			break;
+		}
+		if (t == type) {
+			if (out_len != NULL) {
+				*out_len = l;
+			}
+			return tlvs + off + 3;
+		}
+		off += 3 + (size_t)l;
+	}
+	if (out_len != NULL) {
+		*out_len = 0;
+	}
+	return NULL;
+}
+
+bool
+redwood_qmi_check_result(const uint8_t *tlvs, size_t tlvs_len, uint16_t *out_error)
+{
+	uint16_t len = 0;
+	const uint8_t *v = redwood_qmi_find_tlv(tlvs, tlvs_len, 0x02, &len);
+
+	if (v == NULL || len < 4) {
+		if (out_error != NULL) {
+			*out_error = 0xffff;
+		}
+		return false;
+	}
+	if (out_error != NULL) {
+		*out_error = get_16(v + 2);
+	}
+	return get_16(v) == 0;
+}
+
+/* UIM (0x0b) QMI_UIM_GET_CARD_STATUS (0x002F) TLV 0x10 parser. */
+bool
+redwood_qmi_uim_parse_card_status(const uint8_t *tlvs, size_t tlvs_len, uint8_t *card_state, uint8_t *app_state)
+{
+	uint16_t len = 0;
+	const uint8_t *v = redwood_qmi_find_tlv(tlvs, tlvs_len, 0x10, &len);
+
+	if (v == NULL || len < 6 || v[4] == 0) {
+		return false;
+	}
+	if (card_state != NULL) {
+		*card_state = v[5];     /* 0 = absent, 1 = present, 2 = error */
+	}
+	if (app_state != NULL) {
+		*app_state = (len >= 13 && v[10] > 0) ? v[12] : 0; /* 7 = ready */
+	}
+	return true;
+}
+
+/* DMS (0x02) QMI_DMS_GET_OPERATING_MODE (0x002D) TLV 0x01 parser. */
+bool
+redwood_qmi_dms_parse_oper_mode(const uint8_t *tlvs, size_t tlvs_len, uint8_t *mode_out)
+{
+	uint16_t len = 0;
+	const uint8_t *v = redwood_qmi_find_tlv(tlvs, tlvs_len, 0x01, &len);
+
+	if (v == NULL || len < 1) {
+		return false;
+	}
+	if (mode_out != NULL) {
+		*mode_out = v[0];       /* 0 = online, 1 = low_power, 5 = offline */
+	}
+	return true;
+}
+
+/* NAS (0x03) QMI_NAS_GET_SERVING_SYSTEM (0x0024) TLV 0x01 + TLV 0x12 parser. */
+bool
+redwood_qmi_nas_parse_serving(const uint8_t *tlvs, size_t tlvs_len, uint8_t *reg_state, uint8_t *rat_out,
+    uint16_t *mcc_out, uint16_t *mnc_out, char *oper_out, size_t oper_cap)
+{
+	uint16_t len = 0;
+	const uint8_t *v = redwood_qmi_find_tlv(tlvs, tlvs_len, 0x01, &len);
+
+	if (v == NULL || len < 6) {
+		return false;
+	}
+	if (reg_state != NULL) {
+		*reg_state = v[0];      /* 0 = not registered, 1 = registered, 2 = searching, 3 = denied */
+	}
+	if (rat_out != NULL) {
+		uint8_t n_rat = v[5], best = 0;
+
+		for (uint8_t i = 0; i < n_rat && (size_t)6 + i < len; i++) {
+			uint8_t r = v[6 + i];   /* 0x04 = GSM, 0x05 = UMTS, 0x08 = LTE, 0x0c = 5G NR */
+
+			if (r > best) {
+				best = r;
+			}
+		}
+		*rat_out = best;
+	}
+	v = redwood_qmi_find_tlv(tlvs, tlvs_len, 0x12, &len);
+	if (v == NULL) {
+		v = redwood_qmi_find_tlv(tlvs, tlvs_len, 0x01, &len);
+	}
+	if (v != NULL && len >= 5 && redwood_qmi_find_tlv(tlvs, tlvs_len, 0x12, &len) != NULL) {
+		uint8_t nlen = v[4];
+
+		if (mcc_out != NULL) {
+			*mcc_out = get_16(v);
+		}
+		if (mnc_out != NULL) {
+			*mnc_out = get_16(v + 2);
+		}
+		if (oper_out != NULL && oper_cap > 1 && (size_t)5 + nlen <= len && nlen > 0) {
+			size_t copy = nlen < oper_cap - 1 ? nlen : oper_cap - 1;
+
+			memcpy(oper_out, v + 5, copy);
+			oper_out[copy] = '\0';
+		}
+	}
+	return true;
+}
+
+/* NAS (0x03) QMI_NAS_GET_SIG_INFO (0x004F) / SIGNAL_STRENGTH (0x0020) parser -> RSRP dBm & 0..4 bars. */
+bool
+redwood_qmi_nas_parse_signal(const uint8_t *tlvs, size_t tlvs_len, int16_t *rsrp_out, uint8_t *bars_out, uint8_t *rat_out)
+{
+	uint16_t len = 0;
+	const uint8_t *v;
+	int16_t rsrp = -140;
+
+	/* 5G NR signal info TLV 0x17: int16 rsrp, int16 snr, int16 rsrq */
+	v = redwood_qmi_find_tlv(tlvs, tlvs_len, 0x17, &len);
+	if (v != NULL && len >= 2) {
+		rsrp = (int16_t)get_16(v);
+		if (rsrp >= -140 && rsrp <= -40) {
+			if (rat_out != NULL) {
+				*rat_out = 0x0c;
+			}
+			goto done;
+		}
+	}
+	/* LTE signal info TLV 0x14: int8 rssi, int8 rsrq, int16 rsrp, int16 snr */
+	v = redwood_qmi_find_tlv(tlvs, tlvs_len, 0x14, &len);
+	if (v != NULL && len >= 4) {
+		rsrp = (int16_t)get_16(v + 2);
+		if (rat_out != NULL && *rat_out == 0) {
+			*rat_out = 0x08;
+		}
+		goto done;
+	}
+	/* Legacy signal strength TLV 0x01: int8 rssi, uint8 radio_if */
+	v = redwood_qmi_find_tlv(tlvs, tlvs_len, 0x01, &len);
+	if (v != NULL && len >= 2) {
+		rsrp = (int16_t)(int8_t)v[0];
+		if (rat_out != NULL && *rat_out == 0) {
+			*rat_out = v[1];
+		}
+		goto done;
+	}
+	return false;
+done:
+	if (rsrp_out != NULL) {
+		*rsrp_out = rsrp;
+	}
+	if (bars_out != NULL) {
+		*bars_out = rsrp >= -85 ? 4 : rsrp >= -95 ? 3 : rsrp >= -105 ? 2 : rsrp >= -115 ? 1 : 0;
+	}
+	return true;
+}
+
+/* WDS (0x01) QMI_WDS_GET_RUNTIME_SETTINGS (0x002D) response parser. */
+bool
+redwood_qmi_wds_parse_runtime(const uint8_t *tlvs, size_t tlvs_len, uint32_t *ipv4_out, uint32_t *gw_out,
+    uint32_t *mask_out, uint32_t *dns1_out, uint32_t *dns2_out, uint32_t *mtu_out)
+{
+	uint16_t len = 0;
+	const uint8_t *v;
+
+	v = redwood_qmi_find_tlv(tlvs, tlvs_len, 0x1e, &len);
+	if (v == NULL || len < 4) {
+		return false;
+	}
+	if (ipv4_out != NULL) {
+		*ipv4_out = get_32(v);
+	}
+	if (gw_out != NULL && (v = redwood_qmi_find_tlv(tlvs, tlvs_len, 0x20, &len)) != NULL && len >= 4) {
+		*gw_out = get_32(v);
+	}
+	if (mask_out != NULL && (v = redwood_qmi_find_tlv(tlvs, tlvs_len, 0x21, &len)) != NULL && len >= 4) {
+		*mask_out = get_32(v);
+	}
+	if (dns1_out != NULL && (v = redwood_qmi_find_tlv(tlvs, tlvs_len, 0x15, &len)) != NULL && len >= 4) {
+		*dns1_out = get_32(v);
+	}
+	if (dns2_out != NULL && (v = redwood_qmi_find_tlv(tlvs, tlvs_len, 0x16, &len)) != NULL && len >= 4) {
+		*dns2_out = get_32(v);
+	}
+	if (mtu_out != NULL && (v = redwood_qmi_find_tlv(tlvs, tlvs_len, 0x29, &len)) != NULL && len >= 4) {
+		*mtu_out = get_32(v);
+	}
+	return true;
+}
