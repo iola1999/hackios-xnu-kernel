@@ -60,6 +60,7 @@ ramdisk_begin(const char *arguments)
 
 	if (!ramdisk_hex(&arguments, &total) || *arguments++ != ' ' ||
 	    !ramdisk_hex(&arguments, &window) || *arguments || !total ||
+	    (PLAT == &platform_annibale && total > MAX_RESIDENT_BOOT_SIZE) ||
 	    window > MAX_MEM_SIZE_LIMIT || (window & (BASE_ALIGN - 1)) ||
 	    window <= RESIDENT_RD_OFFSET + RESIDENT_RD_RESERVE ||
 	    total > window - RESIDENT_RD_OFFSET - RESIDENT_RD_RESERVE) {

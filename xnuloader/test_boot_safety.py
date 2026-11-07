@@ -5,11 +5,14 @@ and standalone payload packaging.
 """
 
 import os
+import importlib.util
 import struct
 import subprocess
+import tempfile
 import unittest
 import zlib
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 
@@ -155,7 +158,7 @@ class TestSourceContracts(unittest.TestCase):
         self.assertIn("slot_detect", text)
         self.assertIn("slot_maintain_current", text)
         self.assertIn("slot_set_active_other", text)
-        self.assertIn("gpt_sync_lun4", text)
+        self.assertIn("gpt_sync_lun(bio)", text)
 
         # Prohibit hardcoded "SLOT B"
         self.assertNotIn('"BOOT ANDROID (SLOT B)"', text)
@@ -176,7 +179,8 @@ class TestSourceContracts(unittest.TestCase):
                         "Must call block_start, inspect_storage, and slot_detect before ui_boot_menu")
 
         # Fallback to fastboot debug loop
-        self.assertIn("BOOT FALLBACK - FASTBOOT MODE", text)
+        self.assertIn("boot_fallback_enter();", text)
+        self.assertIn("BOOT FALLBACK - FASTBOOT MODE", (HERE / "loader_06a_screen_ui.inc").read_text())
         self.assertIn("usb_command_loop()", text)
 
     def test_run_kernel_null_fallback(self):
@@ -197,6 +201,100 @@ class TestSourceContracts(unittest.TestCase):
 
 
 class TestStandalonePackager(unittest.TestCase):
+    def packager(self):
+        spec = importlib.util.spec_from_file_location('standalone_under_test', HERE / 'mkstandalone.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_resident_boot_bytes_and_ufs_command(self):
+        module = self.packager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kernel, helper, boot = (root / name for name in ('kernel', 'helper', 'boot'))
+            kernel.write_bytes(b'kernel fixture')
+            helper.write_bytes(b'helper volume')
+            boot.write_bytes(b'NXSB' + bytes(range(256)) * 17)
+            output = root / 'payload.bin'
+            # Compression has its own CLI self-test; inspect the real mkpayload output here.
+            with patch.object(module, 'compress_lz4'):
+                module.build_standalone_payload(kernel, helper, output, boot_image=boot)
+            data = output.read_bytes()
+            magic, length = struct.unpack_from('<II', data)
+            self.assertEqual((magic, length), (0x50554E58, len(data) - 8))
+            entries, offset = {}, 8
+            while data[offset]:
+                name, size, reserved = struct.unpack_from('<16sII', data, offset)
+                name = name.rstrip(b'\0').decode('ascii')
+                self.assertNotIn(name, entries)
+                self.assertEqual(reserved, 0)
+                entries[name] = data[offset + 24:offset + 24 + size]
+                self.assertEqual(len(entries[name]), size)
+                offset += 24 + ((size + 15) & ~15)
+            self.assertEqual(data[offset:], bytes(24))
+            self.assertEqual(entries['rdimage'], boot.read_bytes())
+            self.assertEqual(entries['ramdisk'], helper.read_bytes())
+            self.assertEqual(entries['kernel'], kernel.read_bytes())
+            self.assertNotIn('rdfile', entries)
+            self.assertNotIn('rdres', entries)
+            self.assertTrue(entries['cmdline'].endswith(b'\0'))
+            args = entries['cmdline'][:-1].decode().split()
+            for expected in ('rd=md0', 'rootdev=md0', 'root_apfs=ufs_darwin', 'ufs=2', 'ufs_native=1'):
+                key = expected.split('=', 1)[0]
+                self.assertEqual([arg for arg in args if arg.split('=', 1)[0] == key], [expected])
+
+    def test_invalid_boot_size_refused_before_output_or_subprocess(self):
+        module = self.packager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kernel, helper, boot = (root / name for name in ('kernel', 'helper', 'boot'))
+            kernel.write_bytes(b'kernel fixture')
+            helper.write_bytes(b'helper volume')
+            output = root / 'new-directory' / 'payload.bin'
+            for size in (0, 64 * 1024 * 1024 + 1):
+                with self.subTest(size=size):
+                    with boot.open('wb') as stream:
+                        stream.truncate(size)
+                    with patch.object(module.subprocess, 'run') as run, patch.object(module, 'compress_lz4') as compress:
+                        with self.assertRaises(ValueError):
+                            module.build_standalone_payload(kernel, helper, output, boot_image=boot)
+                        run.assert_not_called()
+                        compress.assert_not_called()
+                    self.assertFalse(output.parent.exists())
+
+    def test_full_container_limit_preserves_existing_output(self):
+        module = self.packager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kernel, helper, boot = (root / name for name in ('kernel', 'helper', 'boot'))
+            # Each entry fits separately; the complete uncompressed container exceeds 55 MiB.
+            for path, mib in ((kernel, 27), (helper, 27), (boot, 2)):
+                with path.open('wb') as stream:
+                    stream.truncate(mib * 1024 * 1024)
+            output = root / 'payload.bin'
+            output.write_bytes(b'existing payload')
+            with patch.object(module, 'compress_lz4') as compress:
+                with self.assertRaisesRegex(RuntimeError, 'loader container limit'):
+                    module.build_standalone_payload(kernel, helper, output, boot_image=boot)
+                compress.assert_not_called()
+            self.assertEqual(output.read_bytes(), b'existing payload')
+
+    def test_duplicate_root_and_ufs_arguments_rejected_before_build(self):
+        module = self.packager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = root / 'fixture'
+            fixture.write_bytes(b'fixture')
+            output = root / 'new-directory' / 'payload.bin'
+            with patch.object(module.subprocess, 'run') as run, patch.object(module, 'compress_lz4') as compress:
+                for argument in ('rd=md0', 'rootdev=md0', 'root_apfs=ufs_darwin', 'ufs=2', 'ufs_native=1'):
+                    with self.subTest(argument=argument), self.assertRaises(ValueError):
+                        module.build_standalone_payload(fixture, fixture, output, boot_image=fixture,
+                                                       cmdline=module.DEFAULT_CMDLINE + ' ' + argument)
+                run.assert_not_called()
+                compress.assert_not_called()
+            self.assertFalse(output.parent.exists())
+
     def test_mkstandalone_script(self):
         script = HERE / "mkstandalone.py"
         res = subprocess.run(["python3", str(script), "--test"], capture_output=True, text=True)

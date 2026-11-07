@@ -668,7 +668,6 @@ fb_command(char *cmd)
 		} else if (starts_with(cmd, "oem ramdisk")) {
 			/* "oem ramdisk": the next download is a root image for the resident area; "oem ramdisk none" drops it */
 			struct payload_info pi;
-
 			parse_payload(&pi, 0);
 			log_len = 0;
 			if (!choose_window(&pi) || win_size <= RESIDENT_RD_OFFSET + RESIDENT_RD_RESERVE) {
@@ -685,7 +684,6 @@ fb_command(char *cmd)
 			uint8_t *dest = (uint8_t *)PAYLOAD_BASE;
 			int streaming = ramdisk_pending();
 			int to_ramdisk = download_to_ramdisk || streaming;
-
 			download_to_ramdisk = 0;
 			if (streaming) {
 				if (!ramdisk_block_size(cmd + 9, &total)) {
@@ -696,16 +694,20 @@ fb_command(char *cmd)
 				dest = (uint8_t *)(win_base + RESIDENT_RD_OFFSET + ramdisk_transfer.received);
 			} else if (to_ramdisk) {
 				limit = win_size - RESIDENT_RD_OFFSET - RESIDENT_RD_RESERVE;
+				if (PLAT == &platform_annibale && limit > MAX_RESIDENT_BOOT_SIZE) {
+					limit = MAX_RESIDENT_BOOT_SIZE;
+				}
 				dest = (uint8_t *)(win_base + RESIDENT_RD_OFFSET);
-				resident_rd_size = 0;
 			}
 			if (total == 0 || total > limit || total > 0xffffffffULL) {
 				fb_reply("FAIL", "bad size");
 				return;
 			}
+			if (to_ramdisk && !streaming) {
+				resident_rd_size = 0;
+			}
 			if (!to_ramdisk) {
 				struct payload_header *ph = (struct payload_header *)PAYLOAD_BASE;
-
 				/* the region holds no consumable container before this transfer does (review U1) */
 				ph->magic = 0;
 				ph->size = 0;
@@ -744,7 +746,6 @@ fb_command(char *cmd)
 			} else {
 				if (!to_ramdisk) {
 					struct payload_header *ph = (struct payload_header *)PAYLOAD_BASE;
-
 					/* a failed transfer publishes nothing: the header its bytes wrote is
 					 * erased, so even a complete-looking prefix waits for a full download */
 					ph->magic = 0;
@@ -825,7 +826,6 @@ fb_command(char *cmd)
 			int have_cp = selftest || (*arg >= '0' && *arg <= '9');
 			uint64_t cp = selftest ? CHECKPOINT_SELFTEST : parse_number(arg, 10);
 
-			set_result("running", cp, 0);
 			fb_reply("OKAY", "");
 			log_len = 0;
 			print("== XNULOADER run (usb) ==\n");

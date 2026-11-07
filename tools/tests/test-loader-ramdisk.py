@@ -3,7 +3,7 @@
 
 The C harness uses the real choose_window, command dispatch through download, and
 command-loop interruption path. EFI allocation and USB transfers are host stubs.
-The host-script tests execute stage-system.sh's Python with a virtual large file.
+The host-script tests execute stage-system.sh's Python with a virtual file and size-refusing loader.
 """
 import contextlib
 import io
@@ -40,6 +40,8 @@ PRELUDE = r'''
 #include <string.h>
 #include <stdarg.h>
 #include <setjmp.h>
+static const int platform_annibale, platform_qemu;
+static const int *PLAT = &platform_annibale;
 static unsigned checks;
 #define CK(x) do { checks++; if (!(x)) { fprintf(stderr, "line %d: %s\n", __LINE__, #x); return 1; } } while (0)
 static uint8_t payload[4096], target[256], receive_buffer[1024 * 1024];
@@ -85,9 +87,11 @@ static int escape_loop;
 static void print(const char *format, ...) { (void)format; }
 /* the panel status of loader_06a_screen_ui.inc: drawing is not what this test checks */
 static inline void ui_init(void) {}
+static void boot_fallback_check(void) {}
 static inline void ui_stage(const char *word) { (void)word; }
 static inline void ui_progress(uint64_t done, uint64_t total) { (void)done; (void)total; }
 /* "oem sh": tools/test-loader-shell.py */
+static const char *slot_unlock_held_recovery(void) { assert(0); return "unexpected recovery"; }
 static void oem_shell(const char *text) { (void)text; }
 /* the host-silence watchdog clock, "oem push" into a running kernel's inbox and "oem dsu": not what this test checks */
 static uint64_t host_last_cmd;
@@ -126,7 +130,7 @@ static void clean(void)
     download_to_ramdisk = kernel_resources_held = firmware_fault = usb_out_lost = usb_in_lost = 0;
     running_live = NULL; usb_connected = 1; rx_calls = data_replies = allocations = 0;
     allocation_error = 0; free_base = 0x8c0000000ULL; free_size = 0x340000000ULL;
-    answer[0] = 0;
+    answer[0] = 0; PLAT = &platform_annibale;
 }
 static void backing(uint64_t window)
 {
@@ -137,30 +141,43 @@ int main(void)
 {
     uint64_t length;
     clean(); fb_command("getvar:ramdisk-protocol"); CK(!strcmp(answer, "OKAY1") && allocations == 0);
-    fb_command("oem ramdisk begin 140000000 2c0000000");
+    fb_command("oem ramdisk begin 4000000 2c0000000");
     CK(!strcmp(answer, "OKAY") && win_size == 0x2c0000000ULL && allocations == 1);
     CK(ramdisk_pending() && resident_rd_size == 0);
-    fb_command("getvar:ramdisk-state"); CK(!strcmp(answer, "OKAYreceiving 0 140000000 2c0000000"));
+    fb_command("getvar:ramdisk-state"); CK(!strcmp(answer, "OKAYreceiving 0 4000000 2c0000000"));
     fb_command("oem run"); CK(!strncmp(answer, "FAIL", 4));
     fb_command("oem selftest"); CK(!strncmp(answer, "FAIL", 4));
     fb_command("oem ramdisk"); CK(!strncmp(answer, "FAIL", 4));
-    CK(ramdisk_block_size("ffffffff", &length) && length == 0xffffffffULL);
+    CK(ramdisk_block_size("2000000", &length) && length == 0x2000000ULL);
     ramdisk_block_done(length, length); CK(resident_rd_size == 0 && ramdisk_pending());
-    CK(ramdisk_block_size("40000001", &length)); ramdisk_block_done(length, length);
-    CK(resident_rd_size == 0x140000000ULL && !ramdisk_pending());
+    CK(ramdisk_block_size("2000000", &length)); ramdisk_block_done(length, length);
+    CK(resident_rd_size == 0x4000000ULL && !ramdisk_pending());
     CK(!ramdisk_command("oem run"));
-    fb_command("getvar:ramdisk-state"); CK(!strcmp(answer, "OKAYready 140000000 140000000 2c0000000"));
+    fb_command("getvar:ramdisk-state"); CK(!strcmp(answer, "OKAYready 4000000 4000000 2c0000000"));
 
+    const char *oversized[] = { "4000001 2c0000000", "100000000 2c0000000", "140000000 2c0000000" };
+    for (unsigned i = 0; i < sizeof(oversized)/sizeof(oversized[0]); i++) {
+        clean(); memset(target, 0xa5, sizeof(target));
+        CK(ramdisk_begin(oversized[i]) != NULL);
+        CK(!allocations && !rx_calls && !data_replies && !resident_rd_size);
+        for (unsigned j = 0; j < sizeof(target); j++) CK(target[j] == 0xa5);
+    }
+    clean(); PLAT = &platform_qemu;
+    CK(!ramdisk_begin("140000000 2c0000000"));
+    CK(ramdisk_transfer.total == 0x140000000ULL && allocations == 1);
+    CK(ramdisk_begin("288000001 2c0000000") != NULL);
+    clean(); CK(!ramdisk_begin("4000000 2c0000000"));
+    ramdisk_block_done(0x4000000, 0x4000000);
     const char *bad[] = { "0 2c0000000", "1 0", "1 2c0000001", "1 400000000",
         "10000000000000000 2c0000000", "ffffffffffffffff 2c0000000", "1 10000000000000000",
         "1", "1 2c0000000 trailing", "1x 2c0000000", "1  2c0000000", "288000001 2c0000000" };
     for (unsigned i = 0; i < sizeof(bad)/sizeof(bad[0]); i++) {
-        CK(ramdisk_begin(bad[i]) != NULL); CK(resident_rd_size == 0x140000000ULL);
+        CK(ramdisk_begin(bad[i]) != NULL); CK(resident_rd_size == 0x4000000ULL);
     }
     CK(ramdisk_begin("8 180000000") != NULL && allocations == 1);
-    CK(!ramdisk_begin("288000000 2c0000000") && ramdisk_pending() && !resident_rd_size);
+    CK(!ramdisk_begin("4000000 2c0000000") && ramdisk_pending() && !resident_rd_size);
     clean(); free_size = 0x180000000ULL;
-    CK(ramdisk_begin("140000000 2c0000000") != NULL && resident_rd_size == 0);
+    CK(ramdisk_begin("4000000 2c0000000") != NULL && resident_rd_size == 0);
     clean(); allocation_error = 1; CK(ramdisk_begin("8 2c0000000") != NULL && win_size == 0);
     clean(); win_base = ~0ULL - 15; win_size = 0x2c0000000ULL;
     CK(ramdisk_begin("8 2c0000000") != NULL);
@@ -205,7 +222,23 @@ int main(void)
     rx_left = 8; fb_command("download:8"); CK(resident_rd_size == 8 && ramdisk_transfer.total == 0 && target[7] == 24);
     fb_command("oem ramdisk"); rx_left = 2; fb_command("download:8"); CK(!resident_rd_size && !strncmp(answer, "FAIL", 4));
     fb_command("oem ramdisk"); fb_command("download:100000000"); CK(!strncmp(answer, "FAIL", 4));
+    fb_command("oem ramdisk");
+    unsigned before_rx = rx_calls, before_data = data_replies;
+    uint8_t saved[sizeof(target)]; memcpy(saved, target, sizeof(target));
+    fb_command("download:4000001");
+    CK(!strncmp(answer, "FAIL", 4) && rx_calls == before_rx && data_replies == before_data);
+    CK(!memcmp(saved, target, sizeof(target)));
     fb_command("oem ramdisk none"); CK(!download_to_ramdisk && !resident_rd_size);
+    clean(); PLAT = &platform_qemu; backing(MAX_MEM_SIZE);
+    fb_command("oem ramdisk"); rx_left = 0;
+    fb_command("download:4000001");
+    CK(data_replies == 1 && rx_calls == 1 && !resident_rd_size);
+    before_rx = rx_calls; before_data = data_replies;
+    char over_window[48];
+    snprintf(over_window, sizeof(over_window), "download:%llx",
+        (unsigned long long)(win_size - RESIDENT_RD_OFFSET - RESIDENT_RD_RESERVE + 1));
+    fb_command("oem ramdisk"); fb_command(over_window);
+    CK(!strncmp(answer, "FAIL", 4) && rx_calls == before_rx && data_replies == before_data);
     printf("loader ramdisk C checks: %u passed\n", checks);
     return 0;
 }
@@ -215,7 +248,7 @@ int main(void)
 def test_loader():
     definitions = '\n'.join(re.search(r'^#define ' + key + r'\s+\S+', BASE_SOURCE, re.M).group()
                             for key in ('BASE_ALIGN', 'MAX_MEM_SIZE', 'MAX_MEM_SIZE_LIMIT',
-                                        'RESIDENT_RD_OFFSET', 'RESIDENT_RD_RESERVE'))
+                                        'RESIDENT_RD_OFFSET', 'RESIDENT_RD_RESERVE', 'MAX_RESIDENT_BOOT_SIZE'))
     command = function(USB_SOURCE, 'fb_command')
     command = command[:command.index('\t\t} else if (starts_with(cmd, "upload"))')] + '\t\t}\n\t}\n}\n'
     assert command.index('lc_cmd_denied(') < command.index('ramdisk_command(cmd)')
@@ -232,6 +265,8 @@ def test_loader():
         subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', str(cfile), '-o', str(binary)], check=True)
         subprocess.run([str(binary)], check=True)
         mutations = {
+            'missing streaming boot limit': ('PLAT == &platform_annibale && total > MAX_RESIDENT_BOOT_SIZE', '0'),
+            'missing legacy boot limit': ('limit = MAX_RESIDENT_BOOT_SIZE;', 'limit = MAX_MEM_SIZE_LIMIT;'),
             'partial publication': ('if (ramdisk_transfer.received == ramdisk_transfer.total) {',
                                     'if (ramdisk_transfer.received != 0) {'),
             'short block accepted': ('ramdisk_transfer.failed || received != wanted ||',
@@ -250,29 +285,117 @@ def test_loader():
             print('mutation rejected:', name)
 
 
+def test_resident_layout():
+    payload_source = (ROOT / 'xnuloader/loader_04_fault_payload_nvram.inc').read_text()
+    macros = '\n'.join(re.search(r'^#define ' + key + r'\s+\S+', BASE_SOURCE, re.M).group()
+                       for key in ('PAYLOAD_MAGIC', 'PAYLOAD_CONTAINER_MAX', 'MAX_RESIDENT_BOOT_SIZE',
+                                   'KERNEL_VIRT_BASE', 'PAGE_SIZE_MAX', 'RESIDENT_RD_OFFSET', 'BASE_ALIGN', 'MAX_MEM_SIZE_LIMIT'))
+    info = payload_source[payload_source.index('struct payload_info {'):payload_source.index('static uint64_t\nparse_number')]
+    layout = LAYOUT_SOURCE[LAYOUT_SOURCE.index('struct run_layout {'):LAYOUT_SOURCE.index('/* F10-PLAN-END */')]
+    # Keep the production guard and its immediate I/O consumers in their actual order.
+    start = LAYOUT_SOURCE.index('\tuint64_t phys_base = win_base;')
+    end = LAYOUT_SOURCE.index('\n\t/* --- load segments', start)
+    dispatch = LAYOUT_SOURCE[start:end]
+    source = r'''
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+static uint8_t payload[4096];
+#define PAYLOAD_BASE ((uint64_t)(uintptr_t)payload)
+static uint64_t payload_bytes, resident_rd_size, win_base = 0x80000000ULL, win_size = 0x180000000ULL;
+static const int platform_annibale, platform_qemu;
+static const int *PLAT = &platform_annibale;
+static unsigned disk_reads, memory_writes;
+static void print(const char *format, ...) { (void)format; }
+static int str_eq(const char *a, const char *b) { return !strcmp(a, b); }
+struct payload_header { uint32_t magic, size; };
+struct payload_entry { char name[16]; uint32_t size, reserved; };
+''' + macros + '\n' + info
+    for name in ('parse_number', 'nul_within', 'parse_payload'):
+        source += function(payload_source, name)
+    source += layout + r'''
+static int rdfile_load(const char *part, uint64_t off, uint64_t size, uint64_t target)
+{ (void)part; (void)off; (void)size; (void)target; disk_reads++; return 1; }
+static void *count_clear(void *p, int c, size_t n)
+{ (void)c; (void)n; memory_writes++; return p; }
+static void *count_copy(void *p, const void *q, size_t n)
+{ (void)q; (void)n; memory_writes++; return p; }
+#undef memset
+#undef memcpy
+#define memset count_clear
+#define memcpy count_copy
+static int deliver(struct payload_info pi) {
+    uint64_t vm_lo = KERNEL_VIRT_BASE + 0x3000000, vm_hi = vm_lo + 0x1000000;
+''' + dispatch + r'''
+    memory_writes++; /* The next production step clears and copies kernel segments. */
+    return 1;
+}
+#undef memset
+#undef memcpy
+static void make_payload(const char *name, const char *text) {
+    memset(payload, 0, sizeof(payload));
+    struct payload_header *h = (void *)payload;
+    struct payload_entry *e = (void *)(h + 1);
+    strcpy(e->name, name); e->size = (uint32_t)strlen(text) + 1;
+    memcpy(e + 1, text, e->size);
+    h->magic = PAYLOAD_MAGIC;
+    h->size = sizeof(*e) * 2 + ((e->size + 15) & ~15u);
+    payload_bytes = sizeof(*h) + h->size;
+    resident_rd_size = disk_reads = memory_writes = 0;
+}
+int main(void) {
+    struct payload_info pi;
+    const char *names[] = {"rdres", "rdfile"};
+    const char *values[] = {"4000001", "darwin:67108865"};
+    for (unsigned i = 0; i < 2; i++) {
+        make_payload(names[i], values[i]); assert(parse_payload(&pi, 0));
+        assert(!deliver(pi)); assert(!disk_reads && !memory_writes);
+    }
+    make_payload("rdres", "4000000"); assert(parse_payload(&pi, 0));
+    assert(deliver(pi)); assert(!disk_reads && memory_writes == 1);
+    make_payload("rdfile", "darwin:67108864"); assert(parse_payload(&pi, 0));
+    assert(deliver(pi)); assert(disk_reads == 1 && memory_writes == 1);
+    make_payload("rdimage", "boot bytes"); assert(parse_payload(&pi, 0));
+    assert(pi.resident_image_size == 11 && !memcmp(pi.resident_image, "boot bytes", 11));
+    assert(deliver(pi)); assert(!disk_reads && memory_writes == 3);
+    struct run_layout L;
+    assert(!plan_layout(win_base, win_size, KERNEL_VIRT_BASE + 0x3000000,
+        KERNEL_VIRT_BASE + 0x4000000, 0, 64, MAX_RESIDENT_BOOT_SIZE + 1, &L));
+    PLAT = &platform_qemu;
+    for (unsigned i = 0; i < 2; i++) {
+        make_payload(names[i], values[i]); assert(parse_payload(&pi, 0));
+        assert(deliver(pi)); assert(disk_reads == i && memory_writes == 1);
+    }
+    make_payload("rdres", "180000000"); assert(parse_payload(&pi, 0));
+    assert(!deliver(pi)); assert(!disk_reads && !memory_writes);
+    puts("resident payload parsing and pre-I/O layout checks: passed");
+    return 0;
+}
+'''
+    with tempfile.TemporaryDirectory(prefix='hackios-layout-test-') as directory:
+        cfile, binary = Path(directory) / 'test.c', Path(directory) / 'test'
+        for mutation in (False, True):
+            content = source
+            if mutation:
+                content = content.replace('resident_rd > MAX_RESIDENT_BOOT_SIZE || resident_source_size > MAX_RESIDENT_BOOT_SIZE', '0')
+            cfile.write_text(content)
+            subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-variable',
+                            str(cfile), '-o', str(binary)], check=True)
+            result = subprocess.run([str(binary)], capture_output=True, text=True)
+            if mutation:
+                assert result.returncode, 'missing layout size limit was not detected'
+                print('mutation rejected: missing pre-I/O resident size limit')
+            else:
+                assert result.returncode == 0, result.stdout + result.stderr
+                print(result.stdout, end='')
+
+
 HOST_CODE = (ROOT / 'tools/stage-system.sh').read_text().split("<<'PYTHON'\n", 1)[1].rsplit('\nPYTHON', 1)[0]
 
 
-def test_host(total, *, capability='1', fail_block=0, wrong_progress=False, window=True, held=False,
-              short_source=False, changed_source=False):
-    state = SimpleNamespace(total=0, received=0, window=0, length=0, position=0, blocks=0, closed=False,
-                            cancelled=False, stat_calls=0)
+def test_host(total, *, capability='1', window=True, held=False):
     calls = []
-
-    class VirtualFile:
-        def __init__(self, mode):
-            self.mode = mode
-            if mode == 'wb':
-                state.length = 0
-
-        def __enter__(self): return self
-        def __exit__(self, *args): return None
-        def fileno(self): return 123
-        def read(self, count):
-            count = min(count, total - int(short_source) - state.position)
-            state.position += count
-            return b'x' * count
-        def write(self, data): state.length += len(data)
 
     class VirtualPath:
         def __init__(self, value): self.value = str(value)
@@ -280,12 +403,7 @@ def test_host(total, *, capability='1', fail_block=0, wrong_progress=False, wind
         def __truediv__(self, name): return VirtualPath(self.value + '/' + name)
         def is_file(self): return True
         def stat(self): return SimpleNamespace(st_size=total, st_mtime_ns=1)
-        def open(self, mode): return VirtualFile(mode)
-
-    class Temporary:
-        def __init__(self, **kwargs): pass
-        def __enter__(self): return '/virtual/blocks'
-        def __exit__(self, *args): state.closed = True
+        def open(self, mode): raise AssertionError('rejected image must not be opened')
 
     def run(command, **kwargs):
         calls.append(command)
@@ -297,17 +415,11 @@ def test_host(total, *, capability='1', fail_block=0, wrong_progress=False, wind
         elif args == ['getvar', 'result']: output = 'result: hung-held\n' if held else 'result: idle\n'
         elif args == ['getvar', 'ramdisk-protocol']: output = 'ramdisk-protocol: ' + capability + '\n'
         elif args[:3] == ['oem', 'ramdisk', 'begin']:
-            state.total, state.window = (int(v, 16) for v in args[3:])
-        elif args == ['oem', 'ramdisk', 'none']: state.cancelled = True
-        elif args == ['getvar', 'ramdisk-state']:
-            phase = 'ready' if state.received == state.total else 'receiving'
-            reported = state.received + (1 if wrong_progress and state.blocks else 0)
-            output = f'(bootloader) ramdisk-state: {phase} {reported:x} {state.total:x} {state.window:x}\n'
-        elif args[0] == 'stage' and total > 0xffffffff:
-            state.blocks += 1
-            assert 0 < state.length <= 256 * 1024 * 1024
-            if state.blocks == fail_block: code = 1; output = 'FAILED transfer\n'
-            else: state.received += state.length
+            requested, requested_window = (int(v, 16) for v in args[3:])
+            if requested > 64 * 1024 * 1024:
+                code = 1; output = 'FAILED invalid ramdisk total/window\n'
+        elif args == ['stage', '/virtual/system.apfs'] and total > 64 * 1024 * 1024:
+            code = 1; output = 'FAILED bad size\n'
         elif args not in (['oem', 'ramdisk'], ['stage', '/virtual/system.apfs']):
             raise AssertionError(args)
         return SimpleNamespace(returncode=code, stdout=output)
@@ -316,44 +428,33 @@ def test_host(total, *, capability='1', fail_block=0, wrong_progress=False, wind
     if window: env['STAGE_SYSTEM_WINDOW'] = '2c0000000'
     status = 0
     output = io.StringIO()
-    def fstat(descriptor):
-        assert descriptor == 123
-        state.stat_calls += 1
-        return SimpleNamespace(st_size=total, st_mtime_ns=2 if changed_source and state.stat_calls > 1 else 1)
     with patch.dict(os.environ, env, clear=True), patch('pathlib.Path', VirtualPath), \
-            patch('subprocess.run', run), patch('tempfile.TemporaryDirectory', Temporary), \
-            patch('os.fstat', fstat), \
+            patch('subprocess.run', run), \
             contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
         try:
             exec(compile(HOST_CODE, 'stage-system.sh', 'exec'), {})
         except SystemExit as error:
             status = error.code
-    return status, state, calls
+    return status, calls
 
 
 def main():
     test_loader()
-    status, state, calls = test_host(1024, capability='', window=False)
+    test_resident_layout()
+    status, calls = test_host(1024, capability='', window=False)
     assert status == 0 and not any('ramdisk-protocol' in c or 'ramdisk-state' in c for c in calls)
     assert calls[-2:] == [['fake-fastboot', '-s', 'xnuloader', 'oem', 'ramdisk'],
                          ['fake-fastboot', '-s', 'xnuloader', 'stage', '/virtual/system.apfs']]
-    status, state, calls = test_host(0x100000001)
-    assert status == 0 and state.received == 0x100000001 and state.blocks == 17 and state.closed
-    status, state, calls = test_host(0x100000001, window=False)
+    for total in (0x4000001, 0x100000001):
+        status, calls = test_host(total)
+        assert status == 1
+    status, calls = test_host(0x100000001, window=False)
     assert status == 1 and not calls
-    status, state, calls = test_host(0x100000001, capability='')
-    assert status == 1 and state.total == 0
-    status, state, calls = test_host(0x100000001, fail_block=2)
-    assert status == 1 and state.blocks == 2 and state.closed
-    status, state, calls = test_host(0x100000001, wrong_progress=True)
-    assert status == 1 and state.blocks == 1 and state.closed
-    status, state, calls = test_host(1024, held=True)
+    status, calls = test_host(0x100000001, capability='')
+    assert status == 1
+    status, calls = test_host(1024, held=True)
     assert status == 1 and not any('stage' in c or 'oem' in c for c in calls)
-    status, state, calls = test_host(0x100000001, short_source=True)
-    assert status == 1 and state.blocks == 16 and state.closed
-    status, state, calls = test_host(0x100000001, changed_source=True)
-    assert status == 1 and state.cancelled and state.closed
-    print('stage-system: nine cases passed (legacy, large, window, capability, transfer, progress, held, source changes)')
+    print('stage-system: legacy upload, size refusal, window, capability and held cases passed')
 
 
 if __name__ == '__main__':

@@ -155,7 +155,7 @@ struct run_layout {
 
 static int
 plan_layout(uint64_t phys_base, uint64_t win_size, uint64_t vm_lo, uint64_t vm_hi, uint64_t ramdisk_size,
-    uint64_t resident_rd, uint64_t rdfile_size, struct run_layout *L)
+	    uint64_t resident_rd, uint64_t resident_source_size, struct run_layout *L)
 {
 	uint64_t slide = phys_base - KERNEL_VIRT_BASE; /* pa = va + slide */
 	uint64_t dt_max = 0x10000;
@@ -170,6 +170,11 @@ plan_layout(uint64_t phys_base, uint64_t win_size, uint64_t vm_lo, uint64_t vm_h
 	L->res_pa = 0;
 	L->res_size = 0;
 	L->rd_resident = 0;
+	if (PLAT == &platform_annibale &&
+	    (resident_rd > MAX_RESIDENT_BOOT_SIZE || resident_source_size > MAX_RESIDENT_BOOT_SIZE)) {
+		print("resident boot image exceeds the %d-byte limit\n", (uint64_t)MAX_RESIDENT_BOOT_SIZE);
+		return 0;
+	}
 
 	/* A resident image next to a payload ramdisk: two disks (which is which is decided where the device tree is written). */
 	if (resident_rd != 0) {
@@ -184,10 +189,9 @@ plan_layout(uint64_t phys_base, uint64_t win_size, uint64_t vm_lo, uint64_t vm_h
 			print("kernel and ramdisk overlap the resident image\n");
 			return 0;
 		}
-		/* the staged system image is written whole at the resident address: it must fit the
-		 * reserved span and the claimed window, checked before the first clear or read */
-		if (rdfile_size > res_size || rdfile_size > win_size - RESIDENT_RD_OFFSET) {
-			print("rdfile: %x bytes do not fit the window (resident span %x at %x)\n", rdfile_size, res_size,
+		/* An image copied or read into the resident area must fit before any memory is changed. */
+		if (resident_source_size > res_size || resident_source_size > win_size - RESIDENT_RD_OFFSET) {
+			print("resident image: %x bytes do not fit the window (resident span %x at %x)\n", resident_source_size, res_size,
 			    res_pa - phys_base);
 			return 0;
 		}
@@ -418,8 +422,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	 * the window is cleared and before the staged image is read from its partition (F10). */
 	struct run_layout L;
 
+	uint64_t resident_source_size = pi.rdfile_size != 0 ? pi.rdfile_size : pi.resident_image_size;
 	if (!plan_layout(phys_base, win_size, vm_lo, vm_hi, pi.ramdisk_size, resident_rd_size,
-	    resident_rd_size != 0 ? pi.rdfile_size : 0, &L)) {
+	    resident_rd_size != 0 ? resident_source_size : 0, &L)) {
 		return 0;
 	}
 	uint64_t kern_lo = L.kern_lo, kern_hi = L.kern_hi;
@@ -435,6 +440,10 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			print("rdfile: giving up on the staged system image\n");
 			return 0;
 		}
+	} else if (L.res_pa != 0 && pi.resident_image_size != 0) {
+		print("rdimage: copying %x bytes to %x\n", pi.resident_image_size, L.res_pa);
+		memset((void *)L.res_pa, 0, L.res_size);
+		memcpy((void *)L.res_pa, pi.resident_image, pi.resident_image_size);
 	}
 
 	/* --- load segments -------------------------------------------------- */
@@ -961,6 +970,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 
 	/* --- hand off (UEFI is left resident, see loader_save_ctx) ------------ */
 	int ran_other_core = 0;
+	/* Standalone and USB boots must report the same state before a kernel can run. */
+	set_result("running", checkpoint, 0);
 	if (loader_save_ctx() == 0) {
 		/* from the handoff on, memory and devices count as held until the return check has
 		 * proof; the write sits before the map clean so the MMU-off round trip cannot lose

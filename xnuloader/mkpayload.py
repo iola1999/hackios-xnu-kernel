@@ -10,6 +10,8 @@ usage: mkpayload.py -o payload.bin name=file [name=file ...] [--cmdline "..."]
        [--require name=sha256 ...] [--require-cmd TOKEN ...] [--forbid-cmd TOKEN ...]
        [--forbid-entry NAME ...]
 
+The optional rdimage=file entry is copied to the resident root address as /dev/md0.
+
 Input checks run before assembly: every input file is read exactly once and
 the same bytes feed the --require hash and the payload entry, so a file
 replaced between the two reads cannot ship unapproved content. Item names are
@@ -73,6 +75,10 @@ for item in args.items:
     if name in inputs:
         sys.exit(f'item: duplicate name {name} ({inputs[name]} and {path}); the loader would keep only the last')
     inputs[name] = path
+
+resident_sources = sum(name == 'rdimage' for name in inputs) + bool(args.rdres) + bool(args.rdfile)
+if resident_sources > 1:
+    sys.exit('resident image: use only one of rdimage, --rdres, or --rdfile')
 
 # One read per input file; the bytes below are what both --require and the
 # payload see.
@@ -152,5 +158,7 @@ if args.checkpoint:
     add('checkpoint', args.checkpoint.encode() + b'\0')
 body += b'\0' * 24
 payload = struct.pack('<II', 0x50554E58, len(body)) + body
+if len(payload) > 0x03700000:
+    sys.exit(f'payload: {len(payload)} bytes exceed the loader container limit 57671680')
 open(args.output, 'wb').write(payload)
 print(f'{args.output}: {len(payload)} bytes, sha256 {hashlib.sha256(payload).hexdigest()}')

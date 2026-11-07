@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
-"""Build standalone payload packaging kernel + root26.apfs + rdfile (LZ4 compressed).
+"""Build a standalone payload with the small boot volume and helper root (LZ4 compressed).
 
-Packages kernel, root26.apfs, and --rdfile darwin:5917904896:0 into an XNUP container,
-then compresses the payload with LZ4 to produce ~26 MB standalone boot payload fitting
-within the 96 MiB boot_a partition.
+The resident boot volume is at most 64 MiB. The iOS system volume remains on UFS and is mounted
+by init after the kernel starts from the boot volume.
 """
 
 import argparse
 import hashlib
-import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 
-DEFAULT_RDFILE = "darwin:5917904896:0"
+MAX_RESIDENT_BOOT_BYTES = 64 * 1024 * 1024
 DEFAULT_IDENTITY = "v57"
 DEFAULT_MEMSIZE = "300000000"
 DEFAULT_CMDLINE = (
-    "debug=0x10e rootdev=md0 launchd_unsecure_cache=1 cpus=4 bootcpu=7 "
+    "debug=0x10e rd=md0 rootdev=md0 root_apfs=ufs_darwin launchd_unsecure_cache=1 cpus=4 bootcpu=7 "
     "small_cores_after=0 adreno8=23 adreno8_pause=0 adreno8_fine=0 adreno8_watch=0 "
     "adreno8_keep=1 adreno8_return=0 adreno8_speed=14 adreno8_secure_preflight=4 "
     "touchscreen=2 buttons=1 battery=1 gpu_log=0 metal=1 cpufreq=1 fb_threads=2 "
@@ -26,7 +24,7 @@ DEFAULT_CMDLINE = (
     "touch_poll_us=4000 pcie=10 pcie_power=1 pcie_sleep_clock=board pcie_bdf=bd_p11.elf "
     "pcie_smps_hpm=1 pcie_bt_en=1 pcie_aop_pdc=1 pcie_rddm=1 wifi_mlo=1 "
     "wifi_mac=02:4b:39:30:00:01 wifi_station=1 ufs=2 ufs_native=1 ufs_write=1 "
-    "var_store=1 var_save_ms=60000 bt=4 cam=5 torch=1 fbwidth=1206 fbheight=2622 fbpitch=460"
+    "bt=4 cam=5 torch=1 fbwidth=1206 fbheight=2622 fbpitch=460"
 )
 
 
@@ -56,6 +54,10 @@ def find_default_ramdisk(root_dir: Path) -> Path:
     return candidates[0]
 
 
+def find_default_boot_image(root_dir: Path) -> Path:
+    return root_dir / "userland/flashboot.apfs"
+
+
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -82,7 +84,7 @@ def build_standalone_payload(
     ramdisk: Path,
     output: Path,
     lz4_output: Path | None = None,
-    rdfile: str = DEFAULT_RDFILE,
+    boot_image: Path | None = None,
     identity: str = DEFAULT_IDENTITY,
     memsize: str = DEFAULT_MEMSIZE,
     cmdline: str = DEFAULT_CMDLINE,
@@ -96,6 +98,16 @@ def build_standalone_payload(
         raise FileNotFoundError(f"kernel not found at {kernel}")
     if not ramdisk.is_file():
         raise FileNotFoundError(f"ramdisk not found at {ramdisk}")
+    if boot_image is None:
+        boot_image = find_default_boot_image(here.parent)
+    if not boot_image.is_file():
+        raise FileNotFoundError(f"boot image not found at {boot_image}; build it with FLASHBOOT=1 CRYPTEXES=flash")
+    if not 0 < boot_image.stat().st_size <= MAX_RESIDENT_BOOT_BYTES:
+        raise ValueError(f"boot image is {boot_image.stat().st_size} bytes; the limit is {MAX_RESIDENT_BOOT_BYTES}")
+    for key, value in (("rd", "md0"), ("rootdev", "md0"), ("root_apfs", "ufs_darwin"),
+                       ("ufs", "2"), ("ufs_native", "1")):
+        if [arg for arg in cmdline.split() if arg.split("=", 1)[0] == key] != [f"{key}={value}"]:
+            raise ValueError(f"cmdline requires exactly one {key}={value}")
 
     output.parent.mkdir(parents=True, exist_ok=True)
     if lz4_output is None:
@@ -114,8 +126,19 @@ def build_standalone_payload(
     cmd.extend([
         f"kernel={kernel}",
         f"ramdisk={ramdisk}",
-        "--rdfile",
-        rdfile,
+        f"rdimage={boot_image}",
+        "--require",
+        f"rdimage={sha256_file(boot_image)}",
+        "--forbid-entry",
+        "rdfile",
+        "--forbid-entry",
+        "rdres",
+        "--require-cmd",
+        "rd=md0",
+        "--require-cmd",
+        "rootdev=md0",
+        "--require-cmd",
+        "root_apfs=ufs_darwin",
         "--identity",
         identity,
         "--memsize",
@@ -142,13 +165,13 @@ def main() -> int:
                         help="Path to kernel Mach-O")
     parser.add_argument("-r", "--ramdisk", type=Path, default=find_default_ramdisk(kernel_root),
                         help="Path to root ramdisk (root26.apfs)")
+    parser.add_argument("-b", "--boot-image", type=Path, default=find_default_boot_image(kernel_root),
+                        help="Path to the small resident boot APFS image")
     parser.add_argument("-o", "--output", type=Path,
                         default=kernel_root / "out/standalone-payload.bin",
                         help="Path to output uncompressed payload")
     parser.add_argument("--lz4-output", type=Path, default=None,
                         help="Path to output LZ4 compressed payload")
-    parser.add_argument("--rdfile", default=DEFAULT_RDFILE,
-                        help="rdfile partition:size:offset specification")
     parser.add_argument("--identity", default=DEFAULT_IDENTITY,
                         help="identity (v57 for iOS 26)")
     parser.add_argument("--memsize", default=DEFAULT_MEMSIZE,
@@ -166,19 +189,21 @@ def main() -> int:
             tmp = Path(td)
             dummy_k = tmp / "kernel"
             dummy_r = tmp / "root.apfs"
+            dummy_b = tmp / "flashboot.apfs"
             dummy_out = tmp / "payload.bin"
             dummy_lz4 = tmp / "payload.bin.lz4"
 
             # Create dummy Mach-O and apfs bytes
             dummy_k.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 1024)
             dummy_r.write_bytes(b"NXSB" + b"\x00" * 1024)
+            dummy_b.write_bytes(b"NXSB" + b"\x00" * 1024)
 
             out_bin, out_lz = build_standalone_payload(
                 kernel=dummy_k,
                 ramdisk=dummy_r,
                 output=dummy_out,
                 lz4_output=dummy_lz4,
-                rdfile="darwin:1048576:0",
+                boot_image=dummy_b,
             )
             assert out_bin.is_file() and out_bin.stat().st_size > 0
             assert out_lz.is_file() and out_lz.stat().st_size > 0
@@ -190,7 +215,7 @@ def main() -> int:
         ramdisk=args.ramdisk,
         output=args.output,
         lz4_output=args.lz4_output,
-        rdfile=args.rdfile,
+        boot_image=args.boot_image,
         identity=args.identity,
         memsize=args.memsize,
         cmdline=args.cmdline,

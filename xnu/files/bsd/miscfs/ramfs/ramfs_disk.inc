@@ -492,13 +492,9 @@ ramfs_disk_sync_impl(struct ramfs_mount *rm)
 		}
 	}
 
-	if (node_count < 1000 && rm->rm_meta_gen > 0) {
-		lck_mtx_unlock(&rm->rm_lock);
-		return EINVAL;
-	}
 	rm->rm_meta_dirty = false;
 	rm->rm_meta_syncing = true;
-	gen = ++rm->rm_meta_gen;
+	gen = rm->rm_meta_gen + 1;
 	write_bytes = RDWFS_ALIGN4K(RDWFS_SUPER_BYTES + payload_bytes);
 	if (write_bytes > RDWFS_SUPER_BYTES + payload_bytes) {
 		bzero((uint8_t *)rm->rm_meta_buf + RDWFS_SUPER_BYTES + payload_bytes,
@@ -516,7 +512,8 @@ ramfs_disk_sync_impl(struct ramfs_mount *rm)
 	sup->payload_crc = crc32(0, (uint8_t *)rm->rm_meta_buf + RDWFS_SUPER_BYTES, (size_t)payload_bytes);
 	sup->super_crc = crc32(0, sup, __builtin_offsetof(struct rdwfs_super, super_crc));
 
-	slot_off = (gen & 1ULL) ? RDWFS_SLOT0_OFFSET : RDWFS_SLOT1_OFFSET;
+	/* Preserve the recovered slot even when generations have unusual parity. */
+	slot_off = rm->rm_meta_slot == 0 ? RDWFS_SLOT1_OFFSET : RDWFS_SLOT0_OFFSET;
 	lck_mtx_unlock(&rm->rm_lock);
 
 	if (write_bytes > RDWFS_SUPER_BYTES) {
@@ -537,6 +534,12 @@ ramfs_disk_sync_impl(struct ramfs_mount *rm)
 	lck_mtx_lock(&rm->rm_lock);
 	rm->rm_meta_syncing = false;
 	wakeup(&rm->rm_meta_syncing);
+	if (error == 0) {
+		rm->rm_meta_gen = gen;
+		rm->rm_meta_slot = slot_off == RDWFS_SLOT0_OFFSET ? 0 : 1;
+	} else {
+		rm->rm_meta_dirty = true;
+	}
 	if (error != 0) {
 		printf("ramfs: metadata write failed (%d)\n", error);
 	} else if (rm->rm_meta_dirty && rm->rm_seed_done && ramfs_var_seed_done != 0 &&
@@ -581,244 +584,7 @@ ramfs_disk_find_ino(struct ramfs_mount *rm, uint64_t ino)
 	return NULL;
 }
 
-static bool
-ramfs_disk_read_slot(struct ramfs_mount *rm, uint64_t slot_off, struct rdwfs_super *sup_out)
-{
-	struct rdwfs_super *sup = (struct rdwfs_super *)rm->rm_meta_buf;
-	uint64_t pay_aligned;
-
-	if (redwood_ufs_var_io(false, slot_off, sup, RDWFS_SUPER_BYTES) != 0) {
-		return false;
-	}
-	if (memcmp(sup->magic, RDWFS_MAGIC_STR, 8) != 0 ||
-	    (sup->version != 1u && sup->version != RDWFS_VERSION) ||
-	    sup->node_count < 1000 ||
-	    sup->page_size != PAGE_SIZE || sup->payload_bytes > RDWFS_SLOT_MAX - RDWFS_SUPER_BYTES) {
-		return false;
-	}
-	if (crc32(0, sup, __builtin_offsetof(struct rdwfs_super, super_crc)) != sup->super_crc) {
-		return false;
-	}
-	pay_aligned = RDWFS_ALIGN4K(sup->payload_bytes);
-	if (RDWFS_SUPER_BYTES + pay_aligned > rm->rm_meta_cap) {
-		size_t new_cap = (size_t)RDWFS_ALIGN4K(RDWFS_SUPER_BYTES + pay_aligned);
-		void *new_buf = ramfs_vm_alloc(new_cap);
-
-		if (new_buf == NULL) {
-			return false;
-		}
-		memcpy(new_buf, sup, RDWFS_SUPER_BYTES);
-		ramfs_vm_free(rm->rm_meta_buf, rm->rm_meta_cap);
-		rm->rm_meta_buf = new_buf;
-		rm->rm_meta_cap = new_cap;
-		sup = (struct rdwfs_super *)rm->rm_meta_buf;
-	}
-	if (pay_aligned > 0 && redwood_ufs_var_io(false, slot_off + RDWFS_SUPER_BYTES,
-	    (uint8_t *)rm->rm_meta_buf + RDWFS_SUPER_BYTES, pay_aligned) != 0) {
-		return false;
-	}
-	if (crc32(0, (uint8_t *)rm->rm_meta_buf + RDWFS_SUPER_BYTES, (size_t)sup->payload_bytes) != sup->payload_crc) {
-		return false;
-	}
-	*sup_out = *sup;
-	return true;
-}
-
-static bool
-ramfs_disk_unpack(struct ramfs_mount *rm, const struct rdwfs_super *sup)
-{
-	const uint8_t *base = (const uint8_t *)rm->rm_meta_buf + RDWFS_SUPER_BYTES;
-	uint64_t end = sup->payload_bytes, at = 0, max_ino = RAMFS_ROOT_INO;
-
-	/* Pass 1: instantiate nodes, symlink targets, regular file block tables, and xattrs. */
-	for (uint32_t i = 0; i < sup->node_count; i++) {
-		struct rdwfs_inode_rec rec;
-		struct ramfs_node *node;
-
-		if (at + sizeof(rec) > end) {
-			return false;
-		}
-		memcpy(&rec, base + at, sizeof(rec));
-		at += sizeof(rec);
-		if (rec.ino > max_ino) {
-			max_ino = rec.ino;
-		}
-		if (rec.ino == RAMFS_ROOT_INO) {
-			node = rm->rm_root;
-		} else {
-			node = ramfs_node_alloc(rm, (enum vtype)rec.type, NULL);
-			node->rn_ino = rec.ino;
-			ramfs_hash_insert(rm, node);
-			rm->rm_nodes++;
-		}
-		node->rn_size = rec.size;
-		node->rn_mode = rec.mode;
-		node->rn_uid = rec.uid;
-		node->rn_gid = rec.gid;
-		node->rn_bsdflags = rec.bsdflags;
-		node->rn_dataprotect_class = rec.dataprotect_class ? rec.dataprotect_class : PROTECTION_CLASS_D;
-		node->rn_nlink = rec.nlink;
-		node->rn_atime.tv_sec = (time_t)rec.atime_sec;
-		node->rn_atime.tv_nsec = (long)rec.atime_nsec;
-		node->rn_mtime.tv_sec = (time_t)rec.mtime_sec;
-		node->rn_mtime.tv_nsec = (long)rec.mtime_nsec;
-		node->rn_ctime.tv_sec = (time_t)rec.ctime_sec;
-		node->rn_ctime.tv_nsec = (long)rec.ctime_nsec;
-		node->rn_btime.tv_sec = (time_t)rec.btime_sec;
-		node->rn_btime.tv_nsec = (long)rec.btime_nsec;
-
-		if (rec.target_len > 0) {
-			uint64_t alen = RDWFS_ALIGN8(rec.target_len);
-
-			if (at + alen > end) {
-				return false;
-			}
-			node->rn_target = kalloc_data(rec.target_len + 1, Z_WAITOK);
-			if (node->rn_target == NULL) {
-				return false;
-			}
-			memcpy(node->rn_target, base + at, rec.target_len);
-			node->rn_target[rec.target_len] = '\0';
-			at += alen;
-		}
-		if (rec.nblocks > 0) {
-			uint64_t bbytes = (uint64_t)rec.nblocks * sizeof(uint32_t);
-			uint64_t alen = RDWFS_ALIGN8(bbytes);
-			uint64_t want = 4;
-
-			if (at + alen > end) {
-				return false;
-			}
-			while (want < rec.nblocks) {
-				want *= 2;
-			}
-			node->rn_pages = kalloc_type(void *, want, Z_WAITOK | Z_ZERO);
-			node->rn_blocks = kalloc_data(want * sizeof(uint32_t), Z_WAITOK | Z_ZERO);
-			if (node->rn_pages == NULL || node->rn_blocks == NULL) {
-				if (node->rn_pages != NULL) {
-					kfree_type(void *, want, node->rn_pages);
-					node->rn_pages = NULL;
-				}
-				if (node->rn_blocks != NULL) {
-					kfree_data(node->rn_blocks, want * sizeof(uint32_t));
-					node->rn_blocks = NULL;
-				}
-				return false;
-			}
-			node->rn_nslots = want;
-			memcpy(node->rn_blocks, base + at, (size_t)bbytes);
-			for (uint32_t b = 0; b < rec.nblocks; b++) {
-				uint32_t dblk = node->rn_blocks[b];
-
-				if (dblk != 0) {
-					ramfs_disk_bmap_set(rm, dblk);
-					node->rn_nalloc++;
-					rm->rm_pages++;
-					os_atomic_inc(&ramfs_var_used_pages, relaxed);
-				}
-			}
-			at += alen;
-		}
-		for (uint32_t x = 0; x < rec.nxattrs; x++) {
-			struct rdwfs_xattr_rec xrec;
-			struct ramfs_xattr *xa;
-			uint64_t alen;
-
-			if (at + sizeof(xrec) > end) {
-				return false;
-			}
-			memcpy(&xrec, base + at, sizeof(xrec));
-			at += sizeof(xrec);
-			alen = RDWFS_ALIGN8((uint64_t)xrec.namelen + (uint64_t)xrec.size);
-			if (at + alen > end || xrec.namelen > XATTR_MAXNAMELEN || xrec.size > RAMFS_MAX_XATTR) {
-				return false;
-			}
-			xa = kalloc_type(struct ramfs_xattr, Z_WAITOK | Z_ZERO);
-			if (xa == NULL) {
-				return false;
-			}
-			xa->rx_name = kalloc_data(xrec.namelen + 1, Z_WAITOK);
-			if (xa->rx_name == NULL) {
-				kfree_type(struct ramfs_xattr, xa);
-				return false;
-			}
-			memcpy(xa->rx_name, base + at, xrec.namelen);
-			xa->rx_name[xrec.namelen] = '\0';
-			xa->rx_namelen = xrec.namelen;
-			if (xrec.size > 0) {
-				xa->rx_data = kalloc_data(xrec.size, Z_WAITOK);
-				if (xa->rx_data == NULL) {
-					kfree_data(xa->rx_name, xrec.namelen + 1);
-					kfree_type(struct ramfs_xattr, xa);
-					return false;
-				}
-				memcpy(xa->rx_data, base + at + xrec.namelen, xrec.size);
-			}
-			xa->rx_size = xrec.size;
-			TAILQ_INSERT_TAIL(&node->rn_xattrs, xa, rx_link);
-			at += alen;
-		}
-		for (uint32_t d = 0; d < rec.ndirents; d++) {
-			struct rdwfs_dirent_rec drec;
-
-			if (at + sizeof(drec) > end) {
-				return false;
-			}
-			memcpy(&drec, base + at, sizeof(drec));
-			at += sizeof(drec) + RDWFS_ALIGN8(drec.namelen);
-		}
-	}
-
-	/* Pass 2: link directory parent pointers and directory entries. */
-	at = 0;
-	for (uint32_t i = 0; i < sup->node_count; i++) {
-		struct rdwfs_inode_rec rec;
-		struct ramfs_node *node;
-
-		memcpy(&rec, base + at, sizeof(rec));
-		at += sizeof(rec);
-		if (rec.target_len > 0) {
-			at += RDWFS_ALIGN8(rec.target_len);
-		}
-		if (rec.nblocks > 0) {
-			at += RDWFS_ALIGN8((uint64_t)rec.nblocks * sizeof(uint32_t));
-		}
-		for (uint32_t x = 0; x < rec.nxattrs; x++) {
-			struct rdwfs_xattr_rec xrec;
-
-			memcpy(&xrec, base + at, sizeof(xrec));
-			at += sizeof(xrec) + RDWFS_ALIGN8((uint64_t)xrec.namelen + (uint64_t)xrec.size);
-		}
-		node = ramfs_disk_find_ino(rm, rec.ino);
-		if (node != NULL && node->rn_type == VDIR) {
-			struct ramfs_node *parent = ramfs_disk_find_ino(rm, rec.parent_ino);
-
-			node->rn_parent = parent != NULL ? parent : rm->rm_root;
-		}
-		for (uint32_t d = 0; d < rec.ndirents; d++) {
-			struct rdwfs_dirent_rec drec;
-			struct ramfs_node *child;
-			uint64_t alen;
-
-			memcpy(&drec, base + at, sizeof(drec));
-			at += sizeof(drec);
-			alen = RDWFS_ALIGN8(drec.namelen);
-			child = ramfs_disk_find_ino(rm, drec.child_ino);
-			if (node != NULL && node->rn_type == VDIR && child != NULL &&
-			    drec.namelen > 0 && drec.namelen <= RAMFS_MAX_NAME) {
-				struct ramfs_dirent *de = ramfs_dirent_alloc((const char *)(base + at), drec.namelen);
-
-				de->rd_node = child;
-				TAILQ_INSERT_TAIL(&node->rn_entries, de, rd_link);
-				node->rn_nentries++;
-			}
-			at += alen;
-		}
-	}
-	rm->rm_next_ino = sup->next_ino > max_ino ? sup->next_ino : (max_ino + 1);
-	rm->rm_meta_gen = sup->generation;
-	return true;
-}
+#include "ramfs_disk_restore.inc"
 
 static struct ramfs_node *
 ramfs_disk_find_child(struct ramfs_node *dir, const char *name, size_t len)
@@ -1020,148 +786,4 @@ ramfs_disk_restore_panic_log(struct ramfs_mount *rm)
 	printf("ramfs: restored %llu bytes of crash log to /private/var/db/panic.log\n", (unsigned long long)pay_len);
 }
 
-static void
-ramfs_disk_mount(struct ramfs_mount *rm)
-{
-	uint64_t part_bytes = 0, avail_bytes, max_blocks;
-	struct rdwfs_super *sup0 = NULL, *sup1 = NULL, *win_sup = NULL;
-	bool ok0 = false, ok1 = false, loaded = false;
-	uint32_t win_slot = 0;
-
-	if (ramfs_disk_claimed || !redwood_ufs_var_info(&part_bytes) || part_bytes <= RDWFS_DATA_OFFSET) {
-		return;
-	}
-	avail_bytes = part_bytes - RDWFS_DATA_OFFSET;
-	max_blocks = avail_bytes / PAGE_SIZE;
-	if (max_blocks > 8388608ULL) {
-		max_blocks = 8388608ULL;
-	}
-	rm->rm_bmap_max = (uint32_t)max_blocks;
-	rm->rm_bmap_words = (rm->rm_bmap_max + 31u) / 32u;
-	rm->rm_bmap = kalloc_data((size_t)rm->rm_bmap_words * sizeof(uint32_t), Z_WAITOK | Z_ZERO);
-	rm->rm_io_page = ramfs_page_alloc(true);
-	rm->rm_meta_cap = RDWFS_INIT_META_CAP;
-	rm->rm_meta_buf = ramfs_vm_alloc(rm->rm_meta_cap);
-	if (rm->rm_bmap == NULL || rm->rm_io_page == NULL || rm->rm_meta_buf == NULL) {
-		if (rm->rm_bmap != NULL) {
-			kfree_data(rm->rm_bmap, (size_t)rm->rm_bmap_words * sizeof(uint32_t));
-			rm->rm_bmap = NULL;
-		}
-		if (rm->rm_io_page != NULL) {
-			ramfs_page_free(rm->rm_io_page);
-			rm->rm_io_page = NULL;
-		}
-		ramfs_vm_free(rm->rm_meta_buf, rm->rm_meta_cap);
-		rm->rm_meta_buf = NULL;
-		return;
-	}
-	rm->rm_bmap[0] |= 1u;
-	rm->rm_bmap_next = part_bytes >= (8ULL << 30) ? (uint32_t)((2048ULL << 20) / PAGE_SIZE) : 1u;
-	rm->rm_disk_loading = true;
-
-	sup0 = kalloc_type(struct rdwfs_super, Z_WAITOK | Z_ZERO);
-	sup1 = kalloc_type(struct rdwfs_super, Z_WAITOK | Z_ZERO);
-	win_sup = kalloc_type(struct rdwfs_super, Z_WAITOK | Z_ZERO);
-	if (sup0 == NULL || sup1 == NULL || win_sup == NULL) {
-		goto out_cleanup_supers;
-	}
-
-	/* Inspect both checkpoint slots and pick the newer valid generation. */
-	if (redwood_ufs_var_io(false, RDWFS_SLOT0_OFFSET, sup0, sizeof(*sup0)) == 0 &&
-	    memcmp(sup0->magic, RDWFS_MAGIC_STR, 8) == 0 &&
-	    (sup0->version == 1u || sup0->version == RDWFS_VERSION) &&
-	    sup0->node_count >= 1000 &&
-	    sup0->page_size == PAGE_SIZE &&
-	    crc32(0, sup0, __builtin_offsetof(struct rdwfs_super, super_crc)) == sup0->super_crc) {
-		ok0 = true;
-	}
-	if (redwood_ufs_var_io(false, RDWFS_SLOT1_OFFSET, sup1, sizeof(*sup1)) == 0 &&
-	    memcmp(sup1->magic, RDWFS_MAGIC_STR, 8) == 0 &&
-	    (sup1->version == 1u || sup1->version == RDWFS_VERSION) &&
-	    sup1->node_count >= 1000 &&
-	    sup1->page_size == PAGE_SIZE &&
-	    crc32(0, sup1, __builtin_offsetof(struct rdwfs_super, super_crc)) == sup1->super_crc) {
-		ok1 = true;
-	}
-	if (ok0 && (!ok1 || sup0->generation >= sup1->generation)) {
-		if (ramfs_disk_read_slot(rm, RDWFS_SLOT0_OFFSET, win_sup) &&
-		    ramfs_disk_unpack(rm, win_sup)) {
-			loaded = true;
-			win_slot = 0;
-		} else if (ok1 && ramfs_disk_read_slot(rm, RDWFS_SLOT1_OFFSET, win_sup) &&
-		    ramfs_disk_unpack(rm, win_sup)) {
-			loaded = true;
-			win_slot = 1;
-		}
-	} else if (ok1) {
-		if (ramfs_disk_read_slot(rm, RDWFS_SLOT1_OFFSET, win_sup) &&
-		    ramfs_disk_unpack(rm, win_sup)) {
-			loaded = true;
-			win_slot = 1;
-		} else if (ok0 && ramfs_disk_read_slot(rm, RDWFS_SLOT0_OFFSET, win_sup) &&
-		    ramfs_disk_unpack(rm, win_sup)) {
-			loaded = true;
-			win_slot = 0;
-		}
-	}
-
-out_cleanup_supers:
-	rm->rm_disk_loading = false;
-	rm->rm_disk_backed = true;
-	rm->rm_meta_call = thread_call_allocate(ramfs_disk_meta_thread, (thread_call_param_t)rm);
-	ramfs_disk_rm = rm;
-	ramfs_disk_claimed = true;
-
-	if (loaded) {
-		ramfs_var_disk_loaded = 1;
-		ramfs_var_seed_done = 1;
-		rm->rm_seed_done = true;
-		printf("ramfs: loaded /private/var from disk (slot %u, gen %llu, %llu nodes, %llu pages)\n",
-		    win_slot, win_sup != NULL ? win_sup->generation : 0ULL, rm->rm_nodes, rm->rm_pages);
-	} else {
-		ramfs_var_disk_loaded = 0;
-		ramfs_var_seed_done = 0;
-		rm->rm_seed_done = false;
-		printf("ramfs: /private/var backed by UFS (%llu MB data region, fresh checkpoint)\n",
-		    avail_bytes >> 20);
-	}
-	if (sup0 != NULL) {
-		kfree_type(struct rdwfs_super, 1, sup0);
-	}
-	if (sup1 != NULL) {
-		kfree_type(struct rdwfs_super, 1, sup1);
-	}
-	if (win_sup != NULL) {
-		kfree_type(struct rdwfs_super, 1, win_sup);
-	}
-	ramfs_disk_restore_panic_log(rm);
-}
-
-static void
-ramfs_disk_unmount(struct ramfs_mount *rm)
-{
-	if (!rm->rm_disk_backed) {
-		return;
-	}
-	if (rm->rm_meta_call != NULL) {
-		(void)thread_call_cancel_wait((thread_call_t)rm->rm_meta_call);
-		(void)thread_call_free((thread_call_t)rm->rm_meta_call);
-		rm->rm_meta_call = NULL;
-	}
-	(void)ramfs_disk_sync(rm);
-	if (rm == ramfs_disk_rm) {
-		ramfs_disk_rm = NULL;
-		ramfs_disk_claimed = false;
-	}
-	if (rm->rm_bmap != NULL) {
-		kfree_data(rm->rm_bmap, (size_t)rm->rm_bmap_words * sizeof(uint32_t));
-		rm->rm_bmap = NULL;
-	}
-	if (rm->rm_io_page != NULL) {
-		ramfs_page_free(rm->rm_io_page);
-		rm->rm_io_page = NULL;
-	}
-	ramfs_vm_free(rm->rm_meta_buf, rm->rm_meta_cap);
-	rm->rm_meta_buf = NULL;
-	rm->rm_disk_backed = false;
-}
+#include "ramfs_disk_mount.inc"

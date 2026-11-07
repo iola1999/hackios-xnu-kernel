@@ -23,6 +23,7 @@ struct payload_entry { char name[16]; uint32_t size; uint32_t reserved; };
  */
 #define RESIDENT_RD_OFFSET  0x08000000ULL
 #define RESIDENT_RD_RESERVE 0x30000000ULL         /* RAM that must remain for the kernel itself */
+#define MAX_RESIDENT_BOOT_SIZE 0x04000000ULL      /* only the small boot volume may occupy md0 */
 #define PAGE_SIZE_MAX       0x4000ULL
 
 #define LOG_PARTITION       u"logdump"

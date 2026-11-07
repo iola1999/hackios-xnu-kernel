@@ -180,6 +180,8 @@ struct payload_info {
 	const uint8_t *kernel;
 	const uint8_t *ramdisk;
 	uint32_t ramdisk_size;
+	const uint8_t *resident_image;
+	uint64_t resident_image_size;
 	const char *cmdline;
 	uint64_t checkpoint;
 	uint64_t forced_base;
@@ -189,6 +191,7 @@ struct payload_info {
 	char rdfile_part[40];           /* a staged system image to read from a real GPT partition (k90-port) */
 	uint64_t rdfile_size;
 	uint64_t rdfile_off;            /* from the partition start; ~0 means aligned to its end */
+	int resident_source;
 	int usb_mode;
 };
 
@@ -317,10 +320,11 @@ parse_payload(struct payload_info *pi, int verbose)
 			}
 			pi->identity = text;
 		} else if (str_eq(e->name, "rdres")) {
-			if (!nul_within(text, e->size)) {
+			if (!nul_within(text, e->size) || pi->resident_source) {
 				bad = 1;
 				break;
 			}
+			pi->resident_source = 1;
 			pi->resident_rd = parse_number(text, 16); /* e.g. loaded there by QEMU; see RESIDENT_RD_OFFSET */
 		} else if (str_eq(e->name, "checkpoint")) {
 			if (!nul_within(text, e->size)) {
@@ -329,7 +333,7 @@ parse_payload(struct payload_info *pi, int verbose)
 			}
 			pi->checkpoint = parse_number(text, 10);  /* where the kernel should stop and come back */
 		} else if (str_eq(e->name, "rdfile")) {
-			if (!nul_within(text, e->size)) {
+			if (!nul_within(text, e->size) || pi->resident_source) {
 				bad = 1;
 				break;
 			}
@@ -345,17 +349,33 @@ parse_payload(struct payload_info *pi, int verbose)
 				pi->rdfile_part[n++] = *q++;
 			}
 			pi->rdfile_part[n] = 0;
-			if (*q == ':') {
-				pi->rdfile_size = parse_number(++q, 10);
-				while (*q && *q != ':') {
-					q++;
-				}
-				pi->rdfile_off = ~0ull;
-				if (*q == ':' && !str_eq(++q, "tail")) {
-					pi->rdfile_off = parse_number(q, 10);
-				}
-				pi->resident_rd = pi->rdfile_size;    /* same delivery path as QEMU's rdres */
+			if (!pi->rdfile_part[0] || *q != ':') {
+				bad = 1;
+				break;
 			}
+			pi->rdfile_size = parse_number(++q, 10);
+			while (*q && *q != ':') {
+				q++;
+			}
+			pi->rdfile_off = ~0ull;
+			if (*q == ':' && !str_eq(++q, "tail")) {
+				pi->rdfile_off = parse_number(q, 10);
+			}
+			if (pi->rdfile_size == 0) {
+				bad = 1;
+				break;
+			}
+			pi->resident_source = 2;
+			pi->resident_rd = pi->rdfile_size;    /* same delivery path as QEMU's rdres */
+		} else if (str_eq(e->name, "rdimage")) {
+			if (pi->resident_source || e->size == 0) {
+				bad = 1;
+				break;
+			}
+			pi->resident_source = 3;
+			pi->resident_image = p + sizeof(*e);
+			pi->resident_image_size = e->size;
+			pi->resident_rd = e->size;
 		} else if (str_eq(e->name, "usb")) {
 			pi->usb_mode = 1;                         /* stay in the loader and take commands over USB */
 		}
