@@ -964,7 +964,40 @@ slot_apply_active(char target_slot)
 static void
 slot_maintain_current(void)
 {
-	slot_apply_active(loader_slot);
+	efi_block_io *bio = lun4_get_bio();
+	if (!bio || !bio->media) return;
+	uint32_t bs = bio->media->block_size;
+	if (bs < 512 || bs > 4096) return;
+
+	static uint8_t hdr[4096] __attribute__((aligned(4096)));
+	if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, 1, bs, hdr)) ||
+	    memcmp(hdr, "EFI PART", 8) != 0) {
+		return;
+	}
+
+	uint64_t entries_lba = *(uint64_t *)(hdr + 72);
+	uint32_t num_entries = *(uint32_t *)(hdr + 80);
+	uint32_t entry_size = *(uint32_t *)(hdr + 84);
+	uint64_t total_bytes = (uint64_t)num_entries * entry_size;
+	uint64_t num_blocks = (total_bytes + bs - 1) / bs;
+	if (total_bytes == 0 || total_bytes > sizeof(ufs_buffer)) return;
+	if (EFI_ERROR(safe_read_blocks(bio, entries_lba, num_blocks, bs, ufs_buffer))) return;
+
+	static const uint8_t inactive_guid[16] = {
+		0xd4, 0x6c, 0x03, 0x77, 0xd5, 0x03, 0xbb, 0x42,
+		0x8e, 0xd1, 0x37, 0xe5, 0xa8, 0x8b, 0xaa, 0x34
+	};
+	const char *target_name = (loader_slot == 'b') ? "boot_b" : "boot_a";
+	uint8_t *entry = gpt_find_entry(ufs_buffer, num_entries, entry_size, target_name);
+	if (!entry || memcmp(entry, inactive_guid, 16) == 0) return;
+
+	uint64_t attr = *(uint64_t *)(entry + 48);
+	if ((attr & (1ULL << 54)) != 0 || attr == 0x006f000000000000ULL) return;
+
+	*(uint64_t *)(entry + 48) = 0x006f000000000000ULL;
+	if (EFI_ERROR(safe_write_blocks(bio, entries_lba, num_blocks, bs, ufs_buffer))) return;
+	gpt_sync_lun(bio);
+	print("slot: refreshed %s retry budget to 0x006f000000000000\n", target_name);
 }
 
 static void

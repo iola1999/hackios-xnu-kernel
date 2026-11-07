@@ -33,6 +33,7 @@ __pycache__/
 !/userland/build.sh
 !/userland/*.py
 !/userland/rc.*
+!/userland/jobs/
 !/userland/com.redwood.*.plist
 !/userland/src/
 !/userland/libmini/

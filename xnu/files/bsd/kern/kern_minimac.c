@@ -261,7 +261,7 @@ minisandbox_container_path(user_addr_t arg)
 	task = proc_task(p);
 	if (user_stack == 0 || argslen == 0 || task == TASK_NULL) {
 		proc_rele(p);
-		return 0;
+		return EPERM;
 	}
 	/* the same way as sysctl_procargsx(): the task keeps the map alive once the process is let go */
 	task_reference(task);
@@ -269,7 +269,7 @@ minisandbox_container_path(user_addr_t arg)
 	map = get_task_map_reference(task);
 	task_deallocate(task);
 	if (map == VM_MAP_NULL) {
-		return 0;
+		return EPERM;
 	}
 	strings_size = vm_map_round_page(argslen, vm_map_page_mask(map));
 	if (kmem_alloc(kernel_map, &strings, strings_size, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
@@ -285,9 +285,10 @@ minisandbox_container_path(user_addr_t arg)
 			vm_map_copy_discard(copy);
 		}
 		kmem_free(kernel_map, strings, strings_size);
-		return 0;                       /* the process is on its way out, or has unmapped its own stack */
+		return EPERM;                   /* the process is on its way out, or has unmapped its own stack */
 	}
 
+	error = EPERM;
 	end = (const char *)(strings + strings_size);
 	for (s = end - argslen; s < end; s += len + 1) {
 		len = strnlen(s, end - s);
