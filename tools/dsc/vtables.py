@@ -36,7 +36,7 @@ def scan(cache, image, section_names=('__const',), min_slots=3):
                 continue
             j = i + 16
             while j + 8 <= len(raw):
-                addr = cache.decode(struct.unpack_from('<Q', raw, j)[0])
+                addr = cache.decode(struct.unpack_from('<Q', raw, j)[0], sec.addr + j)
                 if addr is None or not lo <= addr < hi:
                     break
                 j += 8
@@ -57,8 +57,9 @@ def slots(cache, vtable, count=None, max_count=4096):
     lo, hi = _text_range(cache, image)
     out = []
     while len(out) < (count if count is not None else max_count):
-        raw = cache.u64(vtable + 0x10 + 8 * len(out))
-        addr = cache.decode(raw)
+        address = vtable + 0x10 + 8 * len(out)
+        raw = cache.u64(address)
+        addr = cache.decode(raw, address)
         if count is None and (addr is None or not lo <= addr < hi):
             break
         out.append((len(out), 8 * len(out), raw, addr))

@@ -8,9 +8,8 @@ ios165/ and ios26/ (both started at 0x180000000):
     mapping table at header+0x10;
   - the main file's image table is at 0x88 (offset) and 0x90 (count), entries are
     32 bytes: uuid[16], address u64, textSegmentSize u32, pathOffset u32;
-  - arm64e caches store pointers chained: bit 63 selects the authenticated form
-    (low 32 bits are an offset from the shared region start), otherwise the low
-    36 bits are the offset;
+  - arm64e pointer layouts come from each mapping's slide-info version: v3
+    authenticated offsets are 32 bits; v5 runtime offsets are 34 bits;
   - the arm64 cache stores absolute low-36-bit targets with flag bits in 36..43.
 """
 
@@ -27,6 +26,7 @@ HDR_IMAGES_OFFSET = 0x88
 HDR_IMAGES_COUNT = 0x90
 HDR_SHARED_REGION_START = 0xe0
 HDR_SHARED_REGION_SIZE = 0xe8
+HDR_MAPPING_WITH_SLIDE_OFFSET = 0x138
 
 CACHE_PREFIX = 'dyld_shared_cache_'
 SKIP_ENDINGS = ('.symbols', '.map', '.atlas', '.json')
@@ -91,6 +91,7 @@ class Cache:
         self.images = self._read_images()
         self.mappings = self._read_mappings()
         self._map_starts = [m.address for m in self.mappings]
+        self._slide_infos = self._read_slide_infos() if self.arch == 'arm64e' else []
         self._image_ranges = None
 
     def _fd(self, path):
@@ -143,6 +144,30 @@ class Cache:
         mappings.sort(key=lambda m: m.address)
         return mappings
 
+    def _read_slide_infos(self):
+        """Read the v3/v5 bases from dyld_cache_mapping_and_slide_info records."""
+        infos = []
+        for path in self.files:
+            head = self.peek(0, 0x400, path)
+            table_off, count = struct.unpack_from('<II', head, HDR_MAPPING_WITH_SLIDE_OFFSET)
+            size = os.path.getsize(path)
+            if not table_off or not count:
+                continue
+            if table_off + count * 56 > size:
+                raise CacheError(f'invalid slide mapping table in {path}')
+            table = self.peek(table_off, count * 56, path)
+            for i in range(count):
+                addr, length, _fileoff, off, length_info = struct.unpack_from('<QQQQQ', table, i * 56)
+                if not length_info:
+                    continue
+                if length_info < 24 or off + length_info > size:
+                    raise CacheError(f'invalid slide info in {path}')
+                version, _page_size, pages, base = struct.unpack('<III4xQ', self.peek(off, 24, path))
+                if version in (3, 5) and 24 + pages * 2 > length_info:
+                    raise CacheError(f'truncated v{version} page starts in {path}')
+                infos.append((addr, addr + length, version, base))
+        return infos
+
     def where(self, addr):
         """(path, file offset, initprot) of the file backing a virtual address."""
         i = bisect.bisect_right(self._map_starts, addr) - 1
@@ -166,14 +191,24 @@ class Cache:
     def u64(self, addr):
         return struct.unpack('<Q', self.read(addr, 8))[0]
 
-    def decode(self, raw):
-        """Decode a chained pointer word found in a data segment; None for zero."""
+    def decode(self, raw, address=None):
+        """Decode an unslid target; address is required for mixed slide layouts."""
         if raw == 0:
             return None
         if self.arch == 'arm64e':
-            if raw >> 63:
-                return self.shared_region_start + (raw & 0xffffffff)
-            return self.shared_region_start + (raw & ((1 << 36) - 1))
+            formats = {(version, base) for start, end, version, base in self._slide_infos
+                       if address is None or start <= address < end}
+            if len(formats) != 1:
+                raise CacheError('pointer requires one slide layout; supply its mapped address')
+            version, base = formats.pop()
+            if version == 5:
+                target = base + (raw & ((1 << 34) - 1))
+                return target if raw >> 63 else target | (((raw >> 34) & 0xff) << 56)
+            if version == 3:
+                if raw >> 63:
+                    return base + (raw & 0xffffffff)
+                return ((raw & 0x0007f80000000000) << 13) | (raw & 0x000007ffffffffff)
+            raise CacheError(f'unsupported arm64e slide-info version {version}')
         return raw & ((1 << 36) - 1)
 
     def find_image(self, name):
