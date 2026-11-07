@@ -618,6 +618,17 @@ static void glink_q_write(uint32_t q_off, uint32_t q_sz, uint32_t *write_at, con
 {
 	const uint8_t *bytes = (const uint8_t *)buf;
 	uint32_t aligned = (len + 7u) & ~7u, pos = *write_at;
+	if (q_off == glink_our_q && glink_our_read_at != 0 && q_sz > aligned + 8u) {
+		for (unsigned wait = 0; wait < 200; wait++) {
+			uint32_t r = 0;
+			smem_peek(glink_our_read_at, &r, 4);
+			uint32_t used = (pos >= r) ? (pos - r) : (q_sz - r + pos);
+			if (used + aligned + 8u < q_sz) {
+				break;
+			}
+			sleep_us(100);
+		}
+	}
 	for (uint32_t i = 0; i < aligned; i += 4) {
 		uint32_t w = 0;
 		for (uint32_t b = 0; b < 4 && (i + b) < len; b++) {
@@ -756,6 +767,10 @@ static int adsp_pmic_glink_tx(const void *data, uint32_t len)
 	memcpy(tx + 12, &left, 4);
 	memcpy(tx + 16, data, len);
 	glink_q_write(glink_our_q, glink_our_q_size, &glink_tx_write_pos, tx, 16u + len);
+	for (unsigned i = 0; i < 10; i++) {
+		sleep_us(200);
+		glink_poll_rx();
+	}
 	return 0;
 }
 
@@ -1103,6 +1118,11 @@ static void annibale_adsp_boot_thread(void *arg __unused, wait_result_t w __unus
 		uint32_t try_boot = 1;
 		PE_parse_boot_argn("annibale_adsp", &try_boot, sizeof(try_boot));
 		if (try_boot != 0) {
+			/* Let Adreno 830 GPU finish TrustZone SCM zap authentication first so PAS SMC calls do not contend. */
+			extern bool adreno8_init_done;
+			for (unsigned wait = 0; wait < 120 && !adreno8_init_done; wait++) {
+				sleep_ms(100);
+			}
 			uint64_t probe_sz = 0;
 			for (unsigned wait = 0; wait < 50 &&
 			    !redwood_ufs_fat16_fw_read("adsp_dtb.mdt", &probe_sz, NULL, 0); wait++) {

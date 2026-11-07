@@ -8,6 +8,21 @@
 source "$(dirname "${BASH_SOURCE[0]}")/env-macos.sh"
 cd "$XNU26_SRC" || exit 1
 SRC=$PWD
+if [ -d "$XNU26_ROOT/xnu/files" ]; then
+  python3 - "$XNU26_ROOT/xnu/files" "$SRC" <<'PY'
+import filecmp, os, shutil, sys
+src_root, dst_root = sys.argv[1], sys.argv[2]
+for dirpath, _, filenames in os.walk(src_root):
+    for f in filenames:
+        p1 = os.path.join(dirpath, f)
+        rel = os.path.relpath(p1, src_root)
+        p2 = os.path.join(dst_root, rel)
+        if not os.path.exists(p2) or not filecmp.cmp(p1, p2, shallow=False):
+            os.makedirs(os.path.dirname(p2), exist_ok=True)
+            shutil.copy2(p1, p2)
+            os.utime(p2, None)
+PY
+fi
 export RC_DARWIN_KERNEL_VERSION=${RC_DARWIN_KERNEL_VERSION:-25.6.0}
 
 # Reproducible builds, part one: the version string.

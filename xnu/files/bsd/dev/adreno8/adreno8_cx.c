@@ -693,10 +693,11 @@ adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t argument0,
     uint64_t argument1, uint64_t argument2, uint64_t argument3, uint64_t *answer)
 {
 	uint64_t session = 0;
+	bool continuing = false;
 
 	adreno8_announce("SCM call %#llx arguments %#llx %#llx %#llx", function, argument0, argument1, argument2);
-	for (unsigned attempt = 0; attempt < 100; attempt++) {
-		register uint64_t x0 __asm__("x0") = attempt == 0 ? function : 1;
+	for (unsigned attempt = 0; attempt < 2000; attempt++) {
+		register uint64_t x0 __asm__("x0") = continuing ? 1 : function;
 		register uint64_t x1 __asm__("x1") = arginfo;
 		register uint64_t x2 __asm__("x2") = argument0;
 		register uint64_t x3 __asm__("x3") = argument1;
@@ -707,12 +708,21 @@ adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t argument0,
 
 		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3), "+r" (x4), "+r" (x5),
 		    "+r" (x6), "+r" (x7) : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
-		session = x6;
-		if (x0 != 1) {
-			*answer = x1;
-			printf("adreno8: %u: SCM %#llx returned %d, answer %#llx\n", adreno8_step, function, (int32_t)x0, x1);
-			return (int32_t)x0;
+		if (x0 == 1) {
+			session = x6;
+			continuing = true;
+			continue;
 		}
+		if (x0 == 2 || x0 == 6) {
+			/* TrustZone busy with another core's SMC (e.g. PAS): back off and retry full call. */
+			session = 0;
+			continuing = false;
+			delay(1000);
+			continue;
+		}
+		*answer = x1;
+		printf("adreno8: %u: SCM %#llx returned %d, answer %#llx\n", adreno8_step, function, (int32_t)x0, x1);
+		return (int32_t)x0;
 	}
 	printf("adreno8: %u: SCM continuation limit reached\n", adreno8_step);
 	return -1;

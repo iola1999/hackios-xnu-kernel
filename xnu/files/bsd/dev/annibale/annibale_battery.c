@@ -269,7 +269,7 @@ spmi_wait(vm_offset_t channel)
 static bool
 spmi_read_reg(struct charger_module *mod, uint8_t reg, uint8_t *val)
 {
-	if (!mod->found || !mod->ours || mod->chnl_rd == 0) {
+	if (!mod->found || mod->chnl_rd == 0) {
 		return false;
 	}
 	annibale_spmi_lock();
@@ -541,8 +541,7 @@ static void
 pmic_glink_poll_and_control(bool enable_charging)
 {
 	static const uint32_t mca_poll_props[] = {
-		MCA_PROP_CHG_STATUS, MCA_PROP_CHG_TYPE, MCA_PROP_USB_REAL_TYPE,
-		MCA_PROP_PACK_VBAT, MCA_PROP_PACK_IBAT, MCA_PROP_VBUS_UV, MCA_PROP_IBUS_UA
+		MCA_PROP_CHG_STATUS, MCA_PROP_PACK_IBAT, MCA_PROP_VBUS_UV
 	};
 	static uint32_t poll_tick = 0;
 
@@ -550,18 +549,13 @@ pmic_glink_poll_and_control(bool enable_charging)
 		return;
 	}
 	if (!pmic_glink_state.notify_enabled) {
-		static const int32_t otg_cfg[4] = { 2, 1, -1, -1 };
 		uint8_t zero_u8 = 0, one_u8 = 1;
 
-		pmic_glink_mca_send_buf(BATTMGR_OP_CHG_CTRL, MCA_PROP_CP_PRESENT, &zero_u8, 1);
-		pmic_glink_mca_send_buf(BATTMGR_OP_CHG_CTRL, MCA_PROP_OTG_CFG, otg_cfg, sizeof(otg_cfg));
-		pmic_glink_mca_send_buf(BATTMGR_OP_CHG_CTRL, MCA_PROP_EU_MODEL, &zero_u8, 1);
 		pmic_glink_mca_send_buf(BATTMGR_OP_CHG_CTRL, MCA_PROP_ADC_ENABLE, &one_u8, 1);
-		pmic_glink_mca_send_buf(BATTMGR_OP_CHG_CTRL, MCA_PROP_AICL_EN, &one_u8, 1);
-		pmic_glink_mca_send(BATTMGR_OP_CHG_CTRL, MCA_PROP_AICL_CONT_THD, 4100u);
-		pmic_glink_mca_send(BATTMGR_OP_CHG_CTRL, MCA_PROP_INPUT_VOLT, 4500u);
-		pmic_glink_mca_send(BATTMGR_OP_CHG_CTRL, MCA_PROP_VTERM, 4450u);
-		pmic_glink_mca_send(BATTMGR_OP_CHG_CTRL, MCA_PROP_ITERM, 250u);
+		pmic_glink_mca_send_buf(BATTMGR_OP_CHG_CTRL, MCA_PROP_INPUT_SUSPEND, &zero_u8, 1);
+		pmic_glink_mca_send(BATTMGR_OP_CHG_CTRL, MCA_PROP_INPUT_CURR, 2500u);
+		pmic_glink_mca_send(BATTMGR_OP_CHG_CTRL, MCA_PROP_ICHG, 3000u);
+		pmic_glink_mca_send_buf(BATTMGR_OP_CHG_CTRL, MCA_PROP_CHG_ENABLE, &one_u8, 1);
 		pmic_glink_state.notify_enabled = true;
 	}
 	poll_tick++;
@@ -569,16 +563,12 @@ pmic_glink_poll_and_control(bool enable_charging)
 	    (enable_charging && (poll_tick % 3) == 1)) {
 		uint8_t susp_u8 = 0;
 		uint8_t chg_en_u8 = enable_charging ? 1u : 0u;
-		uint8_t adc_en_u8 = enable_charging ? 1u : 0u;
 		uint32_t icl_ma = enable_charging ? 2500u : 500u;
 		uint32_t ichg_ma = enable_charging ? 3000u : 500u;
 
-		pmic_glink_mca_send_buf(BATTMGR_OP_CHG_CTRL, MCA_PROP_ADC_ENABLE, &adc_en_u8, 1);
 		pmic_glink_mca_send_buf(BATTMGR_OP_CHG_CTRL, MCA_PROP_INPUT_SUSPEND, &susp_u8, 1);
-		pmic_glink_mca_send(BATTMGR_OP_CHG_CTRL, MCA_PROP_INPUT_VOLT, 4500u);
 		pmic_glink_mca_send(BATTMGR_OP_CHG_CTRL, MCA_PROP_INPUT_CURR, icl_ma);
 		pmic_glink_mca_send(BATTMGR_OP_CHG_CTRL, MCA_PROP_ICHG, ichg_ma);
-		pmic_glink_mca_send(BATTMGR_OP_CHG_CTRL, MCA_PROP_VTERM, 4450u);
 		pmic_glink_mca_send_buf(BATTMGR_OP_CHG_CTRL, MCA_PROP_CHG_ENABLE, &chg_en_u8, 1);
 		if (pmic_glink_state.last_chg_enable != (int)enable_charging) {
 			pmic_glink_state.last_chg_enable = (int)enable_charging;
@@ -787,12 +777,19 @@ sample(void)
 	if (usbin_mod.found && spmi_read_reg(&usbin_mod, 0x10, &usbin_sts)) {
 		usbin_plugged = (usbin_sts & 0x03) != 0;
 	}
+	bool dwc3_u0 = false;
+	if (dwc3_dev != 0) {
+		uint32_t dctl = *(volatile uint32_t *)(dwc3_dev + 0x704);
+		uint32_t dsts = *(volatile uint32_t *)(dwc3_dev + 0x70c);
+		/* DSTS USBLNKST [21:18] == 0 (U0 active link) and DEVSPD [2:0] != 4 (connected). */
+		dwc3_u0 = ((dctl & (1u << 31)) != 0) && (((dsts >> 18) & 0x0fu) == 0u) && ((dsts & 0x07u) != 4u);
+	}
 	bool mca_vbus = pmic_glink_state.active &&
 	    (pmic_glink_state.vbus_uv > 4000000 || pmic_glink_state.chg_status == 1 || pmic_glink_state.chg_status == 4);
 	bool flow_charging = (state.current_ua >= CHARGE_FLOW_UA) ||
 	    (values[0] >= 99 && state.current_ua >= -30000);
 	pm8550b_configure_charging(true);
-	if (usbin_plugged || mca_vbus || flow_charging) {
+	if (usbin_plugged || mca_vbus || flow_charging || dwc3_u0) {
 		last_external = true;
 		if (pmic_glink_state.active && pmic_glink_state.chg_status >= 1 && pmic_glink_state.chg_status <= 4) {
 			state.status = pmic_glink_state.chg_status;
@@ -808,10 +805,10 @@ sample(void)
 		int32_t vbus_uv = (pmic_glink_state.active && pmic_glink_state.vbus_uv > 4000000) ?
 		    pmic_glink_state.vbus_uv : 5000000;
 		state.usb_type = (vbus_uv >= 8000000 || pmic_glink_state.chg_type >= 5) ? 6 :
-		    (usbin_plugged ? 1 : 2);
+		    ((usbin_plugged || dwc3_u0) ? 1 : 2);
 		state.usb_voltage_uv = vbus_uv;
 		state.usb_current_ua = state.usb_type == 6 ? 3000000 :
-		    (usbin_plugged && state.current_ua <= CHARGE_FLOW_UA ? 500000 : 2000000);
+		    ((usbin_plugged || dwc3_u0) && state.current_ua <= CHARGE_FLOW_UA ? 500000 : 2000000);
 	}
 	state.charge_uah = values[4] * 1000;
 	state.full_uah = values[5] * 1000;

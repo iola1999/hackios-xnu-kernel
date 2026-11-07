@@ -264,6 +264,7 @@ adreno8_wait_for(struct adreno8_block *b, uint32_t offset, uint32_t mask, uint32
 /* ---- leaving --------------------------------------------------------------------------------------------- */
 
 bool adreno8_gpu8_keep, adreno8_gpu8_return;
+bool adreno8_init_done;
 uint32_t adreno8_gpu8_secure_mode;
 bool adreno8_reset_required;
 
@@ -374,6 +375,7 @@ adreno8_init(void)
 	uint32_t direct_ring = 0, secure_mode_arg = 0;
 
 	if (!PE_parse_boot_argn("adreno8", &asked, sizeof(asked)) || asked == 0) {
+		adreno8_init_done = true;
 		return;
 	}
 	PE_parse_boot_argn("adreno8_only", &only, sizeof(only));
@@ -464,6 +466,7 @@ adreno8_init(void)
 		adreno8_gpu8_block_stop();
 	}
 	printf("adreno8: over; the system goes on starting\n");
+	adreno8_init_done = true;
 	if (adreno8_gpu8_return) {
 		printf("adreno8: adreno8_return: the boot goes on from in here, as redwood's adreno_return does\n");
 		loader_return();
