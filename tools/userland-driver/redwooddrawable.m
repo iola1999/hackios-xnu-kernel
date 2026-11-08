@@ -67,6 +67,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <dlfcn.h>
+#include <dispatch/dispatch.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -309,11 +310,6 @@ rwd_surface_fits_adreno(const struct rwd_surface *surface, unsigned bytes_per_pi
 		rwd_say(why, why_size, "rwd_surface_fits_adreno needs a surface and a pixel size");
 		return -1;
 	}
-	if (surface->planes > 1) {
-		rwd_say(why, why_size, "surface %u has %u planes; a drawable's texture is one "
-		    "plane and this driver imports no others", surface->surface, surface->planes);
-		return -1;
-	}
 	least = (uint64_t)surface->width * bytes_per_pixel;
 	if (surface->rowBytes < least) {
 		rwd_say(why, why_size, "surface %u has %u bytes a row, and %ux%u pixels of %u "
@@ -368,8 +364,8 @@ rwd_surface_fits_adreno(const struct rwd_surface *surface, unsigned bytes_per_pi
  *       'b3a8' with 'BGRA' of the same geometry (MiniIOSurface.cpp:466-479), so a ten-bit
  *       surface asked for comes back eight-bit and a texture made to the asked-for format
  *       would compute wrong colours into it rather than fail;
- *   the YCbCr formats (500-629)        two planes, and nothing on this port has ever carried
- *       a second plane. See rwd_format_of_metal for the three things that would be needed.
+ *   the combined YCbCr formats (500-629) require a multi-plane texture and YCbCr sampling.
+ *       NV12 planes can be imported separately as R8Unorm and RG8Unorm.
  */
 struct rwd_format {
 	unsigned metal;
@@ -435,17 +431,8 @@ rwd_format_of_metal(unsigned metal_pixel_format, uint32_t *fourcc, unsigned *byt
 	 * times in one boot, all for one surface, out of backboardd.
 	 */
 	if (metal_pixel_format >= 500 && metal_pixel_format <= 629) {
-		/* Kept short enough to fit a 512-byte buffer whole: a refusal that is cut off
-		 * mid-reason is a refusal nobody can act on, which is the failure this file
-		 * exists to avoid. The three things it needs are in docs/metal.md 10.46. */
-		rwd_say(why, why_size, "pixel format %u is %s: YCbCr in TWO PLANES, and this "
-		    "import serves one. Missing: per-plane offset and row length from the kernel "
-		    "(kRedwoodSurface reports only the count, RedwoodGPU.cpp:849), a Gallium "
-		    "format for a biplanar Metal texture, and a YCbCr-to-RGB conversion. Refused "
-		    "whole rather than served as its luma plane, which would composite grey and "
-		    "look like a bug elsewhere", metal_pixel_format,
-		    metal_pixel_format == 500 ? "MTLPixelFormatYCBCR8_420_2P"
-					      : "one of Metal's private YCbCr formats (500-629)");
+		rwd_say(why, why_size, "pixel format %u requires combined YCbCr texture sampling; "
+		    "NV12 plane imports accept R8Unorm and RG8Unorm", metal_pixel_format);
 		return -1;
 	}
 	/*
@@ -480,6 +467,80 @@ rwd_format_of_metal(unsigned metal_pixel_format, uint32_t *fourcc, unsigned *byt
 	    "those FourCCs, and 500-629 because they are two planes", metal_pixel_format, served,
 	    refused);
 	return -1;
+}
+
+/* IOSurface offsets are relative to the allocation, including for a nonzero plane 0 offset. */
+int
+rwd_surface_plane(void *iosurface, unsigned long plane, const struct rwd_texture_shape *want,
+    struct rwd_surface *selected, void **allocation_base, char *why, size_t why_size)
+{
+	static size_t (*count)(void *), (*size)(void *);
+	static uint32_t (*format)(void *);
+	static size_t (*width)(void *, size_t), (*height)(void *, size_t);
+	static size_t (*row)(void *, size_t), (*offset)(void *, size_t), (*element)(void *, size_t);
+	static void *(*address)(void *, size_t);
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		*(void **)&count = dlsym(RTLD_DEFAULT, "IOSurfaceGetPlaneCount");
+		*(void **)&size = dlsym(RTLD_DEFAULT, "IOSurfaceGetAllocSize");
+		*(void **)&format = dlsym(RTLD_DEFAULT, "IOSurfaceGetPixelFormat");
+		*(void **)&width = dlsym(RTLD_DEFAULT, "IOSurfaceGetWidthOfPlane");
+		*(void **)&height = dlsym(RTLD_DEFAULT, "IOSurfaceGetHeightOfPlane");
+		*(void **)&row = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRowOfPlane");
+		*(void **)&offset = dlsym(RTLD_DEFAULT, "IOSurfaceGetOffsetOfPlane");
+		*(void **)&element = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerElementOfPlane");
+		*(void **)&address = dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddressOfPlane");
+	});
+	if (iosurface == NULL || want == NULL || selected == NULL || count == NULL || size == NULL ||
+	    format == NULL || width == NULL || height == NULL || row == NULL || offset == NULL ||
+	    element == NULL || address == NULL) {
+		rwd_say(why, why_size, "IOSurface plane geometry is unavailable");
+		return -1;
+	}
+	size_t planes = count(iosurface);
+	if (plane >= (planes ? planes : 1) || planes > UINT32_MAX) {
+		rwd_say(why, why_size, "plane %lu is outside surface plane count %zu", plane, planes);
+		return -1;
+	}
+	uint32_t fourcc = format(iosurface), expected;
+	unsigned bpp;
+	if ((fourcc == '420v' || fourcc == '420f') && planes == 2) {
+		unsigned pixel_format = plane == 0 ? 10 : 30;
+		if (want->pixel_format != pixel_format) {
+			rwd_say(why, why_size, "NV12 plane %lu requires Metal format %u; requested %u",
+			    plane, pixel_format, want->pixel_format);
+			return -1;
+		}
+		bpp = plane == 0 ? 1 : 2;
+	} else if (planes > 1) {
+		rwd_say(why, why_size, "unsupported planar surface FourCC %#x with %zu planes", fourcc, planes);
+		return -1;
+	} else if (rwd_format_of_metal(want->pixel_format, &expected, &bpp, why, why_size) != 0) {
+		return -1;
+	} else if (fourcc != expected) {
+		rwd_say(why, why_size, "surface FourCC %#x does not match Metal format %u",
+		    fourcc, want->pixel_format);
+		return -1;
+	}
+	size_t w = width(iosurface, plane), h = height(iosurface, plane);
+	size_t stride = row(iosurface, plane), begin = offset(iosurface, plane);
+	uintptr_t pixels = (uintptr_t)address(iosurface, plane);
+	if (w == 0 || h == 0 || w > UINT32_MAX || h > UINT32_MAX || stride > UINT32_MAX ||
+	    begin > UINT32_MAX || pixels == 0 || pixels < begin || element(iosurface, plane) != bpp ||
+	    want->width == 0 || want->height == 0 || want->width > w || want->height > h ||
+	    want->type != 2 || want->depth != 1 || want->array_length != 1 ||
+	    want->mip_levels != 1 || want->sample_count != 1) {
+		rwd_say(why, why_size, "invalid surface plane %lu geometry or texture shape", plane);
+		return -1;
+	}
+	*selected = (struct rwd_surface){ .surface = rwd_surface_id(iosurface), .size = size(iosurface),
+	    .offset = (uint32_t)begin, .rowBytes = (uint32_t)stride, .width = (uint32_t)w,
+	    .height = (uint32_t)h, .pixelFormat = fourcc, .planes = (uint32_t)planes };
+	if (selected->surface == 0 || rwd_surface_fits_adreno(selected, bpp, why, why_size) != 0)
+		return -1;
+	if (allocation_base != NULL)
+		*allocation_base = (void *)(pixels - begin);
+	return 0;
 }
 
 /*
@@ -529,95 +590,28 @@ rwd_import_available(void)
 }
 
 struct rwa_texture *
-rwd_texture_for_surface(struct rwa_device *mesa_device, void *iosurface, unsigned long plane,
-			const struct rwd_texture_shape *want, struct rwd_surface *took,
-			char *why, size_t why_size)
+rwd_texture_for_surface(struct rwa_device *mesa_device, const struct rwd_surface *selected,
+    unsigned long plane, const struct rwd_texture_shape *want, char *why, size_t why_size)
 {
-	struct rwd_surface surface;
+	struct rwd_surface surface = *selected, kernel;
 	io_connect_t connection;
 	rwd_import_call import;
 	struct rwa_texture *texture;
-	unsigned bytes_per_pixel = 0;
-	uint32_t fourcc = 0, id;
+	uint32_t id = surface.surface;
 
-	if (took != NULL) {
-		memset(took, 0, sizeof(*took));
-	}
-	if (mesa_device == NULL || want == NULL) {
-		rwd_say(why, why_size, "a drawable's texture needs the compiler library's device "
-		    "and a shape to make it in");
-		return NULL;
-	}
-	/*
-	 * Plane 0 and no other, said before anything is taken. CoreAnimation asks for plane 0
-	 * always on this path -- allocate_drawable_texture passes x4 = 0 at 0x1884b3590 -- so a
-	 * plane of anything else is an application's own IOSurface and not a drawable's, and it
-	 * would need a per-plane geometry this driver does not read.
-	 */
-	if (plane != 0) {
-		rwd_say(why, why_size, "plane %lu of a surface was asked for; this driver "
-		    "imports plane 0 only, and CoreAnimation's drawables never ask for another",
-		    plane);
-		return NULL;
-	}
-	id = rwd_surface_id(iosurface);
-	if (id == 0) {
-		rwd_say(why, why_size, "that surface has no ID, so there is nothing for the "
-		    "kernel to look up (a surface is given one when it is made shareable)");
-		return NULL;
-	}
 	connection = rwd_shared_connection();
 	if (connection == 0) {
 		rwd_say(why, why_size, "no connection to RedwoodGPU: this kernel was booted "
 		    "without gpu=1, so a surface's memory cannot be given to the GPU");
 		return NULL;
 	}
-	/*
-	 * Describe before taking. Describing allocates nothing, so every disagreement below is
-	 * found without a buffer having to be given back -- and the disagreements are the
-	 * point: the descriptor was built by CoreAnimation from the layer's drawableSize and
-	 * pixelFormat, and the surface was made by CoreAnimation from the same two, but this
-	 * driver has seen neither of those steps and must not assume they agreed.
-	 */
-	if (rwd_surface_describe(connection, id, &surface, why, why_size) != 0) {
+	if (rwd_surface_describe(connection, id, &kernel, why, why_size) != 0)
+		return NULL;
+	if (surface.size > kernel.size || surface.pixelFormat != kernel.pixelFormat ||
+	    surface.planes != kernel.planes) {
+		rwd_say(why, why_size, "surface %u geometry differs from the kernel allocation", id);
 		return NULL;
 	}
-	/* The format is judged after the surface is described, so that a refusal names the
-	 * surface's own FourCC and geometry: that is what the next table entry is made from. */
-	if (rwd_format_of_metal(want->pixel_format, &fourcc, &bytes_per_pixel, why,
-	    why_size) != 0) {
-		char reason[512];
-
-		snprintf(reason, sizeof(reason), "%s", why != NULL ? why : "");
-		rwd_say(why, why_size, "surface %u ('%c%c%c%c', %ux%u, %u bytes a row): %s", id,
-		    (char)(surface.pixelFormat >> 24), (char)(surface.pixelFormat >> 16),
-		    (char)(surface.pixelFormat >> 8), (char)surface.pixelFormat, surface.width,
-		    surface.height, surface.rowBytes, reason);
-		return NULL;
-	}
-	/* A texture may cover the top-left part of a larger surface, rows at the surface's own
-	 * pitch: iconservicesagent asks for 130x62 of a 192x64 surface and 64x70 of a 64x128 one. */
-	if (surface.width < want->width || surface.height < want->height) {
-		rwd_say(why, why_size, "surface %u is %ux%u, smaller than the %ux%u the descriptor "
-		    "asks for", id, surface.width, surface.height, want->width, want->height);
-		return NULL;
-	}
-	if (surface.pixelFormat != fourcc) {
-		rwd_say(why, why_size, "surface %u is '%c%c%c%c' and Metal format %u is "
-		    "'%c%c%c%c'", id, (char)(surface.pixelFormat >> 24),
-		    (char)(surface.pixelFormat >> 16), (char)(surface.pixelFormat >> 8),
-		    (char)surface.pixelFormat, want->pixel_format, (char)(fourcc >> 24),
-		    (char)(fourcc >> 16), (char)(fourcc >> 8), (char)fourcc);
-		return NULL;
-	}
-	if (rwd_surface_fits_adreno(&surface, bytes_per_pixel, why, why_size) != 0) {
-		return NULL;
-	}
-	/*
-	 * Everything that could be checked has been. The one thing left is the call that does
-	 * not exist, and it is refused here with the whole of what was learned, because this
-	 * sentence is what the next boot will have to go on.
-	 */
 	import = rwd_import();
 	if (import == NULL) {
 		rwd_say(why, why_size, "surface %u fits (%ux%u '%c%c%c%c', %u bytes a row, "
@@ -659,15 +653,12 @@ rwd_texture_for_surface(struct rwa_device *mesa_device, void *iosurface, unsigne
 	}
 	static unsigned said;
 	if (said < 48) {
-		printf("redwooddrawable: %s import %u: surface %u '%c%c%c%c' %ux%u, %u bytes a row "
-		    "from %u, texture %ux%u of format %u\n", getprogname(), said++, id,
+		printf("redwooddrawable: %s import %u: surface %u plane %lu '%c%c%c%c' %ux%u, %u bytes a row "
+		    "from %u, texture %ux%u of format %u\n", getprogname(), said++, id, plane,
 		    (char)(surface.pixelFormat >> 24), (char)(surface.pixelFormat >> 16),
 		    (char)(surface.pixelFormat >> 8), (char)surface.pixelFormat, surface.width,
 		    surface.height, surface.rowBytes, surface.offset, want->width, want->height,
 		    want->pixel_format);
-	}
-	if (took != NULL) {
-		*took = surface;    /* what the surface turned out to be, for whoever logs it */
 	}
 	return texture;
 }

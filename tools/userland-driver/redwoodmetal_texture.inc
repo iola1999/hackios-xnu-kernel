@@ -575,11 +575,9 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
  */
 static id
 rw_surface_through_copy(RedwoodMetalDevice *device, MTLTextureDescriptor *d, void *surface,
-			NSUInteger plane)
+			NSUInteger plane, const struct rwd_surface *selected, void *allocation_base)
 {
-	static size_t (*row_bytes)(void *), (*alloc_size)(void *), (*plane_count)(void *);
-	static void *(*base_address)(void *);
-	static NSMutableDictionary *shared;   /* "surface format WxH" -> the texture, held here */
+	static NSMutableDictionary *shared;   /* "surface plane format WxH" -> the retained texture */
 	static pthread_mutex_t shared_lock = PTHREAD_MUTEX_INITIALIZER;
 	static unsigned said;
 	RedwoodMetalTexture *texture, *before;
@@ -588,21 +586,11 @@ rw_surface_through_copy(RedwoodMetalDevice *device, MTLTextureDescriptor *d, voi
 	id buffer;
 	size_t row;
 
-	if (row_bytes == NULL) {
-		*(void **)&alloc_size = dlsym(RTLD_DEFAULT, "IOSurfaceGetAllocSize");
-		*(void **)&plane_count = dlsym(RTLD_DEFAULT, "IOSurfaceGetPlaneCount");
-		*(void **)&base_address = dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddress");
-		*(void **)&row_bytes = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRow");
-	}
-	if (surface == NULL || row_bytes == NULL || alloc_size == NULL || plane_count == NULL ||
-	    base_address == NULL || plane != 0 || plane_count(surface) > 1 ||
-	    [d textureType] != MTLTextureType2D || [d mipmapLevelCount] > 1 || [d sampleCount] > 1)
+	row = selected->rowBytes;
+	if (row % 64 == 0 && selected->offset % 64 == 0)
 		return nil;
-	row = row_bytes(surface);
-	if (row == 0 || row % 64 == 0)
-		return nil;
-	key = [NSString stringWithFormat:@"%p %lu %lux%lu", surface, (unsigned long)[d pixelFormat],
-	       (unsigned long)[d width], (unsigned long)[d height]];
+	key = [NSString stringWithFormat:@"%p %lu %lu %lux%lu", surface, (unsigned long)plane,
+	       (unsigned long)[d pixelFormat], (unsigned long)[d width], (unsigned long)[d height]];
 	pthread_mutex_lock(&shared_lock);
 	if (shared == nil)
 		shared = [[NSMutableDictionary alloc] init];
@@ -621,7 +609,7 @@ rw_surface_through_copy(RedwoodMetalDevice *device, MTLTextureDescriptor *d, voi
 	}
 	/* the buffer reads and writes the surface's memory for as long as it lives */
 	CFRetain(surface);
-	buffer = [device newBufferWithBytesNoCopy:base_address(surface) length:alloc_size(surface)
+	buffer = [device newBufferWithBytesNoCopy:allocation_base length:selected->size
 					  options:0 deallocator:^(void *bytes, NSUInteger length) {
 		(void)bytes; (void)length;
 		CFRelease(surface);
@@ -631,7 +619,7 @@ rw_surface_through_copy(RedwoodMetalDevice *device, MTLTextureDescriptor *d, voi
 		pthread_mutex_unlock(&shared_lock);
 		return nil;
 	}
-	texture = [buffer newTextureWithDescriptor:d offset:0 bytesPerRow:row];
+	texture = [buffer newTextureWithDescriptor:d offset:selected->offset bytesPerRow:row];
 	[buffer release];   /* the texture holds it (redwoodSetBuffer) */
 	if (texture != nil) {
 		[texture redwoodSetSurface:surface plane:plane];
@@ -703,13 +691,12 @@ rw_surface_through_copy(RedwoodMetalDevice *device, MTLTextureDescriptor *d, voi
 					   * below is the one place the two meet */
 	struct rwa_texture *texture;
 	id copy;
+	void *allocation_base = NULL;
 
 	if (_mesa == NULL) {
 		rw_print("a drawable's texture needs the compiler library\n");
 		return nil;
 	}
-	if ((copy = rw_surface_through_copy(self, d, s, p)) != nil)
-		return copy;
 	memset(&shape, 0, sizeof(shape));
 	shape.pixel_format = (unsigned)[d pixelFormat];
 	shape.type = (unsigned)[d textureType];
@@ -720,8 +707,19 @@ rw_surface_through_copy(RedwoodMetalDevice *device, MTLTextureDescriptor *d, voi
 	shape.mip_levels = (unsigned)[d mipmapLevelCount];
 	shape.sample_count = (unsigned)[d sampleCount];
 	shape.usage = (unsigned)[d usage];
-	texture = rwd_texture_for_surface(_mesa, s, p, (const struct rwd_texture_shape *)&shape,
-					  &took, why, sizeof(why));
+	if (rwd_surface_plane(s, p, (const struct rwd_texture_shape *)&shape, &took,
+	    &allocation_base, why, sizeof(why)) != 0) {
+		rw_print("surface plane %lu: %s\n", (unsigned long)p, why);
+		return nil;
+	}
+	if (took.rowBytes % 64 != 0 || took.offset % 64 != 0) {
+		copy = rw_surface_through_copy(self, d, s, p, &took, allocation_base);
+		if (copy == nil)
+			rw_print("surface plane %lu copy allocation failed\n", (unsigned long)p);
+		return copy;
+	}
+	texture = rwd_texture_for_surface(_mesa, &took, p, (const struct rwd_texture_shape *)&shape,
+					 why, sizeof(why));
 	if (texture == NULL) {
 		static unsigned long refusals;
 		unsigned long n = __sync_add_and_fetch(&refusals, 1);

@@ -154,39 +154,19 @@ int rwd_surface_fits_adreno(const struct rwd_surface *surface, unsigned bytes_pe
 int rwd_format_of_metal(unsigned metal_pixel_format, uint32_t *fourcc,
 			unsigned *bytes_per_pixel, char *why, size_t why_size);
 
-/*
- * The whole of -newTextureWithDescriptor:iosurface:plane:, except for making the
- * Objective-C object.
- *
- * `want` is the shape the caller read out of the MTLTextureDescriptor; `mesa_device` is the
- * value of -[RedwoodMetalDevice mesaDevice]. On success the surface's buffer is taken, a
- * texture over it is returned, and `took` carries the kernel's answer so the caller can give
- * the buffer back when the texture dies. On failure NULL and a sentence, and nothing is left
- * taken.
- *
- * The surface is only DESCRIBED here, never taken: `rwa_texture_from_surface` takes it, on
- * the library's own connection and into freedreno's table of buffers. Describing allocates
- * nothing, so every disagreement between the descriptor and the surface is found with
- * nothing owed.
- *
- * It refuses BY NAME when the library has no `rwa_texture_from_surface` -- an image built
- * before that call existed -- rather than returning a bare nil, because CoreAnimation does
- * not test the texture it gets back (docs/metal.md 10.46): a nil becomes a drawable whose
- * -texture is nil and the application finds out three frames later, as a Metal assertion
- * about a nil colour attachment.
- */
-struct rwa_texture *rwd_texture_for_surface(struct rwa_device *mesa_device, void *iosurface,
-					    unsigned long plane,
-					    const struct rwd_texture_shape *want,
-					    struct rwd_surface *took,
-					    char *why, size_t why_size);
+/* Select and validate one IOSurface plane. allocation_base is the start of its allocation. */
+int rwd_surface_plane(void *iosurface, unsigned long plane, const struct rwd_texture_shape *want,
+    struct rwd_surface *selected, void **allocation_base, char *why, size_t why_size);
+
+struct rwa_texture *rwd_texture_for_surface(struct rwa_device *mesa_device,
+    const struct rwd_surface *selected, unsigned long plane, const struct rwd_texture_shape *want,
+    char *why, size_t why_size);
 
 /*
  * There is deliberately NO release call here. The buffer a surface's memory becomes belongs
  * to freedreno's table of buffers from the moment the library imports it, and
  * rwa_texture_destroy gives it back -- so a second release on this side would be a second
- * owner of one surface. `took` above is for logging what the surface turned out to be, and
- * `rwd_surface_take` / `rwd_surface_give_back` are for a caller that wants a buffer of its
+ * owner of one surface. `rwd_surface_take` / `rwd_surface_give_back` are for a caller that wants a buffer of its
  * own, which the drawable path is not.
  */
 
