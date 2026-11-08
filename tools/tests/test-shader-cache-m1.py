@@ -105,11 +105,11 @@ def test_layer_b_ir3_uuid_cache():
     assert match is not None, "otool did not find LC_UUID"
     assert match.group(1).upper() == uuid_str, f"UUID mismatch: parsed={uuid_str} otool={match.group(1)}"
 
-    # Check setup-mesa-arm64e.py has shader-cache enabled
+    # setup-mesa-arm64e.py keeps the disk cache off until reading it back is shown to draw correctly
     setup_py = os.path.join(TOP_ROOT, "tools/k90auto/setup-mesa-arm64e.py")
     with open(setup_py, "r", encoding="utf-8") as f:
         setup_content = f.read()
-    assert "-Dshader-cache=enabled" in setup_content, "setup-mesa-arm64e.py missing -Dshader-cache=enabled"
+    assert "-Dshader-cache=disabled" in setup_content, "setup-mesa-arm64e.py missing -Dshader-cache=disabled"
 
     # Check patch exists
     patch_path = os.path.join(KERNEL_ROOT, "tools/mesa/rebase-26/0015-ir3-disk-cache-darwin-uuid.patch")
