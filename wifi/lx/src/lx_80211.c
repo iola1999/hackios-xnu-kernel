@@ -19,7 +19,7 @@
  *
  * On the phone, 13 October, this scans -- 26 channels in 4.1 s, the access points around heard
  * with their channels and strengths -- and joins: the handshake is through 130 ms after the
- * association, and iOS has the network (bsd/dev/redwood_wifi.c, step_driver(), has the
+ * association, and iOS has the network (bsd/dev/annibale_wifi.c, step_driver(), has the
  * account). What is said of other people's networks names them: it is for the log of the run.
  * The name of the network to join and its passphrase are never said, only their lengths.
  */
@@ -974,7 +974,7 @@ lx_station_down(struct lx_radio *radio)
  * is to be `quiet`, only listens. 0 when the driver has said the scan is over.
  */
 int
-lx_scan(struct lx_radio *radio, const uint8_t *name, unsigned name_length, bool quiet, const struct redwood_sta_scan *what)
+lx_scan(struct lx_radio *radio, const uint8_t *name, unsigned name_length, bool quiet, const struct annibale_sta_scan *what)
 {
 	struct ieee80211_hw *hw = &radio->hw;
 	struct ieee80211_scan_request *request;

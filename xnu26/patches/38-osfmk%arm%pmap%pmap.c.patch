@@ -57,7 +57,7 @@ index 19e7e67a276c..ac9f640fcd3c 100644
  	ppnum_t pp)
  {
 -	flush_dcache((vm_offset_t) (pp << PAGE_SHIFT), PAGE_SIZE, TRUE);
-+	/* (redwood: the page number is 32 bits wide and memory goes on above 4 GB: widen before shifting) */
++	/* (annibale: the page number is 32 bits wide and memory goes on above 4 GB: widen before shifting) */
 +	flush_dcache((vm_offset_t) pp << PAGE_SHIFT, PAGE_SIZE, TRUE);
  }
  

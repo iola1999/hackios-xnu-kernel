@@ -1,12 +1,11 @@
 /*
  * The buttons of the REDMI K90 (annibale, SM8750 "sun") -- power, volume up, volume down -- as a
- * source of button records for /dev/redwood-input (sys/redwood_input.h). Only with boot-arg
- * buttons=1; every address below belongs to this phone. bsd/dev/redwood_buttons.c is the same
- * story for the POCO X5 Pro (redwood); with buttons=1 both start, and each stops at the first
- * step on the arbiter's version: that one knows version 5 of it, this one version 7.
+ * source of button records for /dev/annibale-input (sys/annibale_input.h). Only with boot-arg
+ * buttons=1; every address below belongs to this phone. The driver stops at the first step when
+ * the arbiter is not version 7.
  *
  * None of the three is a pin of the SoC. They are inputs of two of the power management chips,
- * exactly as under redwood, only newer silicon:
+ * exactly as under annibale, only newer silicon:
  *   power        KPDPWR_N of the power-on block ("PON") of the PMK8550, the always-on chip:
  *                qcom,pmk8550@0, pon_hlos@1300 (the merged device tree's line 19961), the
  *                pwrkey key of the gpio_keys node taking its interrupt <0x00 0x13 0x07 0x03>
@@ -26,7 +25,7 @@
  * The button polling path only reads. Nothing is written to either chip, neither a register of a PMIC nor the
  * configuration of the pin: the PMICs make the phone's supplies, and a wrong write there can
  * switch one off. The firmware reads the same keys itself (volume down and volume up choose
- * between fastboot and recovery under it as under redwood) and has left both inputs as they are
+ * between fastboot and recovery under it as under annibale) and has left both inputs as they are
  * needed; the driver checks that before it believes them, and where it finds something else it
  * says so and leaves that key alone. The only thing written is the command word that asks the
  * arbiter for a read.
@@ -38,10 +37,10 @@
  * the two registers 60 times a second, and a key has changed when two looks in a row say so. A
  * key that reads as held before it has ever been seen released is not believed (a pin that is not
  * what it was taken for must not become a volume key held down for the whole session). No
- * interrupt is used, as in redwood_buttons.c; what one would take is said at the end of that file.
+ * interrupt is used; what one would take is said at the end of this file.
  *
  * The mapping: the phone has what the iPhone X has, whose user space runs here -- a side button
- * and two volume keys, no home button. Power is the side button (REDWOOD_BUTTON_LOCK).
+ * and two volume keys, no home button. Power is the side button (ANNIBALE_BUTTON_LOCK).
  *
  * The bring-up is made in steps, each said in the log before it is made. Boot-arg
  * buttons_hv_steps=N stops after the first N (buttons=1 asks for all five):
@@ -63,7 +62,7 @@
 #include <mach/mach_types.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
-#include <sys/redwood_input.h>
+#include <sys/annibale_input.h>
 #include <sys/systm.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -153,11 +152,10 @@ static vm_offset_t arb_core, arb_cnfg, arb_chnls, arb_obsrvr;
  * One transfer at a time through the arbiter for this system, whoever asks: the battery reader
  * (bsd/dev/annibale_battery.c) and the flashlight (bsd/dev/annibale_torch.c) take it as
  * well, since like the buttons they each have their own channels and Linux holds one lock for
- * the whole bus (two at once and the arbiter drops one, as redwood_buttons.c learnt). Started as
- * "redwood-spmi" for redwood's v5 arbiter in that file; the annibale drivers share this one, and
+ * the whole bus (two at once and the arbiter drops one). The annibale drivers share this one, and
  * annibale_haptic.c with its private lock should join it once the three are proven on hardware.
  */
-static LCK_GRP_DECLARE(spmi_hv_lck_grp, "redwood-spmi-hv");
+static LCK_GRP_DECLARE(spmi_hv_lck_grp, "annibale-spmi-hv");
 static LCK_SPIN_DECLARE(spmi_hv_lock, &spmi_hv_lck_grp);
 
 void
@@ -319,16 +317,16 @@ find_channel(struct peripheral *p, uint32_t channels)
 
 static struct button {
 	const char *    name;
-	uint32_t        record;         /* REDWOOD_BUTTON_* */
+	uint32_t        record;         /* ANNIBALE_BUTTON_* */
 	bool            usable;         /* its input is what it was taken for */
 	bool            live;           /* it has been seen released */
 	bool            last;           /* the look before this one */
 	bool            down;           /* as reported */
 	uint64_t        since;          /* when it went down */
 	uint32_t        presses;
-} power = { .name = "power", .record = REDWOOD_BUTTON_LOCK },
-    volume_up = { .name = "volume up", .record = REDWOOD_BUTTON_VOLUME_UP },
-    volume_down = { .name = "volume down", .record = REDWOOD_BUTTON_VOLUME_DOWN };
+} power = { .name = "power", .record = ANNIBALE_BUTTON_LOCK },
+    volume_up = { .name = "volume up", .record = ANNIBALE_BUTTON_VOLUME_UP },
+    volume_down = { .name = "volume down", .record = ANNIBALE_BUTTON_VOLUME_DOWN };
 
 /* "12.345 s (08:13:05.918 UTC)": since boot as in the log's own stamps, and as the daemons' lines have it */
 static void
@@ -375,7 +373,7 @@ button_look(struct button *b, bool pressed)
 		absolutetime_to_nanoseconds(now - b->since, &held);
 		printf("buttons: %s released at %s, after %llu ms\n", b->name, when, held / NSEC_PER_MSEC);
 	}
-	redwood_touch_post(pressed ? REDWOOD_BUTTON_DOWN : REDWOOD_BUTTON_UP, b->record, 0, 0);
+	annibale_touch_post(pressed ? ANNIBALE_BUTTON_DOWN : ANNIBALE_BUTTON_UP, b->record, 0, 0);
 }
 
 /* One look at both peripherals. */
@@ -595,7 +593,7 @@ annibale_buttons_init(void)
 	uint32_t enabled = 0, steps = 5;
 	thread_t thread;
 
-	/* only with buttons=1: a phone at hand, somebody to press; the redwood driver starts on the
+	/* only with buttons=1: a phone at hand, somebody to press; the POCO X5 Pro driver starts on the
 	 * same boot-arg and stops itself at the arbiter's version, as this one does if it is not 7 */
 	if (!PE_parse_boot_argn("buttons", &enabled, sizeof(enabled)) || enabled == 0) {
 		return;
@@ -613,8 +611,7 @@ annibale_buttons_init(void)
 }
 
 /*
- * Interrupts would take what looking does not pay for (see the end of redwood_buttons.c: the
- * same reasoning holds here): the arbiter's periph_irq through the interrupt controller, the
+ * Interrupts would take what looking does not pay for: the arbiter's periph_irq through the interrupt controller, the
  * channels' interrupt registers in the "chnls" window 0x1000 apart (v7 moved them from v5's
  * 0x10000), and -- writes to the PMIC -- a bit per key in the power-on block's and the pin's
  * "interrupt type", "polarity" and "enable set", which the firmware may well have left set for

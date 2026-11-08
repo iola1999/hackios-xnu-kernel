@@ -2,10 +2,12 @@ diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
 index 09067002e672..3bf7979fc2b6 100644
 --- a/bsd/dev/arm/systemcalls.c
 +++ b/bsd/dev/arm/systemcalls.c
-@@ -36,6 +36,92 @@
+@@ -36,6 +36,104 @@
  #include <security/mac_framework.h>
  #endif
  
++#include <sys/attr.h>
++
 +/*
 + * Bring-up aid: boot-arg systrace=1 logs every BSD system call that fails,
 + * systrace=2 logs all of them (to the kernel message buffer). For calls that
@@ -83,6 +85,16 @@ index 09067002e672..3bf7979fc2b6 100644
 +				used += (size_t)snprintf(detail + used, sizeof(detail) - used, " %d", mib[i]);
 +			}
 +		}
++	} else if (syscode == SYS_getattrlist || syscode == SYS_fgetattrlist || syscode == SYS_getattrlistat) {
++		/* the attribute groups asked for and the options decide most of getattrlist's EINVALs */
++		struct attrlist al;
++		unsigned at = syscode == SYS_getattrlistat ? 2 : 1;
++
++		if (copyin((user_addr_t)uthread->uu_arg[at], &al, sizeof(al)) == 0) {
++			snprintf(detail, sizeof(detail), " attrs %u cmn 0x%x vol 0x%x dir 0x%x file 0x%x fork 0x%x opts 0x%llx",
++			    al.bitmapcount, al.commonattr, al.volattr, al.dirattr, al.fileattr, al.forkattr,
++			    (unsigned long long)uthread->uu_arg[at + 3]);
++		}
 +	}
 +	detail[sizeof(detail) - 1] = 0;
 +	printf("systrace: %s[%d] %s(0x%llx, 0x%llx, 0x%llx, 0x%llx)%s%s%s%s = %d\n",
@@ -95,7 +107,7 @@ index 09067002e672..3bf7979fc2b6 100644
  #if CONFIG_DTRACE
  extern int32_t dtrace_systrace_syscall(struct proc *, void *, int *);
  extern void dtrace_systrace_syscall_return(unsigned short, int, int *);
-@@ -181,6 +267,10 @@ unix_syscall(
+@@ -181,6 +279,10 @@ unix_syscall(
  	error = (*(callp->sy_call))(proc, &uthread->uu_arg[0], &(uthread->uu_rval[0]));
  	AUDIT_SYSCALL_EXIT(code, proc, uthread, error);
  

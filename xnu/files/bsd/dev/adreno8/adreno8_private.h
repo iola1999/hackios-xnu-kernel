@@ -17,7 +17,7 @@ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
 extern void loader_return(void);
 extern void loader_log_putc(char c);
-extern const uint8_t *redwood_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+extern const uint8_t *annibale_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 
 struct adreno8_block {
 	const char *name;
@@ -95,7 +95,7 @@ struct adreno8_gpu_space {
 #define CBCR_OFF                (1u << 31)      /* ... and whether it is in fact off */
 #define CMD_DB_PHYS             0x81c60000UL
 #define CMD_DB_SIZE             0x20000UL
-#define RPMH_LEVELS             64              /* levels of one rail's list (redwood: 16; gfx.lvl is longer here) */
+#define RPMH_LEVELS             64              /* levels of one rail's list (annibale: 16; gfx.lvl is longer here) */
 #define QFPROM_GPU_SPEED_BIN    0x138
 #define BW_COUNT                12
 #define GPUCC_CX_GDSCR          0x9080          /* bit 0 collapse asked, bit 1 under hardware control, bit 31 up */
@@ -120,7 +120,7 @@ struct adreno8_gpu_space {
 #define GPUCC_GMU_RCGR          0x9318          /* its clock source: parents 0 the crystal, 2 PLL0_OUT_EVEN */
 #define GPUCC_HUB_RCGR          0x93ec
 #define GPUCC_HUB_DIV           0x942c
-#define RCG_SOURCE_MASK         0x371f          /* [10:8] the source, [4:0] the divider - 1 (redwood's mask, same format) */
+#define RCG_SOURCE_MASK         0x371f          /* [10:8] the source, [4:0] the divider - 1 (the POCO X5 Pro's mask, same format) */
 #define RCG_UPDATE              (1u << 0)       /* clk-rcg2 CMD_UPDATE; bit 31 reports ROOT_OFF */
 #define CX_MISC_TCM_RET         0x00e4          /* 1: the GMU's memories were kept: a warm start */
 #define CX_MISC_SW_FUSE         0x1000          /* feature bits (Linux: not a speed limit) */

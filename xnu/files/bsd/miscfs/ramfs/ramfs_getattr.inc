@@ -3,32 +3,32 @@
  * shared between the Data volume (/private/var) and the System volume (/).
  */
 
-#define REDWOOD_CONTAINER_BYTES   128000000000ULL
-#define REDWOOD_SYSTEM_USED_BYTES 15571353600ULL
+#define ANNIBALE_CONTAINER_BYTES   128000000000ULL
+#define ANNIBALE_SYSTEM_USED_BYTES 15571353600ULL
 
-uint64_t redwood_container_total_bytes(void);
-uint64_t redwood_container_free_bytes(void);
+uint64_t annibale_container_total_bytes(void);
+uint64_t annibale_container_free_bytes(void);
 
 uint64_t
-redwood_container_total_bytes(void)
+annibale_container_total_bytes(void)
 {
-	return REDWOOD_CONTAINER_BYTES;
+	return ANNIBALE_CONTAINER_BYTES;
 }
 
 uint64_t
-redwood_container_free_bytes(void)
+annibale_container_free_bytes(void)
 {
 	uint64_t data_bytes = os_atomic_load(&ramfs_var_used_pages, relaxed) * (uint64_t)PAGE_SIZE;
-	uint64_t used_bytes = REDWOOD_SYSTEM_USED_BYTES + data_bytes;
+	uint64_t used_bytes = ANNIBALE_SYSTEM_USED_BYTES + data_bytes;
 
-	return used_bytes < REDWOOD_CONTAINER_BYTES ? (REDWOOD_CONTAINER_BYTES - used_bytes) : 0;
+	return used_bytes < ANNIBALE_CONTAINER_BYTES ? (ANNIBALE_CONTAINER_BYTES - used_bytes) : 0;
 }
 
 static void
 ramfs_fill_statfs(struct ramfs_mount *rm, struct vfsstatfs *sp)
 {
-	uint64_t total_pages = redwood_container_total_bytes() / PAGE_SIZE;
-	uint64_t free_pages = redwood_container_free_bytes() / PAGE_SIZE;
+	uint64_t total_pages = annibale_container_total_bytes() / PAGE_SIZE;
+	uint64_t free_pages = annibale_container_free_bytes() / PAGE_SIZE;
 
 	sp->f_bsize = PAGE_SIZE;
 	sp->f_iosize = PAGE_SIZE;
@@ -52,8 +52,8 @@ ramfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
 	nodes = rm->rm_nodes;
 	lck_mtx_unlock(&rm->rm_lock);
 
-	total_pages = redwood_container_total_bytes() / PAGE_SIZE;
-	free_pages = redwood_container_free_bytes() / PAGE_SIZE;
+	total_pages = annibale_container_total_bytes() / PAGE_SIZE;
+	free_pages = annibale_container_free_bytes() / PAGE_SIZE;
 	used_pages = total_pages - free_pages;
 
 	VFSATTR_RETURN(fsap, f_objcount, nodes);
@@ -81,6 +81,7 @@ ramfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
 		    VOL_CAP_FMT_PERSISTENTOBJECTIDS |
 		    VOL_CAP_FMT_PATH_FROM_ID |
 		    VOL_CAP_FMT_CLONE_MAPPING |
+		    VOL_CAP_FMT_DOCUMENT_ID |
 		    (rm->rm_disk_backed ? (VOL_CAP_FMT_JOURNAL | VOL_CAP_FMT_JOURNAL_ACTIVE) : 0);
 		cap->capabilities[VOL_CAPABILITIES_INTERFACES] =
 		    VOL_CAP_INT_ADVLOCK |
@@ -104,7 +105,8 @@ ramfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
 		    VOL_CAP_FMT_OPENDENYMODES |
 		    VOL_CAP_FMT_HIDDEN_FILES |
 		    VOL_CAP_FMT_PATH_FROM_ID |
-		    VOL_CAP_FMT_CLONE_MAPPING;
+		    VOL_CAP_FMT_CLONE_MAPPING |
+		    VOL_CAP_FMT_DOCUMENT_ID;
 		cap->valid[VOL_CAPABILITIES_INTERFACES] =
 		    VOL_CAP_INT_SEARCHFS |
 		    VOL_CAP_INT_ATTRLIST |
@@ -151,7 +153,7 @@ ramfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
 		VFSATTR_RETURN(fsap, f_backup_time, since);
 	}
 	if (VFSATTR_IS_ACTIVE(fsap, f_uuid)) {
-		static const uuid_t base = { 'r', 'e', 'd', 'w', 'o', 'o', 0x50, 'd', 0x80, 'R', 0, 0, 0, 0, 0, 0 };
+		static const uuid_t base = { 'a', 'n', 'n', 'i', 'b', 'a', 0x50, 'l', 0x80, 'e', 0, 0, 0, 0, 0, 0 };
 		fsid_t fsid = vfs_statfs(mp)->f_fsid;
 
 		memcpy(fsap->f_uuid, base, sizeof(uuid_t));

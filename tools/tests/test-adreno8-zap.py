@@ -31,7 +31,7 @@ static unsigned calls, fail_call, allocations, barriers;
 static uint8_t original[16384], file[16384], metadata[PAGE_SIZE], target[ADRENO8_ZAP_SIZE];
 static size_t file_size;
 static int adreno8_say(const char *format, ...) { return 0; }
-static const uint8_t *redwood_image_file(const char *dir, const char *name, uint64_t *size, int *disk) {
+static const uint8_t *annibale_image_file(const char *dir, const char *name, uint64_t *size, int *disk) {
     assert(!strcmp(dir, "fw") && !strcmp(name, "gen80000_zap.mbn"));
     *size = file_size; return file;
 }

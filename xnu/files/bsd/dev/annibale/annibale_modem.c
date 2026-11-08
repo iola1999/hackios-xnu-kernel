@@ -1,7 +1,7 @@
 /*
  * SM8750 (annibale) MPSS cellular baseband remoteproc, SMEM GLINK IPCRTR transport,
  * QMI service state machine (UIM 0x0b, DMS 0x02, NAS 0x03, WDS 0x01, Voice 0x09, WMS 0x05),
- * /dev/redwood-modem character device, and kern.redwood.* cellular sysctls.
+ * /dev/annibale-modem character device, and kern.annibale.* cellular sysctls.
  *
  * Privacy contract: subscriber and device identifiers (IMEI, IMSI, ICCID, MSISDN, MEID, ESN)
  * are never logged or exposed in sysctls; any identifier field is masked as "***".
@@ -22,9 +22,9 @@
 #include <sys/kauth.h>
 #include <sys/param.h>
 #include <sys/proc.h>
-#include <sys/redwood_input.h>
-#include <sys/redwood_qmi.h>
-#include <sys/redwood_qrtr.h>
+#include <sys/annibale_input.h>
+#include <sys/annibale_qmi.h>
+#include <sys/annibale_qrtr.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
@@ -37,21 +37,21 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 extern kern_return_t thread_terminate(thread_t thread);
-extern lck_mtx_t redwood_smem_alloc_lock;
+extern lck_mtx_t annibale_smem_alloc_lock;
 
-/* Multi-node QRTR registration (bsd/dev/redwood_qrtr.c) and QMI codecs (bsd/dev/redwood_qmi.c) */
-extern void redwood_qrtr_attach_node(uint32_t peer_node, int (*send)(const void *data, uint32_t length));
-extern size_t redwood_qmi_encode_msg(uint8_t *buf, size_t cap, uint8_t flags, uint16_t txn_id,
+/* Multi-node QRTR registration (bsd/dev/annibale_qrtr.c) and QMI codecs (bsd/dev/annibale_qmi.c) */
+extern void annibale_qrtr_attach_node(uint32_t peer_node, int (*send)(const void *data, uint32_t length));
+extern size_t annibale_qmi_encode_msg(uint8_t *buf, size_t cap, uint8_t flags, uint16_t txn_id,
     uint16_t msg_id, const void *tlvs, uint16_t tlv_len);
-extern const uint8_t *redwood_qmi_find_tlv(const uint8_t *tlvs, size_t tlvs_len, uint8_t type, uint16_t *out_len);
-extern bool redwood_qmi_uim_parse_card_status(const uint8_t *tlvs, size_t tlvs_len,
+extern const uint8_t *annibale_qmi_find_tlv(const uint8_t *tlvs, size_t tlvs_len, uint8_t type, uint16_t *out_len);
+extern bool annibale_qmi_uim_parse_card_status(const uint8_t *tlvs, size_t tlvs_len,
     uint8_t *card_state, uint8_t *app_state);
-extern bool redwood_qmi_dms_parse_oper_mode(const uint8_t *tlvs, size_t tlvs_len, uint8_t *mode_out);
-extern bool redwood_qmi_nas_parse_serving(const uint8_t *tlvs, size_t tlvs_len, uint8_t *reg_state,
+extern bool annibale_qmi_dms_parse_oper_mode(const uint8_t *tlvs, size_t tlvs_len, uint8_t *mode_out);
+extern bool annibale_qmi_nas_parse_serving(const uint8_t *tlvs, size_t tlvs_len, uint8_t *reg_state,
     uint8_t *rat_out, uint16_t *mcc_out, uint16_t *mnc_out, char *oper_out, size_t oper_cap);
-extern bool redwood_qmi_nas_parse_signal(const uint8_t *tlvs, size_t tlvs_len, int16_t *rsrp_out,
+extern bool annibale_qmi_nas_parse_signal(const uint8_t *tlvs, size_t tlvs_len, int16_t *rsrp_out,
     uint8_t *bars_out, uint8_t *rat_out);
-extern bool redwood_qmi_wds_parse_runtime(const uint8_t *tlvs, size_t tlvs_len, uint32_t *ipv4_out,
+extern bool annibale_qmi_wds_parse_runtime(const uint8_t *tlvs, size_t tlvs_len, uint32_t *ipv4_out,
     uint32_t *gw_out, uint32_t *mask_out, uint32_t *dns1_out, uint32_t *dns2_out, uint32_t *mtu_out);
 
 /* IPA interface & PAS MDT loader callbacks (bsd/dev/annibale_ipa.c) */
@@ -136,15 +136,15 @@ extern int64_t annibale_tz_pas_auth_reset(uint32_t pas_id);
 #define QMI_VOICE_ALL_CALL_STATUS_IND   0x002eu
 #define QMI_UIM_GET_CARD_STATUS         0x002fu
 
-/* ---- Public ioctl / character device structures for /dev/redwood-modem ----------------------------- */
+/* ---- Public ioctl / character device structures for /dev/annibale-modem ----------------------------- */
 
-enum redwood_modem_state_enum {
+enum annibale_modem_state_enum {
 	MODEM_STATE_OFF = 0, MODEM_STATE_STANDBY = 1, MODEM_STATE_BOOTING = 2,
 	MODEM_STATE_GLINK_UP = 3, MODEM_STATE_QMI_READY = 4, MODEM_STATE_REGISTERED = 5,
 	MODEM_STATE_DATA_CONNECTED = 6,
 };
 
-struct redwood_modem_status {
+struct annibale_modem_status {
 	uint32_t magic, state, sim_state, reg_state, signal_bars;
 	int32_t  rsrp_dbm;
 	uint16_t mcc, mnc;
@@ -154,28 +154,28 @@ struct redwood_modem_status {
 	char     operator_name[32];
 };
 
-struct redwood_modem_voice_cmd {
+struct annibale_modem_voice_cmd {
 	uint32_t action;
 	uint8_t  call_id;
 	char     number[32];
 };
 
-struct redwood_modem_sms_cmd {
+struct annibale_modem_sms_cmd {
 	uint32_t format;
 	uint16_t pdu_len;
 	uint8_t  pdu[180];
 };
 
-#define REDWOOD_MODEM_MAGIC             0x5244574du
-#define REDWOOD_MODEM_IOC_GET_STATUS    _IOR('M', 1, struct redwood_modem_status)
-#define REDWOOD_MODEM_IOC_POLL          _IO('M', 2)
-#define REDWOOD_MODEM_IOC_DATA_CALL     _IOW('M', 3, uint32_t)
-#define REDWOOD_MODEM_IOC_VOICE_CMD     _IOW('M', 4, struct redwood_modem_voice_cmd)
-#define REDWOOD_MODEM_IOC_SMS_SEND      _IOW('M', 5, struct redwood_modem_sms_cmd)
+#define ANNIBALE_MODEM_MAGIC             0x414e4e4du
+#define ANNIBALE_MODEM_IOC_GET_STATUS    _IOR('M', 1, struct annibale_modem_status)
+#define ANNIBALE_MODEM_IOC_POLL          _IO('M', 2)
+#define ANNIBALE_MODEM_IOC_DATA_CALL     _IOW('M', 3, uint32_t)
+#define ANNIBALE_MODEM_IOC_VOICE_CMD     _IOW('M', 4, struct annibale_modem_voice_cmd)
+#define ANNIBALE_MODEM_IOC_SMS_SEND      _IOW('M', 5, struct annibale_modem_sms_cmd)
 
-/* ---- Sysctls under kern.redwood.* ------------------------------------------------------------------ */
+/* ---- Sysctls under kern.annibale.* ------------------------------------------------------------------ */
 
-SYSCTL_DECL(_kern_redwood);
+SYSCTL_DECL(_kern_annibale);
 
 static int sysctl_modem_state = MODEM_STATE_STANDBY;
 static int sysctl_cellular_bars = 0;
@@ -184,17 +184,17 @@ static int sysctl_cellular_rsrp = -140;
 static char sysctl_cellular_rat[16] = "None";
 static char sysctl_cellular_operator[32] = "";
 
-SYSCTL_INT(_kern_redwood, OID_AUTO, modem_state, CTLFLAG_RW | CTLFLAG_LOCKED,
+SYSCTL_INT(_kern_annibale, OID_AUTO, modem_state, CTLFLAG_RW | CTLFLAG_LOCKED,
     &sysctl_modem_state, 0, "SM8750 MPSS modem state (0=off..6=data_connected)");
-SYSCTL_INT(_kern_redwood, OID_AUTO, cellular_bars, CTLFLAG_RW | CTLFLAG_LOCKED,
+SYSCTL_INT(_kern_annibale, OID_AUTO, cellular_bars, CTLFLAG_RW | CTLFLAG_LOCKED,
     &sysctl_cellular_bars, 0, "Cellular signal strength in bars (0..4)");
-SYSCTL_INT(_kern_redwood, OID_AUTO, cellular_sim_state, CTLFLAG_RW | CTLFLAG_LOCKED,
+SYSCTL_INT(_kern_annibale, OID_AUTO, cellular_sim_state, CTLFLAG_RW | CTLFLAG_LOCKED,
     &sysctl_cellular_sim_state, 0, "SIM card state (0=absent, 1=present, 2=ready)");
-SYSCTL_INT(_kern_redwood, OID_AUTO, cellular_rsrp, CTLFLAG_RW | CTLFLAG_LOCKED,
+SYSCTL_INT(_kern_annibale, OID_AUTO, cellular_rsrp, CTLFLAG_RW | CTLFLAG_LOCKED,
     &sysctl_cellular_rsrp, 0, "Cellular RSRP in dBm");
-SYSCTL_STRING(_kern_redwood, OID_AUTO, cellular_rat, CTLFLAG_RW | CTLFLAG_LOCKED,
+SYSCTL_STRING(_kern_annibale, OID_AUTO, cellular_rat, CTLFLAG_RW | CTLFLAG_LOCKED,
     sysctl_cellular_rat, sizeof(sysctl_cellular_rat), "Cellular radio access technology");
-SYSCTL_STRING(_kern_redwood, OID_AUTO, cellular_operator, CTLFLAG_RW | CTLFLAG_LOCKED,
+SYSCTL_STRING(_kern_annibale, OID_AUTO, cellular_operator, CTLFLAG_RW | CTLFLAG_LOCKED,
     sysctl_cellular_operator, sizeof(sysctl_cellular_operator), "Cellular operator name");
 
 /* ---- Driver state ---------------------------------------------------------------------------------- */
@@ -224,7 +224,7 @@ struct qmi_svc_slot {
 	bool     online;
 	bool     queried;
 	uint16_t next_txn;
-	struct redwood_qrtr_port *qrtr_port;
+	struct annibale_qrtr_port *qrtr_port;
 };
 
 enum { SLOT_UIM = 0, SLOT_DMS = 1, SLOT_NAS = 2, SLOT_WDS = 3, SLOT_VOICE = 4, SLOT_WMS = 5, SLOT_COUNT = 6 };
@@ -238,8 +238,8 @@ static struct qmi_svc_slot qmi_slots[SLOT_COUNT] = {
 	[SLOT_WMS]   = { .service_id = QMI_SVC_WMS },
 };
 
-static struct redwood_modem_status modem_status = {
-	.magic = REDWOOD_MODEM_MAGIC,
+static struct annibale_modem_status modem_status = {
+	.magic = ANNIBALE_MODEM_MAGIC,
 	.state = MODEM_STATE_STANDBY,
 	.rsrp_dbm = -140,
 	.mtu = 1500,
@@ -386,7 +386,7 @@ smem_alloc_mpss_item(uint32_t item_id, uint32_t req_size)
 	if (off != 0) {
 		return existing_sz >= req_size ? off : 0;
 	}
-	lck_mtx_lock(&redwood_smem_alloc_lock);
+	lck_mtx_lock(&annibale_smem_alloc_lock);
 	part = smem_find_partition(SMEM_HOST_APPS, SMEM_HOST_MPSS, &part_sz);
 	if (part != 0) {
 		uncached_end = smem_rd(part + 12);
@@ -405,7 +405,7 @@ smem_alloc_mpss_item(uint32_t item_id, uint32_t req_size)
 			smem_wr(part + 12, uncached_end + 16 + aligned_sz);
 		}
 	}
-	lck_mtx_unlock(&redwood_smem_alloc_lock);
+	lck_mtx_unlock(&annibale_smem_alloc_lock);
 	return off;
 }
 
@@ -639,7 +639,7 @@ mpss_glink_poll_rx(void)
 					smem_wr(mpss_glink.desc_off + 8, (tail + aligned_frag) % mpss_glink.their_q_sz);
 					mpss_glink_write_raw(GLINK_CMD_RX_DONE_REUSE, GLINK_OUR_CID, p2, NULL, 0);
 					lck_mtx_unlock(&modem_lock);
-					redwood_qrtr_input(pkt, frag_sz);
+					annibale_qrtr_input(pkt, frag_sz);
 					kfree_data(pkt, frag_sz + 4);
 					lck_mtx_lock(&modem_lock);
 					tail = smem_rd(mpss_glink.desc_off + 8);
@@ -677,11 +677,11 @@ modem_qmi_send(unsigned slot_idx, uint16_t msg_id, const void *tlvs, uint16_t tl
 	if (++s->next_txn == 0) {
 		s->next_txn = 1;
 	}
-	n = redwood_qmi_encode_msg(buf, sizeof(buf), 0x00, s->next_txn, msg_id, tlvs, tlv_len);
+	n = annibale_qmi_encode_msg(buf, sizeof(buf), 0x00, s->next_txn, msg_id, tlvs, tlv_len);
 	if (n == 0) {
 		return EINVAL;
 	}
-	return redwood_qrtr.send(s->qrtr_port, s->node, s->port, buf, n);
+	return annibale_qrtr.send(s->qrtr_port, s->node, s->port, buf, n);
 }
 
 static const char *
@@ -750,7 +750,7 @@ modem_qmi_rx_cb(void *context, uint32_t from_node, uint32_t from_port, const voi
 	case SLOT_UIM:
 		if (msg_id == QMI_UIM_GET_CARD_STATUS) {
 			uint8_t card = 0, app = 0;
-			if (redwood_qmi_uim_parse_card_status(tlvs, tlv_len, &card, &app)) {
+			if (annibale_qmi_uim_parse_card_status(tlvs, tlv_len, &card, &app)) {
 				modem_status.sim_state = (card == 1) ? (app == 7 ? 2u : 1u) : 0u;
 				printf("annibale-modem: QMI UIM SIM state=%u (app=%u, subscriber_id=***)\n",
 				    modem_status.sim_state, app);
@@ -760,7 +760,7 @@ modem_qmi_rx_cb(void *context, uint32_t from_node, uint32_t from_port, const voi
 	case SLOT_DMS:
 		if (msg_id == QMI_DMS_GET_OPERATING_MODE) {
 			uint8_t mode = 0;
-			if (redwood_qmi_dms_parse_oper_mode(tlvs, tlv_len, &mode)) {
+			if (annibale_qmi_dms_parse_oper_mode(tlvs, tlv_len, &mode)) {
 				printf("annibale-modem: QMI DMS operating_mode=%u (device_serial=***)\n", mode);
 				if (mode != 0) {
 					static const uint8_t online_tlv[] = { 0x01, 0x01, 0x00, 0x00 };
@@ -773,7 +773,7 @@ modem_qmi_rx_cb(void *context, uint32_t from_node, uint32_t from_port, const voi
 		if (msg_id == QMI_NAS_GET_SERVING_SYSTEM || msg_id == QMI_NAS_GET_HOME_NETWORK) {
 			uint8_t reg = 0, rat = 0;
 			uint16_t mcc = 0, mnc = 0;
-			if (redwood_qmi_nas_parse_serving(tlvs, tlv_len, &reg, &rat, &mcc, &mnc,
+			if (annibale_qmi_nas_parse_serving(tlvs, tlv_len, &reg, &rat, &mcc, &mnc,
 			    modem_status.operator_name, sizeof(modem_status.operator_name))) {
 				modem_status.reg_state = reg;
 				if (mcc != 0) {
@@ -793,7 +793,7 @@ modem_qmi_rx_cb(void *context, uint32_t from_node, uint32_t from_port, const voi
 		    msg_id == QMI_NAS_GET_SIGNAL_STRENGTH) {
 			int16_t rsrp = -140;
 			uint8_t bars = 0, rat = 0;
-			if (redwood_qmi_nas_parse_signal(tlvs, tlv_len, &rsrp, &bars, &rat)) {
+			if (annibale_qmi_nas_parse_signal(tlvs, tlv_len, &rsrp, &bars, &rat)) {
 				modem_status.rsrp_dbm = rsrp;
 				modem_status.signal_bars = bars;
 				if (rat != 0) {
@@ -805,13 +805,13 @@ modem_qmi_rx_cb(void *context, uint32_t from_node, uint32_t from_port, const voi
 	case SLOT_WDS:
 		if (msg_id == QMI_WDS_START_NET_IF) {
 			uint16_t len = 0;
-			const uint8_t *v = redwood_qmi_find_tlv(tlvs, tlv_len, 0x01, &len);
+			const uint8_t *v = annibale_qmi_find_tlv(tlvs, tlv_len, 0x01, &len);
 			if (v != NULL && len >= 4) {
 				memcpy(&wds_pkt_handle, v, 4);
 			}
 		} else if (msg_id == QMI_WDS_GET_RUNTIME_SETTINGS) {
 			uint32_t ip = 0, gw = 0, mask = 0, d1 = 0, d2 = 0, mtu = 1500;
-			if (redwood_qmi_wds_parse_runtime(tlvs, tlv_len, &ip, &gw, &mask, &d1, &d2, &mtu)) {
+			if (annibale_qmi_wds_parse_runtime(tlvs, tlv_len, &ip, &gw, &mask, &d1, &d2, &mtu)) {
 				modem_status.ipv4_addr = ip;
 				modem_status.ipv4_gw = gw;
 				modem_status.ipv4_dns1 = d1;
@@ -829,7 +829,7 @@ modem_qmi_rx_cb(void *context, uint32_t from_node, uint32_t from_port, const voi
 		if (msg_id == QMI_VOICE_ALL_CALL_STATUS_IND || msg_id == QMI_VOICE_DIAL_CALL ||
 		    msg_id == QMI_VOICE_END_CALL || msg_id == QMI_VOICE_ANSWER_CALL) {
 			uint16_t len = 0;
-			const uint8_t *v = redwood_qmi_find_tlv(tlvs, tlv_len, 0x01, &len);
+			const uint8_t *v = annibale_qmi_find_tlv(tlvs, tlv_len, 0x01, &len);
 			if (msg_id == QMI_VOICE_END_CALL) {
 				modem_status.call_state = 0;
 			} else if (v != NULL && len >= 3) {
@@ -887,9 +887,9 @@ modem_open_qmi_clients(void)
 {
 	for (unsigned i = 0; i < SLOT_COUNT; i++) {
 		if (qmi_slots[i].qrtr_port == NULL) {
-			qmi_slots[i].qrtr_port = redwood_qrtr.open(modem_qmi_rx_cb, modem_qmi_server_cb, (void *)(uintptr_t)i);
+			qmi_slots[i].qrtr_port = annibale_qrtr.open(modem_qmi_rx_cb, modem_qmi_server_cb, (void *)(uintptr_t)i);
 			if (qmi_slots[i].qrtr_port != NULL) {
-				redwood_qrtr.lookup(qmi_slots[i].qrtr_port, qmi_slots[i].service_id, 0, 0);
+				annibale_qrtr.lookup(qmi_slots[i].qrtr_port, qmi_slots[i].service_id, 0, 0);
 			}
 		}
 	}
@@ -898,7 +898,7 @@ modem_open_qmi_clients(void)
 /* ---- Voice & SMS action helpers -------------------------------------------------------------------- */
 
 static int
-modem_voice_action(const struct redwood_modem_voice_cmd *cmd)
+modem_voice_action(const struct annibale_modem_voice_cmd *cmd)
 {
 	if (cmd == NULL) {
 		return EINVAL;
@@ -926,7 +926,7 @@ modem_voice_action(const struct redwood_modem_voice_cmd *cmd)
 }
 
 static int
-modem_sms_send(const struct redwood_modem_sms_cmd *sms)
+modem_sms_send(const struct annibale_modem_sms_cmd *sms)
 {
 	uint8_t tlv[192];
 	uint16_t plen;
@@ -1020,17 +1020,17 @@ poll_loop:
 		lck_mtx_unlock(&modem_lock);
 
 		if (newly_open) {
-			redwood_qrtr_attach_node(QRTR_NODE_MPSS, mpss_qrtr_send);
+			annibale_qrtr_attach_node(QRTR_NODE_MPSS, mpss_qrtr_send);
 			printf("annibale-modem: SMEM GLINK IPCRTR up with MPSS (node %u)\n", QRTR_NODE_MPSS);
 		}
 		if (mpss_glink.ipcrtr_open) {
-			redwood_qrtr_fresh();
+			annibale_qrtr_fresh();
 		}
 		modem_sleep_ms(mpss_glink.ipcrtr_open ? 25 : 200);
 	}
 }
 
-/* ---- /dev/redwood-modem character device ----------------------------------------------------------- */
+/* ---- /dev/annibale-modem character device ----------------------------------------------------------- */
 
 static int
 modem_dev_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
@@ -1047,7 +1047,7 @@ modem_dev_close(__unused dev_t dev, __unused int flags, __unused int devtype, __
 static int
 modem_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 {
-	struct redwood_modem_status snap;
+	struct annibale_modem_status snap;
 	char line[256];
 	int len;
 
@@ -1102,10 +1102,10 @@ modem_dev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 			wds_pkt_handle = 0;
 		}
 	} else if (strncmp(cmd, "hangup", 6) == 0) {
-		struct redwood_modem_voice_cmd vc = { .action = 3, .call_id = 1 };
+		struct annibale_modem_voice_cmd vc = { .action = 3, .call_id = 1 };
 		modem_voice_action(&vc);
 	} else if (strncmp(cmd, "answer", 6) == 0) {
-		struct redwood_modem_voice_cmd vc = { .action = 2, .call_id = 1 };
+		struct annibale_modem_voice_cmd vc = { .action = 2, .call_id = 1 };
 		modem_voice_action(&vc);
 	}
 	modem_sync_sysctls();
@@ -1120,25 +1120,25 @@ modem_dev_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int fflag
 
 	lck_mtx_lock(&modem_lock);
 	switch (cmd) {
-	case REDWOOD_MODEM_IOC_GET_STATUS:
-		*(struct redwood_modem_status *)data = modem_status;
+	case ANNIBALE_MODEM_IOC_GET_STATUS:
+		*(struct annibale_modem_status *)data = modem_status;
 		break;
-	case REDWOOD_MODEM_IOC_POLL:
+	case ANNIBALE_MODEM_IOC_POLL:
 		for (unsigned i = 0; i < SLOT_COUNT; i++) {
 			qmi_slots[i].queried = false;
 		}
 		modem_qmi_poll_services();
 		break;
-	case REDWOOD_MODEM_IOC_DATA_CALL:
+	case ANNIBALE_MODEM_IOC_DATA_CALL:
 		wds_data_wanted = (*(uint32_t *)data != 0);
 		qmi_slots[SLOT_WDS].queried = false;
 		modem_qmi_poll_services();
 		break;
-	case REDWOOD_MODEM_IOC_VOICE_CMD:
-		err = modem_voice_action((const struct redwood_modem_voice_cmd *)data);
+	case ANNIBALE_MODEM_IOC_VOICE_CMD:
+		err = modem_voice_action((const struct annibale_modem_voice_cmd *)data);
 		break;
-	case REDWOOD_MODEM_IOC_SMS_SEND:
-		err = modem_sms_send((const struct redwood_modem_sms_cmd *)data);
+	case ANNIBALE_MODEM_IOC_SMS_SEND:
+		err = modem_sms_send((const struct annibale_modem_sms_cmd *)data);
 		break;
 	default:
 		err = ENOTTY;
@@ -1169,15 +1169,15 @@ annibale_modem_init(void)
 	thread_t th;
 	int major;
 
-	if (!redwood_platform_is_annibale() || modem_inited) {
+	if (!annibale_platform_is_annibale() || modem_inited) {
 		return;
 	}
 	modem_inited = true;
 	PE_parse_boot_argn("modem", &modem_boot_arg, sizeof(modem_boot_arg));
 
 	major = cdevsw_add(-1, &modem_cdevsw);
-	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-modem") == NULL) {
-		printf("annibale-modem: failed to create /dev/redwood-modem\n");
+	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "annibale-modem") == NULL) {
+		printf("annibale-modem: failed to create /dev/annibale-modem\n");
 	}
 	modem_sync_sysctls();
 

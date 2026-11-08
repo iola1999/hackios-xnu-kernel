@@ -10,7 +10,7 @@ index 4d20855..29501e5 100644
 + * Strict payload contract (annibale, PAYLOAD-MEM ruling 2026-10): the build
 + * passes B = PAYLOAD_BASE and the container limit C = PAYLOAD_CAP together.
 + * Without PAYLOAD_CAP the legacy shape below stays byte-for-byte unchanged
-+ * for redwood/QEMU. The checks assume the packer rules in mkxnuimg.py
++ * for the POCO X5 Pro and QEMU. The checks assume the packer rules in mkxnuimg.py
 + * (PAYLOAD_CAP mode): container file length F = 8 + N <= C, container bytes
 + * padded up to align_up(F, 16), and at least 16 readable bytes at every
 + * source container start P (no-payload images carry 16 zero bytes there).

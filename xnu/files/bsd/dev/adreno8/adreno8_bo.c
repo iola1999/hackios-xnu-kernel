@@ -298,7 +298,7 @@ adreno8_bo_unmap(uint64_t address, uint64_t size)
 		if (!entry || !bo_owned(*entry)) return bo_fail("unmap ownership");
 	}
 	/* No wait for the GPU: the caller unmaps only once every submission that could still read the
-	 * buffer has retired (RedwoodGPUMemory.inc, freeBuffer()). */
+	 * buffer has retired (AnnibaleGPUMemory.inc, freeBuffer()). */
 	uint64_t began = mach_absolute_time();
 	for (uint64_t at = 0; at < size; at += SMMU_GRANULE)
 		*adreno8_space_entry(&adreno8_gpu_space, (uint32_t)(address + at)) = ADRENO8_PTE_EXTERNAL;

@@ -17,8 +17,8 @@
 #include <time.h>
 #include <unistd.h>
 
-#include <sys/redwood_qmi.h>
-#include <sys/redwood_qrtr.h>
+#include <sys/annibale_qmi.h>
+#include <sys/annibale_qrtr.h>
 
 #define HZ 250                          /* what a Linux might have: qmi_txn_wait() must take it from here */
 #define msecs_to_jiffies(ms)    ((unsigned long)(ms) * HZ / 1000)

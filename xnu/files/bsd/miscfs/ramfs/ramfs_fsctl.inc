@@ -1,8 +1,8 @@
 /*
  * FSIOC_CAS_BSDFLAGS, the generic compare-and-swap of a file's BSD flags: vfs_syscalls.c checks the
  * caller's right to change the flags and leaves the swap to the file system, as HFS and APFS do it.
- * The FileProvider LocalStorage extension sets its flags this way on every item it creates; without an
- * answer creating the "Downloads" folder fails with ENOTTY.
+ * revisiond sets UF_TRACKED this way on every item FileProvider's LocalStorage extension creates (see
+ * ramfs_track()); without an answer creating the "Downloads" folder fails with ENOTTY.
  *
  * The other fsctls answered are APFS's, because this volume reports itself as apfs and iOS 26 code
  * chooses its paths from that:
@@ -102,6 +102,7 @@ ramfs_cas_bsdflags(struct ramfs_node *node, struct fsioc_cas_bsdflags *cas)
 	cas->actual_flags = node->rn_bsdflags;
 	if (cas->actual_flags == cas->expected_flags) {
 		node->rn_bsdflags = cas->new_flags;
+		ramfs_track(node);
 		ramfs_touch(node, false);
 	}
 	lck_mtx_unlock(&rm->rm_lock);

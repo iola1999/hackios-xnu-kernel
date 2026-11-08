@@ -9,4 +9,4 @@ index 75bbfc1c1a4d..a95975f14685 100644
 +osfmk/minicrypto/mc_digests.c	standard
 +osfmk/minicrypto/mc_provider.c	standard
 +osfmk/minicrypto/mc_aes.c	standard
-+osfmk/kern/redwood_threads.c	standard
++osfmk/kern/annibale_threads.c	standard

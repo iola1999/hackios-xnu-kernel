@@ -36,7 +36,7 @@ firmware_indicates(uint16_t message, unsigned ms)
 }
 
 static void
-firmware_peer(struct redwood_qrtr_port *port, const uint8_t *data, size_t length)
+firmware_peer(struct annibale_qrtr_port *port, const uint8_t *data, size_t length)
 {
 	static uint8_t reply[512];
 	uint16_t message = (uint16_t)(data[3] | data[4] << 8);
@@ -55,9 +55,9 @@ firmware_peer(struct redwood_qrtr_port *port, const uint8_t *data, size_t length
 		struct qmi_wlanfw_ind_register_resp_msg_v01 resp = { .fw_status_valid = 1, .fw_status = 0 };
 
 		memset(&req, 0, sizeof(req));
-		firmware.bad |= redwood_qmi_decode(data, length, qmi_wlanfw_ind_register_req_msg_v01_ei, &req) < 0 || !req.fw_ready_enable ||
+		firmware.bad |= annibale_qmi_decode(data, length, qmi_wlanfw_ind_register_req_msg_v01_ei, &req) < 0 || !req.fw_ready_enable ||
 		    !req.fw_init_done_enable || !req.cal_done_enable || req.request_mem_enable_valid;
-		n = redwood_qmi_encode(QMI_RESPONSE, message, (uint16_t)(data[1] | data[2] << 8), qmi_wlanfw_ind_register_resp_msg_v01_ei, &resp,
+		n = annibale_qmi_encode(QMI_RESPONSE, message, (uint16_t)(data[1] | data[2] << 8), qmi_wlanfw_ind_register_resp_msg_v01_ei, &resp,
 		    reply, sizeof(reply));
 		break;
 	}
@@ -65,7 +65,7 @@ firmware_peer(struct redwood_qrtr_port *port, const uint8_t *data, size_t length
 		static struct qmi_wlanfw_host_cap_req_msg_v01 req;
 
 		memset(&req, 0, sizeof(req));
-		firmware.bad |= redwood_qmi_decode(data, length, qmi_wlanfw_host_cap_req_msg_v01_ei, &req) < 0 || !req.num_clients_valid ||
+		firmware.bad |= annibale_qmi_decode(data, length, qmi_wlanfw_host_cap_req_msg_v01_ei, &req) < 0 || !req.num_clients_valid ||
 		    req.num_clients != 1 || !req.mem_cfg_mode_valid || req.m3_support != 0;
 		break;
 	}
@@ -86,7 +86,7 @@ firmware_peer(struct redwood_qrtr_port *port, const uint8_t *data, size_t length
 		resp.fw_build_id_valid = 1;
 		strcpy(resp.fw_build_id, "WLAN.MSL.1.0.1-01277-QCAMSLSWCBT-1");
 		firmware.bad |= length != QMI_HEADER_SIZE;
-		n = redwood_qmi_encode(QMI_RESPONSE, message, (uint16_t)(data[1] | data[2] << 8), qmi_wlanfw_cap_resp_msg_v01_ei, &resp, reply,
+		n = annibale_qmi_encode(QMI_RESPONSE, message, (uint16_t)(data[1] | data[2] << 8), qmi_wlanfw_cap_resp_msg_v01_ei, &resp, reply,
 		    sizeof(reply));
 		break;
 	}
@@ -94,7 +94,7 @@ firmware_peer(struct redwood_qrtr_port *port, const uint8_t *data, size_t length
 		struct qmi_wlanfw_device_info_resp_msg_v01 resp = { .bar_addr = 0x17a00000, .bar_size = 0x200000, .bar_addr_valid = 1,
 			                                            .bar_size_valid = 1 };
 
-		n = redwood_qmi_encode(QMI_RESPONSE, message, (uint16_t)(data[1] | data[2] << 8), qmi_wlfw_device_info_resp_msg_v01_ei, &resp,
+		n = annibale_qmi_encode(QMI_RESPONSE, message, (uint16_t)(data[1] | data[2] << 8), qmi_wlfw_device_info_resp_msg_v01_ei, &resp,
 		    reply, sizeof(reply));
 		break;
 	}
@@ -102,7 +102,7 @@ firmware_peer(struct redwood_qrtr_port *port, const uint8_t *data, size_t length
 		static struct qmi_wlanfw_bdf_download_req_msg_v01 req;
 
 		memset(&req, 0, sizeof(req));
-		if (redwood_qmi_decode(data, length, qmi_wlanfw_bdf_download_req_msg_v01_ei, &req) < 0 || !req.valid || !req.data_valid ||
+		if (annibale_qmi_decode(data, length, qmi_wlanfw_bdf_download_req_msg_v01_ei, &req) < 0 || !req.valid || !req.data_valid ||
 		    req.seg_id != firmware.segments || req.total_size != sizeof(firmware.file) ||
 		    firmware.got_length + req.data_len > sizeof(firmware.got)) {
 			firmware.bad = true;
@@ -120,7 +120,7 @@ firmware_peer(struct redwood_qrtr_port *port, const uint8_t *data, size_t length
 	case 0x22: {                    /* mode */
 		struct qmi_wlanfw_wlan_mode_req_msg_v01 req = { 0 };
 
-		firmware.bad |= redwood_qmi_decode(data, length, qmi_wlanfw_wlan_mode_req_msg_v01_ei, &req) < 0 || firmware.modes >= 4;
+		firmware.bad |= annibale_qmi_decode(data, length, qmi_wlanfw_wlan_mode_req_msg_v01_ei, &req) < 0 || firmware.modes >= 4;
 		firmware.mode[firmware.modes++ & 3] = req.mode;
 		if (req.mode == 7) {            /* cold boot calibration: done after a while, then ready */
 			firmware_indicates(QMI_WLFW_COLD_BOOT_CAL_DONE_IND_V01, 30);
@@ -132,7 +132,7 @@ firmware_peer(struct redwood_qrtr_port *port, const uint8_t *data, size_t length
 		static struct qmi_wlanfw_wlan_cfg_req_msg_v01 req;
 
 		memset(&req, 0, sizeof(req));
-		firmware.bad |= redwood_qmi_decode(data, length, qmi_wlanfw_wlan_cfg_req_msg_v01_ei, &req) < 0 || !req.tgt_cfg_valid ||
+		firmware.bad |= annibale_qmi_decode(data, length, qmi_wlanfw_wlan_cfg_req_msg_v01_ei, &req) < 0 || !req.tgt_cfg_valid ||
 		    req.tgt_cfg_len != 9 || req.tgt_cfg[8].pipe_num != 8 || !req.svc_cfg_valid || req.svc_cfg_len != 20 ||
 		    strcmp(req.host_version, "WIN") != 0;
 		break;
@@ -272,7 +272,7 @@ test_conversation(void)
 	for (size_t i = 0; i < sizeof(firmware.file); i++) {
 		firmware.file[i] = (unsigned char)(rnd() >> 11);
 	}
-	redwood_qmi_set_transport(&router_ops);
+	annibale_qmi_set_transport(&router_ops);
 	check(qmi_handle_init(&qmi, ATH11K_QMI_RESP_LEN_MAX, &host_ops, host_handlers) == 0, "conversation: no handle");
 	router.peer = firmware_peer;
 	check(qmi_add_lookup(&qmi, ATH11K_QMI_WLFW_SERVICE_ID_V01, ATH11K_QMI_WLFW_SERVICE_VERS_V01,
@@ -405,7 +405,7 @@ test_conversation(void)
 		pthread_join(firmware.threads[i], NULL);
 	}
 	qmi_handle_release(&qmi);
-	redwood_qmi_set_transport(NULL);
+	annibale_qmi_set_transport(NULL);
 }
 
 #endif /* !NO_ATH11K */

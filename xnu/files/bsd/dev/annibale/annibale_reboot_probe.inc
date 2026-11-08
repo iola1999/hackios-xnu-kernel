@@ -44,7 +44,7 @@ annibale_reboot_probe(void)
 	if (!PE_parse_boot_argn("annibale_reboot_lk", &enabled, sizeof(enabled))) {
 		return;
 	}
-	if (enabled != 1 || !redwood_platform_is_annibale()) {
+	if (enabled != 1 || !annibale_platform_is_annibale()) {
 		problem = "requires annibale hardware description and annibale_reboot_lk=1";
 		goto out;
 	}

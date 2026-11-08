@@ -288,7 +288,7 @@ dsu_command(const char *cmd)
  * tools/k90auto/dsu.py pads the system image with zeros to a 16 GiB slot, so the slot's tail is
  * this port's own: the store is its last 4 GiB, two slots of userland/src/var_store.c (2 GiB each,
  * a header at the start of each). The block service lists it as the partition "dsu_store", in
- * blocks of userdata's size, and the kernel sees /dev/rufs_dsu_store (bsd/dev/redwood_ufs.c).
+ * blocks of userdata's size, and the kernel sees /dev/rufs_dsu_store (bsd/dev/annibale_ufs.c).
  *
  * A write lands in userdata, where a wrong sector is Android's data and cannot be undone. So the
  * store is listed only when the DSU file found through lp_metadata is the one holding this run's
@@ -357,8 +357,8 @@ dsu_store_io(int write, uint64_t lba, uint64_t bytes, uint8_t *buf)
 static int
 dsu_block_is_zero_or_head(const uint8_t *p, uint64_t bs)
 {
-	static const char magic[8] = "RDWVAR\0";
-	static const char fs_magic[8] = {'R', 'D', 'W', 'F', 'S', '0', '0', '1'};
+	static const char magic[8] = "ANNVAR\0";
+	static const char fs_magic[8] = {'A', 'N', 'N', 'F', 'S', '0', '0', '1'};
 
 	if (memcmp(p, magic, sizeof(magic)) == 0 || memcmp(p, fs_magic, sizeof(fs_magic)) == 0) {
 		return 1;
@@ -448,7 +448,7 @@ dsu_store_open(struct loader_block_part *bp, int want_write, int *writable)
 	for (uint64_t slot = 0; slot < DSU_STORE_BYTES / DSU_STORE_SLOT && why == NULL; slot++) {
 		if (EFI_ERROR(dsu_slot_io(0, dsu_store_at + slot * DSU_STORE_SLOT, bs, ufs_buffer))) {
 			why = "a header block does not read";
-		} else if (slot == 0 && memcmp(ufs_buffer, "RDWFS001", 8) == 0) {
+		} else if (slot == 0 && memcmp(ufs_buffer, "ANNFS001", 8) == 0) {
 			break;
 		} else if (!dsu_block_is_zero_or_head(ufs_buffer, bs)) {
 			why = "a header block holds something else than zeros or a header";

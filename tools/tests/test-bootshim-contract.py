@@ -3,7 +3,7 @@
 
 Coverage (annibale PAYLOAD-MEM contract, 2026-10):
   * packer: strict XNUP container validation and the 16-byte padding rule;
-  * shim compile: the legacy (redwood/QEMU) forms stay byte-identical to the
+  * shim compile: the legacy (annibale/QEMU) forms stay byte-identical to the
     pre-change baseline, reconstructed from the committed patch hunk;
   * shim statics: label order, stores only after every range check, an 8-byte
     (not 16-byte) target header clear, literal pools ending at _Payload,
@@ -493,8 +493,8 @@ def cli_tests(tmp):
          dict(FD_BASE='0xa7100000', PAYLOAD_BASE='0xa7100000', PAYLOAD_CAP='0x3700000'), good,
          None, 'overlaps the payload window'),
         ('FD file shorter than FD_SIZE', {}, good, FIX['q'] - 16, 'bytes != FD_SIZE'),
-        ('no Mu tree (prebuilt shim predates strict)', dict(UEFI_FD=str(fx / 'missing.fd')), good,
-         None, 'predates the strict contract'),
+        ('no Mu tree', dict(UEFI_FD=str(fx / 'missing.fd')), good,
+         None, 'needs the BootShim built from Mu-Silicium/'),
         ('container without XNUP magic', {}, b'JUNK' * 16, None, 'not an XNUP container'),
         ('container body past C-8', {}, struct.pack('<II', 0x50554E58, FIX['c'] - 4) + TERM, None,
          'exceeds C-8'),
@@ -646,8 +646,8 @@ def main():
             if r.returncode != 0:
                 die(f'{form}/{side} compile failed: {r.stderr[:200]}')
         if (Path(tmp) / f'{form}_old.o').read_bytes() != (Path(tmp) / f'{form}_new.o').read_bytes():
-            die(f'{form} form is no longer byte-identical for redwood/QEMU')
-    ok('compile: legacy and plain shim objects stay byte-identical (redwood/QEMU unchanged)')
+            die(f'{form} form is no longer byte-identical for annibale/QEMU')
+    ok('compile: legacy and plain shim objects stay byte-identical (annibale/QEMU unchanged)')
 
     static_tests(tmp, objs)
     packer_tests(load_packer())

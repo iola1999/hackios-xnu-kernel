@@ -7,7 +7,7 @@ index f2b9ce24bd8d..3aed167fe32e 100644
  }
  
 +/*
-+ * (redwood) What kind of work the thread's work interval is for: one of WORK_INTERVAL_TYPE_*,
++ * (annibale) What kind of work the thread's work interval is for: one of WORK_INTERVAL_TYPE_*,
 + * or WORK_INTERVAL_TYPE_LAST for a thread that has joined none.
 + */
 +uint32_t

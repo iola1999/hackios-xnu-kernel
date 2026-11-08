@@ -1,6 +1,6 @@
 # annibale 维护副本
 
-annibale 的 UEFI 源码在公开仓库 [iola1999/hackios-mu-silicium](https://github.com/iola1999/hackios-mu-silicium) 的 `k90-port` 分支（Project-Silicium/Mu-Silicium 的副本），构建步骤见顶层工作区的 `docs/analysis/annibale-uefi-build.md`。这里按 `files/<相对路径>` 存放 annibale 专属覆盖文件的副本，与 `uefi/files/`（redwood 移植的导出目录）分开维护：`uefi/export.sh` 重写 `uefi/files/` 时不读取本目录，也不要对 annibale 工作树运行 `export.sh` 或 redwood 的 `apply.sh`。
+annibale 的 UEFI 源码在公开仓库 [iola1999/hackios-mu-silicium](https://github.com/iola1999/hackios-mu-silicium) 的 `k90-port` 分支（Project-Silicium/Mu-Silicium 的副本），构建步骤见顶层工作区的 `docs/analysis/annibale-uefi-build.md`。这里按 `files/<相对路径>` 存放 annibale 专属覆盖文件的副本，与 `uefi/files/` 分开维护。
 
 `BASE` 记录本副本对应的 Mu-Silicium 提交 `5e3fafb466449bb35c31345e4ec4dd83dfa9abf6`（`k90-port` 上加入副本之前的那一笔）。`k90-port` 的下一笔提交 `cb43663` 已经包含这份副本，从公开仓库克隆 `k90-port` 时不需要再手工复制。
 

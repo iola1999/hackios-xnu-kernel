@@ -19,7 +19,7 @@ def function(path, name):
     return source[start:end]
 
 
-command = function("xnu/files/bsd/dev/redwood/redwood_goodix.c", "goodix_command")
+command = function("xnu/files/bsd/dev/annibale/annibale_goodix.c", "goodix_command")
 sgi = function("xnu/files/osfmk/arm64/gic_v3_irq.c", "gic_send_sgi")
 source = r'''
 #include <assert.h>
@@ -64,7 +64,7 @@ int main(void) {
     for (int i = 0; i < 8; i++) {
         assert(platform_annibale.core_mpidr[i] == expected[i]);
         assert(platform_core_index(&platform_annibale, expected[i]) == i);
-        assert(platform_redwood.core_mpidr[i] == (uint32_t)i * 0x100);
+        assert(platform_poco.core_mpidr[i] == (uint32_t)i * 0x100);
         assert(platform_qemu_virt.core_mpidr[i] == (uint32_t)i);
     }
     assert(platform_core_index(&platform_annibale, 0x700) == -1);

@@ -57,7 +57,7 @@ static void nanoseconds_to_absolutetime(uint64_t n, uint64_t *out) { *out = n; }
 static void absolutetime_to_nanoseconds(uint64_t n, uint64_t *out) { *out = n; }
 static void annibale_spmi_lock(void) { assert(!lock_depth++); }
 static void annibale_spmi_unlock(void) { assert(lock_depth-- == 1); }
-static bool redwood_platform_is_annibale(void) { return identity; }
+static bool annibale_platform_is_annibale(void) { return identity; }
 static bool PE_parse_boot_argn(const char *key, void *out, unsigned length) {
     assert(length == 4);
     if (!strcmp(key, "annibale_reboot_lk")) { *(uint32_t *)out = enabled; return present; }

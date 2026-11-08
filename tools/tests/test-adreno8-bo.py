@@ -4,8 +4,8 @@
 Each mode runs in its own process: the guard page after each BO, the search that starts after the
 last reservation and wraps around, refusals that refuse one buffer, the failures that close every
 BO operation, and the ownership checks. Each mutation of adreno8_bo.c below has to fail a mode.
-Dropped: the unmap that waited for EOP and GPU idle, since RedwoodGPUMemory.inc's freeBuffer() now
-unmaps only after the last submission retired (tools/test-redwood-gpu-lifetime.py checks that).
+Dropped: the unmap that waited for EOP and GPU idle, since AnnibaleGPUMemory.inc's freeBuffer() now
+unmaps only after the last submission retired (tools/test-annibale-gpu-lifetime.py checks that).
 Dropped: the refill of a released hole from the lowest free page, replaced by the next-fit cursor.
 """
 from pathlib import Path

@@ -4,7 +4,7 @@
 HEAD starts at disk byte zero; TAIL ends at the actual disk size. Both must
 contain their complete GPT header and entry array. Obtain these backups from
 the current device; an offline parser cannot establish their capture time.
-Optional stopped-filesystem RDWFS metadata supplies exact var copy ranges.
+Optional stopped-filesystem ANNFS metadata supplies exact var copy ranges.
 By default only JSON is emitted. --output-dir creates a new host directory
 with candidate GPT copies and the plan; existing output paths are refused.
 JSON output can contain device GUIDs and belongs in local ignored storage.
@@ -26,9 +26,9 @@ APFS_TYPE = uuid.UUID("7c3457ef-0000-11aa-aa11-00306543ecac")
 HEADER = struct.Struct("<8sIIIIQQQQ16sQIII")
 MAX_BACKUP_BYTES = 16 << 20
 
-spec = importlib.util.spec_from_file_location("rdwfs_inspect", Path(__file__).with_name("rdwfs-inspect.py"))
-rdwfs = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(rdwfs)
+spec = importlib.util.spec_from_file_location("annfs_inspect", Path(__file__).with_name("annfs-inspect.py"))
+annfs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(annfs)
 
 
 def require(condition, message):
@@ -187,7 +187,7 @@ def plan(head, tail, disk_bytes, sector_bytes, root_bytes=16 << 30, var_metadata
     require(new_var_first <= var["last_lba"], "target darwin size exhausts darwin_var")
     old_var_bytes = (var["last_lba"] - var["first_lba"] + 1) * sector_bytes
     new_var_bytes = (var["last_lba"] - new_var_first + 1) * sector_bytes
-    rdwfs.check_capacity(new_var_bytes, "target darwin_var capacity")
+    annfs.check_capacity(new_var_bytes, "target darwin_var capacity")
     new_root = dict(root, last_lba=new_var_first - 1)
     new_var = dict(var, first_lba=new_var_first)
     changed = [entry["entry"] for entry, new in ((root, new_root), (var, new_var)) if entry != new]
@@ -197,7 +197,7 @@ def plan(head, tail, disk_bytes, sector_bytes, root_bytes=16 << 30, var_metadata
 
     var_report = None
     if var_metadata is not None:
-        var_report = rdwfs.inspect(var_metadata, old_var_bytes, new_var_bytes)
+        var_report = annfs.inspect(var_metadata, old_var_bytes, new_var_bytes)
     old_var_offset = var["first_lba"] * sector_bytes
     new_var_offset = new_var_first * sector_bytes
     var_ranges = None if var_report is None or var_report["status"] == "invalid" else var_report["backup_ranges"]
@@ -235,7 +235,7 @@ def plan(head, tail, disk_bytes, sector_bytes, root_bytes=16 << 30, var_metadata
         },
     }
     if output_dir is not None:
-        require(report["data_fits"] is not False, "RDWFS metadata does not fit the proposed partition")
+        require(report["data_fits"] is not False, "ANNFS metadata does not fit the proposed partition")
         new_head = candidate_copy(head, primary, new_table, disk_bytes, sector_bytes, True)
         new_tail = candidate_copy(tail, backup, new_table, disk_bytes, sector_bytes, False)
         checked = plan(new_head, new_tail, disk_bytes, sector_bytes, root_bytes)
@@ -251,11 +251,11 @@ def main(argv=None):
     parser.add_argument("--disk-bytes", type=lambda value: int(value, 0), required=True)
     parser.add_argument("--sector-bytes", type=int, required=True)
     parser.add_argument("--root-bytes", type=lambda value: int(value, 0), default=16 << 30)
-    parser.add_argument("--var-metadata", help="saved complete 64 MiB RDWFS metadata")
+    parser.add_argument("--var-metadata", help="saved complete 64 MiB ANNFS metadata")
     parser.add_argument("--output-dir", help="new host directory for candidate GPT copies and plan JSON")
     args = parser.parse_args(argv)
     try:
-        metadata = None if args.var_metadata is None else rdwfs.read_metadata(args.var_metadata)
+        metadata = None if args.var_metadata is None else annfs.read_metadata(args.var_metadata)
         report = plan(read_backup(args.head), read_backup(args.tail), args.disk_bytes,
                       args.sector_bytes, args.root_bytes, metadata, args.output_dir)
     except (OSError, ValueError) as error:

@@ -77,9 +77,9 @@ static kern_return_t kernel_thread_start(thread_continue_t f, void *arg, thread_
 static void thread_wakeup(event_t e) { (void)e; wakeups++; }
 static wait_result_t assert_wait_timeout(event_t e, int i, uint32_t interval, uint64_t scale) { (void)e; (void)i; assert(interval * scale == 50000000ULL); return 0; }
 static bool ml_cpu_idle_time(int cpu, uint64_t *idle) { *idle = idle_ns[cpu]; return true; }
-/* redwood_threads.c's freeze watchdog runs from this thread's tick; it has no part in the governor. */
-static uint64_t redwood_touch_last(void) { return 0; }
-static void redwood_freeze_check(uint64_t touched) { (void)touched; }
+/* annibale_threads.c's freeze watchdog runs from this thread's tick; it has no part in the governor. */
+static uint64_t annibale_touch_last(void) { return 0; }
+static void annibale_freeze_check(uint64_t touched) { (void)touched; }
 static bool PE_parse_boot_argn(const char *name, void *value, int size)
 {
     (void)size;

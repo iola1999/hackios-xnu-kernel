@@ -37,7 +37,7 @@
 # host RAM).
 cd "$(dirname "$(readlink -f "$0")")/.." || exit 1
 K=${KERNEL:-xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837}
-[ -f $K ] || { K=prebuilt/mach.development.bcm2837; echo "run-ios.sh: no kernel built here, using $K" >&2; }
+[ -f $K ] || { echo "run-ios.sh: no kernel built here ($K)" >&2; exit 1; }
 IMG=${IMG:-userland/system.apfs}
 ROOT=${ROOT:-userland/root.apfs}
 [ -f "$IMG" ] && [ -f "$ROOT" ] || { echo "run-ios.sh: $IMG or $ROOT is missing (userland/build.sh makes them)"; exit 1; }
@@ -105,7 +105,7 @@ if [ -n "$QEMU_NET" ] && [ "$QEMU_NET" != 0 ]; then
 	NET=(-netdev user,id=net0 -device virtio-net-device,netdev=net0)
 	CMDLINE="virtio_net=1 $CMDLINE"
 fi
-# the sound device (QEMU 8.2 or newer has one for this machine): the kernel's sink for /dev/redwood-audio
+# the sound device (QEMU 8.2 or newer has one for this machine): the kernel's sink for /dev/annibale-audio
 SOUND=()
 if qemu-system-aarch64 -device help 2>/dev/null | grep -q '"virtio-sound-device"'; then
 	case "${AUDIO:-none}" in

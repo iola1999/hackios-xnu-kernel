@@ -52,33 +52,26 @@ extern void gic_v3_irq_cpu_shutdown(void);
 void loader_log_putc(char c);
 void loader_return(void);
 void hv_wdt_pet_NOW(void);
-extern void redwood_adreno_quiesce(void);
-extern void redwood_adreno_stop(void);
-extern void redwood_adreno_minute(void);
+extern void annibale_adreno_quiesce(void);
+extern void annibale_adreno_stop(void);
+extern void annibale_adreno_minute(void);
 extern void adreno8_quiesce(void);      /* bsd/dev/adreno8.c: the Adreno 830's stepper on the other phone */
 extern void adreno8_return_quiesce(void);
-extern void redwood_wifi_stop(void);
-extern void redwood_wifi_quiesce(void);
-extern void redwood_adsp_stop(void);
-extern void redwood_adsp_quiesce(void);
-extern void redwood_ddr_quiesce(void);
-extern void redwood_haptic_quiesce(void);
+extern void annibale_wifi_stop(void);
+extern void annibale_wifi_quiesce(void);
 extern void annibale_haptic_quiesce(void);
-extern void redwood_torch_quiesce(void);
 extern void annibale_torch_quiesce(void);
-extern void redwood_camera_quiesce(void);
-extern void redwood_mic_quiesce(void);
 extern void MiniIOMobileFramebufferQuiesce(void);   /* iokit/Kernel/MiniFramebufferFlip.inc */
 extern void MiniIOMobileFramebufferPowerOff(void);
-boolean_t redwood_halting_poweroff = FALSE;
-extern void redwood_ufs_quiesce(void);
-extern void redwood_var_save_on_return(void);   /* bsd/dev/redwood_ufs.c: the data volume into the flash */
-extern int redwood_ufs_var_io(bool write, uint64_t offset, void *buf, uint64_t len);
+boolean_t annibale_halting_poweroff = FALSE;
+extern void annibale_ufs_quiesce(void);
+extern void annibale_var_save_on_return(void);   /* bsd/dev/annibale_ufs.c: the data volume into the flash */
+extern int annibale_ufs_var_io(bool write, uint64_t offset, void *buf, uint64_t len);
 extern uint32_t crc32(uint32_t crc, const void *buf, size_t len);
 void loader_checkpoint(uint64_t n);
 
-#define RDWFS_PANIC_OFFSET       (64ULL << 20)
-#define RDWFS_PANIC_SIZE         (16ULL << 20)
+#define ANNFS_PANIC_OFFSET       (64ULL << 20)
+#define ANNFS_PANIC_SIZE         (16ULL << 20)
 #define KLOG_MAGIC               0x474f4c4bU     /* 'KLOG' */
 #define KLOG_VERSION             1U
 
@@ -295,7 +288,7 @@ loader_panic_sync_ufs(const char *reason, uint32_t flags)
 	kh->payload_crc = crc32(0, p, at);
 	kh->head_crc = crc32(0, kh, __builtin_offsetof(struct klog_head, head_crc));
 
-	(void)redwood_ufs_var_io(true, RDWFS_PANIC_OFFSET, loader_panic_buf, write_len);
+	(void)annibale_ufs_var_io(true, ANNFS_PANIC_OFFSET, loader_panic_buf, write_len);
 
 	if (locked) {
 		os_atomic_store(&loader_panic_sync_lock, 0, release);
@@ -377,7 +370,7 @@ extern uint64_t loader_stub_slot[4];
  * valid from the first instruction; the loader knows the distance to the physical ones.
  */
 
-/* The inbox: a file from the host while the kernel runs, for rwsh "pull" (kern.redwood.inbox), so a
+/* The inbox: a file from the host while the kernel runs, for rwsh "pull" (kern.annibale.inbox), so a
  * library can be replaced without a new image. In the kernel image so its memory is contiguous and
  * the loader reaches it the way it reaches the log. 16 MB holds the AIR library (about 15 MB); the
  * kernel's static span and the root image after it have to end below the resident system image at
@@ -391,7 +384,7 @@ static char loader_inbox[LOADER_INBOX_SIZE] __attribute__((aligned(16384)));
  * loader to hand to the host once the kernel is back. { physical address, bytes, kernel address }.
  */
 uint64_t loader_recording[3];
-/* ... and of the sound (/dev/redwood-audio makes one with boot-arg rec_sound). */
+/* ... and of the sound (/dev/annibale-audio makes one with boot-arg rec_sound). */
 uint64_t loader_sound[3];
 
 struct loader_live loader_live = {
@@ -417,7 +410,7 @@ loader_live_inbox(const char **data, uint64_t *len)
 
 /*
  * The last command the host passed through the loader ("oem sh TEXT") and its sequence number, 0
- * before the first; for kern.redwood.cmd in bsd/dev/redwood_threads.c. The loader writes the text
+ * before the first; for kern.annibale.cmd in bsd/dev/annibale_threads.c. The loader writes the text
  * and then the number from its own core without a lock, so the text is taken only when the number
  * reads the same before and after the copy.
  */
@@ -618,19 +611,13 @@ loader_return(void)
 	/* Synchronously flush final complete panic/crash log to darwin_var reserved sector before storage quiesce */
 	loader_panic_sync_ufs("loader_return", 1);
 
-	redwood_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
-	redwood_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
+	annibale_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
+	annibale_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
 	adreno8_return_quiesce();       /* the other phone's GMU back in reset and its translation off without parking */
-	redwood_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
-	redwood_adsp_quiesce();         /* nor the audio DSP */
-	redwood_ddr_quiesce();          /* and the vote for the memory's bandwidth taken away */
-	redwood_haptic_quiesce();       /* the vibration motor's chip back into reset, if it was let out */
+	annibale_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
 	annibale_haptic_quiesce();      /* or the PMIC's haptics block of the other phone, if it was configured */
-	redwood_torch_quiesce();        /* the flashlight off, if it was lit */
 	annibale_torch_quiesce();       /* or the other phone's, lit on its PMIC's flash module */
-	redwood_camera_quiesce();       /* the camera powered down, if it was powered up */
-	redwood_mic_quiesce();          /* (what the microphones' path did, said again: it happens in the log's middle) */
-	if (redwood_halting_poweroff) {
+	if (annibale_halting_poweroff) {
 		MiniIOMobileFramebufferPowerOff();
 	} else {
 		MiniIOMobileFramebufferQuiesce();       /* the display back on the boot framebuffer, the last frame in it (fb_flip) */
@@ -682,10 +669,9 @@ loader_return_timer(__unused thread_call_param_t p0, __unused thread_call_param_
 		loader_panic_sync_ufs("return_panic_timer", 2);
 	}
 	if (!as_panic) {
-		redwood_var_save_on_return();   /* the data volume kept, while the system is still whole */
-		redwood_adreno_stop();          /* a GPU kept for the system is given back while there is a thread to wait in */
-		redwood_wifi_stop();            /* and the Wi-Fi DSP, if it runs, shut down */
-		redwood_adsp_stop();            /* and the audio DSP */
+		annibale_var_save_on_return();   /* the data volume kept, while the system is still whole */
+		annibale_adreno_stop();          /* a GPU kept for the system is given back while there is a thread to wait in */
+		annibale_wifi_stop();            /* and the Wi-Fi DSP, if it runs, shut down */
 	}
 	if (PE_parse_boot_argn("return_cpu", &cpu, sizeof(cpu)) && cpu <= (uint32_t)ml_get_max_cpu_number() &&
 	    cpu_xcall((int)cpu, loader_return_test, (void *)(uintptr_t)(as_panic ? 2 : 1)) == KERN_SUCCESS) {
@@ -728,10 +714,9 @@ loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p
 		for (const char *c = banner; *c; c++) {
 			loader_log_putc(*c);
 		}
-		redwood_var_save_on_return();
-		redwood_adreno_stop();
-		redwood_wifi_stop();
-		redwood_adsp_stop();
+		annibale_var_save_on_return();
+		annibale_adreno_stop();
+		annibale_wifi_stop();
 		loader_return();
 	}
 	clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
@@ -779,11 +764,11 @@ extern void MiniIOSurfaceUsage(uint32_t *count, uint64_t *bytes);
  * daemons, and once none is left and it is below the second, whatever is next in line -- the
  * window server included.
  */
-void redwood_memory_line(char *buf, size_t len);
+void annibale_memory_line(char *buf, size_t len);
 
-/* The line itself (also kern.redwood_memory, for a job list to keep: bsd/miscfs/apfs/apfs_vfsops.c) */
+/* The line itself (also kern.annibale_memory, for a job list to keep: bsd/miscfs/apfs/apfs_vfsops.c) */
 void
-redwood_memory_line(char *buf, size_t len)
+annibale_memory_line(char *buf, size_t len)
 {
 #define MB(pages)       ((unsigned int)(((uint64_t)(pages) * PAGE_SIZE) >> 20))
 	uint32_t surfaces = 0;
@@ -806,9 +791,9 @@ memory_report(void)
 {
 	char line[256];
 
-	redwood_memory_line(line, sizeof(line));
+	annibale_memory_line(line, sizeof(line));
 	printf("%s", line);
-	redwood_adreno_minute();                /* (and how warm the GPU is, if it is in use) */
+	annibale_adreno_minute();                /* (and how warm the GPU is, if it is in use) */
 }
 
 void

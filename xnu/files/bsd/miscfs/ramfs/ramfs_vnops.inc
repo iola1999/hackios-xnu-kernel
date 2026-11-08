@@ -82,6 +82,7 @@ ramfs_make(vnode_t dvp, vnode_t *vpp, struct componentname *cnp, struct vnode_at
 		return error;
 	}
 	node->rn_ino = rm->rm_next_ino++;
+	ramfs_track(node);
 	if ((vap == NULL || !VATTR_IS_ACTIVE(vap, va_dataprotect_class) ||
 	    vap->va_dataprotect_class == PROTECTION_CLASS_DEFAULT) && dir->rn_dataprotect_class != 0)
 		node->rn_dataprotect_class = dir->rn_dataprotect_class;
@@ -266,6 +267,7 @@ ramfs_getattr(struct vnop_getattr_args *ap)
 	VATTR_RETURN(vap, va_gid, node->rn_gid);
 	VATTR_RETURN(vap, va_mode, node->rn_mode);
 	VATTR_RETURN(vap, va_flags, node->rn_bsdflags);
+	VATTR_RETURN(vap, va_document_id, node->rn_docid);
 	VATTR_RETURN(vap, va_create_time, node->rn_btime);
 	VATTR_RETURN(vap, va_addedtime, node->rn_btime);
 	VATTR_RETURN(vap, va_access_time, node->rn_atime);
@@ -344,6 +346,7 @@ ramfs_setattr(struct vnop_setattr_args *ap)
 	}
 	if (VATTR_IS_ACTIVE(vap, va_flags)) {
 		node->rn_bsdflags = vap->va_flags;
+		ramfs_track(node);
 		VATTR_SET_SUPPORTED(vap, va_flags);
 	}
 	if (VATTR_IS_ACTIVE(vap, va_dataprotect_class)) {

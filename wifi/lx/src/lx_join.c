@@ -2,7 +2,7 @@
  * The station of the 802.11 layer, its second half (the first is lx_80211.c, whose remarks at the
  * top describe both): joining one network protected with WPA2 -- authentication, association,
  * the four-way handshake of lx_wpa.c, the keys given to the driver --, block ack sessions the
- * access point asks for, leaving again, and the station as the kernel asks for it (redwood_sta.h).
+ * access point asks for, leaving again, and the station as the kernel asks for it (annibale_sta.h).
  */
 #include "lx_80211.h"
 
@@ -501,7 +501,7 @@ station_width(struct lx_radio *radio, struct linuxkpi_ieee80211_channel *primary
  * the last scan, if that heard the network, or one made now.
  */
 static int
-station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
+station_join(struct lx_radio *radio, const struct annibale_sta_join *what)
 {
 	const uint8_t *name = what->ssid;
 	unsigned name_length = what->ssid_length;
@@ -520,7 +520,7 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
 	if (name_length == 0 || name_length > sizeof(radio->want)) {
 		return (EINVAL);
 	}
-	if (what->security != REDWOOD_STA_WPA2_PSK) {
+	if (what->security != ANNIBALE_STA_WPA2_PSK) {
 		lx_tell("lx: a network without WPA2 and a passphrase is asked for: that is not built\n");
 		return (ENOTSUP);
 	}
@@ -798,7 +798,7 @@ out:
 int
 lx_station_join(void)
 {
-	static struct redwood_sta_join what;
+	static struct annibale_sta_join what;
 	struct lx_radio *radio = the_radio;
 	unsigned name_length = sizeof(what.ssid), passphrase_length = sizeof(what.passphrase);
 	int error;
@@ -813,7 +813,7 @@ lx_station_join(void)
 	}
 	what.ssid_length = (uint8_t)name_length;
 	what.passphrase_length = (uint8_t)passphrase_length;
-	what.security = REDWOOD_STA_WPA2_PSK;
+	what.security = ANNIBALE_STA_WPA2_PSK;
 	lx_os_net_attach(radio->wiphy->perm_addr);
 	error = station_join(radio, &what);
 	explicit_bzero(&what, sizeof(what));
@@ -865,7 +865,7 @@ lx_station_send(const unsigned char *frame, unsigned long length)
 	return (lx_ethernet_send(radio, frame, (unsigned)length) ? 0 : ENOBUFS);
 }
 
-/* ---- the station boundary: what the kernel asks through sys/redwood_sta.h --------------------------------- */
+/* ---- the station boundary: what the kernel asks through sys/annibale_sta.h --------------------------------- */
 
 static int
 boundary_power(bool on)
@@ -887,7 +887,7 @@ boundary_power(bool on)
 }
 
 static int
-boundary_scan(const struct redwood_sta_scan *what)
+boundary_scan(const struct annibale_sta_scan *what)
 {
 	static unsigned said;
 	struct lx_radio *radio = the_radio;
@@ -912,9 +912,9 @@ boundary_scan(const struct redwood_sta_scan *what)
 }
 
 static void
-boundary_heard(void (*each)(const struct redwood_sta_bss *, void *), void *context)
+boundary_heard(void (*each)(const struct annibale_sta_bss *, void *), void *context)
 {
-	static struct redwood_sta_bss bss;	/* (one thread calls this) */
+	static struct annibale_sta_bss bss;	/* (one thread calls this) */
 	struct lx_radio *radio = the_radio;
 
 	for (unsigned i = 0; radio != NULL && i < radio->heard_count; i++) {
@@ -940,7 +940,7 @@ boundary_heard(void (*each)(const struct redwood_sta_bss *, void *), void *conte
 }
 
 static int
-boundary_join(const struct redwood_sta_join *what)
+boundary_join(const struct annibale_sta_join *what)
 {
 	struct lx_radio *radio = the_radio;
 	int error;
@@ -975,7 +975,7 @@ boundary_leave(void)
 
 /* (on any thread: nothing here but reading) */
 static void
-boundary_state(struct redwood_sta_state *state)
+boundary_state(struct annibale_sta_state *state)
 {
 	struct lx_radio *radio = the_radio;
 
@@ -984,8 +984,8 @@ boundary_state(struct redwood_sta_state *state)
 		return;
 	}
 	lx_os_lock();
-	state->phase = radio->joined ? REDWOOD_STA_JOINED : radio->joining ? REDWOOD_STA_JOINING : radio->scan == 1 ?
-	    REDWOOD_STA_SCANNING : REDWOOD_STA_IDLE;
+	state->phase = radio->joined ? ANNIBALE_STA_JOINED : radio->joining ? ANNIBALE_STA_JOINING : radio->scan == 1 ?
+	    ANNIBALE_STA_SCANNING : ANNIBALE_STA_IDLE;
 	state->last_error = radio->last_error;
 	if ((radio->joined || radio->joining) && radio->target.found) {
 		memcpy(state->bss.bssid, radio->target.address, ETH_ALEN);
@@ -1003,7 +1003,7 @@ boundary_state(struct redwood_sta_state *state)
 }
 
 static unsigned
-boundary_channels(struct redwood_sta_channel *channels, unsigned most)
+boundary_channels(struct annibale_sta_channel *channels, unsigned most)
 {
 	struct lx_radio *radio = the_radio;
 	unsigned count = 0;
@@ -1014,15 +1014,15 @@ boundary_channels(struct redwood_sta_channel *channels, unsigned most)
 		for (int i = 0; has != NULL && i < has->n_channels && count < most; i++) {
 			if (!(has->channels[i].flags & IEEE80211_CHAN_DISABLED)) {
 				channels[count].frequency = (uint16_t)has->channels[i].center_freq;
-				channels[count++].flags = (uint16_t)((has->channels[i].flags & IEEE80211_CHAN_NO_IR ? REDWOOD_STA_CHANNEL_PASSIVE :
-				    0) | (has->channels[i].flags & IEEE80211_CHAN_RADAR ? REDWOOD_STA_CHANNEL_RADAR : 0));
+				channels[count++].flags = (uint16_t)((has->channels[i].flags & IEEE80211_CHAN_NO_IR ? ANNIBALE_STA_CHANNEL_PASSIVE :
+				    0) | (has->channels[i].flags & IEEE80211_CHAN_RADAR ? ANNIBALE_STA_CHANNEL_RADAR : 0));
 			}
 		}
 	}
 	return (count);
 }
 
-static struct redwood_sta_ops boundary = {
+static struct annibale_sta_ops boundary = {
 	.power = boundary_power,
 	.scan = boundary_scan,
 	.heard = boundary_heard,

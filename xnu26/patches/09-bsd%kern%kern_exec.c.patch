@@ -134,7 +134,7 @@ index 2467b24045cd..40afa39a3a7f 100644
 -	}
  
 +	/*
-+	 * redwood: three of the four checks below cannot be passed in this port, and all stand in
++	 * annibale: three of the four checks below cannot be passed in this port, and all stand in
 +	 * the way of something ordinary. The entitlement is one nobody carries here (nothing is
 +	 * signed, AMFI is a stub), and the persona is one nobody makes -- yet a package manager
 +	 * becomes root by asking for exactly this: Sileo spawns apt and dpkg into persona 99 with
@@ -172,7 +172,7 @@ index 2467b24045cd..40afa39a3a7f 100644
  	if (!persona) {
 -		return ESRCH;
 +		/*
-+		 * redwood: there are no personas in this port -- nothing makes them, and
++		 * annibale: there are no personas in this port -- nothing makes them, and
 +		 * kpersona_find_by_type() answers "no such process" to everyone who asks. iOS's own
 +		 * programs get along without them, but a package manager becomes root by way of one:
 +		 * Sileo asks posix_spawn for persona 99 with OVERRIDE and uid 0 (its APTWrapper), and
@@ -375,7 +375,7 @@ index 2467b24045cd..40afa39a3a7f 100644
 -	} while (new_pid_version == previous_pid_version);
 -	proc_setpidversion(p, new_pid_version);
 +	/*
-+	 * (redwood) Except when xpcproxy becomes the service it was spawned for: then the process keeps
++	 * (annibale) Except when xpcproxy becomes the service it was spawned for: then the process keeps
 +	 * xpcproxy's identity version, as if launchd had spawned the service itself, which is what launchd
 +	 * means by eliding xpcproxy ("service will attempt to elide xpcproxy"; here it spawns xpcproxy
 +	 * all the same). RunningBoard keeps the audit token of such a process from before the exec and

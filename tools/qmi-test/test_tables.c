@@ -167,7 +167,7 @@ test_ath11k_tables(void)
 
 		/* filled to the brim: as long as ath11k's header says the message can get */
 		fill(m->ei, a, true, FILL_MOST);
-		length = redwood_qmi_encode(QMI_REQUEST, 1, 1, m->ei, a, message, sizeof(message));
+		length = annibale_qmi_encode(QMI_REQUEST, 1, 1, m->ei, a, message, sizeof(message));
 		check(length >= QMI_HEADER_SIZE, "%s: cannot be encoded when full (%d)", m->name, length);
 		if (m->limit >= 0) {
 			/*
@@ -184,7 +184,7 @@ test_ath11k_tables(void)
 			check(length - QMI_HEADER_SIZE == expected, "%s: full, it encodes to %d bytes, not %d (ath11k's header says %d at most)",
 			    m->name, length - QMI_HEADER_SIZE, expected, m->limit);
 		}
-		check(redwood_qmi_decode(message, (size_t)length, m->ei, b) == length && same(m->ei, a, b, true), "%s: full, it does not come back the same",
+		check(annibale_qmi_decode(message, (size_t)length, m->ei, b) == length && same(m->ei, a, b, true), "%s: full, it does not come back the same",
 		    m->name);
 		/* (the bytes after a structure are guard bytes: nothing may have been written there) */
 		check(memcmp(b + m->size, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16) == 0, "%s: decoding wrote past the structure", m->name);
@@ -194,12 +194,12 @@ test_ath11k_tables(void)
 			memset(a, 0, m->size);
 			memset(b, 0, m->size);
 			fill(m->ei, a, true, FILL_RANDOM);
-			length = redwood_qmi_encode(QMI_INDICATION, (uint16_t)rnd(), (uint16_t)rnd(), m->ei, a, message, sizeof(message));
-			if (length < 0 || redwood_qmi_decode(message, (size_t)length, m->ei, b) != length || !same(m->ei, a, b, true)) {
+			length = annibale_qmi_encode(QMI_INDICATION, (uint16_t)rnd(), (uint16_t)rnd(), m->ei, a, message, sizeof(message));
+			if (length < 0 || annibale_qmi_decode(message, (size_t)length, m->ei, b) != length || !same(m->ei, a, b, true)) {
 				check(false, "%s: round %d: does not come back the same (%d)", m->name, round, length);
 				break;
 			}
-			second = redwood_qmi_encode(message[0], (uint16_t)(message[3] | message[4] << 8), (uint16_t)(message[1] | message[2] << 8),
+			second = annibale_qmi_encode(message[0], (uint16_t)(message[3] | message[4] << 8), (uint16_t)(message[1] | message[2] << 8),
 			    m->ei, b, again, sizeof(again));
 			if (second != length || memcmp(message, again, (size_t)length) != 0) {
 				check(false, "%s: round %d: encoded again, the bytes differ", m->name, round);
@@ -223,7 +223,7 @@ test_ath11k_tables(void)
 					uint8_t *exact = malloc(cut ? cut : 1);
 
 					memcpy(exact, damaged, cut);
-					(void)redwood_qmi_decode(exact, cut, m->ei, b);
+					(void)annibale_qmi_decode(exact, cut, m->ei, b);
 					free(exact);
 				}
 				checks++;

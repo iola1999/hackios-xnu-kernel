@@ -25,7 +25,7 @@ USERLAND_ROOT = os.path.join(TOP_ROOT, "hackios-xnu-userland")
 
 
 # ==============================================================================
-# Helper for rw_pipe_key implementation (matching redwoodmetal_pipecache.inc)
+# Helper for rw_pipe_key implementation (matching annibalemetal_pipecache.inc)
 # ==============================================================================
 def rw_pipe_add_bytes(h, data: bytes):
     n = len(data) if data is not None else 0
@@ -42,7 +42,7 @@ def compute_rw_pipe_key(
     shape_bytes: bytes,
     linked_functions: list,
 ) -> bytes:
-    """Exact python reproduction of rw_pipe_key from redwoodmetal_pipecache.inc."""
+    """Exact python reproduction of rw_pipe_key from annibalemetal_pipecache.inc."""
     h = hashlib.sha256()
     rw_pipe_add_bytes(h, vertex_air)
     rw_pipe_add_bytes(h, vertex_name.encode("utf-8") if vertex_name else b"")
@@ -207,13 +207,13 @@ def test_m1_pipe_key_topological_differences():
 
 def test_m1_air_cache_format_and_corruption():
     """Verify .air cache serialization, naming, and truncation behavior."""
-    stitch_inc = os.path.join(KERNEL_ROOT, "tools/userland-driver/redwoodmetal_stitch.inc")
+    stitch_inc = os.path.join(KERNEL_ROOT, "tools/userland-driver/annibalemetal_stitch.inc")
     with open(stitch_inc, "r", encoding="utf-8") as f:
         src = f.read()
 
     # Check that .air extension is used consistently
     air_paths = re.findall(r'stringWithFormat:@"([^"]+)"', src)
-    air_patterns = [p for p in air_paths if "redwood-aircache" in p or "%@.air" in p]
+    air_patterns = [p for p in air_paths if "annibale-aircache" in p or "%@.air" in p]
     assert len(air_patterns) > 0, "No .air cache paths found in stitch.inc"
     for p in air_patterns:
         assert p.endswith(".air"), f"Cache path does not end in .air: {p}"
@@ -314,8 +314,8 @@ def test_m2_directory_permissions_and_paths():
     assert skel_dict[loc_dir]["mode"] == "755", f"{loc_dir} has incorrect mode {skel_dict[loc_dir]['mode']} (expected 755)"
     print(f"PASS M2.4: var.skel.extra locationd entry verified: {loc_dir} (205:205 755)")
 
-    # redwood-aircache & ir3cache: 777
-    for cache_p in ["/private/var/db/redwood-aircache", "/private/var/db/redwood-ir3cache"]:
+    # annibale-aircache & ir3cache: 777
+    for cache_p in ["/private/var/db/annibale-aircache", "/private/var/db/annibale-ir3cache"]:
         assert cache_p in skel_dict, f"Missing cache dir: {cache_p}"
         assert skel_dict[cache_p]["mode"] == "777", f"{cache_p} mode is {skel_dict[cache_p]['mode']}"
         print(f"PASS M2.5: var.skel.extra shader cache dir verified: {cache_p} (777)")
@@ -330,10 +330,10 @@ def test_m2_directory_permissions_and_paths():
     assert 'chown("/private/var/mobile/Library/Weather", 501, 501);' in init_src
     assert 'mkdir("/private/var/db/locationd", 0755);' in init_src
     assert 'chown("/private/var/db/locationd", 205, 205);' in init_src
-    assert 'mkdir("/private/var/db/redwood-aircache", 0777);' in init_src
-    assert 'chmod("/private/var/db/redwood-aircache", 0777);' in init_src
-    assert 'mkdir("/private/var/db/redwood-ir3cache", 0777);' in init_src
-    assert 'chmod("/private/var/db/redwood-ir3cache", 0777);' in init_src
+    assert 'mkdir("/private/var/db/annibale-aircache", 0777);' in init_src
+    assert 'chmod("/private/var/db/annibale-aircache", 0777);' in init_src
+    assert 'mkdir("/private/var/db/annibale-ir3cache", 0777);' in init_src
+    assert 'chmod("/private/var/db/annibale-ir3cache", 0777);' in init_src
     print("PASS M2.6: init_mount.inc runtime self-healing and permission enforcement verified")
 
 

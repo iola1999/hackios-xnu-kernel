@@ -483,7 +483,7 @@ static void sc_write_logs(void)
 	CK(compose_calls == 1, "wlog_held_stages");
 	CK(find_calls == 0 && w_blocks == 0 && flushes == 0, "wlog_held_no_firmware_calls");
 	CK(cap_has("KERNEL LOG"), "wlog_held_echoes");
-	active_watch = 1;   /* the watch loop keeps its cooperative flush (redwood notes) */
+	active_watch = 1;   /* the watch loop keeps its cooperative flush (annibale notes) */
 	find_calls = w_blocks = 0;
 	write_logs("k", 1);
 	CK(find_calls == 1 && w_blocks > 0, "wlog_watch_allowed");

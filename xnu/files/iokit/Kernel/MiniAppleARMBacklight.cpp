@@ -77,7 +77,7 @@ fixed_nits(uint64_t millinits)
 
 /* The level the mixers were last given, in 1024ths (nits over kBLMilliNitsMax; full while the panel takes the value). */
 extern "C" {
-uint32_t redwood_backlight_level = kBLLevelFull;
+uint32_t annibale_backlight_level = kBLLevelFull;
 }
 
 class AppleARMBacklight : public IOService
@@ -349,8 +349,8 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 	level = (uint32_t) (millinits * kBLLevelFull / kBLMilliNitsMax);
 	/* with fb_dcs=4 the panel takes v itself, and the mixers are given the full level */
 	mixed = MiniIOMobileFramebufferDCS((uint32_t) v) ? kBLLevelFull : level;
-	if (mixed != redwood_backlight_level) {
-		redwood_backlight_level = mixed;
+	if (mixed != annibale_backlight_level) {
+		annibale_backlight_level = mixed;
 		MiniIOMobileFramebufferDim(mixed);
 	}
 	bl.service->publish(v, millinits);

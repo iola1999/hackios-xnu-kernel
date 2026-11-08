@@ -167,7 +167,7 @@ gpu_load_ucode(const char *name, struct adreno8_memory **out)
 {
 	uint64_t size = 0;
 	int disk = 0;
-	const uint8_t *image = redwood_image_file("fw", name, &size, &disk);
+	const uint8_t *image = annibale_image_file("fw", name, &size, &disk);
 	if (image == NULL || size < 8 || size > 0x1000000 || (size & 3))
 		return gpu_fail("microcode file bounds");
 	*out = adreno8_gpu_alloc(name, (uint32_t)size - 4, 4096, ADRENO8_MEM_READ | ADRENO8_MEM_EXEC);

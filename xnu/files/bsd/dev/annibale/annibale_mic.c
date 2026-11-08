@@ -10,7 +10,7 @@
  *                            MOD_PCM_ENC (0x07001004, IID 0x6022) ->
  *                            MOD_RD_SHMEM (0x07001001, IID 0x6021)
  *   - Shared DMA capture window at reach_buffer + 0x8000 (4 slots of 960 frames @ 48 kHz)
- *   - Exposes 48 kHz 16-bit PCM capture on both /dev/redwood-mic and /dev/redwood-audio read()
+ *   - Exposes 48 kHz 16-bit PCM capture on both /dev/annibale-mic and /dev/annibale-audio read()
  */
 
 #include <kern/clock.h>
@@ -26,7 +26,7 @@
 #include <sys/fcntl.h>
 #include <sys/param.h>
 #include <sys/proc.h>
-#include <sys/redwood_audio.h>
+#include <sys/annibale_audio.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
 #include <sys/vnode.h>
@@ -513,12 +513,12 @@ harvest_capture_period(uint32_t slot, volatile uint8_t *dma_va, uint32_t valid_b
 	}
 	lck_spin_unlock(amic_ring_lock);
 
-	if (redwood_audio_recording_mic()) {
+	if (annibale_audio_recording_mic()) {
 		for (uint32_t i = 0; i < valid_samples; i++) {
 			period_stereo[2 * i] = period_mono[i];
 			period_stereo[2 * i + 1] = period_mono[i];
 		}
-		redwood_audio_record_fed(period_stereo, valid_samples);
+		annibale_audio_record_fed(period_stereo, valid_samples);
 	}
 }
 
@@ -530,7 +530,7 @@ mic_capture_thread(void *arg __unused, wait_result_t w __unused)
 
 	say("capture feeder thread running\n");
 	for (;;) {
-		bool active = (mic_open_clients > 0) || redwood_audio_recording_mic();
+		bool active = (mic_open_clients > 0) || annibale_audio_recording_mic();
 		if (active) {
 			lck_mtx_lock(&amic_lock);
 			if (mic_capture_error != 0 || (!mic_graphs_started && !start_capture_graphs())) {
@@ -558,7 +558,7 @@ mic_capture_thread(void *arg __unused, wait_result_t w __unused)
 	}
 }
 
-/* ---- /dev/redwood-mic and /dev/redwood-audio read() implementation --------------------------- */
+/* ---- /dev/annibale-mic and /dev/annibale-audio read() implementation --------------------------- */
 
 int annibale_mic_read(struct uio *uio, int ioflag);
 void annibale_mic_init(void);
@@ -695,10 +695,10 @@ annibale_mic_init(void)
 	}
 
 	int major = cdevsw_add(-1, &mic_cdevsw);
-	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-mic") == NULL) {
-		say("warning: could not create /dev/redwood-mic node\n");
+	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "annibale-mic") == NULL) {
+		say("warning: could not create /dev/annibale-mic node\n");
 	} else {
-		say("registered /dev/redwood-mic (major %d)\n", major);
+		say("registered /dev/annibale-mic (major %d)\n", major);
 	}
 
 	uint32_t mic_boot = 0;

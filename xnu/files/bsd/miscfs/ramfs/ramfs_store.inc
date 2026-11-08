@@ -2,7 +2,7 @@
  * ramfs_store.inc: File page allocation, storage, and persistence write helpers.
  *
  * ramfs_store() allocates and writes data to a node's in-memory page slots
- * and prepares disk block writes for disk-backed mounts (RDWFS001).
+ * and prepares disk block writes for disk-backed mounts (ANNFS001).
  * ramfs_store_write() performs synchronous UFS block writes and memory-pressure
  * page evictions outside rm->rm_lock to prevent lock contention during bulk writes
  * and seed unpack.

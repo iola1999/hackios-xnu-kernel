@@ -36,7 +36,7 @@ adreno8_smmu_layout(void)
 	printf("adreno8: %u: SMMU: %u stream match registers, %u contexts, %u pages of %#x before the contexts' own\n", adreno8_step,
 	    adreno8_smmu_matches, adreno8_smmu_contexts, adreno8_smmu_pages, adreno8_smmu_page);
 	if (2 * adreno8_smmu_pages * adreno8_smmu_page != adreno8_smmu.size) {
-		printf("adreno8: %u: that makes %#x of registers, the device tree says %#x: believed anyway (redwood's formula, an open question here)\n",
+		printf("adreno8: %u: that makes %#x of registers, the device tree says %#x: believed anyway (the POCO X5 Pro's formula, an open question here)\n",
 		    adreno8_step, 2 * adreno8_smmu_pages * adreno8_smmu_page, adreno8_smmu.size);
 	}
 	if (adreno8_smmu_contexts <= GMU_CONTEXT ||

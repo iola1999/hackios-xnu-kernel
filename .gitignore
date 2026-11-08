@@ -5,6 +5,7 @@
 !/.gitignore
 !/README.md
 !/LICENSE
+!/NOTICES.md
 !/common/
 !/docs/
 !/xl
@@ -30,7 +31,6 @@ __pycache__/
 # hackios-xnu-userland's files share this working tree (common/setup.sh)
 /docs/air.md
 /docs/air-report.md
-/prebuilt/userland/
 /tools/apfs/
 /tools/air/
 /tools/mesa/

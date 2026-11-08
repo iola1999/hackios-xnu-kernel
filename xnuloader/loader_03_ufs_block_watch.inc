@@ -8,14 +8,14 @@
  * resident, and this loader already serves the kernel from core 0 while the kernel runs on another
  * (the battery). So the kernel asks for blocks through a page both can see, and core 0 reads them
  * with that driver's ReadBlocks into a buffer both can see. The kernel's side is
- * bsd/dev/redwood_ufs.c; it gets the page's address as ufs_shared_pa= on its command line.
+ * bsd/dev/annibale_ufs.c; it gets the page's address as ufs_shared_pa= on its command line.
  *
  * Reads, and -- with ufs_write=1 on the command line -- writes into one place and nowhere else:
  * dsu_store, the last 4 GiB of the slot Android's DSU installer keeps the iOS system image in
  * (loader_dsu.inc, dsu_store_open). It is not a GPT partition: this loader lists it in the table as
  * one, of its own blocks, and maps them onto the extents of the DSU file in userdata. No answer to
  * the kernel can reach any other part of the storage. The refusals are here, in the kernel
- * (bsd/dev/redwood_ufs.c) and in UEFI's own driver, which bounds userdata: a request has to pass
+ * (bsd/dev/annibale_ufs.c) and in UEFI's own driver, which bounds userdata: a request has to pass
  * all three.
  *
  * Each side writes its own cache lines only: the kernel the request, core 0 the answer (and the
@@ -25,7 +25,7 @@
  * nothing of its own in its cache to write back over the data; the kernel, which fills the buffer
  * for a write, cleans its own lines of it before it asks.
  */
-#define BLOCK_MAGIC        0x4b434f4c42574452ULL       /* "RDWBLOCK" */
+#define BLOCK_MAGIC        0x4b434f4c424e4e41ULL       /* "ANNBLOCK" */
 #define BLOCK_VERSION      3
 #define BLOCK_MAX_PARTS    160
 #define BLOCK_MAX_UNITS    16
@@ -708,7 +708,7 @@ charger_start(void)
 	static const efi_guid qcom_charger_guid = QCOM_CHARGER_GUID;
 	efi_status ex_status, qcom_status, init_status = 0;
 
-	if (charger_enabled || PLAT != &platform_redwood) {
+	if (charger_enabled || PLAT != &platform_poco) {
 		return;
 	}
 	ex_status = BS->locate_protocol(&charger_ex_guid, NULL, (void **)&CHARGER_EX);

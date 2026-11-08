@@ -354,7 +354,7 @@ struct kernel_live {
  * boot-service client on core 0 while XNU runs on another core.  The loader is
  * therefore the one safe place to call it; XNU only reads this cache.
  */
-#define LOADER_BATTERY_MAGIC            0x2154544142574452ULL /* "RDWBATT!" */
+#define LOADER_BATTERY_MAGIC            0x21545441424e4e41ULL /* "ANNBATT!" */
 #define LOADER_BATTERY_VERSION          1
 #define LOADER_BATTERY_VALID            (1u << 0)
 #define LOADER_BATTERY_PRESENT          (1u << 1)

@@ -216,7 +216,7 @@ GenericARMPE::probe(IOService * provider, SInt32 * score)
  * failing all of them waits up to 5 seconds for an IONetworkController to be registered. This
  * device tree has none of them and nothing here is an IONetworkController, so every process
  * that asked waited the 5 seconds. The address published here is a locally administered one;
- * RedwoodWLAN still gives the radio's own address to its controller when there is a radio.
+ * AnnibaleWLAN still gives the radio's own address to its controller when there is a radio.
  */
 static void
 publishWifiAddress(void)
@@ -335,7 +335,7 @@ GenericARMPE::start(IOService * provider)
 
 /*
  * The time of day. On hardware the calendar clock is synced from the PMIC RTC and persist
- * partition by redwood_ufs_sync_rtc(); otherwise /chosen boot-epoch sets the starting offset.
+ * partition by annibale_ufs_sync_rtc(); otherwise /chosen boot-epoch sets the starting offset.
  */
 static long gBootEpoch;         /* the calendar time at which the system timer read zero */
 static bool gBootEpochKnown;

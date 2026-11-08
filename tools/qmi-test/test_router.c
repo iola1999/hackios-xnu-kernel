@@ -10,9 +10,9 @@
 #define SERVER_NODE     7
 #define SERVER_PORT     0x4001
 
-struct redwood_qrtr_port {
-	redwood_qrtr_receive_t receive;
-	redwood_qrtr_server_t server;
+struct annibale_qrtr_port {
+	annibale_qrtr_receive_t receive;
+	annibale_qrtr_server_t server;
 	void *context;
 	bool open;
 	unsigned lookups, sent, closed;
@@ -22,12 +22,12 @@ struct redwood_qrtr_port {
 	size_t last_length;
 	int send_error;                 /* what send answers */
 	/* what the other side does with a datagram: called from send (as a router that delivers at once would) */
-	void (*peer)(struct redwood_qrtr_port *port, const uint8_t *data, size_t length);
+	void (*peer)(struct annibale_qrtr_port *port, const uint8_t *data, size_t length);
 };
-static struct redwood_qrtr_port router;
+static struct annibale_qrtr_port router;
 
-static struct redwood_qrtr_port *
-router_open(redwood_qrtr_receive_t receive, redwood_qrtr_server_t server, void *context)
+static struct annibale_qrtr_port *
+router_open(annibale_qrtr_receive_t receive, annibale_qrtr_server_t server, void *context)
 {
 	memset(&router, 0, sizeof(router));
 	router.receive = receive;
@@ -38,7 +38,7 @@ router_open(redwood_qrtr_receive_t receive, redwood_qrtr_server_t server, void *
 }
 
 static int
-router_send(struct redwood_qrtr_port *port, uint32_t node, uint32_t to_port, const void *data, size_t length)
+router_send(struct annibale_qrtr_port *port, uint32_t node, uint32_t to_port, const void *data, size_t length)
 {
 	if (port->send_error) {
 		return port->send_error;
@@ -55,7 +55,7 @@ router_send(struct redwood_qrtr_port *port, uint32_t node, uint32_t to_port, con
 }
 
 static int
-router_lookup(struct redwood_qrtr_port *port, uint32_t service, uint32_t version, uint32_t instance)
+router_lookup(struct annibale_qrtr_port *port, uint32_t service, uint32_t version, uint32_t instance)
 {
 	port->lookups++;
 	port->looked_service = service;
@@ -65,13 +65,13 @@ router_lookup(struct redwood_qrtr_port *port, uint32_t service, uint32_t version
 }
 
 static void
-router_close(struct redwood_qrtr_port *port)
+router_close(struct annibale_qrtr_port *port)
 {
 	port->open = false;
 	port->closed++;
 }
 
-static const struct redwood_qrtr_ops router_ops = { router_open, router_send, router_lookup, router_close };
+static const struct annibale_qrtr_ops router_ops = { router_open, router_send, router_lookup, router_close };
 
 /* A datagram from the server to the handle, as the router's thread would bring it. */
 static void
@@ -219,7 +219,7 @@ static const struct qmi_msg_handler handle_handlers[] = {
 
 /* The peer of the simplest kind: answers "ask" with twice the number, at once. */
 static void
-doubling_peer(struct redwood_qrtr_port *port, const uint8_t *data, size_t length)
+doubling_peer(struct annibale_qrtr_port *port, const uint8_t *data, size_t length)
 {
 	uint8_t reply[32];
 	size_t n;
@@ -260,7 +260,7 @@ asker_thread(void *argument)
 	a->id = (uint16_t)qmi_txn_init(a->qmi, &txn, answer_ei, &a->answer);
 	a->result = qmi_send_request(a->qmi, NULL, &txn, MESSAGE_ASK, 16, ask_ei, &ask);
 	if (a->result == 0) {
-		a->result = redwood_qmi_txn_wait_ms(&txn, 3000);
+		a->result = annibale_qmi_txn_wait_ms(&txn, 3000);
 	}
 	return NULL;
 }
@@ -278,10 +278,10 @@ test_helpers(void)
 	int id, result;
 
 	/* no router: no handle */
-	redwood_qmi_set_transport(NULL);
+	annibale_qmi_set_transport(NULL);
 	check(qmi_handle_init(&qmi, 8192, &handle_ops, handle_handlers) == -ENXIO && qmi.sock == NULL, "a handle is made with no router there");
 
-	redwood_qmi_set_transport(&router_ops);
+	annibale_qmi_set_transport(&router_ops);
 	memset(&seen, 0, sizeof(seen));
 	check(qmi_handle_init(&qmi, 8192, &handle_ops, handle_handlers) == 0 && qmi.sock != NULL && router.open, "no handle with a router there");
 
@@ -311,7 +311,7 @@ test_helpers(void)
 		check_bytes(router.last, (int)router.last_length, want, sizeof(want), "the request as the router got it");
 		check(router.last_node == SERVER_NODE && router.last_port == SERVER_PORT, "the request goes to %u:%u", router.last_node, router.last_port);
 	}
-	result = redwood_qmi_txn_wait_ms(&txn, 1000);
+	result = annibale_qmi_txn_wait_ms(&txn, 1000);
 	check(result == 21 && answer.resp.result == 0 && answer.twice_valid == 1 && answer.twice == 42, "the reply does not arrive (%d, %u)", result,
 	    answer.twice);
 
@@ -362,7 +362,7 @@ test_helpers(void)
 	reply[1] ^= 0x40;
 	reply[8] = 9;                                   /* the TLV says more than the message has */
 	deliver(reply, n);
-	result = redwood_qmi_txn_wait_ms(&txn, 200);
+	result = annibale_qmi_txn_wait_ms(&txn, 200);
 	check(result == -EINVAL, "a reply that cannot be decoded gives %d", result);
 
 	/* three at once have three numbers; two threads ask, the replies come in the other order */
@@ -457,5 +457,5 @@ test_helpers(void)
 
 	qmi_handle_release(&qmi);
 	check(router.closed == 1 && !router.open && qmi.sock == NULL, "release does not close the port");
-	redwood_qmi_set_transport(NULL);
+	annibale_qmi_set_transport(NULL);
 }

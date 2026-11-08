@@ -16,7 +16,7 @@ index a92c3c0..284621a 100644
  	vm_named_entry_t        user_entry __unused,
  	ipc_port_t             *object_handle)
  {
-+	/* redwood: every failed copy entry (MAP_MEM_VM_COPY), with what it was asked for; at most 16 a
++	/* annibale: every failed copy entry (MAP_MEM_VM_COPY), with what it was asked for; at most 16 a
 +	 * boot. memory_entry_copy_failed below adds the map entry when the copy itself failed. */
 +	if (kr != KERN_SUCCESS && (permission & MAP_MEM_VM_COPY)) {
 +		static int said;
@@ -38,7 +38,7 @@ index a92c3c0..284621a 100644
  }
  
 +/*
-+ * redwood: say why a copy entry (MAP_MEM_VM_COPY) could not be made, with the map entry the range
++ * annibale: say why a copy entry (MAP_MEM_VM_COPY) could not be made, with the map entry the range
 + * starts in. QuartzCore sends an ASTC image's bytes to the window server as such an entry, and a
 + * failure reaches backboardd as "CompressedImage port is MACH_PORT_NULL!". At most 16 lines a boot.
 + */

@@ -2,15 +2,15 @@
  * The flashlight of the REDMI K90 (annibale, SM8750 "sun"): the flash LED module of the PM8550
  * (SPMI slave 1, registers 0xee00; the device tree's qcom,flash_led@ee00 under qcom,pm8550@1,
  * line 20878 of the merged decompile, "qcom,qti-pm8350c-flash-led" -- four channels, the same
- * block family as redwood's PM8350C of bsd/dev/redwood_torch.c), with the rear flash LED on its
+ * block family as the POCO X5 Pro's PM8350C), with the rear flash LED on its
  * channel 0. The camera's torch and flash hang off it: the camera nodes name pm8550_torch0
  * (phandle 0x6b7, line 20945: torch, current step 12500 uA, max-current-ma 0x1f4 -- 500) and
  * pm8550_flash0 (0x6b3, line 20988: flash, same step, 500 mA for 300 ms).
  *
  * Numbers come from the vendor driver of this platform, drivers/leds/leds-qti-flash.c of
  * kernel_oneplus_sm8750 branch "sixteen" (the device tree's compatible names it), from the
- * device tree itself, and from what bsd/dev/redwood_torch.c verified register by register on
- * redwood's same-generation module: the module answers type 0x18 and subtype 0x07 at 0x04 and
+ * device tree itself, and from what was verified register by register on
+ * the POCO X5 Pro's same-generation module: the module answers type 0x18 and subtype 0x07 at 0x04 and
  * 0x05; the torch current of Android's flashlight there was 125 mA in steps of 12.5 mA --
  * ITARGET code round(mA / 12.5) - 1 at IRESOLUTION bit 0 clear -- the module enabled by
  * FLASH_ENABLE_CONTROL = 0x80, then the channel by EN_LED_CTRL bit 0, and off in the reverse
@@ -18,7 +18,7 @@
  * only, deliberately leaves the per-channel safety timer disarmed (its flash path arms it, its
  * disable path clears its bit: leds-qti-flash.c 457-460 and 497-500): the torch is guarded in
  * software, ten times a second, on the module's own fault flags -- which is what this file does
- * too, as redwood_torch.c does.
+ * too.
  *
  * Writing to a PMIC is not like writing anywhere else: the PMICs make the phone's supplies. So
  * every write goes through one function that takes only this module's registers, every write is
@@ -40,7 +40,7 @@
  *   torch_ma=M     the current of the test and of later light, 1 to 500 (the device tree's
  *                  torch0 max-current-ma, line 20946).
  *   torch=3        instead of the test: the light for iOS until the run ends, through
- *                  /dev/redwood-torch as on redwood (level 0 to 1000 of torch_ma), on for
+ *                  /dev/annibale-torch as on the POCO X5 Pro (level 0 to 1000 of torch_ma), on for
  *                  torch_max_s at a time at most (default 30, at most 120). With any torch=N the
  *                  loader also tells iOS the camera has a flash, which Control Center's button needs.
  *
@@ -51,8 +51,8 @@
  * out) the light goes off.
  *
  * Register layouts: Linux drivers/spmi/spmi-pmic-arb.c (arbiter version 7: annibale_haptic.c's
- * windows), qcom's leds-qti-flash.c of this platform, and redwood_torch.c's verification of the
- * same module one phone older.
+ * windows), qcom's leds-qti-flash.c of this platform, and the verification of the
+ * same module on the POCO X5 Pro.
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
@@ -63,9 +63,9 @@
 #include <miscfs/devfs/devfs.h>
 #include <pexpert/pexpert.h>
 #include <sys/conf.h>
-#include <sys/redwood_audio.h>
-#include <sys/redwood_input.h>
-#include <sys/redwood_sensors.h>
+#include <sys/annibale_audio.h>
+#include <sys/annibale_input.h>
+#include <sys/annibale_sensors.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
 
@@ -278,7 +278,7 @@ spmi_write16_once(uint16_t addr, uint8_t value)
 		spin_us(1);
 	}
 	wr(channel + CH_WDATA0, value);
-	/* the 16-bit register address's write, as Linux's regmap-spmi-ext and redwood_torch.c send it */
+	/* the 16-bit register address's write, as Linux's regmap-spmi-ext sends it */
 	wr(channel + CH_CMD, CMD_OPC(OPC_EXT_WRITEL) | CMD_REG(addr) | (1 - 1));
 	start = mach_absolute_time();
 	do {
@@ -368,7 +368,7 @@ flash_put(uint16_t reg, uint8_t value)
 
 /* ---- the module's registers (leds-qti-flash.c, relative to the function's base) -------------------- */
 
-#define FLASH_TYPE              0x04            /* 0x18: a flash LED module (redwood_torch.c 277) */
+#define FLASH_TYPE              0x04            /* 0x18: a flash LED module */
 #define FLASH_TYPE_VALUE        0x18
 #define FLASH_SUBTYPE           0x05            /* 0x07: four channels (FLASH_LED_4_CHAN) */
 #define FLASH_SUBTYPE_VALUE     0x07
@@ -393,7 +393,7 @@ flash_put(uint16_t reg, uint8_t value)
  * on `configured` says the module was found and known, `broken` that something said surprise
  * since. Only channel 0 is ever touched -- the rear LED, the one the device tree's torch0 names.
  */
-static LCK_GRP_DECLARE(torch_hv_lck_grp, "redwood-torch-hv");
+static LCK_GRP_DECLARE(torch_hv_lck_grp, "annibale-torch-hv");
 static LCK_MTX_DECLARE(torch_hv_lck, &torch_hv_lck_grp);
 
 static bool
@@ -544,7 +544,7 @@ may_light(void)
  * vendor driver's own disable path clears that bit, and a torch is guarded in software on this
  * family (leds-qti-flash.c arms the timer for flashes only) -- and restored on the way out.
  */
-/* ITARGET's code for `ma': round(mA / 12.5) - 1 (redwood_torch.c), the smallest current at least */
+/* ITARGET's code for `ma': round(mA / 12.5) - 1, the smallest current at least */
 static unsigned
 itarget_code(uint32_t ma)
 {
@@ -650,7 +650,7 @@ dark_locked(void)
 
 /*
  * The light's guard while it is lit, ten times a second: still lit (nobody else took the module),
- * no fault in real time, the battery under the 45 C of Android's torch (redwood_torch.c; -273 while
+ * no fault in real time, the battery under the 45 C of Android's torch (-273 while
  * nothing knows). Anything else puts it out for the rest of the run. The caller holds torch_hv_lck.
  */
 static bool
@@ -673,7 +673,7 @@ watch_locked(void)
 		dark_locked();
 		return false;
 	}
-	if ((temperature = redwood_battery_temperature()) > 45) {
+	if ((temperature = annibale_battery_temperature()) > 45) {
 		say("torch: the battery reads %d C, over Android's 45 C for the torch: the light goes off\n", temperature);
 		dark_locked();
 		return false;
@@ -726,8 +726,8 @@ done:
 }
 
 /*
- * torch=3: the light for iOS, through redwood_torch.c's device and its contract, which
- * libredwood-media.dylib in mediaserverd already speaks (userland/src/inject_media.c): a write of
+ * torch=3: the light for iOS, through /dev/annibale-torch and its contract, which
+ * libannibale-media.dylib in mediaserverd already speaks (userland/src/inject_media.c): a write of
  * a 32-bit level, 0 to 1000 (thousandths of torch_ma; 0 off), a read of what is lit now. The
  * device is made before mediaserverd opens it, at the thread's start. The light stays on for
  * torch_max_s at most (default 30, at most 120) and then stays off until iOS asks for 0.
@@ -849,8 +849,8 @@ serve_thread(__unused void *parameter, __unused wait_result_t result)
 	bool cut = false;                         /* put out at the limit: dark until iOS asks for 0 */
 	int major = cdevsw_add(-1, &torch_cdevsw);
 
-	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-torch") == NULL) {
-		say("torch: /dev/redwood-torch cannot be made\n");
+	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "annibale-torch") == NULL) {
+		say("torch: /dev/annibale-torch cannot be made\n");
 		goto done;
 	}
 	lck_mtx_lock(&torch_hv_lck);
@@ -860,7 +860,7 @@ serve_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 	show_state("as found");
 	lck_mtx_unlock(&torch_hv_lck);
-	say("torch: the light is iOS's (/dev/redwood-torch): 1000 is %u mA, at most %u s at a time\n", milliamps, max_secs);
+	say("torch: the light is iOS's (/dev/annibale-torch): 1000 is %u mA, at most %u s at a time\n", milliamps, max_secs);
 	nanoseconds_to_absolutetime((uint64_t)max_secs * NSEC_PER_SEC, &limit);
 	for (;;) {
 		uint32_t want = wanted, ma = (milliamps * want + 500) / 1000;
@@ -906,7 +906,7 @@ annibale_torch_init(void)
 	int mode = -1;
 	thread_continue_t body = serve_thread;
 
-	if (!redwood_platform_is_annibale()) {
+	if (!annibale_platform_is_annibale()) {
 		return;
 	}
 	annibale_sensors_init();
@@ -916,7 +916,7 @@ annibale_torch_init(void)
 	}
 	PE_parse_boot_argn("torch_ma", &milliamps, sizeof(milliamps));
 	if (milliamps == 0 || milliamps > TORCH_MAX_MA) {
-		milliamps = 125;                  /* Android's torch current, as redwood's */
+		milliamps = 125;                  /* Android's torch current, as the POCO X5 Pro's */
 	}
 	PE_parse_boot_argn("torch_max_s", &max_secs, sizeof(max_secs));
 	max_secs = max_secs == 0 || max_secs > 120 ? 30 : max_secs;
@@ -956,8 +956,7 @@ annibale_torch_low_off(void)
 /*
  * At the run's end and on a panic's way out: the light off and, if it had cleared one, the
  * safety timer given back as it was. No readbacks here -- on that way out the log may be
- * closing, and a stuck light is stopped by the writes themselves (redwood_torch.c quiesce does
- * the same). The channel states are said one last time for the log's end.
+ * closing, and a stuck light is stopped by the writes themselves. The channel states are said one last time for the log's end.
  */
 void
 annibale_torch_quiesce(void)

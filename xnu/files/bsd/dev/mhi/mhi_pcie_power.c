@@ -32,7 +32,7 @@
 #include <kern/clock.h>
 #include <libkern/libkern.h>
 #include <machine/machine_routines.h>
-#include <sys/redwood_audio.h>
+#include <sys/annibale_audio.h>
 #include <sys/systm.h>
 
 #include "mhi_pcie_private.h"
@@ -72,9 +72,9 @@ poll(vm_offset_t reg, uint32_t mask, uint32_t value, uint32_t step_us, uint32_t 
 
 /* ---- C: RPMh ---------------------------------------------------------------------------------- */
 
-#define RSC_PHYS                0x16520000UL        /* apps RSC, DRV2 (the same one redwood_goodix.c uses) */
+#define RSC_PHYS                0x16520000UL        /* apps RSC, DRV2 (the same one annibale_goodix.c uses) */
 #define RSC_SIZE                0x10000UL
-#define CMD_DB_PHYS             0x81c60000UL        /* aop_cmd_db_region, as redwood_goodix.c's board_setup() */
+#define CMD_DB_PHYS             0x81c60000UL        /* aop_cmd_db_region, as annibale_goodix.c's board_setup() */
 #define CMD_DB_SIZE             0x20000UL
 
 /*

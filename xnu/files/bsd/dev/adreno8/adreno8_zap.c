@@ -138,7 +138,7 @@ adreno8_zap_authenticate(void)
 	if (zap_attempted || !adreno8_reset_required || PAGE_SIZE < ADRENO8_ZAP_METADATA_MAX) {
 		return false;
 	}
-	data = redwood_image_file("fw", "gen80000_zap.mbn", &size, &disk);
+	data = annibale_image_file("fw", "gen80000_zap.mbn", &size, &disk);
 	if (size > 0x100000 || !adreno8_zap_parse(data, (size_t)size, &image)) {
 		printf("adreno8: zap: invalid or missing combined gen80000 MBN\n");
 		return false;

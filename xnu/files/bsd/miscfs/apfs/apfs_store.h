@@ -10,14 +10,14 @@
 #include "apfs_write.h"
 
 /* The volume this will touch and no other: its name, and the names of the slots in its root. */
-#define APFS_STORE_VOLNAME  "RedwoodStore"
+#define APFS_STORE_VOLNAME  "AnnibaleStore"
 #define APFS_STORE_SLOTS    2
 #define APFS_STORE_SLOT0    "slot0"
 #define APFS_STORE_SLOT1    "slot1"
 
 /* The first block of a slot is its header alone; the payload begins after it. */
 #define APFS_STORE_PAYLOAD  4096
-#define APFS_STORE_MAGIC    "RDWSTOR"
+#define APFS_STORE_MAGIC    "ANNSTOR"
 #define APFS_STORE_VERSION  1
 #define APFS_STORE_HEAD_LEN 64
 

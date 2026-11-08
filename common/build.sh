@@ -3,10 +3,9 @@
 #
 # usage: common/build.sh <device> [userland/build.sh variables...]
 #   common/build.sh qemu-virt
-#   common/build.sh redwood GL=1
+#   common/build.sh annibale GL=1
 #
-#   1. kernel   xnu/apply.sh, xnu-deps/setup.sh, xnu-build.sh   -- only with theos + iPhoneOS16.5.sdk,
-#                                                                  otherwise prebuilt/ is used
+#   1. kernel   xnu/apply.sh, xnu-deps/setup.sh, xnu-build.sh   -- only with theos + iPhoneOS16.5.sdk
 #   2. loader   xnuloader/build.sh                              -- only with clang + lld-link; a
 #                                                                  profile may set LOADER_CFLAGS
 #                                                                  (-DDIRECT_PHONE_PLAT for phones:
@@ -42,7 +41,7 @@ if ! skip kernel; then
 		[ -f $K ] && { [ $K -nt out/.kernel-start ] || ! grep -q "error:" out/kernel-build.log; } &&
 			echo "build: kernel $(stat -c %s $K) bytes" || die "kernel build failed, see out/kernel-build.log"
 	else
-		echo "build: no theos/iPhoneOS16.5.sdk: using prebuilt/mach.development.bcm2837"
+		echo "build: no theos/iPhoneOS16.5.sdk: the kernel is not built"
 	fi
 fi
 
@@ -63,14 +62,10 @@ fi
 
 if ! skip boot && [ "$KIND" = phone ]; then
 	# the UEFI with the loader inside, the way `xl enter` makes it: the loader then brings up its USB link
-	# The image carries the variant the profile asked for. A phone that needs the phone macros
-	# never falls back to the generic prebuilt -- wrong-platform loader bytes boot-loop silently
-	# (in QEMU the kernel hangs at 616 bytes), so here they are refused out loud (F04).
+	# The image carries the variant the profile asked for: wrong-platform loader bytes boot-loop
+	# silently (in QEMU the kernel hangs at 616 bytes), so a missing one is refused out loud (F04).
 	L=xnuloader/$LOADER_OUT
-	if [ ! -f $L ] && [ $LOADER_OUT = loader.efi ] && [ -f prebuilt/loader.efi ]; then
-		L=prebuilt/loader.efi
-	fi
-	[ -f $L ] || die "no xnuloader/$LOADER_OUT: run common/build.sh $DEVICE without SKIP=loader (the generic prebuilt is no substitute for $LOADER_OUT)"
+	[ -f $L ] || die "no xnuloader/$LOADER_OUT: run common/build.sh $DEVICE without SKIP=loader"
 	python3 xnuloader/mkpayload.py -o out/usb-payload.bin loader.efi=$L --usb > /dev/null || die "mkpayload.py failed"
 	FD_BASE=$FD_BASE FD_SIZE=$FD_SIZE PAYLOAD_BASE=$PAYLOAD_BASE PAYLOAD_CAP=$PAYLOAD_CAP UEFI_FD=$UEFI_FD DTB=$DTB UEFI_TARGET=$UEFI_TARGET \
 		python3 mkxnuimg.py -p out/usb-payload.bin -o out/$DEVICE-boot.img || die "mkxnuimg.py failed"

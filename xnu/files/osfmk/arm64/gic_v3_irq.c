@@ -303,7 +303,7 @@ gic_v3_spi_count(uint32_t intid)
 /*
  * What the processor-signal interrupts asked for, per receiving processor: one count per SIGP bit
  * (0..11) set in its cpu_signal word when the interrupt was taken, and in GIC_SIGNAL_KINDS - 1 the
- * ones that found no bit set (SIGPnop: a wake from WFI and nothing else). For kern.redwood.cpus.
+ * ones that found no bit set (SIGPnop: a wake from WFI and nothing else). For kern.annibale.cpus.
  */
 static uint32_t gic_signal_kinds[MAX_CPUS][GIC_SIGNAL_KINDS];
 
@@ -329,12 +329,12 @@ gic_count_signal(int cpu)
 }
 
 /*
- * kern.redwood.prof: where the processors are, sampled at every interrupt. Each interrupt
+ * kern.annibale.prof: where the processors are, sampled at every interrupt. Each interrupt
  * records the interrupted context in a per-processor table keyed by (pid, pc, lr): the user pc and
  * lr when it came from user space, the unslid kernel pc when from the kernel (pid 0 for kernel
  * threads, and GIC_PROF_IDLE for a processor's idle thread). Interrupts arrive at about 10,000 a
  * second per processor here, mostly the scheduler's IPIs, so a few seconds give a profile of
- * everything that runs, user and system time apart. Off until kern.redwood.prof is written.
+ * everything that runs, user and system time apart. Off until kern.annibale.prof is written.
  */
 #define GIC_PROF_SLOTS          GIC_PROF_TABLE
 #define GIC_PROF_PROBES         8

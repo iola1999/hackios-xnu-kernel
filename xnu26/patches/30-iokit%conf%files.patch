@@ -10,10 +10,10 @@ index c72c690d7c74..657e895328de 100644
 +iokit/Kernel/MiniIOSurface.cpp			optional iokitcpp
 +iokit/Kernel/MiniIOMobileFramebuffer.cpp		optional iokitcpp
 +iokit/Kernel/MiniAppleARMBacklight.cpp		optional iokitcpp
-+iokit/Kernel/RedwoodGPU.cpp				optional iokitcpp
-+iokit/Kernel/RedwoodWLAN.cpp			optional iokitcpp
-+iokit/Kernel/RedwoodBT.cpp				optional iokitcpp
-+iokit/Kernel/RedwoodBattery.cpp			optional iokitcpp
++iokit/Kernel/AnnibaleGPU.cpp				optional iokitcpp
++iokit/Kernel/AnnibaleWLAN.cpp			optional iokitcpp
++iokit/Kernel/AnnibaleBT.cpp				optional iokitcpp
++iokit/Kernel/AnnibaleBattery.cpp			optional iokitcpp
 +iokit/Kernel/MiniAppleKeyStore.cpp			optional iokitcpp
 +iokit/Kernel/MiniIONetworkStack.cpp			optional iokitcpp
  iokit/Kernel/IOPlatformIO.cpp				optional iokitcpp

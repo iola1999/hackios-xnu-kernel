@@ -12,8 +12,8 @@
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
 #include <pexpert/device_tree.h>
-#include <sys/redwood_audio.h>
-#include <sys/redwood_input.h>
+#include <sys/annibale_audio.h>
+#include <sys/annibale_input.h>
 #include <sys/systm.h>
 #include <vm/memory_types.h>
 
@@ -748,7 +748,7 @@ sample(void)
 		printf("battery: BQ27Z561 invalid sample: SOC=%u voltage=%u temperature=%u\n", values[0], values[1], values[3]);
 		return false;
 	}
-	struct redwood_battery_state state = {0};
+	struct annibale_battery_state state = {0};
 	state.size = sizeof(state);
 	state.percent_hundredths = values[0] * 100;
 	state.voltage_uv = values[1] * 1000;
@@ -766,7 +766,7 @@ sample(void)
 	 * kernel-12377-cmd47-bo42), so flow under CHARGE_FLOW_UA counts as none. Running iOS draws
 	 * hundreds of mA from the battery, so a battery that is not being drained is on external power:
 	 * a charger that holds a full battery shows as plugged in and not charging (status 3), which
-	 * RedwoodBattery reports as charging, as an iPhone shows it. A supply weaker than the phone's
+	 * AnnibaleBattery reports as charging, as an iPhone shows it. A supply weaker than the phone's
 	 * draw (a computer's USB port) still reads as discharging. */
 	/* Hysteresis window [-250 mA, +50 mA] to eliminate toggling around 0 mA:
 	 * > +50 mA: battery is actively charging from external power
@@ -814,7 +814,7 @@ sample(void)
 	state.full_uah = values[5] * 1000;
 	state.design_uah = values[6] * 1000;
 	state.cycles = values[7];
-	redwood_battery_report(&state);
+	annibale_battery_report(&state);
 	int fraction = state.temperature_hundredths % 100;
 	printf("battery: BQ27Z561 SOC=%u%% V=%u mV I=%d mA T=%d.%02d C\n", values[0], values[1],
 	    (int16_t)values[2], state.temperature_hundredths / 100, fraction < 0 ? -fraction : fraction);

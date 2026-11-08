@@ -23,7 +23,7 @@
 
 #include "annibale_bt_private.h"
 
-extern const uint8_t *redwood_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+extern const uint8_t *annibale_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 extern kern_return_t thread_terminate(thread_t thread);
 
 #define H4_COMMAND              0x01
@@ -257,7 +257,7 @@ nvm_edits(const uint8_t *data, uint32_t size, struct edit *edit, unsigned *count
 			edit[(*count)++] = (struct edit){ d, (uint8_t)(data[d] & 0xfe) };
 			edit[(*count)++] = (struct edit){ d + 1, 0 };
 		} else if (id == NVM_TAG_BD_ADDR && len == 6 && *count + 6 <= 12) {
-			static const uint8_t bd[6] = { 0x02, 0x52, 0x44, 0x57, 0x00, 0x02 };
+			static const uint8_t bd[6] = { 0x02, 0x41, 0x4e, 0x4e, 0x00, 0x02 };
 
 			bt_say("bt: nvm: tag 2 (address) %02x:%02x:%02x:%02x:%02x:%02x -> %02x:%02x:%02x:%02x:%02x:%02x\n",
 			    data[d + 5], data[d + 4], data[d + 3], data[d + 2], data[d + 1], data[d],
@@ -283,7 +283,7 @@ static bool
 download(const char *name, bool nvm)
 {
 	uint64_t size64 = 0;
-	const uint8_t *data = redwood_image_file("fw", name, &size64, NULL);
+	const uint8_t *data = annibale_image_file("fw", name, &size64, NULL);
 	uint32_t size = (uint32_t)size64, mode = 0, sent = 0, pieces = 0, next = 25;
 	uint8_t cmd[2 + EDL_SEGMENT], ev[64];
 	struct edit edit[12];
@@ -368,7 +368,7 @@ nvm(char *used, size_t size)
 	for (unsigned i = 0; i < count; i++) {
 		uint64_t length = 0;
 
-		if (redwood_image_file("fw", names[i], &length, NULL) == NULL) {
+		if (annibale_image_file("fw", names[i], &length, NULL) == NULL) {
 			bt_say("bt: nvm: %s is not in fw/\n", names[i]);
 			continue;
 		}
@@ -402,7 +402,7 @@ build_info(void)
 		build[--len] = 0;
 	}
 	snprintf(name, sizeof(name), "hmtbtfw%02x.ver", chip.rom_ver);
-	ver = redwood_image_file("fw", name, &ver_size, NULL);
+	ver = annibale_image_file("fw", name, &ver_size, NULL);
 	if (ver != NULL) {
 		uint64_t vlen = ver_size;
 

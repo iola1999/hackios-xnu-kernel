@@ -1,29 +1,27 @@
 #!/usr/bin/env python3
 """
-Pack the redwood UEFI (with the hook that starts the XNU loader) and an optional payload
+Pack the device's UEFI (with the hook that starts the XNU loader) and an optional payload
 into an Android boot image for `fastboot boot`.
 
   kernel = gzip(BootShim + UEFI FD + ["XNUP" container]) + DTB
 
 The boot shim copies the FD to its base and the payload to PAYLOAD_BASE.
 
-The UEFI pieces are taken from a Mu-Silicium tree built here (Mu-Silicium/, see uefi/README.md)
-or, when there is none, from prebuilt/uefi/.
+The UEFI pieces are taken from a Mu-Silicium tree built here (Mu-Silicium/, see uefi/README.md).
 
 usage: mkxnuimg.py [-p payload.bin] [-o out.img]
 
 Another device (common/devices/<name>.conf, read by common/build.sh) sets these in the environment:
-  UEFI_TARGET   Mu-Silicium device name (default redwood)    UEFI_FD, DTB   files to use instead
+  UEFI_TARGET   Mu-Silicium device name (required)           UEFI_FD, DTB   files to use instead
   FD_BASE, FD_SIZE, PAYLOAD_BASE                              addresses from its UEFI port's memory map
   PAYLOAD_CAP   strict payload contract (annibale): container limit C in bytes, passed to the
-                shim as -DPAYLOAD_CAP. Set = strict checks below; unset = legacy shape (redwood,
+                shim as -DPAYLOAD_CAP. Set = strict checks below; unset = legacy shape (POCO X5 Pro,
                 QEMU) keeps its original container check and byte stream.
 """
 import argparse, gzip, os, struct, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MU = os.path.join(HERE, 'Mu-Silicium')
-PREBUILT = os.path.join(HERE, 'prebuilt', 'uefi')
 
 XNUP_MAGIC = b'XNUP'
 ENTRY_HDR = 24  # char name[16], u32 size, u32 reserved (see xnuloader/mkpayload.py)
@@ -106,11 +104,11 @@ def build_blob(shim, fd, container, cap):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('-p', '--payload')
-    ap.add_argument('-o', '--output', default=os.path.join(HERE, 'xnu-redwood.img'))
+    ap.add_argument('-o', '--output', default=os.path.join(HERE, 'xnu-boot.img'))
     ap.add_argument('--mode', default='RELEASE')
     args = ap.parse_args()
 
-    target = os.environ.get('UEFI_TARGET') or 'redwood'
+    target = os.environ.get('UEFI_TARGET') or sys.exit('UEFI_TARGET: the Mu-Silicium device name, see common/devices/')
     fd_base, fd_size = env_int('FD_BASE', 0x9FD00000), env_int('FD_SIZE', 0x200000)
     payload_base, payload_max = env_int('PAYLOAD_BASE', 0xF0000000), 0x04000000
     payload_cap = env_int('PAYLOAD_CAP', 0)
@@ -144,8 +142,7 @@ def main():
             sys.exit(f'the FD destination [{fd_base:#x}, {fd_base + fd_size:#x}) overlaps the payload window '
                      f'[{payload_base:#x}, {payload_base + payload_cap:#x})')
         if not use_mu:
-            sys.exit('PAYLOAD_CAP needs the BootShim built from Mu-Silicium/ '
-                     '(prebuilt/uefi/BootShim.bin predates the strict contract)')
+            sys.exit('PAYLOAD_CAP needs the BootShim built from Mu-Silicium/')
         fd_len = os.path.getsize(fd_path)
         if fd_len != fd_size:
             sys.exit(f'FD file {fd_path}: {fd_len:#x} bytes != FD_SIZE {fd_size:#x}')
@@ -168,10 +165,7 @@ def main():
                  'dtb': os.path.join(MU, f'Resources/DTBs/{target}.dtb'), 'ramdisk': os.path.join(MU, 'Resources/ramdisk'),
                  'mkbootimg': os.path.join(MU, 'Resources/Scripts/mkbootimg.py')}
     else:
-        parts = {'shim': os.path.join(PREBUILT, 'BootShim.bin'), 'fd': os.path.join(PREBUILT, 'SILICIUM_UEFI.fd'),
-                 'dtb': os.path.join(PREBUILT, 'redwood.dtb'), 'ramdisk': os.path.join(PREBUILT, 'ramdisk'),
-                 'mkbootimg': os.path.join(PREBUILT, 'mkbootimg.py')}
-        if os.environ.get('UEFI_FD'): parts['fd'] = os.environ['UEFI_FD']
+        sys.exit(f'no Mu-Silicium tree built for {target}: {fd_path} (see uefi/README.md)')
     shim = open(parts['shim'], 'rb').read()
     fd = open(parts['fd'], 'rb').read()
     assert len(fd) == fd_size, hex(len(fd))

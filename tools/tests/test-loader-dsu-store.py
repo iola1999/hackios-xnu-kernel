@@ -124,7 +124,7 @@ int main(void) {
 	CK(EFI_ERROR(dsu_store_io(0, (4ULL << 30) / BS - 1, 2 * BS, buf)));
 
 	/* a header block left as var_store writes it still takes writes */
-	memcpy(block_of(store_lba(12ULL << 30), 1), "RDWVAR\0\0", 8);
+	memcpy(block_of(store_lba(12ULL << 30), 1), "ANNVAR\0\0", 8);
 	CK(dsu_store_open(&bp, 1, &w) == 1 && w == 1);
 	/* something else in the second header: read only */
 	block_of(store_lba(14ULL << 30), 1)[100] = 1;

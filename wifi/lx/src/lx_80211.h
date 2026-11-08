@@ -18,7 +18,7 @@
 #include "lx_wpa.h"
 
 #define HEARD_MOST	128
-#define ELEMENTS_MOST	REDWOOD_STA_ELEMENTS_MOST
+#define ELEMENTS_MOST	ANNIBALE_STA_ELEMENTS_MOST
 
 /* A network, as its beacons describe it. */
 struct lx_heard {
@@ -130,6 +130,6 @@ void lx_handshake_message(struct lx_radio *radio, const uint8_t *frame, unsigned
 /* the interface in station mode, up and down; a scan with it */
 int lx_station_up(struct lx_radio *radio);
 void lx_station_down(struct lx_radio *radio);
-int lx_scan(struct lx_radio *radio, const uint8_t *name, unsigned name_length, bool quiet, const struct redwood_sta_scan *what);
+int lx_scan(struct lx_radio *radio, const uint8_t *name, unsigned name_length, bool quiet, const struct annibale_sta_scan *what);
 
 #endif

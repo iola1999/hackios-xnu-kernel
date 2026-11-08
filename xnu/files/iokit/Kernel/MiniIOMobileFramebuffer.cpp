@@ -54,8 +54,8 @@ micros(uint64_t absolute)
 
 #include "MiniFramebufferFlip.inc"
 
-extern "C" void redwood_tl(const char * format, ...) __printflike(1, 2);
-extern "C" uint32_t redwood_frames_shown;        /* (bsd/sys/redwood_input.h) */
+extern "C" void annibale_tl(const char * format, ...) __printflike(1, 2);
+extern "C" uint32_t annibale_frames_shown;        /* (bsd/sys/annibale_input.h) */
 
 /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5) */
 enum {
@@ -488,7 +488,7 @@ IOMobileFramebuffer::start(IOService * provider)
 
 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
 	/* for who draws with the GPU (userland/src/eagl.c): a frame need not be waited for before it is handed over */
-	setProperty("RedwoodWaitsForGPU", kOSBooleanTrue);
+	setProperty("AnnibaleWaitsForGPU", kOSBooleanTrue);
 	publishModes();
 	setName("disp0");
 	registerService();
@@ -742,7 +742,7 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 		char who[24] = "?";
 
 		proc_selfname(who, sizeof(who));
-		redwood_tl("tl: s %u %d %llu %s at %llu\n", swapWord(swap, SWAP_ID),
+		annibale_tl("tl: s %u %d %llu %s at %llu\n", swapWord(swap, SWAP_ID),
 		    proc_pid(current_proc()), (unsigned long long)thread_tid(current_thread()), who, micros(now));
 	}
 	IOLockLock(fSwapLock);
@@ -853,7 +853,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		fLastFrameRefresh = has_latch ? latch_frame : 0;
 	}
 	if (gTouchLat && has_latch) {
-		redwood_tl("tl: l %u at %llu frame %u source ctl_flush\n", latch_swap,
+		annibale_tl("tl: l %u at %llu frame %u source ctl_flush\n", latch_swap,
 		    (unsigned long long)micros(latched), latch_frame);
 	}
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
@@ -917,9 +917,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
 	IOLockUnlock(fSwapLock);
 	fSwapsShown++;
-	redwood_frames_shown = fSwapsShown;      /* (kern.redwood.frames: what a control run watches) */
+	annibale_frames_shown = fSwapsShown;      /* (kern.annibale.frames: what a control run watches) */
 	if (gTouchLat) {
-		redwood_tl("tl: v %u ready %llu shown %llu done %llu\n", swapWord(swap, SWAP_ID), micros(ready), micros(copy_began),
+		annibale_tl("tl: v %u ready %llu shown %llu done %llu\n", swapWord(swap, SWAP_ID), micros(ready), micros(copy_began),
 		    micros(drawn));
 	}
 	if (layers != fLayersShown) {
@@ -1242,7 +1242,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 
 	case kFBMethodSwapWait:                         /* a swap is on the screen as soon as it is made */
 		if (gTouchLat) {
-			redwood_tl("tl: w %llu %#llx %#llx at %llu\n", args->scalarInputCount > 0 ? in[0] : 0,
+			annibale_tl("tl: w %llu %#llx %#llx at %llu\n", args->scalarInputCount > 0 ? in[0] : 0,
 			    args->scalarInputCount > 1 ? in[1] : 0, args->scalarInputCount > 2 ? in[2] : 0, micros(mach_absolute_time()));
 		}
 		return kIOReturnSuccess;
@@ -1343,7 +1343,7 @@ publishDisplayNode(void)
 		data = OSData::withBytes("display-subsystem", sizeof("display-subsystem"));
 		props->setObject("device_type", data);
 		OSSafeReleaseNULL(data);
-		data = OSData::withBytes("redwood,framebuffer", sizeof("redwood,framebuffer"));
+		data = OSData::withBytes("annibale,framebuffer", sizeof("annibale,framebuffer"));
 		props->setObject("compatible", data);
 		OSSafeReleaseNULL(data);
 		data = OSData::withBytes("disp0", sizeof("disp0"));

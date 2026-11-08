@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build the xnu-12377 kernel for redwood on macOS with Xcode. Extra make args are passed through
+# Build the xnu-12377 kernel for annibale on macOS with Xcode. Extra make args are passed through
 # (exporthdrs: only the headers, which xnu26/deps-macos.sh --stage2 needs).
 # The symbol sets for kexts are not made (KEXT_CREATE_SYMBOL_SET): no kext is ever loaded, and
 # the exports of the closed parts of the kernel are missing from them.
@@ -8,14 +8,19 @@
 source "$(dirname "${BASH_SOURCE[0]}")/env-macos.sh"
 cd "$XNU26_SRC" || exit 1
 SRC=$PWD
+# xnu/files, except what xnu26/files.skip names, as xnu26/apply.sh copies it: those files are
+# Apple's 12377 originals (with their pieces from patches/), and the 8796 versions do not compile here.
 if [ -d "$XNU26_ROOT/xnu/files" ]; then
-  python3 - "$XNU26_ROOT/xnu/files" "$SRC" <<'PY'
+  python3 - "$XNU26_ROOT/xnu/files" "$SRC" "$XNU26_ROOT/xnu26/files.skip" <<'PY'
 import filecmp, os, shutil, sys
 src_root, dst_root = sys.argv[1], sys.argv[2]
+skip = set(open(sys.argv[3]).read().split())
 for dirpath, _, filenames in os.walk(src_root):
     for f in filenames:
         p1 = os.path.join(dirpath, f)
         rel = os.path.relpath(p1, src_root)
+        if rel in skip:
+            continue
         p2 = os.path.join(dst_root, rel)
         if not os.path.exists(p2) or not filecmp.cmp(p1, p2, shallow=False):
             os.makedirs(os.path.dirname(p2), exist_ok=True)
@@ -55,9 +60,9 @@ if [ -d "$XNU26_ROOT/wifi/lx" ] && [ -f "$LX" ]; then
   fi
 fi
 if [ -f "$LX" ]; then now="$LX $(stat -f %m "$LX")"; else LX= now=; fi
-if [ -d BUILD/obj ] && [ "$(cat BUILD/obj/redwood-objects 2>/dev/null)" != "$now" ]; then
+if [ -d BUILD/obj ] && [ "$(cat BUILD/obj/annibale-objects 2>/dev/null)" != "$now" ]; then
   rm -f BUILD/obj/*/mach.*.unstripped BUILD/obj/*/mach.*.unstripped.noctf    # (the link's output, and its copy)
-  echo "$now" > BUILD/obj/redwood-objects
+  echo "$now" > BUILD/obj/annibale-objects
 fi
 
 # Strip outer -j/--jobs flags: makedefs/MakeInc.cmd sets MAKEJOBS=--jobs=$(hw.ncpu) on sub-makes,
@@ -149,7 +154,7 @@ fi
 # Reproducible builds, part three: __FILE__ in panic and assert strings is the path clang was given,
 # which would put the build machine's directory (and its user name) into the kernel. RC_NONARCH_CFLAGS
 # reaches C, C++ and assembler (makedefs/MakeInc.def OTHER_CFLAGS); the strings become osfmk/kern/....
-${MAKE:-gmake} XCRUN="$XNU26_ROOT/xnu26/xcrun" SDKROOT="$XNU26_SDK" REDWOOD_OBJECTS="$LX" \
+${MAKE:-gmake} XCRUN="$XNU26_ROOT/xnu26/xcrun" SDKROOT="$XNU26_SDK" ANNIBALE_OBJECTS="$LX" \
   RC_NONARCH_CFLAGS="-ffile-prefix-map=$SRC/=" \
   ARCH_CONFIGS=ARM64 MACHINE_CONFIGS=${MACHINE:-BCM2837} KERNEL_CONFIGS=${KERNEL_CONFIG:-DEVELOPMENT} \
   ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64 BUILD_WERROR=0 BUILD_LTO=0 DO_CTFMERGE=0 LOGCOLORS=n \

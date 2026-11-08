@@ -26,10 +26,10 @@ static int scm_pas_call(uint64_t fn, uint64_t arginfo, uint64_t a0, uint64_t a1,
 static const uint8_t *fw_read_file(const char *name, uint64_t *size_out, bool *from_root_out)
 {
 	*from_root_out = false;
-	const uint8_t *img = redwood_image_file("fw", name, size_out, NULL);
+	const uint8_t *img = annibale_image_file("fw", name, size_out, NULL);
 	if (img != NULL) return img;
 	if (rootvnode != NULLVP) {
-		static const char *const prefixes[] = { "/fw", "/redwood/fw" };
+		static const char *const prefixes[] = { "/fw", "/annibale/fw" };
 		vfs_context_t ctx = vfs_context_kernel();
 		for (unsigned p = 0; p < 2; p++) {
 			char path[80];
@@ -59,10 +59,10 @@ static const uint8_t *fw_read_file(const char *name, uint64_t *size_out, bool *f
 		}
 	}
 	uint64_t fat_sz = 0;
-	if (redwood_ufs_fat16_fw_read(name, &fat_sz, NULL, 0) && fat_sz > 0 && fat_sz <= PAGE_SIZE * 4) {
+	if (annibale_ufs_fat16_fw_read(name, &fat_sz, NULL, 0) && fat_sz > 0 && fat_sz <= PAGE_SIZE * 4) {
 		uint8_t *buf = kalloc_data(fat_sz, Z_WAITOK);
 		if (buf != NULL) {
-			if (redwood_ufs_fat16_fw_read(name, &fat_sz, buf, fat_sz)) {
+			if (annibale_ufs_fat16_fw_read(name, &fat_sz, buf, fat_sz)) {
 				*size_out = fat_sz;
 				*from_root_out = true;
 				return buf;
@@ -140,7 +140,7 @@ static bool fw_load_mdt(const char *stem, uint32_t region_base, uint32_t region_
 			fw->segment[fw->segments].file = fw_read_file(bname, &bsz, &broot);
 			fw->segment[fw->segments].from_root = broot;
 			if (fw->segment[fw->segments].file == NULL) {
-				if (!redwood_ufs_fat16_fw_read(bname, &bsz, NULL, 0) || bsz != seg.file_size) {
+				if (!annibale_ufs_fat16_fw_read(bname, &bsz, NULL, 0) || bsz != seg.file_size) {
 					fw_release(fw);
 					return false;
 				}
@@ -194,7 +194,7 @@ static bool pas_stage_and_setup(const char *stem, uint32_t pas_id, uint32_t regi
 			char bname[32];
 			uint64_t bsz = 0;
 			snprintf(bname, sizeof(bname), "%s.b%02u", stem, fw->segment[s].seg_idx);
-			if (!redwood_ufs_fat16_fw_read(bname, &bsz, carveout + at, fsz) || bsz != fsz) {
+			if (!annibale_ufs_fat16_fw_read(bname, &bsz, carveout + at, fsz) || bsz != fsz) {
 				ml_io_unmap((vm_offset_t)carveout, region_size);
 				return false;
 			}

@@ -1,5 +1,5 @@
 /*
- * Tests of the QMI helpers (bsd/dev/redwood_qmi.c in the kernel tree) on the machine that builds
+ * Tests of the QMI helpers (bsd/dev/annibale_qmi.c in the kernel tree) on the machine that builds
  * them; tools/qmi-test/run.sh compiles and runs this.
  *
  * Three kinds:
@@ -10,7 +10,7 @@
  *      tables filled at random, encoded, decoded and compared; filled to the brim and the length
  *      compared with the ..._MAX_LEN its header gives; a hundred thousand damaged messages decoded
  *      under the address sanitizer;
- *   3. the helpers over a router made up here (struct redwood_qrtr_ops): lookup, a server coming
+ *   3. the helpers over a router made up here (struct annibale_qrtr_ops): lookup, a server coming
  *      and going, requests and replies as transactions (in time, late, never, crossed, undecodable),
  *      indications to handlers, and the whole exchange a WCN6750's firmware and ath11k have up to
  *      "firmware ready", played by a firmware made up here.

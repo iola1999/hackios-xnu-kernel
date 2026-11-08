@@ -1,29 +1,29 @@
 /*
- * Direct UFS persistence for /private/var (RDWFS001).
+ * Direct UFS persistence for /private/var (ANNFS001).
  *
  * File data pages are written straight through to 16 KB blocks on /dev/ufs_darwin_var
- * (or /dev/rufs_dsu_store) at RDWFS_DATA_OFFSET + dblk * PAGE_SIZE, and faulted in on
+ * (or /dev/rufs_dsu_store) at ANNFS_DATA_OFFSET + dblk * PAGE_SIZE, and faulted in on
  * demand when read. Metadata (inodes, directories, symlinks, extended attributes, and
  * per-file block tables) is checkpointed to two alternating 32 MiB slots at the start
  * of the partition (0 MiB and 32 MiB), each protected by superblock and payload CRC32s.
  */
 
-extern bool redwood_ufs_var_info(uint64_t *size_bytes_out);
-extern int redwood_ufs_var_io(bool write, uint64_t offset, void *buf, uint64_t len);
+extern bool annibale_ufs_var_info(uint64_t *size_bytes_out);
+extern int annibale_ufs_var_io(bool write, uint64_t offset, void *buf, uint64_t len);
 
-#define RDWFS_MAGIC_STR          "RDWFS001"
-#define RDWFS_VERSION            2u
+#define ANNFS_MAGIC_STR          "ANNFS001"
+#define ANNFS_VERSION            3u
 #define rm_disk_enabled          rm_disk_backed
-#define RDWFS_SUPER_BYTES        4096u
-#define RDWFS_SLOT0_OFFSET       0ULL
-#define RDWFS_SLOT1_OFFSET       (32ULL << 20)
-#define RDWFS_SLOT_MAX           (32ULL << 20)
-#define RDWFS_PANIC_OFFSET       (64ULL << 20)
-#define RDWFS_PANIC_SIZE         (16ULL << 20)
-#define RDWFS_DATA_OFFSET        (512ULL << 20)
-#define RDWFS_INIT_META_CAP      (8ULL << 20)
-#define RDWFS_ALIGN8(n)          (((uint64_t)(n) + 7ULL) & ~7ULL)
-#define RDWFS_ALIGN4K(n)         (((uint64_t)(n) + 4095ULL) & ~4095ULL)
+#define ANNFS_SUPER_BYTES        4096u
+#define ANNFS_SLOT0_OFFSET       0ULL
+#define ANNFS_SLOT1_OFFSET       (32ULL << 20)
+#define ANNFS_SLOT_MAX           (32ULL << 20)
+#define ANNFS_PANIC_OFFSET       (64ULL << 20)
+#define ANNFS_PANIC_SIZE         (16ULL << 20)
+#define ANNFS_DATA_OFFSET        (512ULL << 20)
+#define ANNFS_INIT_META_CAP      (8ULL << 20)
+#define ANNFS_ALIGN8(n)          (((uint64_t)(n) + 7ULL) & ~7ULL)
+#define ANNFS_ALIGN4K(n)         (((uint64_t)(n) + 4095ULL) & ~4095ULL)
 
 #define KLOG_MAGIC               0x474f4c4bU     /* 'KLOG' */
 #define KLOG_MAGIC_ARCHIVED      0x474f4c44U     /* 'DLOG' */
@@ -42,7 +42,7 @@ struct klog_head {
 };
 _Static_assert(sizeof(struct klog_head) == 64, "klog_head must be 64 bytes");
 
-struct rdwfs_super {
+struct annfs_super {
 	char     magic[8];
 	uint32_t version;
 	uint32_t page_size;
@@ -54,9 +54,9 @@ struct rdwfs_super {
 	uint32_t super_crc;
 	uint8_t  reserved[4096 - 52];
 };
-_Static_assert(sizeof(struct rdwfs_super) == 4096, "rdwfs_super must be 4096 bytes");
+_Static_assert(sizeof(struct annfs_super) == 4096, "annfs_super must be 4096 bytes");
 
-struct rdwfs_inode_rec {
+struct annfs_inode_rec {
 	uint64_t ino;
 	uint64_t size;
 	uint64_t parent_ino;
@@ -71,19 +71,21 @@ struct rdwfs_inode_rec {
 	uint32_t nblocks;
 	uint32_t nxattrs;
 	uint32_t ndirents;
-	uint32_t iflags;                /* ramfs_node.rn_iflags; zero in images written before it existed */
+	uint32_t iflags;                /* ramfs_node.rn_iflags */
+	uint32_t document_id;           /* ramfs_node.rn_docid */
+	uint32_t reserved;
 	int64_t  atime_sec, atime_nsec;
 	int64_t  mtime_sec, mtime_nsec;
 	int64_t  ctime_sec, ctime_nsec;
 	int64_t  btime_sec, btime_nsec;
 };
 
-struct rdwfs_xattr_rec {
+struct annfs_xattr_rec {
 	uint32_t namelen;
 	uint32_t size;
 };
 
-struct rdwfs_dirent_rec {
+struct annfs_dirent_rec {
 	uint64_t child_ino;
 	uint32_t namelen;
 	uint32_t reserved;
@@ -133,10 +135,10 @@ sysctl_var_seed_done SYSCTL_HANDLER_ARGS
 	return error;
 }
 
-SYSCTL_DECL(_kern_redwood);
-SYSCTL_INT(_kern_redwood, OID_AUTO, var_disk_loaded, CTLFLAG_RD | CTLFLAG_LOCKED,
-    &ramfs_var_disk_loaded, 0, "1 when /private/var was loaded from RDWFS001 on disk");
-SYSCTL_PROC(_kern_redwood, OID_AUTO, var_seed_done,
+SYSCTL_DECL(_kern_annibale);
+SYSCTL_INT(_kern_annibale, OID_AUTO, var_disk_loaded, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &ramfs_var_disk_loaded, 0, "1 when /private/var was loaded from ANNFS001 on disk");
+SYSCTL_PROC(_kern_annibale, OID_AUTO, var_seed_done,
     CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
     &ramfs_var_seed_done, 0, sysctl_var_seed_done, "I",
     "1 when /private/var seed unpack has completed");
@@ -219,7 +221,7 @@ ramfs_disk_read_block(struct ramfs_mount *rm, uint32_t dblk, void *dst)
 	if (!rm->rm_disk_backed || dblk == 0 || dblk >= rm->rm_bmap_max) {
 		return EIO;
 	}
-	return redwood_ufs_var_io(false, RDWFS_DATA_OFFSET + (uint64_t)dblk * PAGE_SIZE, dst, PAGE_SIZE);
+	return annibale_ufs_var_io(false, ANNFS_DATA_OFFSET + (uint64_t)dblk * PAGE_SIZE, dst, PAGE_SIZE);
 }
 
 static int
@@ -228,7 +230,7 @@ ramfs_disk_write_block(struct ramfs_mount *rm, uint32_t dblk, const void *src)
 	if (!rm->rm_disk_backed || dblk == 0 || dblk >= rm->rm_bmap_max) {
 		return EIO;
 	}
-	return redwood_ufs_var_io(true, RDWFS_DATA_OFFSET + (uint64_t)dblk * PAGE_SIZE,
+	return annibale_ufs_var_io(true, ANNFS_DATA_OFFSET + (uint64_t)dblk * PAGE_SIZE,
 	    (void *)(uintptr_t)src, PAGE_SIZE);
 }
 
@@ -297,18 +299,18 @@ ramfs_disk_dirty_locked(struct ramfs_mount *rm)
 	}
 }
 
-/* Serialize all live nodes into rm->rm_meta_buf + RDWFS_SUPER_BYTES. rm->rm_lock is held. */
+/* Serialize all live nodes into rm->rm_meta_buf + ANNFS_SUPER_BYTES. rm->rm_lock is held. */
 static int
 ramfs_disk_pack_locked(struct ramfs_mount *rm, uint64_t *payload_bytes_out, uint32_t *node_count_out)
 {
-	uint8_t *base = (uint8_t *)rm->rm_meta_buf + RDWFS_SUPER_BYTES;
-	uint64_t cap = rm->rm_meta_cap > RDWFS_SUPER_BYTES ? (rm->rm_meta_cap - RDWFS_SUPER_BYTES) : 0;
+	uint8_t *base = (uint8_t *)rm->rm_meta_buf + ANNFS_SUPER_BYTES;
+	uint64_t cap = rm->rm_meta_cap > ANNFS_SUPER_BYTES ? (rm->rm_meta_cap - ANNFS_SUPER_BYTES) : 0;
 	uint64_t at = 0;
 	uint32_t nodes = 0;
 
 	for (uint32_t h = 0; h < RAMFS_HASH_SIZE; h++) {
 		for (struct ramfs_node *node = rm->rm_hash[h]; node != NULL; node = node->rn_hnext) {
-			struct rdwfs_inode_rec rec;
+			struct annfs_inode_rec rec;
 			struct ramfs_xattr *xa;
 			struct ramfs_dirent *de;
 			uint32_t nblocks = 0, nxattrs = 0, ndirents = 0, target_len = 0;
@@ -339,8 +341,8 @@ ramfs_disk_pack_locked(struct ramfs_mount *rm, uint64_t *payload_bytes_out, uint
 					}
 				}
 			}
-			need = sizeof(rec) + RDWFS_ALIGN8(target_len) +
-			    RDWFS_ALIGN8((uint64_t)nblocks * sizeof(uint32_t));
+			need = sizeof(rec) + ANNFS_ALIGN8(target_len) +
+			    ANNFS_ALIGN8((uint64_t)nblocks * sizeof(uint32_t));
 			if (at + need > cap) {
 				return ENOSPC;
 			}
@@ -361,6 +363,7 @@ ramfs_disk_pack_locked(struct ramfs_mount *rm, uint64_t *payload_bytes_out, uint
 			rec.nxattrs = nxattrs;
 			rec.ndirents = ndirents;
 			rec.iflags = node->rn_iflags;
+			rec.document_id = node->rn_docid;
 			rec.atime_sec = node->rn_atime.tv_sec;
 			rec.atime_nsec = node->rn_atime.tv_nsec;
 			rec.mtime_sec = node->rn_mtime.tv_sec;
@@ -374,7 +377,7 @@ ramfs_disk_pack_locked(struct ramfs_mount *rm, uint64_t *payload_bytes_out, uint
 			at += sizeof(rec);
 
 			if (target_len > 0) {
-				uint64_t alen = RDWFS_ALIGN8(target_len);
+				uint64_t alen = ANNFS_ALIGN8(target_len);
 
 				bzero(base + at, (size_t)alen);
 				memcpy(base + at, node->rn_target, target_len);
@@ -382,19 +385,19 @@ ramfs_disk_pack_locked(struct ramfs_mount *rm, uint64_t *payload_bytes_out, uint
 			}
 			if (nblocks > 0) {
 				uint64_t bbytes = (uint64_t)nblocks * sizeof(uint32_t);
-				uint64_t alen = RDWFS_ALIGN8(bbytes);
+				uint64_t alen = ANNFS_ALIGN8(bbytes);
 
 				bzero(base + at, (size_t)alen);
 				memcpy(base + at, node->rn_blocks, (size_t)bbytes);
 				at += alen;
 			}
 			TAILQ_FOREACH(xa, &node->rn_xattrs, rx_link) {
-				struct rdwfs_xattr_rec xrec = {
+				struct annfs_xattr_rec xrec = {
 					.namelen = (uint32_t)xa->rx_namelen,
 					.size = (uint32_t)xa->rx_size,
 				};
 				uint64_t raw = (uint64_t)xrec.namelen + (uint64_t)xrec.size;
-				uint64_t alen = RDWFS_ALIGN8(raw);
+				uint64_t alen = ANNFS_ALIGN8(raw);
 
 				if (at + sizeof(xrec) + alen > cap) {
 					return ENOSPC;
@@ -410,7 +413,7 @@ ramfs_disk_pack_locked(struct ramfs_mount *rm, uint64_t *payload_bytes_out, uint
 			}
 			if (node->rn_type == VDIR) {
 				TAILQ_FOREACH(de, &node->rn_entries, rd_link) {
-					struct rdwfs_dirent_rec drec;
+					struct annfs_dirent_rec drec;
 					uint64_t alen;
 
 					if (de->rd_node == NULL || de->rd_node->rn_nlink == 0 ||
@@ -420,7 +423,7 @@ ramfs_disk_pack_locked(struct ramfs_mount *rm, uint64_t *payload_bytes_out, uint
 					drec.child_ino = de->rd_node->rn_ino;
 					drec.namelen = de->rd_namelen;
 					drec.reserved = 0;
-					alen = RDWFS_ALIGN8(drec.namelen);
+					alen = ANNFS_ALIGN8(drec.namelen);
 					if (at + sizeof(drec) + alen > cap) {
 						return ENOSPC;
 					}
@@ -444,7 +447,7 @@ ramfs_disk_sync_impl(struct ramfs_mount *rm)
 {
 	uint64_t payload_bytes = 0, write_bytes, gen, slot_off;
 	uint32_t node_count = 0;
-	struct rdwfs_super *sup;
+	struct annfs_super *sup;
 	int error = 0;
 
 	if (rm == NULL || !rm->rm_disk_enabled || !rm->rm_seed_done || ramfs_var_seed_done == 0 || rm->rm_disk_loading) {
@@ -455,7 +458,7 @@ ramfs_disk_sync_impl(struct ramfs_mount *rm)
 		rm->rm_meta_dirty = true;
 	}
 	while (rm->rm_meta_syncing) {
-		msleep(&rm->rm_meta_syncing, &rm->rm_lock, PRIBIO, "rdwfssync", NULL);
+		msleep(&rm->rm_meta_syncing, &rm->rm_lock, PRIBIO, "annfssync", NULL);
 	}
 	if (!rm->rm_meta_dirty) {
 		lck_mtx_unlock(&rm->rm_lock);
@@ -464,15 +467,15 @@ ramfs_disk_sync_impl(struct ramfs_mount *rm)
 
 	while (ramfs_disk_pack_locked(rm, &payload_bytes, &node_count) == ENOSPC) {
 		size_t old_cap = rm->rm_meta_cap;
-		size_t new_cap = old_cap ? old_cap * 2 : RDWFS_INIT_META_CAP;
+		size_t new_cap = old_cap ? old_cap * 2 : ANNFS_INIT_META_CAP;
 		void *new_buf;
 
-		if (new_cap > RDWFS_SLOT_MAX) {
-			if (old_cap >= RDWFS_SLOT_MAX) {
+		if (new_cap > ANNFS_SLOT_MAX) {
+			if (old_cap >= ANNFS_SLOT_MAX) {
 				lck_mtx_unlock(&rm->rm_lock);
 				return ENOSPC;
 			}
-			new_cap = RDWFS_SLOT_MAX;
+			new_cap = ANNFS_SLOT_MAX;
 		}
 		rm->rm_meta_syncing = true;
 		lck_mtx_unlock(&rm->rm_lock);
@@ -496,40 +499,40 @@ ramfs_disk_sync_impl(struct ramfs_mount *rm)
 	rm->rm_meta_dirty = false;
 	rm->rm_meta_syncing = true;
 	gen = rm->rm_meta_gen + 1;
-	write_bytes = RDWFS_ALIGN4K(RDWFS_SUPER_BYTES + payload_bytes);
-	if (write_bytes > RDWFS_SUPER_BYTES + payload_bytes) {
-		bzero((uint8_t *)rm->rm_meta_buf + RDWFS_SUPER_BYTES + payload_bytes,
-		    (size_t)(write_bytes - (RDWFS_SUPER_BYTES + payload_bytes)));
+	write_bytes = ANNFS_ALIGN4K(ANNFS_SUPER_BYTES + payload_bytes);
+	if (write_bytes > ANNFS_SUPER_BYTES + payload_bytes) {
+		bzero((uint8_t *)rm->rm_meta_buf + ANNFS_SUPER_BYTES + payload_bytes,
+		    (size_t)(write_bytes - (ANNFS_SUPER_BYTES + payload_bytes)));
 	}
-	sup = (struct rdwfs_super *)rm->rm_meta_buf;
+	sup = (struct annfs_super *)rm->rm_meta_buf;
 	bzero(sup, sizeof(*sup));
-	memcpy(sup->magic, RDWFS_MAGIC_STR, 8);
-	sup->version = RDWFS_VERSION;
+	memcpy(sup->magic, ANNFS_MAGIC_STR, 8);
+	sup->version = ANNFS_VERSION;
 	sup->page_size = PAGE_SIZE;
 	sup->generation = gen;
 	sup->payload_bytes = payload_bytes;
 	sup->next_ino = rm->rm_next_ino;
 	sup->node_count = node_count;
-	sup->payload_crc = crc32(0, (uint8_t *)rm->rm_meta_buf + RDWFS_SUPER_BYTES, (size_t)payload_bytes);
-	sup->super_crc = crc32(0, sup, __builtin_offsetof(struct rdwfs_super, super_crc));
+	sup->payload_crc = crc32(0, (uint8_t *)rm->rm_meta_buf + ANNFS_SUPER_BYTES, (size_t)payload_bytes);
+	sup->super_crc = crc32(0, sup, __builtin_offsetof(struct annfs_super, super_crc));
 
 	/* Preserve the recovered slot even when generations have unusual parity. */
-	slot_off = rm->rm_meta_slot == 0 ? RDWFS_SLOT1_OFFSET : RDWFS_SLOT0_OFFSET;
+	slot_off = rm->rm_meta_slot == 0 ? ANNFS_SLOT1_OFFSET : ANNFS_SLOT0_OFFSET;
 	lck_mtx_unlock(&rm->rm_lock);
 
-	if (write_bytes > RDWFS_SUPER_BYTES) {
-		error = redwood_ufs_var_io(true, slot_off + RDWFS_SUPER_BYTES,
-		    (uint8_t *)rm->rm_meta_buf + RDWFS_SUPER_BYTES, write_bytes - RDWFS_SUPER_BYTES);
+	if (write_bytes > ANNFS_SUPER_BYTES) {
+		error = annibale_ufs_var_io(true, slot_off + ANNFS_SUPER_BYTES,
+		    (uint8_t *)rm->rm_meta_buf + ANNFS_SUPER_BYTES, write_bytes - ANNFS_SUPER_BYTES);
 	}
 	if (error == 0) {
-		error = redwood_ufs_var_io(true, slot_off, rm->rm_meta_buf, RDWFS_SUPER_BYTES);
+		error = annibale_ufs_var_io(true, slot_off, rm->rm_meta_buf, ANNFS_SUPER_BYTES);
 	}
 	if (error == 0 && gen == 1) {
-		if (write_bytes > RDWFS_SUPER_BYTES) {
-			(void)redwood_ufs_var_io(true, RDWFS_SLOT1_OFFSET + RDWFS_SUPER_BYTES,
-			    (uint8_t *)rm->rm_meta_buf + RDWFS_SUPER_BYTES, write_bytes - RDWFS_SUPER_BYTES);
+		if (write_bytes > ANNFS_SUPER_BYTES) {
+			(void)annibale_ufs_var_io(true, ANNFS_SLOT1_OFFSET + ANNFS_SUPER_BYTES,
+			    (uint8_t *)rm->rm_meta_buf + ANNFS_SUPER_BYTES, write_bytes - ANNFS_SUPER_BYTES);
 		}
-		(void)redwood_ufs_var_io(true, RDWFS_SLOT1_OFFSET, rm->rm_meta_buf, RDWFS_SUPER_BYTES);
+		(void)annibale_ufs_var_io(true, ANNFS_SLOT1_OFFSET, rm->rm_meta_buf, ANNFS_SUPER_BYTES);
 	}
 
 	lck_mtx_lock(&rm->rm_lock);
@@ -537,7 +540,7 @@ ramfs_disk_sync_impl(struct ramfs_mount *rm)
 	wakeup(&rm->rm_meta_syncing);
 	if (error == 0) {
 		rm->rm_meta_gen = gen;
-		rm->rm_meta_slot = slot_off == RDWFS_SLOT0_OFFSET ? 0 : 1;
+		rm->rm_meta_slot = slot_off == ANNFS_SLOT0_OFFSET ? 0 : 1;
 	} else {
 		rm->rm_meta_dirty = true;
 	}
@@ -624,7 +627,7 @@ ramfs_disk_restore_panic_log(struct ramfs_mount *rm)
 	if (head_buf == NULL) {
 		return;
 	}
-	if (redwood_ufs_var_io(false, RDWFS_PANIC_OFFSET, head_buf, PAGE_SIZE) != 0) {
+	if (annibale_ufs_var_io(false, ANNFS_PANIC_OFFSET, head_buf, PAGE_SIZE) != 0) {
 		ramfs_vm_free(head_buf, PAGE_SIZE);
 		return;
 	}
@@ -639,19 +642,19 @@ ramfs_disk_restore_panic_log(struct ramfs_mount *rm)
 		ramfs_vm_free(head_buf, PAGE_SIZE);
 		return;
 	}
-	if (kh->payload_bytes == 0 || kh->payload_bytes > (RDWFS_PANIC_SIZE - sizeof(struct klog_head))) {
+	if (kh->payload_bytes == 0 || kh->payload_bytes > (ANNFS_PANIC_SIZE - sizeof(struct klog_head))) {
 		ramfs_vm_free(head_buf, PAGE_SIZE);
 		return;
 	}
 
 	pay_len = kh->payload_bytes;
-	total_len = RDWFS_ALIGN4K(sizeof(struct klog_head) + pay_len);
+	total_len = ANNFS_ALIGN4K(sizeof(struct klog_head) + pay_len);
 	full_buf = (uint8_t *)ramfs_vm_alloc((size_t)total_len);
 	if (full_buf == NULL) {
 		ramfs_vm_free(head_buf, PAGE_SIZE);
 		return;
 	}
-	if (redwood_ufs_var_io(false, RDWFS_PANIC_OFFSET, full_buf, total_len) != 0) {
+	if (annibale_ufs_var_io(false, ANNFS_PANIC_OFFSET, full_buf, total_len) != 0) {
 		ramfs_vm_free(full_buf, (size_t)total_len);
 		ramfs_vm_free(head_buf, PAGE_SIZE);
 		return;
@@ -779,7 +782,7 @@ ramfs_disk_restore_panic_log(struct ramfs_mount *rm)
 	kh->head_crc = crc32(0, kh, __builtin_offsetof(struct klog_head, head_crc));
 	bzero(head_buf, PAGE_SIZE);
 	memcpy(head_buf, kh, sizeof(*kh));
-	(void)redwood_ufs_var_io(true, RDWFS_PANIC_OFFSET, head_buf, PAGE_SIZE);
+	(void)annibale_ufs_var_io(true, ANNFS_PANIC_OFFSET, head_buf, PAGE_SIZE);
 
 	ramfs_vm_free(full_buf, (size_t)total_len);
 	ramfs_vm_free(head_buf, PAGE_SIZE);

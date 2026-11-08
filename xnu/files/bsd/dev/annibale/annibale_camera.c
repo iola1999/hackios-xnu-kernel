@@ -14,8 +14,8 @@
  *   - CSID-lite0: 0x0ad6d000 (hardware TPG & RDI0 routing, VC0, MIPI RAW10)
  *   - IFE-lite0: 0x0ad6f800 (Write Master 0 DMA to camera_region)
  *   - Camera DMA region: camera_region at 0x9b300000 (8 MB, mmap-able)
- *   - Exports /dev/redwood-camera conforming to struct redwood_camera_frame (RAW10 1920x1080@30fps),
- *     supporting both struct redwood_camera_command and ASCII control writes ("front", "back", "focus N").
+ *   - Exports /dev/annibale-camera conforming to struct annibale_camera_frame (RAW10 1920x1080@30fps),
+ *     supporting both struct annibale_camera_command and ASCII control writes ("front", "back", "focus N").
  */
 
 #include <kern/clock.h>
@@ -28,9 +28,9 @@
 #include <sys/conf.h>
 #include <sys/errno.h>
 #include <sys/proc.h>
-#include <sys/redwood_audio.h>
-#include <sys/redwood_camera.h>
-#include <sys/redwood_input.h>
+#include <sys/annibale_audio.h>
+#include <sys/annibale_camera.h>
+#include <sys/annibale_input.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
 
@@ -834,7 +834,7 @@ cam_hardware_power_down(void)
 	say("camera pipeline powered down\n");
 }
 
-/* Character Device Operations for /dev/redwood-camera */
+/* Character Device Operations for /dev/annibale-camera */
 
 static int
 annibale_cam_open(dev_t dev __unused, int flags __unused, int devtype __unused, struct proc *p __unused)
@@ -867,7 +867,7 @@ annibale_cam_close(dev_t dev __unused, int flags __unused, int devtype __unused,
 static int
 annibale_cam_read(dev_t dev __unused, struct uio *uio, int ioflag __unused)
 {
-	struct redwood_camera_frame frame;
+	struct annibale_camera_frame frame;
 	vm_offset_t payload_vbase;
 	uint64_t seq;
 	uint32_t exp, gain, focus, sensor;
@@ -904,7 +904,7 @@ annibale_cam_read(dev_t dev __unused, struct uio *uio, int ioflag __unused)
 
 	/* 4. Prepare frame header on stack */
 	bzero(&frame, sizeof(frame));
-	memcpy(frame.magic, REDWOOD_CAMERA_MAGIC, sizeof(frame.magic));
+	memcpy(frame.magic, ANNIBALE_CAMERA_MAGIC, sizeof(frame.magic));
 	frame.header_bytes = sizeof(frame);
 	frame.width = CAM_WIDTH;
 	frame.height = CAM_HEIGHT;
@@ -924,7 +924,7 @@ annibale_cam_read(dev_t dev __unused, struct uio *uio, int ioflag __unused)
 	frame.frame_lines_max = 65535;
 	frame.margin = 8;
 	frame.sensor = sensor;
-	frame.focus = (sensor == 1u) ? focus : REDWOOD_CAMERA_NO_FOCUS;
+	frame.focus = (sensor == 1u) ? focus : ANNIBALE_CAMERA_NO_FOCUS;
 
 	/* 5. Copy frame header to userland WITHOUT holding cam_lock */
 	error = uiomove((caddr_t)&frame, sizeof(frame), uio);
@@ -949,9 +949,9 @@ annibale_cam_write(dev_t dev __unused, struct uio *uio, int ioflag __unused)
 		return EINVAL;
 	}
 
-	/* Support binary struct redwood_camera_command writes */
-	if (resid == (user_ssize_t)sizeof(struct redwood_camera_command)) {
-		struct redwood_camera_command cmd;
+	/* Support binary struct annibale_camera_command writes */
+	if (resid == (user_ssize_t)sizeof(struct annibale_camera_command)) {
+		struct annibale_camera_command cmd;
 		int error = uiomove((caddr_t)&cmd, sizeof(cmd), uio);
 		if (error != 0) {
 			return error;
@@ -959,16 +959,16 @@ annibale_cam_write(dev_t dev __unused, struct uio *uio, int ioflag __unused)
 
 		lck_mtx_lock(cam_lock);
 		switch (cmd.command) {
-		case REDWOOD_CAMERA_EXPOSURE:
+		case ANNIBALE_CAMERA_EXPOSURE:
 			current_exposure = cmd.a > 0 ? cmd.a : 1000;
 			current_gain = cmd.b > 0 ? cmd.b : 256;
 			cci0_apply_exposure(current_exposure, current_gain);
 			break;
-		case REDWOOD_CAMERA_FOCUS:
+		case ANNIBALE_CAMERA_FOCUS:
 			current_focus = cmd.a > 1023u ? 1023u : cmd.a;
 			cci0_apply_focus(current_focus);
 			break;
-		case REDWOOD_CAMERA_SENSOR:
+		case ANNIBALE_CAMERA_SENSOR:
 			if (cmd.a != current_sensor) {
 				current_sensor = (cmd.a == 2u) ? 2u : 1u;
 				if (cam_region_vbase != 0) {
@@ -1088,38 +1088,34 @@ void
 annibale_camera_init(void)
 {
 	static bool initialized = false;
-	if (initialized || !redwood_platform_is_annibale()) {
+	if (initialized || !annibale_platform_is_annibale()) {
 		return;
 	}
 	initialized = true;
 
 	int cam_arg = -1;
-	uint32_t fake_n = 0;
 	(void)PE_parse_boot_argn("cam_hw", &cam_hw_mmio, sizeof(cam_hw_mmio));
 	if (PE_parse_boot_argn("cam", &cam_arg, sizeof(cam_arg))) {
 		if (cam_arg == 0) {
 			say("cam=0: camera driver disabled by boot-arg\n");
 			return;
 		}
-		if (cam_arg == 5 && PE_parse_boot_argn("cam_fake", &fake_n, sizeof(fake_n)) && fake_n != 0) {
-			return; /* Let redwood_camera.c serve cam=5 cam_fake=1 */
-		}
 		if (cam_arg > 0) {
 			boot_cam_level = (uint32_t)cam_arg;
 		}
 	}
 
-	say("registering /dev/redwood-camera driver bridge on annibale...\n");
+	say("registering /dev/annibale-camera driver bridge on annibale...\n");
 
 	cam_lock_grp = lck_grp_alloc_init("annibale-cam", LCK_GRP_ATTR_NULL);
 	cam_lock = lck_mtx_alloc_init(cam_lock_grp, LCK_ATTR_NULL);
 
 	int major = cdevsw_add(-1, &annibale_cam_cdevsw);
 	if (major >= 0) {
-		if (devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-camera") != NULL) {
-			say("/dev/redwood-camera created successfully\n");
+		if (devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "annibale-camera") != NULL) {
+			say("/dev/annibale-camera created successfully\n");
 		} else {
-			say("warning: failed to create devfs node for /dev/redwood-camera\n");
+			say("warning: failed to create devfs node for /dev/annibale-camera\n");
 		}
 	} else {
 		say("warning: failed to allocate cdevsw major for camera\n");

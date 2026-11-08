@@ -1,7 +1,7 @@
 /*
  * Step 9 of the PCIe survey (pcie=9): the exchange with the WCN7850 firmware's service (WLFW, QMI service 69)
  * that ath12k's qmi.c makes before the rest of the driver touches the chip, in its order and with its values for
- * this chip, as bsd/dev/redwood_wlfw.c does for the WCN6750 and ath11k. A STAND-IN: it is here to learn from the
+ * this chip, as bsd/dev/annibale_wlfw.c does for the WCN6750 and ath11k. A STAND-IN: it is here to learn from the
  * phone whether this firmware takes ath12k's messages, which board data file is this phone's and what memory the
  * firmware asks for, before ath12k's own qmi.c is made to run.
  *
@@ -29,13 +29,13 @@
 #include <machine/limits.h>
 #include <pexpert/pexpert.h>
 #include <sys/errno.h>
-#include <sys/redwood_qmi.h>
+#include <sys/annibale_qmi.h>
 #include <sys/systm.h>
 #include "mhi_pcie_private.h"
 
 #define printf mhi_pcie_say
 
-#if !__has_include("redwood_wlfw_ath12k.h")
+#if !__has_include("annibale_wlfw_ath12k.h")
 
 void
 mhi_pcie_wlfw(void)
@@ -46,10 +46,10 @@ mhi_pcie_wlfw(void)
 
 #else
 
-#define REDWOOD_QMI_NO_KERNEL_CONNECT
-#include "redwood_wlfw_ath12k.h"
+#define ANNIBALE_QMI_NO_KERNEL_CONNECT
+#include "annibale_wlfw_ath12k.h"
 
-extern const uint8_t *redwood_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+extern const uint8_t *annibale_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 
 #define ATH12K_FIRMWARE_MODE_NORMAL     0       /* core.h: the mode "mission" */
 #define WLFW_MODE_OFF                   4
@@ -160,7 +160,7 @@ wait_for(volatile bool *flag, uint32_t ms)
 static int
 wlfw_new_server(struct qmi_handle *qmi, struct qmi_service *service)
 {
-	int error = redwood_qmi_connect(qmi->sock, service->node, service->port);
+	int error = annibale_qmi_connect(qmi->sock, service->node, service->port);
 
 	printf("pcie: step 9: the service is at node %u port %u (version %u, instance %u)%s\n", service->node, service->port,
 	    service->version, service->instance, error ? ": cannot be connected to" : "");
@@ -239,7 +239,7 @@ ask(const char *what, int message, size_t largest, const struct qmi_elem_info *r
 		if (ret < 0) {
 			qmi_txn_cancel(&txn);
 		} else {
-			ret = redwood_qmi_txn_wait_ms(&txn, ATH12K_QMI_WLANFW_TIMEOUT_MS);
+			ret = annibale_qmi_txn_wait_ms(&txn, ATH12K_QMI_WLANFW_TIMEOUT_MS);
 		}
 	}
 	if (ret >= 0 && result->result == QMI_RESULT_SUCCESS_V01) {
@@ -266,7 +266,7 @@ send_file(const char *what, const char *name, uint8_t type, uint32_t board_id)
 	struct qmi_wlanfw_bdf_download_resp_msg_v01 reply;
 	uint64_t size = 0, began = now_ms();
 	int disk = 0;
-	const uint8_t *data = redwood_image_file("fw", name, &size, &disk);
+	const uint8_t *data = annibale_image_file("fw", name, &size, &disk);
 	uint32_t left, pieces = 0;
 
 	if (data == NULL || size == 0 || size > 1024 * 1024) {
@@ -314,7 +314,7 @@ send_qdss(void)
 	struct result_only reply;
 	uint64_t size = 0;
 	int disk = 0;
-	const uint8_t *data = redwood_image_file("fw", "qdss_trace_config_v2.cfg", &size, &disk);
+	const uint8_t *data = annibale_image_file("fw", "qdss_trace_config_v2.cfg", &size, &disk);
 	uint32_t left, pieces = 0;
 
 	if (data == NULL || size == 0 || size > 1024 * 1024) {
@@ -514,7 +514,7 @@ load_board(void)
 	if (!send_file("board data", name, ATH12K_QMI_BDF_TYPE_ELF, board_id)) {
 		return false;
 	}
-	image = redwood_image_file("fw", "phy_ucode20.elf", &size, &disk);
+	image = annibale_image_file("fw", "phy_ucode20.elf", &size, &disk);
 	copy = image != NULL && size != 0 ? mhi_pcie_dma_alloc(size, &m3.addr) : NULL;
 	if (copy == NULL) {
 		printf("pcie: step 9: no fw/phy_ucode20.elf, or no memory for it (%llu bytes)\n", size);

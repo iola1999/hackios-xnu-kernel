@@ -110,7 +110,7 @@ K=$ROOT/xnu/files/bsd/sys
 DFLAGS="-Isrc/ath12k -Isrc -include $W/include/lx_prelude.h -include $W/ath12k/lx_ath12k.h -DCONFIG_ATH12K_DEBUG
 	-DLX_POOL_MB=96u -DLX_RINGS_MB=64u -DLX_ALIGN_NATURAL
 	-DKBUILD_MODNAME=\"ath12k\"
-	-DLX_REDWOOD_LX_H=\"$K/redwood_lx.h\" -DLX_REDWOOD_QMI_H=\"$K/redwood_qmi.h\""
+	-DLX_ANNIBALE_LX_H=\"$K/annibale_lx.h\" -DLX_ANNIBALE_QMI_H=\"$K/annibale_qmi.h\""
 mkdir -p obj out
 rm -f obj/*.err
 compile() {		# compile SOURCE OBJECT [FLAGS]: only when the object is older than anything it was made of
@@ -151,7 +151,7 @@ missing=
 for s in $(cat out/undefined.txt); do
 	case " $(echo $KERNEL) " in *" $s "*) continue ;; esac
 	case $s in
-	lx_os_*|qmi_*|redwood_qmi_*|section\$*) continue ;;
+	lx_os_*|qmi_*|annibale_qmi_*|section\$*) continue ;;
 	ath12k_*|__ath12k_*) ;;
 	*) echo "mk-ath12k.sh: nothing defines $s" >&2; missing=1; continue ;;
 	esac

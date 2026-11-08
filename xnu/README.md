@@ -2,7 +2,7 @@
 
 Our changes to XNU `xnu-8796.121.2` (the iOS 16.5 kernel, Darwin 22.5.0):
 
-- `patches/` -- changes to Apple's files, one piece per file, applied in the order `patches/series` names them (the single `redwood.patch` this directory used to hold is retired: per-file pieces mean two people editing two files never touch the same piece);
+- `patches/` -- changes to Apple's files, one piece per file, applied in the order `patches/series` names them (the single `annibale.patch` this directory used to hold is retired: per-file pieces mean two people editing two files never touch the same piece);
 - `files/` -- new files, at their paths in the XNU tree;
 - `apply.sh` -- takes Apple's sources and applies all of this; `export.sh` -- the reverse.
 
@@ -19,7 +19,7 @@ You need:
 
 ```sh
 xnu/apply.sh             # ~6 s: tag xnu-8796.121.2 of apple-oss-distributions/xnu + our changes
-                         #       -> xnu-src/xnu-8796.121.2, branch redwood, changes uncommitted
+                         #       -> xnu-src/xnu-8796.121.2, branch annibale, changes uncommitted
 xnu-deps/setup.sh        # ~30 s: dependency sources, mig/unifdef/tcsh, the SDK overlay, two libraries
 tools/mk-ath11k.sh       # optional, once: the phone's Wi-Fi driver (fetches Linux and FreeBSD sources)
 tools/mk-wlfw.sh         #   ... and its firmware-service message tables
@@ -27,7 +27,7 @@ tools/mk-wlfw.sh         #   ... and its firmware-service message tables
 ```
 
 Result: `xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837`.
-`./xl run` and `qemu/run-ios.sh` take the kernel from there by themselves (and from `prebuilt/` only when it is not there).
+`./xl run` and `qemu/run-ios.sh` take the kernel from there by themselves.
 `common/build.sh <device>` runs all of these steps.
 
 Checked: in an empty directory holding only the repository, these commands produced a kernel of the same
@@ -51,9 +51,8 @@ Things to know:
 
 ## Working on the tree
 
-Changes are made directly in `xnu-src/xnu-8796.121.2` (an ordinary git tree of Apple's, on branch `redwood`).
-Before committing to this repository run `xnu/export.sh` (it regenerates `patches/` and `files/`); to update
-the ready-made kernel in `prebuilt/`, `tools/update-prebuilt.sh`.
+Changes are made directly in `xnu-src/xnu-8796.121.2` (an ordinary git tree of Apple's, on branch `annibale`).
+Before committing to this repository run `xnu/export.sh` (it regenerates `patches/` and `files/`).
 
 **Two traps, each of which cost a build.**
 
@@ -76,14 +75,14 @@ The error was there before any of our changes.
 | `iokit/Kernel/MiniIOSurface.*`, `MiniIOMobileFramebuffer.cpp`, `MiniAppleKeyStore.cpp` | replacements for closed drivers: surfaces, the display (scaled to the panel, with screen recording), the key store |
 | `bsd/miscfs/apfs/`, `bsd/miscfs/ramfs/` | our file systems: APFS (the root on flash and the images in memory) and a writable file system in memory |
 | `bsd/kern/kern_minimac.c`, `libkern/amfi/` | AMFI and Sandbox stand-ins (MAC policies), entitlements from the program's signature |
-| `bsd/dev/redwood_input.c`, `redwood_goodix.c`, `redwood_virtio_input.c` | input: `/dev/redwood-touch`, the Goodix GT9916 driver (SPI bit-banged over GPIO), virtio-input for QEMU |
-| `bsd/dev/redwood_cpufreq.c` | CPU frequency (Qualcomm EPSS) |
-| `bsd/dev/redwood_net.c`, `bsd/sys/redwood_net.h`, `redwood_virtio_net.c` | the network interface `en0` on the kernel's network KPI (without IONetworkingFamily) and the boundary between it and whatever carries the frames (a "link": three functions in `redwood_net.h`); the first link is virtio-net for QEMU |
-| `bsd/dev/redwood_adreno.c`, `iokit/Kernel/RedwoodGPU.cpp` | the phone's GPU (Adreno 642L): step-by-step bring-up (`adreno=N`: power, GMU, the zap shader, microcode), buffers and the command queue; an IOKit client with a subset of msm DRM for Mesa |
-| `bsd/dev/redwood_wifi.c`, `bsd/sys/redwood_qrtr.h` | the phone's Wi-Fi (WCN6750): Qualcomm shared memory (SMEM), the signalling bits between us and the Wi-Fi processor (SMP2P), the power processor's mailbox, loading the Wi-Fi processor's firmware, starting it through TrustZone, GLINK and QRTR on top of it; `redwood_qrtr.h` is a datagram port for the rest of the kernel |
-| `bsd/dev/redwood_qmi.c`, `bsd/sys/redwood_qmi.h` | QMI, the message protocol of the services on Qualcomm processors: table-driven encoding, requests and replies, indications; the interface is Linux's (`qmi_*`) so that ath11k's `qmi.c` builds unchanged; tested on the computer (`tools/qmi-test/run.sh`) |
-| `bsd/dev/redwood_wlfw.c` | the conversation with the Wi-Fi firmware service; the message descriptions are taken from the ath11k sources at build time (`tools/mk-wlfw.sh`) and are not in git |
-| `bsd/dev/redwood_audio.c`, `redwood_virtio_sound.c`, `redwood_speaker.c` | sound: `/dev/redwood-audio` (where our output device in mediaserverd writes what iOS plays), recording it to memory, virtio-sound for QEMU; a first look at the phone's speaker amplifiers |
+| `bsd/dev/annibale_input.c`, `annibale_goodix.c`, `annibale_virtio_input.c` | input: `/dev/annibale-touch`, the Goodix GT9916 driver (SPI bit-banged over GPIO), virtio-input for QEMU |
+| `bsd/dev/annibale_cpufreq.c` | CPU frequency (Qualcomm EPSS) |
+| `bsd/dev/annibale_net.c`, `bsd/sys/annibale_net.h`, `annibale_virtio_net.c` | the network interface `en0` on the kernel's network KPI (without IONetworkingFamily) and the boundary between it and whatever carries the frames (a "link": three functions in `annibale_net.h`); the first link is virtio-net for QEMU |
+| `bsd/dev/annibale_adreno.c`, `iokit/Kernel/AnnibaleGPU.cpp` | the phone's GPU (Adreno 642L): step-by-step bring-up (`adreno=N`: power, GMU, the zap shader, microcode), buffers and the command queue; an IOKit client with a subset of msm DRM for Mesa |
+| `bsd/dev/annibale_wifi.c`, `bsd/sys/annibale_qrtr.h` | the phone's Wi-Fi (WCN6750): Qualcomm shared memory (SMEM), the signalling bits between us and the Wi-Fi processor (SMP2P), the power processor's mailbox, loading the Wi-Fi processor's firmware, starting it through TrustZone, GLINK and QRTR on top of it; `annibale_qrtr.h` is a datagram port for the rest of the kernel |
+| `bsd/dev/annibale_qmi.c`, `bsd/sys/annibale_qmi.h` | QMI, the message protocol of the services on Qualcomm processors: table-driven encoding, requests and replies, indications; the interface is Linux's (`qmi_*`) so that ath11k's `qmi.c` builds unchanged; tested on the computer (`tools/qmi-test/run.sh`) |
+| `bsd/dev/annibale_wlfw.c` | the conversation with the Wi-Fi firmware service; the message descriptions are taken from the ath11k sources at build time (`tools/mk-wlfw.sh`) and are not in git |
+| `bsd/dev/annibale_audio.c`, `annibale_virtio_sound.c`, `annibale_speaker.c` | sound: `/dev/annibale-audio` (where our output device in mediaserverd writes what iOS plays), recording it to memory, virtio-sound for QEMU; a first look at the phone's speaker amplifiers |
 | `bsd/pthread/pthread_kext_static.c` | the pthread kext, linked into the kernel |
 
 Besides the hooks for all of this, the pieces in `patches/` fix what stops the open XNU from building and running outside

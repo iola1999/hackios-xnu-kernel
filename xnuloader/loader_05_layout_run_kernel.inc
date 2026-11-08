@@ -472,9 +472,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	uint64_t this_mpidr = READ_SYSREG(MPIDR_EL1) & 0xFFFFFF, kernel_mpidr = this_mpidr;
 	/* "cpus=N" or "cpumask=M" there too: the kernel may have more cores than the one it starts on */
 	int more_cores = 0, battery_requested = 0, ufs_requested = 0, low_dma_requested = 0;
-	/* "torch=N" (not 0) there too: the phone's flashlight is the kernel's (bsd/dev/redwood_torch.c) */
+	/* "torch=N" (not 0) there too: the phone's flashlight is the kernel's (bsd/dev/annibale/annibale_torch.c) */
 	int torch_requested = 0;
-	/* "cam=5" there too: the phone's wide camera is iOS's (bsd/dev/redwood_camera.c) */
+	/* "cam=5" there too: the phone's wide camera is iOS's (bsd/dev/annibale/annibale_camera.c) */
 	int camera_requested = 0;
 	/* (the loader stays for run after run: what the last run's arguments said must not hold for this one) */
 	gamut_p3 = 0;
@@ -724,8 +724,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_identity(&w, &id->root);
 	dt_prop_str(&w, "platform-name", id->platform);
 	/* what iBoot takes from the factory configuration of a real phone; fixed size fields */
-	dt_prop_padded(&w, "serial-number", "RDW00POCOX5P", 32);
-	dt_prop_padded(&w, "mlb-serial-number", "RDW00POCOX5PMLB00", 32);
+	dt_prop_padded(&w, "serial-number", "ANN00K900001", 32);
+	dt_prop_padded(&w, "mlb-serial-number", "ANN00K900001MLB00", 32);
 	dt_prop_padded(&w, "model-number", "MQAC2", 32);
 	dt_prop_padded(&w, "region-info", "LL/A", 32);
 	dt_prop_padded(&w, "regulatory-model-number", "A1865", 32);
@@ -752,11 +752,11 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	 * (UDID) from the serial number, the chip ID and the two addresses; when one is missing it
 	 * asks its helper for the factory data, is refused and waits forever (and lsd with it).
 	 */
-	static const uint8_t wifi_address[6] = { 0x02, 0x52, 0x44, 0x57, 0x00, 0x01 };
-	static const uint8_t bluetooth_address[6] = { 0x02, 0x52, 0x44, 0x57, 0x00, 0x02 };
-	static const uint8_t manifest_hash[48] = { 0x72, 0x65, 0x64, 0x77, 0x6f, 0x6f, 0x64 };
+	static const uint8_t wifi_address[6] = { 0x02, 0x41, 0x4e, 0x4e, 0x00, 0x01 };
+	static const uint8_t bluetooth_address[6] = { 0x02, 0x41, 0x4e, 0x4e, 0x00, 0x02 };
+	static const uint8_t manifest_hash[48] = { 0x61, 0x6e, 0x6e, 0x69, 0x62, 0x61, 0x6c, 0x65 };
 	static const uint8_t no_behavior[16];
-	dt_prop_u64(&w, "unique-chip-id", 0x000052445730001ULL);
+	dt_prop_u64(&w, "unique-chip-id", 0x0000414e4e30001ULL);
 	dt_prop_u32(&w, "chip-id", id->chip_id);
 	dt_prop_u32(&w, "board-id", id->board_id);
 	dt_prop(&w, "mac-address-wifi0", wifi_address, sizeof(wifi_address));

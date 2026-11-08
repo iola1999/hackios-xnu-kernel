@@ -29,7 +29,7 @@
  * The CPU subtype is reported as arm64e only so that ml_grade_binary() accepts them (boot-arg
  * arm64e=0: arm64, for iOS 16.5, whose dyld then picks its arm64 slice and shared cache).
  */
-#define REDWOOD_ARM64E_USERLAND   1
+#define ANNIBALE_ARM64E_USERLAND   1
 
 #define __ARM_ARCH__              8
 #define __ARM_VMSA__              8

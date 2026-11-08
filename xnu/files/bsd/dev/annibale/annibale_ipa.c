@@ -27,7 +27,7 @@
 #include <sys/kern_event.h>
 #include <sys/kpi_mbuf.h>
 #include <sys/proc.h>
-#include <sys/redwood_input.h>
+#include <sys/annibale_input.h>
 #include <sys/sockio.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
@@ -41,7 +41,7 @@
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 extern uint64_t kvtophys(vm_offset_t va);
-extern const uint8_t *redwood_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+extern const uint8_t *annibale_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 
 #ifndef IFT_CELLULAR
 #define IFT_CELLULAR            0xff
@@ -84,15 +84,15 @@ static struct {
 
 static int (*ipa_modem_tx_fn)(const uint8_t *qmap_frame, size_t len);
 
-SYSCTL_DECL(_kern_redwood);
+SYSCTL_DECL(_kern_annibale);
 static char sysctl_cellular_ipv4[32] = "0.0.0.0";
 static char sysctl_cellular_gw[32] = "0.0.0.0";
 static char sysctl_cellular_dns[64] = "0.0.0.0";
-SYSCTL_STRING(_kern_redwood, OID_AUTO, cellular_ipv4, CTLFLAG_RD | CTLFLAG_LOCKED,
+SYSCTL_STRING(_kern_annibale, OID_AUTO, cellular_ipv4, CTLFLAG_RD | CTLFLAG_LOCKED,
     sysctl_cellular_ipv4, sizeof(sysctl_cellular_ipv4), "Cellular pdp_ip0 IPv4 address");
-SYSCTL_STRING(_kern_redwood, OID_AUTO, cellular_gw, CTLFLAG_RD | CTLFLAG_LOCKED,
+SYSCTL_STRING(_kern_annibale, OID_AUTO, cellular_gw, CTLFLAG_RD | CTLFLAG_LOCKED,
     sysctl_cellular_gw, sizeof(sysctl_cellular_gw), "Cellular pdp_ip0 IPv4 gateway");
-SYSCTL_STRING(_kern_redwood, OID_AUTO, cellular_dns, CTLFLAG_RD | CTLFLAG_LOCKED,
+SYSCTL_STRING(_kern_annibale, OID_AUTO, cellular_dns, CTLFLAG_RD | CTLFLAG_LOCKED,
     sysctl_cellular_dns, sizeof(sysctl_cellular_dns), "Cellular pdp_ip0 IPv4 DNS servers");
 
 static void
@@ -443,7 +443,7 @@ annibale_ipa_init(void)
 	ifnet_t ifp = NULL;
 	errno_t error;
 
-	if (!redwood_platform_is_annibale() || ipa_inited) {
+	if (!annibale_platform_is_annibale() || ipa_inited) {
 		return;
 	}
 	ipa_inited = true;
@@ -514,7 +514,7 @@ annibale_tz_smc(uint64_t fn, uint64_t arg_cnt, uint64_t a0, uint64_t a1, uint64_
 	return -1;
 }
 
-extern bool redwood_ufs_fat16_fw_read(const char *name, uint64_t *size_out, volatile void *dst_buf, uint64_t dst_cap);
+extern bool annibale_ufs_fat16_fw_read(const char *name, uint64_t *size_out, volatile void *dst_buf, uint64_t dst_cap);
 
 int64_t
 annibale_tz_pas_auth_reset(uint32_t pas_id)
@@ -525,13 +525,13 @@ annibale_tz_pas_auth_reset(uint32_t pas_id)
 static uint8_t *
 annibale_read_fw_file(const char *name, uint64_t *size_out, bool *needs_free_out)
 {
-	static const char *const fw_dirs[] = { "/fw", "/redwood/fw", "/System/Volumes/iOS/fw" };
+	static const char *const fw_dirs[] = { "/fw", "/annibale/fw", "/System/Volumes/iOS/fw" };
 	const uint8_t *img_data;
 	vfs_context_t ctx;
 
 	*size_out = 0;
 	*needs_free_out = false;
-	img_data = redwood_image_file("fw", name, size_out, NULL);
+	img_data = annibale_image_file("fw", name, size_out, NULL);
 	if (img_data != NULL && *size_out > 0) {
 		return __DECONST(uint8_t *, img_data);
 	}
@@ -571,10 +571,10 @@ annibale_read_fw_file(const char *name, uint64_t *size_out, bool *needs_free_out
 		}
 	}
 	uint64_t fat_sz = 0;
-	if (redwood_ufs_fat16_fw_read(name, &fat_sz, NULL, 0) && fat_sz > 0 && fat_sz <= 0x400000ULL) {
+	if (annibale_ufs_fat16_fw_read(name, &fat_sz, NULL, 0) && fat_sz > 0 && fat_sz <= 0x400000ULL) {
 		uint8_t *buf = kalloc_data(fat_sz, Z_WAITOK);
 		if (buf != NULL) {
-			if (redwood_ufs_fat16_fw_read(name, &fat_sz, buf, fat_sz)) {
+			if (annibale_ufs_fat16_fw_read(name, &fat_sz, buf, fat_sz)) {
 				*size_out = fat_sz;
 				*needs_free_out = true;
 				return buf;
@@ -590,7 +590,7 @@ annibale_fw_exists(const char *name)
 {
 	uint64_t sz = 0;
 	bool need_free = false;
-	if (redwood_ufs_fat16_fw_read(name, &sz, NULL, 0) && sz > 0) {
+	if (annibale_ufs_fat16_fw_read(name, &sz, NULL, 0) && sz > 0) {
 		return true;
 	}
 	uint8_t *buf = annibale_read_fw_file(name, &sz, &need_free);

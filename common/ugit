@@ -4,9 +4,9 @@
 #
 # -f is required on `add`: the shared work tree also reads this checkout's .gitignore, whose first
 # rule ignores everything (/*), so a tracked file gets reported as "paths are ignored" anyway.
-# `common/ugit add -f userland/src/redwoodmetal.m` stages it and its tracked state does not change.
+# `common/ugit add -f userland/src/annibalemetal.m` stages it and its tracked state does not change.
 #
-# Change the driver and shim sources (userland/src/redwoodmetal*.m, *.inc, sb_metal_*.m) and
+# Change the driver and shim sources (userland/src/annibalemetal*.m, *.inc, sb_metal_*.m) and
 # tools/mesa/ here, not with `git -C`: the separate checkout under hackios-xnu-userland/ carries
 # another copy of these files that only the 16.5 line builds from. `common/ugit status` is how to
 # tell whether a file is under version control here.

@@ -24,7 +24,7 @@
 #include <pexpert/pexpert.h>
 #include <sys/errno.h>
 #include <sys/kauth.h>
-#include <sys/redwood_audio.h>
+#include <sys/annibale_audio.h>
 #include <sys/systm.h>
 #include <sys/vnode.h>
 #include <sys/vnode_internal.h>
@@ -37,11 +37,11 @@ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, u
 extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 extern uint64_t kvtophys(vm_offset_t va);
 extern kern_return_t thread_terminate(thread_t thread);
-extern const uint8_t *redwood_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
-extern bool redwood_ufs_fat16_fw_read(const char *name, uint64_t *size_out, volatile void *dst_buf, uint64_t dst_cap);
+extern const uint8_t *annibale_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+extern bool annibale_ufs_fat16_fw_read(const char *name, uint64_t *size_out, volatile void *dst_buf, uint64_t dst_cap);
 
-extern lck_mtx_t redwood_aop_mailbox_lock;
-extern lck_mtx_t redwood_smem_alloc_lock;
+extern lck_mtx_t annibale_aop_mailbox_lock;
+extern lck_mtx_t annibale_smem_alloc_lock;
 
 #define say(...) printf("aadsp: " __VA_ARGS__)
 
@@ -563,17 +563,17 @@ static bool aoss_send_msg(const char *msg)
 	uint32_t words[QMP_MESSAGE / 4] = { 0 };
 	bool ok = false;
 
-	lck_mtx_lock(&redwood_aop_mailbox_lock);
+	lck_mtx_lock(&annibale_aop_mailbox_lock);
 	if (aoss_base == 0) {
 		aoss_base = ml_io_map(AOSS_PHYS, AOSS_SIZE);
 		if (aoss_base == 0) {
-			lck_mtx_unlock(&redwood_aop_mailbox_lock);
+			lck_mtx_unlock(&annibale_aop_mailbox_lock);
 			return false;
 		}
 	}
 	if (aoss_our_box == 0) {
 		if (mmio_rd(aoss_base) != QMP_MAGIC_VALUE) {
-			lck_mtx_unlock(&redwood_aop_mailbox_lock);
+			lck_mtx_unlock(&annibale_aop_mailbox_lock);
 			return false;
 		}
 		mmio_wr(aoss_base + QMP_OUR_LINK, QMP_UP);
@@ -587,13 +587,13 @@ static bool aoss_send_msg(const char *msg)
 		for (unsigned i = 0; i < 200 && mmio_rd(aoss_base + QMP_OUR_CHANNEL_ACK) != QMP_UP; i++) sleep_ms(1);
 		uint32_t box = mmio_rd(aoss_base + QMP_OUR_BOX), bsz = mmio_rd(aoss_base + QMP_OUR_BOX_SIZE);
 		if (box >= AOSS_SIZE || bsz < QMP_MESSAGE) {
-			lck_mtx_unlock(&redwood_aop_mailbox_lock);
+			lck_mtx_unlock(&annibale_aop_mailbox_lock);
 			return false;
 		}
 		aoss_our_box = box;
 	}
 	if (mmio_rd(aoss_base + aoss_our_box) != 0) {
-		lck_mtx_unlock(&redwood_aop_mailbox_lock);
+		lck_mtx_unlock(&annibale_aop_mailbox_lock);
 		return false;
 	}
 	strlcpy((char *)words, msg, sizeof(words));
@@ -610,7 +610,7 @@ static bool aoss_send_msg(const char *msg)
 		sleep_ms(2);
 	}
 	if (!ok) mmio_wr(aoss_base + aoss_our_box, 0);
-	lck_mtx_unlock(&redwood_aop_mailbox_lock);
+	lck_mtx_unlock(&annibale_aop_mailbox_lock);
 	return ok;
 }
 
@@ -876,10 +876,10 @@ static void glink_poll_rx(void)
 
 static bool glink_init_queues(bool cold_boot)
 {
-	lck_mtx_lock(&redwood_smem_alloc_lock);
+	lck_mtx_lock(&annibale_smem_alloc_lock);
 	uint32_t desc = smem_alloc_item(ITEM_GLINK_DESC, 32);
 	uint32_t our_q = smem_alloc_item(ITEM_GLINK_OUR_Q, GLINK_QUEUE_SIZE);
-	lck_mtx_unlock(&redwood_smem_alloc_lock);
+	lck_mtx_unlock(&annibale_smem_alloc_lock);
 	if (desc == 0 || our_q == 0) {
 		return false;
 	}
@@ -1032,9 +1032,9 @@ bool annibale_adsp_gpr_ready(void)
 
 static void smp2p_init_ours(void)
 {
-	lck_mtx_lock(&redwood_smem_alloc_lock);
+	lck_mtx_lock(&annibale_smem_alloc_lock);
 	uint32_t at = smem_alloc_item(ITEM_SMP2P_OURS, sizeof(struct smp2p_item));
-	lck_mtx_unlock(&redwood_smem_alloc_lock);
+	lck_mtx_unlock(&annibale_smem_alloc_lock);
 	if (at == 0) return;
 	struct smp2p_item ours;
 	if (!smem_peek(at, &ours, sizeof(ours)) || ours.magic != SMP2P_MAGIC) {
@@ -1099,7 +1099,7 @@ static void annibale_adsp_boot_thread(void *arg __unused, wait_result_t w __unus
 			}
 			uint64_t probe_sz = 0;
 			for (unsigned wait = 0; wait < 50 &&
-			    !redwood_ufs_fat16_fw_read("adsp_dtb.mdt", &probe_sz, NULL, 0); wait++) {
+			    !annibale_ufs_fat16_fw_read("adsp_dtb.mdt", &probe_sz, NULL, 0); wait++) {
 				sleep_ms(100);
 			}
 			struct fw_image dtb_fw, main_fw;

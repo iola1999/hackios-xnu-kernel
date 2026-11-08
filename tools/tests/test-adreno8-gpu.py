@@ -176,7 +176,7 @@ void adreno8_hold(bool single_access) { (void)single_access; }
 static unsigned setup_waits;
 static void ring_setup_wait(void);
 void adreno8_sleep_us(uint32_t us) { if (us == 100000) { setup_waits++; if (adreno8_direct_ring) ring_setup_wait(); } }
-const uint8_t *redwood_image_file(const char *, const char *, uint64_t *, int *);
+const uint8_t *annibale_image_file(const char *, const char *, uint64_t *, int *);
 #define _DEV_ADRENO8_PRIVATE_H
 ''' + constants + '\n#include "adreno8_gpu.c"\n#undef printf\n' + reference + r'''
 static uint32_t gpu_regs[8][0x10000], gmu_regs[0x1a000], current_pipe;
@@ -346,7 +346,7 @@ void adreno8_put(struct adreno8_block *block, const char *name, uint32_t offset,
     adreno8_wr(block->base + offset, value);
 }
 
-const uint8_t *redwood_image_file(const char *dir, const char *name, uint64_t *size, int *disk)
+const uint8_t *annibale_image_file(const char *dir, const char *name, uint64_t *size, int *disk)
 {
     assert(!strcmp(dir, "fw"));
     unsigned i = !strcmp(name, "gen80000_aqe.fw");

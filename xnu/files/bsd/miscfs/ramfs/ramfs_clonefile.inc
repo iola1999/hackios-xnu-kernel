@@ -176,6 +176,7 @@ ramfs_clonefile(struct vnop_clonefile_args *ap)
 	}
 
 	node->rn_ino = rm->rm_next_ino++;
+	ramfs_track(node);
 	ramfs_hash_insert(rm, node);
 	if (src->rn_type == VDIR) {
 		node->rn_nlink = 2;

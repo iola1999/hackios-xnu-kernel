@@ -8,7 +8,7 @@ index 64d187a50afc..1c3ff6ff16ff 100644
  			error = vnode_lookup(PREBOOT_CRYPTEX_PATH, 0, &preboot_vp, vfs_context_current());
 -			if (error || srfmp->vp->v_mount != preboot_vp->v_mount) {
 +			/*
-+			 * (redwood) Or a volume of its own mounted on a directory right inside it: iOS
++			 * (annibale) Or a volume of its own mounted on a directory right inside it: iOS
 +			 * grafts each cryptex image into the Preboot volume (graftdmg), so its files are
 +			 * that volume's; this port mounts the image there as it is (bsd/miscfs/apfs), a
 +			 * mount of its own whose covered directory is Preboot's Cryptexes/<name>.

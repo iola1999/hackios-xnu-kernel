@@ -7,7 +7,7 @@ index 3829f5fb5ebc..b0e218daf64c 100644
  #endif /* CONFIG_THREAD_GROUPS */
  
 +/*
-+ * (redwood) What kind of work the thread's work interval is for: one of WORK_INTERVAL_TYPE_*,
++ * (annibale) What kind of work the thread's work interval is for: one of WORK_INTERVAL_TYPE_*,
 + * or WORK_INTERVAL_TYPE_LAST for a thread that has joined none.
 + */
 +uint32_t

@@ -3,7 +3,7 @@
 
 Covers:
 1. build.sh idempotency (runs multiple times, verifies no ln: File exists failure, verifies all ln -s have -f);
-2. var_store.c secondary unpack prevention (verifies var_store skips unpack when kern.redwood.var_disk_loaded != 0, default_device probe order);
+2. var_store.c secondary unpack prevention (verifies var_store skips unpack when kern.annibale.var_disk_loaded != 0, default_device probe order);
 3. input26_service touch move-to-down promotion and state machine;
 4. package.py jobs_source, default WIFI_FW=1, and AUDIO=1.
 """
@@ -64,14 +64,14 @@ class TestBuildShIdempotency(unittest.TestCase):
         """Simulate how ln -sf handles target paths that are dangling on the host."""
         with tempfile.TemporaryDirectory() as td:
             link_path = os.path.join(td, "test_link")
-            # Create symlink pointing to nonexistent path /redwood/lib/...
-            res1 = subprocess.run(["ln", "-sf", "/redwood/lib/RedwoodAudio.driver", link_path],
+            # Create symlink pointing to nonexistent path /annibale/lib/...
+            res1 = subprocess.run(["ln", "-sf", "/annibale/lib/AnnibaleAudio.driver", link_path],
                                   capture_output=True, text=True)
             self.assertEqual(res1.returncode, 0, res1.stderr)
             self.assertTrue(os.path.islink(link_path))
 
             # Second execution of ln -sf over existing symlink must succeed with exit code 0
-            res2 = subprocess.run(["ln", "-sf", "/redwood/lib/RedwoodAudio.driver", link_path],
+            res2 = subprocess.run(["ln", "-sf", "/annibale/lib/AnnibaleAudio.driver", link_path],
                                   capture_output=True, text=True)
             self.assertEqual(res2.returncode, 0, res2.stderr)
 
@@ -127,7 +127,7 @@ static int unpack_called = 0;
 /* Mock sysctlbyname */
 int mock_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     (void)newp; (void)newlen;
-    if (strcmp(name, "kern.redwood.var_disk_loaded") == 0) {
+    if (strcmp(name, "kern.annibale.var_disk_loaded") == 0) {
         if (mock_sysctl_ret != 0) return -1;
         if (oldp && oldlenp && *oldlenp >= sizeof(int)) {
             *(int *)oldp = mock_var_disk_loaded_val;
@@ -168,7 +168,7 @@ static int sim_var_store_entry(const char *what) {
     if (strcmp(what, "load") == 0) {
         int disk_loaded = 0;
         size_t dlen = sizeof(disk_loaded);
-        if (mock_sysctlbyname("kern.redwood.var_disk_loaded", &disk_loaded, &dlen, NULL, 0) == 0 && disk_loaded != 0) {
+        if (mock_sysctlbyname("kern.annibale.var_disk_loaded", &disk_loaded, &dlen, NULL, 0) == 0 && disk_loaded != 0) {
             printf("var_store: /private/var already loaded from persistent disk; seed unpack skipped\n");
             return 0;
         }
@@ -318,9 +318,9 @@ class TestInput26ServiceTouchPromotion(unittest.TestCase):
 #include <string.h>
 
 #define MAX_FINGERS 10
-#define REDWOOD_TOUCH_DOWN 0
-#define REDWOOD_TOUCH_MOVE 1
-#define REDWOOD_TOUCH_UP   2
+#define ANNIBALE_TOUCH_DOWN 0
+#define ANNIBALE_TOUCH_MOVE 1
+#define ANNIBALE_TOUCH_UP   2
 
 #define DIGITIZER_RANGE    0x00000001
 #define DIGITIZER_TOUCH    0x00000002
@@ -330,7 +330,7 @@ class TestInput26ServiceTouchPromotion(unittest.TestCase):
 #define EDGE_TOP    0.04
 #define EDGE_BOTTOM 0.06
 
-struct redwood_touch {
+struct annibale_touch {
     uint64_t time;
     uint32_t type;
     uint32_t finger;
@@ -358,7 +358,7 @@ struct dispatched_record {
 
 static struct dispatched_record last_record;
 
-static void sim_send_touch(const struct redwood_touch *t) {
+static void sim_send_touch(const struct annibale_touch *t) {
     memset(&last_record, 0, sizeof(last_record));
     uint32_t type = t->type;
     unsigned f = t->finger;
@@ -367,20 +367,20 @@ static void sim_send_touch(const struct redwood_touch *t) {
         return;
     }
     if (!fingers[f].touching) {
-        if (type == REDWOOD_TOUCH_MOVE) {
-            type = REDWOOD_TOUCH_DOWN;
-        } else if (type != REDWOOD_TOUCH_DOWN) {
+        if (type == ANNIBALE_TOUCH_MOVE) {
+            type = ANNIBALE_TOUCH_DOWN;
+        } else if (type != ANNIBALE_TOUCH_DOWN) {
             return;
         }
     }
-    uint32_t change = type == REDWOOD_TOUCH_MOVE ? DIGITIZER_POSITION : DIGITIZER_RANGE | DIGITIZER_TOUCH;
+    uint32_t change = type == ANNIBALE_TOUCH_MOVE ? DIGITIZER_POSITION : DIGITIZER_RANGE | DIGITIZER_TOUCH;
 
     last_record.was_touching = fingers[f].touching;
-    fingers[f].touching = type != REDWOOD_TOUCH_UP;
+    fingers[f].touching = type != ANNIBALE_TOUCH_UP;
     fingers[f].x = t->x / 65535.0;
     fingers[f].y = t->y / 65535.0;
 
-    if (type == REDWOOD_TOUCH_DOWN) {
+    if (type == ANNIBALE_TOUCH_DOWN) {
         fingers[f].edge = fingers[f].x < EDGE_SIDE || fingers[f].x > 1 - EDGE_SIDE ||
                           fingers[f].y < EDGE_TOP || fingers[f].y > 1 - EDGE_BOTTOM;
     }
@@ -396,31 +396,31 @@ int main(void) {
     memset(fingers, 0, sizeof(fingers));
 
     /* Test 1: Normal DOWN event */
-    struct redwood_touch t1 = { .time = 100, .type = REDWOOD_TOUCH_DOWN, .finger = 0, .x = 32768, .y = 32768 };
+    struct annibale_touch t1 = { .time = 100, .type = ANNIBALE_TOUCH_DOWN, .finger = 0, .x = 32768, .y = 32768 };
     sim_send_touch(&t1);
-    if (!last_record.dispatched || last_record.event_type != REDWOOD_TOUCH_DOWN || !last_record.is_touching) {
+    if (!last_record.dispatched || last_record.event_type != ANNIBALE_TOUCH_DOWN || !last_record.is_touching) {
         fprintf(stderr, "FAIL: Test 1 normal DOWN\n");
         return 1;
     }
 
     /* Test 2: Normal MOVE event while touching */
-    struct redwood_touch t2 = { .time = 110, .type = REDWOOD_TOUCH_MOVE, .finger = 0, .x = 33000, .y = 33000 };
+    struct annibale_touch t2 = { .time = 110, .type = ANNIBALE_TOUCH_MOVE, .finger = 0, .x = 33000, .y = 33000 };
     sim_send_touch(&t2);
-    if (!last_record.dispatched || last_record.event_type != REDWOOD_TOUCH_MOVE || last_record.change_mask != DIGITIZER_POSITION) {
+    if (!last_record.dispatched || last_record.event_type != ANNIBALE_TOUCH_MOVE || last_record.change_mask != DIGITIZER_POSITION) {
         fprintf(stderr, "FAIL: Test 2 normal MOVE\n");
         return 2;
     }
 
     /* Test 3: Normal UP event */
-    struct redwood_touch t3 = { .time = 120, .type = REDWOOD_TOUCH_UP, .finger = 0, .x = 33000, .y = 33000 };
+    struct annibale_touch t3 = { .time = 120, .type = ANNIBALE_TOUCH_UP, .finger = 0, .x = 33000, .y = 33000 };
     sim_send_touch(&t3);
-    if (!last_record.dispatched || last_record.event_type != REDWOOD_TOUCH_UP || last_record.is_touching) {
+    if (!last_record.dispatched || last_record.event_type != ANNIBALE_TOUCH_UP || last_record.is_touching) {
         fprintf(stderr, "FAIL: Test 3 normal UP\n");
         return 3;
     }
 
     /* Test 4: Stray UP when not touching -> must be discarded */
-    struct redwood_touch t4 = { .time = 130, .type = REDWOOD_TOUCH_UP, .finger = 0, .x = 33000, .y = 33000 };
+    struct annibale_touch t4 = { .time = 130, .type = ANNIBALE_TOUCH_UP, .finger = 0, .x = 33000, .y = 33000 };
     sim_send_touch(&t4);
     if (last_record.dispatched) {
         fprintf(stderr, "FAIL: Test 4 stray UP was not discarded\n");
@@ -428,9 +428,9 @@ int main(void) {
     }
 
     /* Test 5: Adversarial MOVE when not touching (dropped DOWN) -> MUST PROMOTE TO DOWN */
-    struct redwood_touch t5 = { .time = 200, .type = REDWOOD_TOUCH_MOVE, .finger = 1, .x = 1000, .y = 30000 };
+    struct annibale_touch t5 = { .time = 200, .type = ANNIBALE_TOUCH_MOVE, .finger = 1, .x = 1000, .y = 30000 };
     sim_send_touch(&t5);
-    if (!last_record.dispatched || last_record.event_type != REDWOOD_TOUCH_DOWN) {
+    if (!last_record.dispatched || last_record.event_type != ANNIBALE_TOUCH_DOWN) {
         fprintf(stderr, "FAIL: Test 5 dropped DOWN promotion to DOWN failed\n");
         return 5;
     }
@@ -448,15 +448,15 @@ int main(void) {
     }
 
     /* Test 6: Subsequent MOVE on finger 1 -> stays MOVE */
-    struct redwood_touch t6 = { .time = 210, .type = REDWOOD_TOUCH_MOVE, .finger = 1, .x = 2000, .y = 30000 };
+    struct annibale_touch t6 = { .time = 210, .type = ANNIBALE_TOUCH_MOVE, .finger = 1, .x = 2000, .y = 30000 };
     sim_send_touch(&t6);
-    if (!last_record.dispatched || last_record.event_type != REDWOOD_TOUCH_MOVE || last_record.change_mask != DIGITIZER_POSITION) {
+    if (!last_record.dispatched || last_record.event_type != ANNIBALE_TOUCH_MOVE || last_record.change_mask != DIGITIZER_POSITION) {
         fprintf(stderr, "FAIL: Test 6 subsequent MOVE on promoted finger\n");
         return 9;
     }
 
     /* Test 7: Out of bounds finger index */
-    struct redwood_touch t7 = { .time = 220, .type = REDWOOD_TOUCH_MOVE, .finger = MAX_FINGERS, .x = 2000, .y = 30000 };
+    struct annibale_touch t7 = { .time = 220, .type = ANNIBALE_TOUCH_MOVE, .finger = MAX_FINGERS, .x = 2000, .y = 30000 };
     sim_send_touch(&t7);
     if (last_record.dispatched) {
         fprintf(stderr, "FAIL: Test 7 out of bounds finger was dispatched\n");

@@ -300,7 +300,7 @@ def run_tests():
     assert not sim2.mount.timer_scheduled, "Timer scheduled during seed unpack!"
     print("  ✓ Zero metadata timer firings during seed unpack (no storm)")
 
-    # Simulate sysctl kern.redwood.var_seed_done=1
+    # Simulate sysctl kern.annibale.var_seed_done=1
     sim2.var_seed_done = 1
     sim2.mount.rm_seed_done = True
     with sim2.mount.rm_lock:

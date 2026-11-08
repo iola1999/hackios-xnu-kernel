@@ -24,7 +24,7 @@ static const struct adreno8_cmd_db_header *adreno8_cmd_db;
  * The entry of the boot loader's list that names a resource: where RPMh has it (0: nowhere) and
  * its raw data. For a supply rail the data is the list of levels it knows, two bytes each; for a
  * bus monitor one struct of eight bytes; the GMU's firmware is told the levels by their position
- * in the list. (redwood_adreno.c's rpmh_resource(), widened to return the raw data too.)
+ * in the list. (annibale_adreno.c's rpmh_resource(), widened to return the raw data too.)
  */
 
 uint32_t
@@ -501,7 +501,7 @@ adreno8_clock_source(const char *name, uint32_t rcgr, uint32_t source)
 
 /*
  * What later steps check before touching anything: the CX half answered, is up, and has the two
- * clocks its registers live on. This machine has no ported frequency counter (redwood measured
+ * clocks its registers live on. This machine has no ported frequency counter (annibale measured
  * with debugcc; SM8750's counterpart is unmapped here), so the control registers are trusted and
  * the next step's first read shows whether they lied.
  */
@@ -549,7 +549,7 @@ adreno8_step_cx_power(void)
 	gdscr = adreno8_get(&adreno8_gpucc, "cx gdscr", GPUCC_CX_GDSCR);
 	hw = adreno8_get(&adreno8_gpucc, "cx hw control", GPUCC_CX_HW_CTRL);
 	if ((gdscr | hw) & GDSC_POWER_ON) {
-		printf("adreno8: %u: THE CX HALF IS UP ALREADY: the boot loader (or an earlier step in this session) switched it on and the AOP keeps it: leaving it and going on (unlike redwood: on this phone the vendor's preemption logic wants CX up)\n", adreno8_step);
+		printf("adreno8: %u: THE CX HALF IS UP ALREADY: the boot loader (or an earlier step in this session) switched it on and the AOP keeps it: leaving it and going on (unlike annibale: on this phone the vendor's preemption logic wants CX up)\n", adreno8_step);
 		if (adreno8_speeds == NULL) {
 			printf("adreno8: %u: (speed bin not read this session: step 1 alone asks the fuses)\n", adreno8_step);
 		}

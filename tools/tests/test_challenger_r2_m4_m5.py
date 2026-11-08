@@ -250,7 +250,7 @@ def test_m5_iris_scm_and_hfi():
 
     # 1. PAS ID 9 SCM argument packing with genuine ELF metadata header
     assert "SCM_PAS_INIT_IMAGE, 0x82, IRIS_PAS_ID, metadata_pa" in src
-    assert "redwood_image_file" in src
+    assert "annibale_image_file" in src
     assert "vpu35_4v.mbn" in src
     print("PASS M5.4: SCM_PAS_INIT_IMAGE authenticates genuine MBN metadata buffer parsed from vpu35_4v.mbn ELF headers.")
 

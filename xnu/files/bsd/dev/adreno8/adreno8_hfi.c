@@ -4,7 +4,7 @@
 #include "adreno8_memory_private.h"
 #include "adreno8_clock_private.h"
 #include "adreno8_context_private.h"
-#include <sys/redwood_input.h>
+#include <sys/annibale_input.h>
 #include <kern/sched_prim.h>
 
 #define printf adreno8_say
@@ -144,7 +144,7 @@ adreno8_hfi_health(void)
 static uint64_t retired_ticks;
 uint64_t adreno8_retired_total;                 /* never reset: adreno8_speed_tick()'s measure of load */
 static uint32_t retired_count, retired_by[7];
-extern void redwood_tl(const char *format, ...) __printflike(1, 2);
+extern void annibale_tl(const char *format, ...) __printflike(1, 2);
 
 /*
  * Boot-arg gpu_tl=1: a line for every submission retired, "tl: R TIMESTAMP sub US sop US eop US",
@@ -179,11 +179,11 @@ adreno8_retire_note(const uint32_t *msg)
 				lo = adreno8_rd(adreno8_gmu.base + GMU_ALWAYS_ON_LO);
 				hi = adreno8_rd(adreno8_gmu.base + GMU_ALWAYS_ON_HI);
 			}
-			redwood_tl("tl: R clock ao %llu mach %llu\n", ((uint64_t)hi << 32 | lo) * 10 / 192, nanos / 1000);
+			annibale_tl("tl: R clock ao %llu mach %llu\n", ((uint64_t)hi << 32 | lo) * 10 / 192, nanos / 1000);
 			clocked = true;
 		}
 
-		redwood_tl("tl: R %u sub %llu sop %llu eop %llu\n", msg[2], submitted * 10 / 192, sop * 10 / 192, eop * 10 / 192);
+		annibale_tl("tl: R %u sub %llu sop %llu eop %llu\n", msg[2], submitted * 10 / 192, sop * 10 / 192, eop * 10 / 192);
 	}
 
 	while (bucket < 6 && ticks * 10 / 192 >= limits_us[bucket]) bucket++;
@@ -193,7 +193,7 @@ adreno8_retire_note(const uint32_t *msg)
 	adreno8_retired_total += ticks;
 }
 
-/* What the notifications said since this was last asked (redwood_gpu_worked's contract). */
+/* What the notifications said since this was last asked (annibale_gpu_worked's contract). */
 void
 adreno8_hfi_worked(uint64_t *microseconds, uint32_t *count, uint32_t by[7])
 {
@@ -695,7 +695,7 @@ adreno8_step_gx_power(void)
 
 /*
  * adreno8_speed=N above 1: the GPU's speed follows its load between the floor and speed N of
- * adreno8_boot_speeds (1 the slowest). Called with each submission under RedwoodGPU's lock and
+ * adreno8_boot_speeds (1 the slowest). Called with each submission under AnnibaleGPU's lock and
  * acting at most every 100 ms, on the GPU time of the submissions retired since (TS_RETIRE):
  *  - up to N at once when that time, scaled to speed 1, is 20% of the interval or more, or within
  *    adreno8_touch_ms (default 1500) of a touch (annibale_cpufreq.c's boost);
@@ -720,7 +720,7 @@ uint32_t adreno8_speed_floor = 3, adreno8_touch_ms = 1500;
 static uint32_t adreno8_speed_now = 1, adreno8_speed_changes, adreno8_speed_limit, adreno8_speed_cool_ticks;
 static uint64_t adreno8_speed_ticked, adreno8_speed_busy_seen, adreno8_speed_light_since;
 
-/* For RedwoodGPU's statistics: the speed voted last (the step 15 vote until a change) and the changes since. */
+/* For AnnibaleGPU's statistics: the speed voted last (the step 15 vote until a change) and the changes since. */
 void
 adreno8_speed_state(uint32_t *mhz, uint32_t *changes)
 {

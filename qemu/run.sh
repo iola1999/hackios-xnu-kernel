@@ -15,9 +15,9 @@ T=${1:-20}; shift
 EFI=${QEMU_EFI:-/usr/share/edk2/aarch64/QEMU_EFI.fd}
 [ -f "$EFI" ] || { echo "run.sh: no UEFI firmware at $EFI (set QEMU_EFI and QEMU_VARS)"; exit 1; }
 cp "${QEMU_VARS:-/usr/share/edk2/aarch64/QEMU_VARS.fd}" vars.fd 2>/dev/null
-# the loader is the boot application of the little FAT volume QEMU makes of esp/:
-# the one built here, or else the one that comes with the repository
-L=../xnuloader/loader.efi; [ -f $L ] || L=../prebuilt/loader.efi
+# the loader built here is the boot application of the little FAT volume QEMU makes of esp/
+L=../xnuloader/loader.efi
+[ -f $L ] || { echo "run.sh: no loader built here ($L)"; exit 1; }
 mkdir -p esp/EFI/BOOT && cp -u $L esp/EFI/BOOT/BOOTAA64.EFI
 case $(uname -s) in Darwin) LIMIT=gtimeout ;; *) LIMIT=timeout ;; esac
 "$LIMIT" "$T" qemu-system-aarch64 -M virt,gic-version=3 -cpu ${QEMU_CPU:-cortex-a76} -smp ${QEMU_SMP:-1} -m ${QEMU_MEM:-6G} \

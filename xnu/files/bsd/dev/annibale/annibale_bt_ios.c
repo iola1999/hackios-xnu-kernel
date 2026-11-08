@@ -1,9 +1,9 @@
 /*
  * Bluetooth for iOS 26 (boot-arg bt=4): the Skywalk kernel-pipe nexus and kernel control socket
  * com.apple.uart.sk.bluetooth, the character devices /dev/uart.bluetooth, /dev/cu.bluetooth and
- * /dev/bt_h4, the readiness sysctl kern.redwood.bt_ready, and the H4 pump over SE14.
+ * /dev/bt_h4, the readiness sysctl kern.annibale.bt_ready, and the H4 pump over SE14.
  *
- * bluetoothd's POSIX H4 transport looks up the IOKit service "bluetooth" (RedwoodBT.cpp) for its
+ * bluetoothd's POSIX H4 transport looks up the IOKit service "bluetooth" (AnnibaleBT.cpp) for its
  * BSD Name and 6-byte local-mac-address, connects the kernel control socket com.apple.uart.sk.bluetooth,
  * reads the 16-byte Skywalk nexus UUID from socket option 0x5412, and opens a Skywalk channel on that
  * nexus. Both the control socket connect and /dev/uart.bluetooth open wait up to 40 s for the kernel's
@@ -33,10 +33,10 @@
 #include <os/atomic_private.h>
 #include "annibale_bt_private.h"
 
-extern void RedwoodBTStart(const char *bsdname, const uint8_t *address);
-extern void RedwoodBTSetAddress(const uint8_t *address);
+extern void AnnibaleBTStart(const char *bsdname, const uint8_t *address);
+extern void AnnibaleBTSetAddress(const uint8_t *address);
 
-SYSCTL_DECL(_kern_redwood);
+SYSCTL_DECL(_kern_annibale);
 
 #define BT_RING                 (16u << 10)
 #define IBS_WAKE_ACK            0xfc
@@ -51,7 +51,7 @@ static int bt_serving;
 static bool bt_ibs_asleep;
 static volatile uint32_t bt_irq_event;
 
-SYSCTL_INT(_kern_redwood, OID_AUTO, bt_ready, CTLFLAG_RD | CTLFLAG_LOCKED, &bt_serving, 0,
+SYSCTL_INT(_kern_annibale, OID_AUTO, bt_ready, CTLFLAG_RD | CTLFLAG_LOCKED, &bt_serving, 0,
     "whether the WCN7850 Bluetooth firmware and reset are ready");
 
 static void
@@ -1018,7 +1018,7 @@ annibale_bt_ios_early(void)
 	(void)devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "uart.bluetooth");
 	(void)devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "bt_h4");
 	bt_say("bt: /dev/cu.bluetooth, /dev/uart.bluetooth and /dev/bt_h4 made (opens wait for bt_ready)\n");
-	RedwoodBTStart("uart.bluetooth", NULL);
+	AnnibaleBTStart("uart.bluetooth", NULL);
 	btsk_start();
 	bt_kctl_register();
 }
@@ -1033,10 +1033,10 @@ annibale_bt_ios_serve(const uint8_t addr[6])
 		return;
 	}
 	if (addr != NULL && (addr[0] | addr[1] | addr[2] | addr[3] | addr[4] | addr[5]) != 0) {
-		RedwoodBTSetAddress(addr);
+		AnnibaleBTSetAddress(addr);
 	}
-	extern void RedwoodBTSetPowerState(bool on);
-	RedwoodBTSetPowerState(true);
+	extern void AnnibaleBTSetPowerState(bool on);
+	AnnibaleBTSetPowerState(true);
 	lck_mtx_lock(bt_ring_lock);
 	bt_ring_fill();
 	bt_serving = 1;

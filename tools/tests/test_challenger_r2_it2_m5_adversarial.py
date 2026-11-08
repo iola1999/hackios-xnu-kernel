@@ -138,7 +138,7 @@ def stress_test_iris():
 
     # 3. SCM PAS ID 9 Authentication and Removal of Fake Simulation Mode
     auth_fn = src[src.find("iris_pas_authenticate"):src.find("iris_power_up")]
-    assert "redwood_image_file(\"fw\", \"vpu35_4v.mbn\"" in auth_fn
+    assert "annibale_image_file(\"fw\", \"vpu35_4v.mbn\"" in auth_fn
     assert "memcmp(data, \"\\177ELF\", 4) != 0" in auth_fn, "Must validate ELF magic header"
     assert "(flags & 0x07000000) == 0x02000000" in auth_fn, "Must locate signature hash segment in ELF"
     assert "SCM_PAS_INIT_IMAGE" in auth_fn

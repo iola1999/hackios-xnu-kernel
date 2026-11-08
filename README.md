@@ -2,7 +2,7 @@
 
 本仓库是 [HackiOS K90 移植](https://github.com/iola1999/hackios-redmi-k90-annibale)的内核部分：XNU 12377 的补丁与驱动、驻留 loader、loader 镜像的装配脚本、ath12k 的 LinuxKPI 层，以及 iOS 26 的 Metal 驱动。默认分支 `k90-port`。使用方法、当前进展和排查记录都在顶层工作区。
 
-本仓库 fork 自 OOSEX GANG 的 [hackios-xnu-kernel](https://github.com/oosexgang/hackios-xnu-kernel)，保留其 Git 历史。上游面向 POCO X5 Pro（redwood）和 QEMU 的 iOS 16.5 代码（`xnu/` 的 8796 内核构建、`qemu/`、`prebuilt/`、redwood 的 UEFI 移植）仍在仓库里，本分支不维护这部分，也没有在 K90 上验证。
+本仓库 fork 自 OOSEX GANG 的 [hackios-xnu-kernel](https://github.com/oosexgang/hackios-xnu-kernel)，保留其 Git 历史。上游面向 POCO X5 Pro 和 QEMU 的 iOS 16.5 代码（`xnu/` 的 8796 内核构建、`qemu/`）仍在仓库里，本分支不维护这部分，也没有在 K90 上验证。
 
 ## 1. 建立构建树
 
@@ -56,11 +56,11 @@ xnu26/build-macos.sh                          # 构建内核
 
 - 仓库不含 iOS 文件。系统盘在使用者自己的机器上由用户态仓库的 `ios26/fetch.sh` 从 IPSW 取出。
 - 本仓库按 [Apple Public Source License 2.0](LICENSE) 发布。`xnu/`、`xnu26/` 是 XNU 的衍生作品，按 APSL 2.0 发布；loader、脚本等其余代码也按同一许可证发布。第三方代码保留各自的许可证，见下文。
-- `prebuilt/mach.*` 是由 `xnu/` 构建的内核，其中含 ath11k（BSD-3-Clause-Clear）和 FreeBSD LinuxKPI（BSD-2-Clause）代码，见 [prebuilt/NOTICES.md](prebuilt/NOTICES.md)。
+- 内核链接的 ath11k、ath12k（BSD-3-Clause-Clear）与 FreeBSD LinuxKPI（BSD-2-Clause）的版权与许可证全文见 [NOTICES.md](NOTICES.md)。
 - `xnu/files/bsd/miscfs/apfs/libzbitmap/` 与 `xnu-deps/build/lzbitmap/` 是 libzbitmap（Corellium LLC，此处为 MIT）；`xnu/files/bsd/miscfs/apfs/libdeflate/` 是 libdeflate 1.24（Eric Biggers，MIT，见该目录的 `COPYING`）。
 - `xnu/files/bsd/dev/mhi_boot.c` 与 `mhi_boot.h` 是 UniXNU 的 MhiBoot，未修改，BSD-2-Clause-Patent，取自 hakios-arm64e-dada（`bsd/dev/hakios_mhi_boot.c`）；`xnu/files/bsd/dev/mhi_pcie_fw.c` 参照该项目的 `bsd/dev/hakios_dada_wifi.c`（HakiOS，APSL 2.0）。
 - ath11k、ath12k、Linux 与 FreeBSD 的源码不在仓库里，由 `tools/mk-ath11k.sh`、`tools/mk-ath12k.sh` 下载固定版本。`wifi/lx/patches/*.patch` 是对 FreeBSD 头文件的修改，`wifi/lx/` 其余部分是本项目代码。`xnu-deps/build/ath12k/out/ath12k.o` 存在时构建的 12377 内核会链接 ath12k（BSD-3-Clause-Clear）和 FreeBSD LinuxKPI（BSD-2-Clause）代码。
-- `uefi/files/Binaries/redwood` 与 `prebuilt/uefi/SILICIUM_UEFI.fd` 含有取自 redwood 小米固件的 UEFI 驱动，分发方式与 Project Silicium 对其他机型的做法相同；`prebuilt/uefi/mkbootimg.py` 来自 AOSP，Apache-2.0。
+- `prebuilt/uefi/mkbootimg.py` 来自 AOSP，Apache-2.0。
 - HackiOS 是独立研究项目，与 Apple Inc. 没有关联，也没有得到其授权或认可。iOS、iPhone 和 Apple 是 Apple Inc. 的商标。
 
 ## 5. 致谢

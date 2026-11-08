@@ -103,7 +103,7 @@
 
 static uint8_t brake_samples[8] = { 0xff, 0x3f, 0x1f, 0x00, 0x00, 0x00, 0x00, 0x00 };
 
-/* ---- hv_haptic=4: the timing iOS's waveform is judged by (the redwood driver's numbers) ------ */
+/* ---- hv_haptic=4: the timing iOS's waveform is judged by (the POCO X5 Pro driver's numbers) ------ */
 
 #define ACTIVE_US               30000                   /* a write that was not silence counts for this long */
 #define SILENT_BELOW            256                     /* of 32768: samples no larger are silence */

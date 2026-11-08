@@ -128,11 +128,11 @@ test_own_tables(void)
 	o.big_valid = 1;
 	strcpy(o.big.name, "xyz");
 	o.big.n = 42;
-	n = redwood_qmi_encode(QMI_REQUEST, 0xabcd, 0x1234, outer_ei, &o, buffer, sizeof(buffer));
+	n = annibale_qmi_encode(QMI_REQUEST, 0xabcd, 0x1234, outer_ei, &o, buffer, sizeof(buffer));
 	check_bytes(buffer, n, full, sizeof(full), "own table, everything there");
 
 	memset(&back, 0, sizeof(back));
-	n = redwood_qmi_decode(full, sizeof(full), outer_ei, &back);
+	n = annibale_qmi_decode(full, sizeof(full), outer_ei, &back);
 	check(n == (int)sizeof(full), "own table: decoding gives %d, not the message's %zu bytes", n, sizeof(full));
 	check(back.first == 0x7f && back.second_valid == 1 && back.second == 0x12345678 && back.list_valid == 1 &&
 	    back.list_len == 2 && back.list[0] == 1 && back.list[1] == 0xffff && back.fixed[0] == 0x0102030405060708ULL &&
@@ -147,13 +147,13 @@ test_own_tables(void)
 	o.kind = 5;
 	o.second = 77;                  /* not valid: must not be sent */
 	o.list_len = 3;
-	n = redwood_qmi_encode(QMI_INDICATION, 1, 0, outer_ei, &o, buffer, sizeof(buffer));
+	n = annibale_qmi_encode(QMI_INDICATION, 1, 0, outer_ei, &o, buffer, sizeof(buffer));
 	check_bytes(buffer, n, bare, sizeof(bare), "own table, nothing optional");
 
 	memset(&back, 0xee, sizeof(back));
 	memset(&back, 0, offsetof(struct outer, fixed));
 	back.inners_valid = back.text_valid = back.big_valid = 0;
-	n = redwood_qmi_decode(shuffled, sizeof(shuffled), outer_ei, &back);
+	n = annibale_qmi_decode(shuffled, sizeof(shuffled), outer_ei, &back);
 	check(n == (int)sizeof(shuffled) && back.kind == 9 && back.first == 0x11 && back.second_valid == 1 && back.second == 2 &&
 	    back.list_valid == 1 && back.list_len == 0 && back.inners_valid == 0 && back.text_valid == 0 && back.big_valid == 0,
 	    "own table: TLVs out of order, unknown ones and a repeated one (%d)", n);
@@ -161,15 +161,15 @@ test_own_tables(void)
 
 	/* what must be refused */
 	memset(&o, 0, sizeof(o));
-	check(redwood_qmi_encode(QMI_REQUEST, 1, 1, outer_ei, &o, buffer, 34) == -EMSGSIZE, "a buffer one byte too small is not refused");
-	check(redwood_qmi_encode(QMI_REQUEST, 1, 1, outer_ei, &o, buffer, 35) == 35, "a buffer of exactly the size is refused");
+	check(annibale_qmi_encode(QMI_REQUEST, 1, 1, outer_ei, &o, buffer, 34) == -EMSGSIZE, "a buffer one byte too small is not refused");
+	check(annibale_qmi_encode(QMI_REQUEST, 1, 1, outer_ei, &o, buffer, 35) == 35, "a buffer of exactly the size is refused");
 	o.list_valid = 1;
 	o.list_len = 6;
-	check(redwood_qmi_encode(QMI_REQUEST, 1, 1, outer_ei, &o, buffer, sizeof(buffer)) == -EINVAL, "a count over the array's size is encoded");
+	check(annibale_qmi_encode(QMI_REQUEST, 1, 1, outer_ei, &o, buffer, sizeof(buffer)) == -EINVAL, "a count over the array's size is encoded");
 	o.list_len = 0;
 	o.text_valid = 1;
 	memset(o.text, 'a', sizeof(o.text));
-	check(redwood_qmi_encode(QMI_REQUEST, 1, 1, outer_ei, &o, buffer, sizeof(buffer)) == -EINVAL, "a string with no end is encoded");
+	check(annibale_qmi_encode(QMI_REQUEST, 1, 1, outer_ei, &o, buffer, sizeof(buffer)) == -EINVAL, "a string with no end is encoded");
 	{
 		static const uint8_t count_too_big[] = { 0, 0, 0, 0, 0, 0x0f, 0, 0x11, 0x0c, 0, 0x06, 0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0 };
 		static const uint8_t tlv_past_end[] = { 0, 0, 0, 0, 0, 0x04, 0, 0x01, 0x05, 0, 0x01 };
@@ -180,18 +180,18 @@ test_own_tables(void)
 		uint8_t long_string[7 + 3 + 300];
 
 		memset(&back, 0, sizeof(back));
-		check(redwood_qmi_decode(count_too_big, sizeof(count_too_big), outer_ei, &back) == -EINVAL, "a count over the array's size is decoded");
-		check(redwood_qmi_decode(tlv_past_end, sizeof(tlv_past_end), outer_ei, &back) == -EINVAL, "a TLV longer than the message is decoded");
-		check(redwood_qmi_decode(value_past_tlv, sizeof(value_past_tlv), outer_ei, &back) == -EINVAL, "a number longer than its TLV is decoded");
-		check(redwood_qmi_decode(length_lies, sizeof(length_lies), outer_ei, &back) == -EINVAL, "a header that says more than there is, is believed");
-		check(redwood_qmi_decode(stray_byte, sizeof(stray_byte), outer_ei, &back) == -EINVAL, "a stray byte after the last TLV is let pass");
-		check(redwood_qmi_decode(inner_short, sizeof(inner_short), outer_ei, &back) == -EINVAL, "a structure cut short is decoded");
+		check(annibale_qmi_decode(count_too_big, sizeof(count_too_big), outer_ei, &back) == -EINVAL, "a count over the array's size is decoded");
+		check(annibale_qmi_decode(tlv_past_end, sizeof(tlv_past_end), outer_ei, &back) == -EINVAL, "a TLV longer than the message is decoded");
+		check(annibale_qmi_decode(value_past_tlv, sizeof(value_past_tlv), outer_ei, &back) == -EINVAL, "a number longer than its TLV is decoded");
+		check(annibale_qmi_decode(length_lies, sizeof(length_lies), outer_ei, &back) == -EINVAL, "a header that says more than there is, is believed");
+		check(annibale_qmi_decode(stray_byte, sizeof(stray_byte), outer_ei, &back) == -EINVAL, "a stray byte after the last TLV is let pass");
+		check(annibale_qmi_decode(inner_short, sizeof(inner_short), outer_ei, &back) == -EINVAL, "a structure cut short is decoded");
 		memset(long_string, 'b', sizeof(long_string));
 		memcpy(long_string, "\0\0\0\0\0\x2f\x01\x13\x2c\x01", 10);     /* a string of exactly 300 */
-		check(redwood_qmi_decode(long_string, sizeof(long_string), outer_ei, &back) == -EINVAL, "a string that fills its buffer is decoded");
+		check(annibale_qmi_decode(long_string, sizeof(long_string), outer_ei, &back) == -EINVAL, "a string that fills its buffer is decoded");
 		long_string[5] = 0x2e;
 		long_string[8] = 0x2b;                                          /* 299: fits, with its zero */
-		check(redwood_qmi_decode(long_string, sizeof(long_string) - 1, outer_ei, &back) == 7 + 3 + 299 && strlen(back.text) == 299,
+		check(annibale_qmi_decode(long_string, sizeof(long_string) - 1, outer_ei, &back) == 7 + 3 + 299 && strlen(back.text) == 299,
 		    "a string one short of its buffer is not decoded");
 	}
 	/* the reply every response starts with */
@@ -204,11 +204,11 @@ test_own_tables(void)
 		};
 		struct qmi_response_type_v01 r = { 0xffff, 0xffff };
 
-		check(redwood_qmi_decode(ok, sizeof(ok), reply_ei, &r) == 14 && r.result == QMI_RESULT_SUCCESS_V01 && r.error == QMI_ERR_NONE_V01,
+		check(annibale_qmi_decode(ok, sizeof(ok), reply_ei, &r) == 14 && r.result == QMI_RESULT_SUCCESS_V01 && r.error == QMI_ERR_NONE_V01,
 		    "the common reply, success");
-		check(redwood_qmi_decode(no, sizeof(no), reply_ei, &r) == 14 && r.result == QMI_RESULT_FAILURE_V01 &&
+		check(annibale_qmi_decode(no, sizeof(no), reply_ei, &r) == 14 && r.result == QMI_RESULT_FAILURE_V01 &&
 		    r.error == QMI_ERR_NOT_SUPPORTED_V01, "the common reply, failure");
-		check_bytes(buffer, redwood_qmi_encode(QMI_RESPONSE, 0x22, 7, reply_ei, &r, buffer, sizeof(buffer)), no, sizeof(no), "the common reply");
+		check_bytes(buffer, annibale_qmi_encode(QMI_RESPONSE, 0x22, 7, reply_ei, &r, buffer, sizeof(buffer)), no, sizeof(no), "the common reply");
 	}
 	/* a request with nothing in it */
 	{
@@ -216,8 +216,8 @@ test_own_tables(void)
 		static const struct qmi_elem_info none_ei[] = { { QMI_EOTI, 0, 0, NO_ARRAY, 0, 0, NULL } };
 		uint8_t nothing = 0;
 
-		check_bytes(buffer, redwood_qmi_encode(QMI_REQUEST, 0x24, 9, none_ei, &nothing, buffer, sizeof(buffer)), empty, sizeof(empty), "an empty request");
-		check_bytes(buffer, redwood_qmi_encode(QMI_REQUEST, 0x24, 9, NULL, NULL, buffer, sizeof(buffer)), empty, sizeof(empty), "a request with no table");
+		check_bytes(buffer, annibale_qmi_encode(QMI_REQUEST, 0x24, 9, none_ei, &nothing, buffer, sizeof(buffer)), empty, sizeof(empty), "an empty request");
+		check_bytes(buffer, annibale_qmi_encode(QMI_REQUEST, 0x24, 9, NULL, NULL, buffer, sizeof(buffer)), empty, sizeof(empty), "a request with no table");
 	}
 }
 
@@ -257,7 +257,7 @@ test_wlfw_by_hand(void)
 		req.cal_done_enable_valid = 1;
 		req.cal_done_enable = 1;
 		req.pin_connect_result_enable = 1;      /* (not valid: stays out) */
-		check_bytes(buffer, redwood_qmi_encode(QMI_REQUEST, 0x20, 5, qmi_wlanfw_ind_register_req_msg_v01_ei, &req, buffer,
+		check_bytes(buffer, annibale_qmi_encode(QMI_REQUEST, 0x20, 5, qmi_wlanfw_ind_register_req_msg_v01_ei, &req, buffer,
 		    sizeof(buffer)), want, sizeof(want), "WLFW indication register request");
 	}
 	/* the mode: one number that is always there, one byte that may be */
@@ -270,10 +270,10 @@ test_wlfw_by_hand(void)
 		struct qmi_wlanfw_wlan_mode_req_msg_v01 req = { .mode = 7, .hw_debug_valid = 1, .hw_debug = 0 };
 		struct qmi_wlanfw_wlan_mode_req_msg_v01 back;
 
-		check_bytes(buffer, redwood_qmi_encode(QMI_REQUEST, 0x22, 9, qmi_wlanfw_wlan_mode_req_msg_v01_ei, &req, buffer,
+		check_bytes(buffer, annibale_qmi_encode(QMI_REQUEST, 0x22, 9, qmi_wlanfw_wlan_mode_req_msg_v01_ei, &req, buffer,
 		    sizeof(buffer)), want, sizeof(want), "WLFW mode request");
 		memset(&back, 0, sizeof(back));
-		check(redwood_qmi_decode(want, sizeof(want), qmi_wlanfw_wlan_mode_req_msg_v01_ei, &back) == (int)sizeof(want) &&
+		check(annibale_qmi_decode(want, sizeof(want), qmi_wlanfw_wlan_mode_req_msg_v01_ei, &back) == (int)sizeof(want) &&
 		    back.mode == 7 && back.hw_debug_valid == 1 && back.hw_debug == 0, "WLFW mode request, decoded");
 	}
 	/* a piece of the board file: an array of bytes with a 2-byte count */
@@ -305,10 +305,10 @@ test_wlfw_by_hand(void)
 		req.end = 1;
 		req.bdf_type_valid = 1;
 		req.bdf_type = 1;
-		check_bytes(buffer, redwood_qmi_encode(QMI_REQUEST, 0x25, 0x0102, qmi_wlanfw_bdf_download_req_msg_v01_ei, &req, buffer,
+		check_bytes(buffer, annibale_qmi_encode(QMI_REQUEST, 0x25, 0x0102, qmi_wlanfw_bdf_download_req_msg_v01_ei, &req, buffer,
 		    sizeof(buffer)), want, sizeof(want), "WLFW board data request");
 		memset(&back, 0, sizeof(back));
-		check(redwood_qmi_decode(want, sizeof(want), qmi_wlanfw_bdf_download_req_msg_v01_ei, &back) == (int)sizeof(want) &&
+		check(annibale_qmi_decode(want, sizeof(want), qmi_wlanfw_bdf_download_req_msg_v01_ei, &back) == (int)sizeof(want) &&
 		    back.data_valid == 1 && back.data_len == 5 && memcmp(back.data, "\xde\xad\xbe\xef\x01", 5) == 0 && back.seg_id == 2 &&
 		    back.end == 1 && back.bdf_type == 1, "WLFW board data request, decoded");
 	}
@@ -330,7 +330,7 @@ test_wlfw_by_hand(void)
 		static struct qmi_wlanfw_cap_resp_msg_v01 cap;
 
 		memset(&cap, 0, sizeof(cap));
-		check(redwood_qmi_decode(reply, sizeof(reply), qmi_wlanfw_cap_resp_msg_v01_ei, &cap) == (int)sizeof(reply),
+		check(annibale_qmi_decode(reply, sizeof(reply), qmi_wlanfw_cap_resp_msg_v01_ei, &cap) == (int)sizeof(reply),
 		    "WLFW capabilities reply is not decoded");
 		check(cap.resp.result == 0 && cap.chip_info_valid == 1 && cap.chip_info.chip_id == 0x18 && cap.chip_info.chip_family == 0x0b &&
 		    cap.board_info_valid == 1 && cap.board_info.board_id == 0xff && cap.soc_info_valid == 1 && cap.soc_info.soc_id == 0x40020320 &&
@@ -338,7 +338,7 @@ test_wlfw_by_hand(void)
 		    strcmp(cap.fw_version_info.fw_build_timestamp, "2023-04-15 01:27") == 0 && cap.fw_build_id_valid == 1 &&
 		    strcmp(cap.fw_build_id, "WLAN.MSL.1.0.1-01277-QCAMSLSWCBT-1") == 0 && cap.num_macs_valid == 1 && cap.num_macs == 2 &&
 		    cap.voltage_mv_valid == 0, "WLFW capabilities reply: the fields are not what the bytes say");
-		check_bytes(buffer, redwood_qmi_encode(QMI_RESPONSE, 0x24, 3, qmi_wlanfw_cap_resp_msg_v01_ei, &cap, buffer, sizeof(buffer)),
+		check_bytes(buffer, annibale_qmi_encode(QMI_RESPONSE, 0x24, 3, qmi_wlanfw_cap_resp_msg_v01_ei, &cap, buffer, sizeof(buffer)),
 		    reply, sizeof(reply), "WLFW capabilities reply, encoded again");
 	}
 	/* "give me memory": an array of structures, each with an array of structures in it */
@@ -354,7 +354,7 @@ test_wlfw_by_hand(void)
 		static struct qmi_wlanfw_request_mem_ind_msg_v01 ind;
 
 		memset(&ind, 0, sizeof(ind));
-		check(redwood_qmi_decode(indication, sizeof(indication), qmi_wlanfw_request_mem_ind_msg_v01_ei, &ind) == (int)sizeof(indication),
+		check(annibale_qmi_decode(indication, sizeof(indication), qmi_wlanfw_request_mem_ind_msg_v01_ei, &ind) == (int)sizeof(indication),
 		    "WLFW memory request is not decoded");
 		check(ind.mem_seg_len == 2 && ind.mem_seg[0].size == 0x400000 && ind.mem_seg[0].type == 1 && ind.mem_seg[0].mem_cfg_len == 1 &&
 		    ind.mem_seg[1].size == 0x80000 && ind.mem_seg[1].type == 4 && ind.mem_seg[1].mem_cfg_len == 0,

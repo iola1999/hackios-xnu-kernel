@@ -8,7 +8,7 @@ index 504b3fa7c742..740381b872c7 100644
  	n = PE_get_random_seed(dst, request_size);
 +#if defined(BCM2837)
 +	/*
-+	 * redwood: the loader hands over 64 bytes, what xnu-8796 asks for. The rest of the 256 are
++	 * annibale: the loader hands over 64 bytes, what xnu-8796 asks for. The rest of the 256 are
 +	 * HMAC-SHA512 of a block number keyed with those 64.
 +	 */
 +	if (n >= SEED_SIZE && n < request_size && n % SEED_SIZE == 0 && request_size % SEED_SIZE == 0) {

@@ -2,29 +2,27 @@ diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
 index 07143d539042..966e8ef38d3a 100644
 --- a/osfmk/arm64/machine_routines.c
 +++ b/osfmk/arm64/machine_routines.c
-@@ -907,17 +907,30 @@ ml_get_machine_mem(void)
+@@ -907,17 +907,33 @@ ml_get_machine_mem(void)
  	return machine_info.memory_size;
  }
  
 +extern void loader_return(void);
-+extern void redwood_var_save_on_return(void);
-+extern void redwood_adreno_stop(void);
-+extern void redwood_wifi_stop(void);
-+extern void redwood_adsp_stop(void);
++extern void annibale_var_save_on_return(void);
++extern void annibale_adreno_stop(void);
++extern void annibale_wifi_stop(void);
 +extern void MiniIOMobileFramebufferPowerOff(void);
-+extern boolean_t redwood_halting_poweroff;
++extern boolean_t annibale_halting_poweroff;
 +
  __attribute__((noreturn))
  void
  halt_all_cpus(boolean_t reboot)
  {
 +	if (!reboot) {
-+		redwood_halting_poweroff = TRUE;
++		annibale_halting_poweroff = TRUE;
 +	}
-+	redwood_var_save_on_return();
-+	redwood_adreno_stop();
-+	redwood_wifi_stop();
-+	redwood_adsp_stop();
++	annibale_var_save_on_return();
++	annibale_adreno_stop();
++	annibale_wifi_stop();
  	if (reboot) {
  		printf("MACH Reboot\n");
  		PEHaltRestart(kPERestartCPU);
@@ -38,11 +36,11 @@ index 07143d539042..966e8ef38d3a 100644
  	while (1) {
  		;
  	}
-@@ -1140,6 +1154,21 @@ ml_read_chip_revision(unsigned int *rev __unused)
+@@ -1140,6 +1156,21 @@ ml_read_chip_revision(unsigned int *rev __unused)
  #endif
  }
  
-+/* How long processor cpu_id has been idle since it started, in mach_absolute_time() units (redwood_cpufreq.c's cpuload). */
++/* How long processor cpu_id has been idle since it started, in mach_absolute_time() units (annibale_cpufreq.c's cpuload). */
 +bool ml_cpu_idle_time(int cpu_id, uint64_t *idle);
 +
 +bool
@@ -60,7 +58,7 @@ index 07143d539042..966e8ef38d3a 100644
  void
  ml_parse_cpu_topology(void)
  {
-@@ -1414,7 +1435,11 @@ ml_get_boot_cluster_type(void)
+@@ -1414,7 +1445,11 @@ ml_get_boot_cluster_type(void)
  int
  ml_get_cpu_number(uint32_t phys_id)
  {
@@ -72,7 +70,7 @@ index 07143d539042..966e8ef38d3a 100644
  
  	for (unsigned i = 0; i < topology_info.num_cpus; i++) {
  		if (topology_info.cpus[i].phys_id == phys_id) {
-@@ -2708,8 +2733,16 @@ _enable_virtual_timer(void)
+@@ -2708,8 +2743,16 @@ _enable_virtual_timer(void)
  	uint64_t cntvctl = CNTV_CTL_EL0_ENABLE; /* One wants to use 32 bits, but "mrs" prefers it this way */
  
  	__builtin_arm_wsr64(KERNEL_CNTV_CTL_EL0, cntvctl);
@@ -89,12 +87,12 @@ index 07143d539042..966e8ef38d3a 100644
  #if HAS_APPLE_GENERIC_TIMER
  	__builtin_arm_wsr64("S3_1_C15_C13_4", CNTP_CTL_EL0_IMASKED);
  #endif
-@@ -3395,6 +3428,13 @@ ml_unsafe_kernel_text_init(void)
+@@ -3395,6 +3438,13 @@ ml_unsafe_kernel_text_init(void)
  		_unsafe_kernel_text_initialized = true;
  		_unsafe_kernel_text = (0 == *(const int *)value);
  	}
 +#if defined(BCM2837)
-+	/* redwood: no iBoot to say so, and no CTRR: the kernel's text is never locked down */
++	/* annibale: no iBoot to say so, and no CTRR: the kernel's text is never locked down */
 +	if (!_unsafe_kernel_text_initialized) {
 +		_unsafe_kernel_text_initialized = true;
 +		_unsafe_kernel_text = true;

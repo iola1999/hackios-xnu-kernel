@@ -102,14 +102,14 @@ def patch_entry(head, tail, index, offset, value, fmt=None):
 
 
 def metadata(block=None):
-    rdwfs = tool.rdwfs
-    root = [2, 0, 2, 2, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0] + [0] * 8
-    payload = rdwfs.INODE.pack(*root)
+    annfs = tool.annfs
+    root = [2, 0, 2, 2, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0] + [0] * 8
+    payload = annfs.INODE.pack(*root)
     if block is not None:
-        file = [3, rdwfs.PAGE_SIZE, 2, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0] + [0] * 8
-        payload += rdwfs.INODE.pack(*file) + struct.pack("<II", block, 0)
-    result = bytearray(rdwfs.METADATA_BYTES)
-    rdwfs.SUPER.pack_into(result, 0, b"RDWFS001", 2, rdwfs.PAGE_SIZE, 1,
+        file = [3, annfs.PAGE_SIZE, 2, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0] + [0] * 8
+        payload += annfs.INODE.pack(*file) + struct.pack("<II", block, 0)
+    result = bytearray(annfs.METADATA_BYTES)
+    annfs.SUPER.pack_into(result, 0, b"ANNFS001", 3, annfs.PAGE_SIZE, 1,
                          len(payload), 4, 1 if block is None else 2, zlib.crc32(payload), 0)
     struct.pack_into("<I", result, 48, zlib.crc32(result[:48]))
     result[4096:4096 + len(payload)] = payload
@@ -246,7 +246,7 @@ class ExpansionTest(unittest.TestCase):
         self.assertEqual(result["var_transfer_ranges"], [
             {"source_offset": 32 * GIB, "target_offset": 40 * GIB, "length": 512 << 20},
             {"source_offset": 34 * GIB + (512 << 20), "target_offset": 42 * GIB + (512 << 20),
-             "length": tool.rdwfs.PAGE_SIZE},
+             "length": tool.annfs.PAGE_SIZE},
         ])
         rollback = result["rollback"]
         self.assertEqual(rollback["old_system_range"], {"offset": 24 * GIB, "length": 8 * GIB})
@@ -257,14 +257,14 @@ class ExpansionTest(unittest.TestCase):
 
     def test_var_copy_detects_overlap_with_old_referenced_ranges(self):
         head, tail = fixture()
-        block = (8 * GIB - tool.rdwfs.DATA_OFFSET) // tool.rdwfs.PAGE_SIZE
+        block = (8 * GIB - tool.annfs.DATA_OFFSET) // tool.annfs.PAGE_SIZE
         result = tool.plan(head, tail, DISK_BYTES, SS, var_metadata=metadata(block))
         self.assertTrue(result["rollback"]["var_copy_overlaps_old_referenced_ranges"])
 
     def test_var_tail_reference_blocks_expansion(self):
         head, tail = fixture()
         before = tool.plan(head, tail, DISK_BYTES, SS)["darwin_var"]["before_bytes"]
-        block = (before - tool.rdwfs.DATA_OFFSET) // tool.rdwfs.PAGE_SIZE - 1
+        block = (before - tool.annfs.DATA_OFFSET) // tool.annfs.PAGE_SIZE - 1
         result = tool.plan(head, tail, DISK_BYTES, SS, var_metadata=metadata(block))
         self.assertFalse(result["data_fits"])
         self.assertIsNone(result["var_transfer_ranges"])
@@ -351,7 +351,7 @@ class ExpansionTest(unittest.TestCase):
     def test_invalid_var_fit_creates_no_candidate_directory(self):
         head, tail = fixture()
         source_bytes = tool.plan(head, tail, DISK_BYTES, SS)["darwin_var"]["before_bytes"]
-        block = (source_bytes - tool.rdwfs.DATA_OFFSET) // tool.rdwfs.PAGE_SIZE - 1
+        block = (source_bytes - tool.annfs.DATA_OFFSET) // tool.annfs.PAGE_SIZE - 1
         with tempfile.TemporaryDirectory(prefix="darwin-gpt-var-") as directory:
             output = Path(directory) / "new"
             with self.assertRaisesRegex(ValueError, "does not fit"):

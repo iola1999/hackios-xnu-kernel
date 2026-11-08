@@ -12,7 +12,7 @@ Usage: userdata-dual-carve.py DIR [--root-gib 16] [--var-gib 104]
 Dual Partition Architecture:
   1. Shrink Android userdata f2fs by exactly 120 GiB (retaining ~110.88 GiB for Android).
   2. Create /dev/ufs_darwin (16 GiB): for unmodified Apple iOS 26 os.dmg + systemos.dmg + appos.dmg (c=0,1,2).
-  3. Create /dev/ufs_darwin_var (104 GiB): for /private/var kernel-native direct read-write persistence (RDWFS001).
+  3. Create /dev/ufs_darwin_var (104 GiB): for /private/var kernel-native direct read-write persistence (ANNFS001).
 """
 import argparse
 import os

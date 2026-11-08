@@ -22,8 +22,8 @@
  *   the SE registers when the clocks report CLK_OFF == 0.
  *
  * Userland contract:
- *   - /dev/redwood-sensors character device (read, write, ioctl)
- *   - sysctl kern.redwood.als_lux (RW) and kern.redwood.prox_near (RW)
+ *   - /dev/annibale-sensors character device (read, write, ioctl)
+ *   - sysctl kern.annibale.als_lux (RW) and kern.annibale.prox_near (RW)
  *   - annibale_sensors_report() for ADSP SSC / kernel sensor updates
  */
 
@@ -38,8 +38,8 @@
 #include <sys/conf.h>
 #include <sys/errno.h>
 #include <sys/proc.h>
-#include <sys/redwood_input.h>
-#include <sys/redwood_sensors.h>
+#include <sys/annibale_input.h>
+#include <sys/annibale_sensors.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
@@ -48,7 +48,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
 extern void loader_log_putc(char c);
 
-SYSCTL_DECL(_kern_redwood);
+SYSCTL_DECL(_kern_annibale);
 
 /* ---- SM8750 GCC, TLMM, and QUPv3 Wrapper 2 (I2C Hub) physical addresses ------------------- */
 
@@ -114,14 +114,14 @@ SYSCTL_DECL(_kern_redwood);
 #define STK6A2X_REG_ALS_DATA_MSB        0x13
 #define STK6A2X_REG_PDT_ID              0x3e
 
-static LCK_GRP_DECLARE(sensors_lck_grp, "redwood-sensors");
+static LCK_GRP_DECLARE(sensors_lck_grp, "annibale-sensors");
 static LCK_MTX_DECLARE(sensors_lck, &sensors_lck_grp);
 
 static vm_offset_t gcc_base, tlmm_base, se10_base, se12_base;
 static bool initialized;
 static int hw_i2c_mode;
 
-static struct redwood_sensors_state sensor_state = {
+static struct annibale_sensors_state sensor_state = {
 	.sample = {
 		.timestamp = 0,
 		.als_lux = 150,
@@ -130,7 +130,7 @@ static struct redwood_sensors_state sensor_state = {
 		.prox_raw = ANNIBALE_GLS6151_PROX_OFFSET,
 		.prox_distance_mm = 50,
 		.prox_near = 0,
-		.source_flags = REDWOOD_SENSOR_SRC_DEFAULT,
+		.source_flags = ANNIBALE_SENSOR_SRC_DEFAULT,
 	},
 	.back_als_lux = 120,
 	.prox_crosstalk = ANNIBALE_GLS6151_PROX_OFFSET,
@@ -336,7 +336,7 @@ poll_hardware_sensors(void)
 		sensor_state.sample.clear_raw = clr;
 		sensor_state.sample.ir_raw = ir;
 		sensor_state.sample.als_lux = lux;
-		update_proximity_from_raw_locked(ps, REDWOOD_SENSOR_SRC_HW_I2C | REDWOOD_SENSOR_SRC_FRONT_OK);
+		update_proximity_from_raw_locked(ps, ANNIBALE_SENSOR_SRC_HW_I2C | ANNIBALE_SENSOR_SRC_FRONT_OK);
 		lck_mtx_unlock(&sensors_lck);
 	}
 	if (geni_i2c_read_regs(se10_base, GCC_QUPV3_WRAP2_S2_CBCR, ANNIBALE_STK6A2X_I2C_ADDR,
@@ -345,7 +345,7 @@ poll_hardware_sensors(void)
 
 		lck_mtx_lock(&sensors_lck);
 		sensor_state.back_als_lux = (back_raw * 678) / 1000;
-		sensor_state.sample.source_flags |= REDWOOD_SENSOR_SRC_BACK_OK;
+		sensor_state.sample.source_flags |= ANNIBALE_SENSOR_SRC_BACK_OK;
 		lck_mtx_unlock(&sensors_lck);
 	}
 }
@@ -370,7 +370,7 @@ annibale_sensors_report(uint32_t als_lux, uint32_t clear_raw, uint32_t ir_raw,
 	lck_mtx_unlock(&sensors_lck);
 }
 
-/* ---- sysctl handlers: kern.redwood.als_lux and kern.redwood.prox_near ---------------------- */
+/* ---- sysctl handlers: kern.annibale.als_lux and kern.annibale.prox_near ---------------------- */
 
 static int
 sysctl_als_lux(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
@@ -391,10 +391,10 @@ sysctl_als_lux(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused i
 	lck_mtx_lock(&sensors_lck);
 	sensor_state.sample.als_lux = (uint32_t)value;
 	sensor_state.sample.clear_raw = (uint32_t)value * 4;
-	sensor_state.sample.source_flags |= REDWOOD_SENSOR_SRC_INJECTED;
+	sensor_state.sample.source_flags |= ANNIBALE_SENSOR_SRC_INJECTED;
 	sensor_state.sample.timestamp = mach_absolute_time();
 	lck_mtx_unlock(&sensors_lck);
-	say("sensors: sysctl kern.redwood.als_lux set to %d lux\n", value);
+	say("sensors: sysctl kern.annibale.als_lux set to %d lux\n", value);
 	return 0;
 }
 
@@ -415,19 +415,19 @@ sysctl_prox_near(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused
 	sensor_state.sample.prox_near = value ? 1 : 0;
 	sensor_state.sample.prox_distance_mm = value ? 0 : 50;
 	sensor_state.sample.prox_raw = value ? (sensor_state.prox_near_thresh + 200) : sensor_state.prox_crosstalk;
-	sensor_state.sample.source_flags |= REDWOOD_SENSOR_SRC_INJECTED;
+	sensor_state.sample.source_flags |= ANNIBALE_SENSOR_SRC_INJECTED;
 	sensor_state.sample.timestamp = mach_absolute_time();
 	lck_mtx_unlock(&sensors_lck);
-	say("sensors: sysctl kern.redwood.prox_near set to %d\n", value ? 1 : 0);
+	say("sensors: sysctl kern.annibale.prox_near set to %d\n", value ? 1 : 0);
 	return 0;
 }
 
-SYSCTL_PROC(_kern_redwood, OID_AUTO, als_lux, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+SYSCTL_PROC(_kern_annibale, OID_AUTO, als_lux, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
     NULL, 0, sysctl_als_lux, "I", "ambient light sensor illuminance in lux");
-SYSCTL_PROC(_kern_redwood, OID_AUTO, prox_near, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+SYSCTL_PROC(_kern_annibale, OID_AUTO, prox_near, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
     NULL, 0, sysctl_prox_near, "I", "proximity sensor state (0 = far, 1 = near)");
 
-/* ---- /dev/redwood-sensors character device ------------------------------------------------- */
+/* ---- /dev/annibale-sensors character device ------------------------------------------------- */
 
 static int
 sensors_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
@@ -438,7 +438,7 @@ sensors_open(__unused dev_t dev, __unused int flags, __unused int type, __unused
 static int
 sensors_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 {
-	struct redwood_sensors_state snapshot;
+	struct annibale_sensors_state snapshot;
 	user_ssize_t resid = uio_resid(uio);
 
 	if (resid <= 0) {
@@ -451,11 +451,11 @@ sensors_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 	snapshot = sensor_state;
 	lck_mtx_unlock(&sensors_lck);
 
-	if (resid >= (user_ssize_t)sizeof(struct redwood_sensors_state)) {
-		return uiomove((caddr_t)&snapshot, sizeof(struct redwood_sensors_state), uio);
+	if (resid >= (user_ssize_t)sizeof(struct annibale_sensors_state)) {
+		return uiomove((caddr_t)&snapshot, sizeof(struct annibale_sensors_state), uio);
 	}
 	return uiomove((caddr_t)&snapshot.sample,
-	    (int)MIN(sizeof(struct redwood_sensor_sample), (size_t)resid), uio);
+	    (int)MIN(sizeof(struct annibale_sensor_sample), (size_t)resid), uio);
 }
 
 static bool
@@ -485,8 +485,8 @@ sensors_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 	char buf[64] = { 0 };
 	int error;
 
-	if (resid == (user_ssize_t)sizeof(struct redwood_sensor_sample)) {
-		struct redwood_sensor_sample in_sample;
+	if (resid == (user_ssize_t)sizeof(struct annibale_sensor_sample)) {
+		struct annibale_sensor_sample in_sample;
 
 		if ((error = uiomove((caddr_t)&in_sample, sizeof(in_sample), uio)) != 0) {
 			return error;
@@ -496,7 +496,7 @@ sensors_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 		if (sensor_state.sample.timestamp == 0) {
 			sensor_state.sample.timestamp = mach_absolute_time();
 		}
-		sensor_state.sample.source_flags |= REDWOOD_SENSOR_SRC_INJECTED;
+		sensor_state.sample.source_flags |= ANNIBALE_SENSOR_SRC_INJECTED;
 		lck_mtx_unlock(&sensors_lck);
 		return 0;
 	}
@@ -523,13 +523,13 @@ sensors_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 				sensor_state.sample.prox_distance_mm = v ? 0 : 50;
 				sensor_state.sample.prox_raw = v ? (sensor_state.prox_near_thresh + 200) : sensor_state.prox_crosstalk;
 			} else {
-				update_proximity_from_raw_locked(v, REDWOOD_SENSOR_SRC_INJECTED);
+				update_proximity_from_raw_locked(v, ANNIBALE_SENSOR_SRC_INJECTED);
 			}
 		}
 	} else if (strncmp(buf, "raw", 3) == 0) {
 		uint32_t v = 0;
 		if (parse_uint(buf + 3, &v)) {
-			update_proximity_from_raw_locked(v, REDWOOD_SENSOR_SRC_INJECTED);
+			update_proximity_from_raw_locked(v, ANNIBALE_SENSOR_SRC_INJECTED);
 		}
 	} else if (strncmp(buf, "lux", 3) == 0) {
 		uint32_t v = 0;
@@ -544,7 +544,7 @@ sensors_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 			sensor_state.sample.clear_raw = v * 4;
 		}
 	}
-	sensor_state.sample.source_flags |= REDWOOD_SENSOR_SRC_INJECTED;
+	sensor_state.sample.source_flags |= ANNIBALE_SENSOR_SRC_INJECTED;
 	sensor_state.sample.timestamp = mach_absolute_time();
 	lck_mtx_unlock(&sensors_lck);
 	return 0;
@@ -554,25 +554,25 @@ static int
 sensors_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
 {
 	switch (cmd) {
-	case REDWOOD_SENSORS_GET_STATE:
+	case ANNIBALE_SENSORS_GET_STATE:
 		lck_mtx_lock(&sensors_lck);
 		if (sensor_state.sample.timestamp == 0) {
 			sensor_state.sample.timestamp = mach_absolute_time();
 		}
-		*(struct redwood_sensors_state *)data = sensor_state;
+		*(struct annibale_sensors_state *)data = sensor_state;
 		lck_mtx_unlock(&sensors_lck);
 		return 0;
-	case REDWOOD_SENSORS_SET_STATE:
+	case ANNIBALE_SENSORS_SET_STATE:
 		lck_mtx_lock(&sensors_lck);
-		sensor_state.sample = *(const struct redwood_sensor_sample *)data;
+		sensor_state.sample = *(const struct annibale_sensor_sample *)data;
 		if (sensor_state.sample.timestamp == 0) {
 			sensor_state.sample.timestamp = mach_absolute_time();
 		}
-		sensor_state.sample.source_flags |= REDWOOD_SENSOR_SRC_INJECTED;
+		sensor_state.sample.source_flags |= ANNIBALE_SENSOR_SRC_INJECTED;
 		lck_mtx_unlock(&sensors_lck);
 		return 0;
-	case REDWOOD_SENSORS_CALIBRATE: {
-		struct redwood_sensors_state *cal = (struct redwood_sensors_state *)data;
+	case ANNIBALE_SENSORS_CALIBRATE: {
+		struct annibale_sensors_state *cal = (struct annibale_sensors_state *)data;
 
 		lck_mtx_lock(&sensors_lck);
 		if (cal->prox_crosstalk != 0) {
@@ -637,7 +637,7 @@ annibale_sensors_init(void)
 	uint32_t boot_lux = 0, boot_prox = 0;
 	int major;
 
-	if (!redwood_platform_is_annibale() || initialized) {
+	if (!annibale_platform_is_annibale() || initialized) {
 		return;
 	}
 	initialized = true;
@@ -656,11 +656,11 @@ annibale_sensors_init(void)
 
 	major = cdevsw_add(-1, &sensors_cdevsw);
 	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666,
-	    "redwood-sensors") == NULL) {
-		say("sensors: /dev/redwood-sensors cannot be made\n");
+	    "annibale-sensors") == NULL) {
+		say("sensors: /dev/annibale-sensors cannot be made\n");
 		return;
 	}
-	say("sensors: /dev/redwood-sensors ready (kern.redwood.als_lux=%u, kern.redwood.prox_near=%u)\n",
+	say("sensors: /dev/annibale-sensors ready (kern.annibale.als_lux=%u, kern.annibale.prox_near=%u)\n",
 	    sensor_state.sample.als_lux, sensor_state.sample.prox_near);
 
 	if (kernel_thread_start(sensors_thread, NULL, &thread) == KERN_SUCCESS) {

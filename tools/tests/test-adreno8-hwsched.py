@@ -59,8 +59,8 @@ typedef void *event_t;
 #define GMU_ALWAYS_ON_HI 0x1000
 #define GMU_ALWAYS_ON_LO 0x1004
 #define GMU_GMU2HOST_MASK 0x1008
-static void redwood_tl(const char *format, ...) __printflike(1, 2);
-static void redwood_tl(const char *format, ...) { (void)format; assert(false); }
+static void annibale_tl(const char *format, ...) __printflike(1, 2);
+static void annibale_tl(const char *format, ...) { (void)format; assert(false); }
 static kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *, uint32_t), void *context) {
     (void)intid; (void)edge; (void)handler; (void)context; assert(false); return 1;
 }

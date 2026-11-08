@@ -1,11 +1,11 @@
 #!/bin/bash
-# Get Apple's XNU sources (the release that iOS 16.5 was built from) and put the redwood
+# Get Apple's XNU sources (the release that iOS 16.5 was built from) and put the annibale
 # work on top of them: patches/ changes Apple's files -- one piece per file, applied in the
 # order patches/series names them -- and files/ holds the new ones.
 # usage: xnu/apply.sh [DIR]              (default: $XNU_SRC, else xnu-src/xnu-8796.121.2 next to this directory)
 # env:   XNU_URL   where to fetch from (default: Apple's repository on GitHub; an existing clone
 #                  that has the tag will do: XNU_URL=file:///path/to/xnu)
-# The result is a git tree on the branch "redwood" with the work uncommitted, which is how
+# The result is a git tree on the branch "annibale" with the work uncommitted, which is how
 # xnu/export.sh expects to find it. A directory that already exists is left alone.
 set -e
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -23,7 +23,7 @@ trap 'echo "apply.sh: failed; removing the incomplete $DIR" >&2; rm -rf "$DIR"' 
 cd "$DIR"
 git remote add origin "$URL"
 git fetch -q --depth 1 origin "refs/tags/$TAG:refs/tags/$TAG"      # that one release, without the history
-git checkout -q -b redwood "$TAG"
+git checkout -q -b annibale "$TAG"
 [ "$(git rev-parse HEAD)" = "$BASE" ] || { echo "apply.sh: $TAG is $(git rev-parse HEAD), expected $BASE" >&2; false; }
 echo 'BUILD/' >> .git/info/exclude
 while IFS= read -r piece; do

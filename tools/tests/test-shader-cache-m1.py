@@ -21,7 +21,7 @@ TOP_ROOT = os.path.dirname(KERNEL_ROOT)
 def test_line_limits():
     """Verify all modified source files are strictly under 1200 lines (AGENTS.md §2)."""
     files = [
-        os.path.join(KERNEL_ROOT, "tools/userland-driver/redwoodmetal_stitch.inc"),
+        os.path.join(KERNEL_ROOT, "tools/userland-driver/annibalemetal_stitch.inc"),
         os.path.join(KERNEL_ROOT, "tools/mesa/air/air_metal_vertex_cache.inc"),
         os.path.join(KERNEL_ROOT, "userland/src/inject/inject_sb26.c"),
         os.path.join(KERNEL_ROOT, "userland/src/inject/inject_posterboard.c"),
@@ -37,7 +37,7 @@ def test_line_limits():
 
 
 def test_layer_a_air_cache_key():
-    """Verify Layer A SHA-256 cache key calculation matching redwoodmetal_stitch.inc."""
+    """Verify Layer A SHA-256 cache key calculation matching annibalemetal_stitch.inc."""
     # Test vector: library_id, func_name, spec_name, constants
     lib_id = "com.apple.QuartzCore.air"
     func = "VfxU10Xh"
@@ -57,8 +57,8 @@ def test_layer_a_air_cache_key():
     expected_hex = h.hexdigest()
 
     assert len(expected_hex) == 64
-    cache_path = f"/private/var/db/redwood-aircache/{expected_hex}.air"
-    assert cache_path.startswith("/private/var/db/redwood-aircache/")
+    cache_path = f"/private/var/db/annibale-aircache/{expected_hex}.air"
+    assert cache_path.startswith("/private/var/db/annibale-aircache/")
     assert cache_path.endswith(".air")
     print(f"PASS Layer A: AIR cache key={expected_hex[:16]}... path={cache_path}")
 
@@ -82,14 +82,14 @@ def parse_macho_lc_uuid(dylib_path):
 
 
 def test_layer_b_ir3_uuid_cache():
-    """Verify Layer B Mach-O LC_UUID extraction on libredwoodair.dylib."""
-    air_dylib = os.path.join(KERNEL_ROOT, "out/ios26-resume/bbmetal-device/libredwoodair.dylib")
+    """Verify Layer B Mach-O LC_UUID extraction on libannibaleair.dylib."""
+    air_dylib = os.path.join(KERNEL_ROOT, "out/ios26-resume/bbmetal-device/libannibaleair.dylib")
     if not os.path.isfile(air_dylib):
-        print("SKIP Layer B binary test: libredwoodair.dylib not found")
+        print("SKIP Layer B binary test: libannibaleair.dylib not found")
         return
 
     uuid_bytes = parse_macho_lc_uuid(air_dylib)
-    assert uuid_bytes is not None, "Failed to extract LC_UUID from libredwoodair.dylib"
+    assert uuid_bytes is not None, "Failed to extract LC_UUID from libannibaleair.dylib"
     assert len(uuid_bytes) == 16, f"Invalid UUID length: {len(uuid_bytes)}"
 
     # Format UUID string
@@ -117,7 +117,7 @@ def test_layer_b_ir3_uuid_cache():
     with open(patch_path, "r", encoding="utf-8") as f:
         patch_content = f.read()
     assert "get_darwin_macho_uuid" in patch_content
-    assert "REDWOOD_IR3_CACHE_DIR" in patch_content
+    assert "ANNIBALE_IR3_CACHE_DIR" in patch_content
 
     print(f"PASS Layer B: ir3 Mach-O LC_UUID verified ({uuid_str}) and patch validated")
 
@@ -165,12 +165,12 @@ def test_throttling_and_nonblocking():
     with open(pb, "r", encoding="utf-8") as f:
         pb_src = f.read()
 
-    assert "com.redwood.wallpaper.suspend" in sb26_src
+    assert "com.annibale.wallpaper.suspend" in sb26_src
     assert "CHHapticEngine" in sb26_src
     assert "capabilitiesForHardware" in sb26_src
     assert "supportsHaptics" in sb26_src
 
-    assert "com.redwood.wallpaper.suspend" in pb_src
+    assert "com.annibale.wallpaper.suspend" in pb_src
     assert "CADisplayLink" in pb_src
     assert "addToRunLoop:forMode:" in pb_src
     assert "_MTLCommandBuffer" in pb_src

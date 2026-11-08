@@ -7,7 +7,7 @@
  *   - Subgraph SG_SPEAKER (0x4005): MOD_I2S_SINK (0x0700100a) on secondary MI2S (GPIO121-124)
  *   - Subgraph SG_PLAY (0x4001): MOD_WR_SHMEM (0x07001000) -> MOD_PCM_DEC (0x07001005) ->
  *     MOD_PCM_CNV (0x07001003) -> MOD_I2S_SINK
- *   - Speaker protection via redwood_guard (200 Hz HPF + RMS/fast/slow thermal & excursion limiter)
+ *   - Speaker protection via annibale_guard (200 Hz HPF + RMS/fast/slow thermal & excursion limiter)
  */
 
 #include <kern/clock.h>
@@ -20,7 +20,7 @@
 #include <sys/conf.h>
 #include <sys/kernel.h>
 #include <sys/param.h>
-#include <sys/redwood_audio.h>
+#include <sys/annibale_audio.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
 
@@ -664,9 +664,9 @@ fill_period_slot(uint32_t slot, bool muted, uint32_t below_eighths)
 	}
 
 	/* Run speaker protection (200 Hz 4th-order HPF + thermal/excursion limiter) */
-	redwood_guard_process(local, PERIOD_FRAMES);
-	if (redwood_audio_recording_fed()) {
-		redwood_audio_record_fed(local, PERIOD_FRAMES);
+	annibale_guard_process(local, PERIOD_FRAMES);
+	if (annibale_audio_recording_fed()) {
+		annibale_audio_record_fed(local, PERIOD_FRAMES);
 	}
 
 	for (uint32_t s = 0; s < PERIOD_FRAMES * CHANNELS; s++) {
@@ -702,11 +702,11 @@ reach_feeder_thread(void *arg __unused, wait_result_t w __unused)
 	for (;;) {
 		uint32_t cur_below = 0, cur_gen = 0;
 		bool cur_muted = false;
-		if (redwood_audio_volume(&cur_below, &cur_muted, &cur_gen) && cur_gen != last_vol_gen) {
+		if (annibale_audio_volume(&cur_below, &cur_muted, &cur_gen) && cur_gen != last_vol_gen) {
 			last_vol_gen = cur_gen;
 			vol_below = cur_below;
 			vol_muted = cur_muted;
-			redwood_guard_attenuation(vol_muted ? REDWOOD_GUARD_SILENT : vol_below);
+			annibale_guard_attenuation(vol_muted ? ANNIBALE_GUARD_SILENT : vol_below);
 			annibale_audio_amp_set_volume(vol_below, vol_muted);
 		}
 
@@ -765,7 +765,7 @@ reach_feeder_thread(void *arg __unused, wait_result_t w __unused)
 	}
 }
 
-/* Redwood Audio sink implementation */
+/* Annibale Audio sink implementation */
 static uint32_t
 reach_audio_sink(const int16_t *frames, uint32_t count)
 {
@@ -864,8 +864,8 @@ annibale_audio_reach_init(void)
 	if (ring_storage == NULL) {
 		ring_storage = kalloc_data(RING_FRAMES * CHANNELS * sizeof(int16_t), Z_WAITOK | Z_ZERO);
 	}
-	redwood_guard_configure(true, 6 * 8);
-	redwood_guard_attenuation(18 * 8);
+	annibale_guard_configure(true, 6 * 8);
+	annibale_guard_attenuation(18 * 8);
 
 	/* 5. Configure secondary MI2S TLMM pins */
 	configure_i2s_pins();
@@ -873,8 +873,8 @@ annibale_audio_reach_init(void)
 	/* 6. Probe Smart Amplifiers on I2C */
 	(void)annibale_audio_amp_probe();
 
-	/* 7. Register Redwood Audio sink (AudioReach graphs are built by feeder once ADSP GLINK is ready) */
-	redwood_audio_set_sink("annibale-reach", reach_audio_sink);
+	/* 7. Register Annibale Audio sink (AudioReach graphs are built by feeder once ADSP GLINK is ready) */
+	annibale_audio_set_sink("annibale-reach", reach_audio_sink);
 
 	/* 8. Launch feeder thread */
 	thread_t th;

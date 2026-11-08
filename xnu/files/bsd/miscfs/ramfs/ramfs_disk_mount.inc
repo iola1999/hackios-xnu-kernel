@@ -32,6 +32,7 @@ ramfs_disk_clear_nodes(struct ramfs_mount *rm)
 	rm->rm_root = NULL;
 	rm->rm_meta_gen = 0;
 	rm->rm_next_ino = RAMFS_ROOT_INO + 1;
+	rm->rm_next_docid = 1;
 	if (rm->rm_bmap != NULL) {
 		bzero(rm->rm_bmap, (size_t)rm->rm_bmap_words * sizeof(uint32_t));
 		rm->rm_bmap[0] = 1;
@@ -53,10 +54,10 @@ ramfs_disk_empty_root(struct ramfs_mount *rm)
 static int
 ramfs_disk_empty_metadata(struct ramfs_mount *rm)
 {
-	for (uint64_t off = RDWFS_SLOT0_OFFSET; off < RDWFS_SLOT1_OFFSET + RDWFS_SLOT_MAX;) {
-		uint64_t len = RDWFS_SLOT1_OFFSET + RDWFS_SLOT_MAX - off;
+	for (uint64_t off = ANNFS_SLOT0_OFFSET; off < ANNFS_SLOT1_OFFSET + ANNFS_SLOT_MAX;) {
+		uint64_t len = ANNFS_SLOT1_OFFSET + ANNFS_SLOT_MAX - off;
 		if (len > rm->rm_meta_cap) len = rm->rm_meta_cap;
-		int error = redwood_ufs_var_io(false, off, rm->rm_meta_buf, len);
+		int error = annibale_ufs_var_io(false, off, rm->rm_meta_buf, len);
 		if (error != 0) return error;
 		const uint8_t *bytes = rm->rm_meta_buf;
 		for (uint64_t i = 0; i < len; i++) {
@@ -71,31 +72,31 @@ static int
 ramfs_disk_mount(struct ramfs_mount *rm)
 {
 	uint64_t part_bytes = 0, max_blocks;
-	struct rdwfs_super *sup[2] = { NULL, NULL };
-	uint64_t offsets[2] = { RDWFS_SLOT0_OFFSET, RDWFS_SLOT1_OFFSET };
+	struct annfs_super *sup[2] = { NULL, NULL };
+	uint64_t offsets[2] = { ANNFS_SLOT0_OFFSET, ANNFS_SLOT1_OFFSET };
 	bool valid[2] = { false, false }, loaded = false;
 	int error = ENOMEM;
 	unsigned win_slot = 0;
 
 	if (ramfs_disk_claimed) return EBUSY;
-	if (!redwood_ufs_var_info(&part_bytes)) return ENXIO;
-	if (part_bytes < RDWFS_DATA_OFFSET + 2 * PAGE_SIZE) return EINVAL;
-	max_blocks = (part_bytes - RDWFS_DATA_OFFSET) / PAGE_SIZE;
+	if (!annibale_ufs_var_info(&part_bytes)) return ENXIO;
+	if (part_bytes < ANNFS_DATA_OFFSET + 2 * PAGE_SIZE) return EINVAL;
+	max_blocks = (part_bytes - ANNFS_DATA_OFFSET) / PAGE_SIZE;
 	if (max_blocks > 8388608ULL) max_blocks = 8388608ULL;
 	rm->rm_bmap_max = (uint32_t)max_blocks;
 	rm->rm_bmap_words = (rm->rm_bmap_max + 31u) / 32u;
 	rm->rm_bmap = kalloc_data((size_t)rm->rm_bmap_words * sizeof(uint32_t), Z_WAITOK | Z_ZERO);
 	rm->rm_io_page = ramfs_page_alloc(true);
-	rm->rm_meta_cap = RDWFS_INIT_META_CAP;
+	rm->rm_meta_cap = ANNFS_INIT_META_CAP;
 	rm->rm_meta_buf = ramfs_vm_alloc(rm->rm_meta_cap);
 	if (rm->rm_bmap == NULL || rm->rm_io_page == NULL || rm->rm_meta_buf == NULL) goto fail;
 	rm->rm_bmap[0] = 1;
 	rm->rm_bmap_next = part_bytes >= (8ULL << 30) ? (uint32_t)((2048ULL << 20) / PAGE_SIZE) : 1u;
 	rm->rm_disk_loading = true;
 	for (unsigned i = 0; i < 2; i++) {
-		sup[i] = kalloc_type(struct rdwfs_super, Z_WAITOK | Z_ZERO);
+		sup[i] = kalloc_type(struct annfs_super, Z_WAITOK | Z_ZERO);
 		if (sup[i] == NULL) { error = ENOMEM; goto fail; }
-		error = redwood_ufs_var_io(false, offsets[i], sup[i], sizeof(*sup[i]));
+		error = annibale_ufs_var_io(false, offsets[i], sup[i], sizeof(*sup[i]));
 		if (error != 0) goto fail;
 		valid[i] = ramfs_disk_super_valid(sup[i]);
 	}
@@ -133,15 +134,15 @@ ramfs_disk_mount(struct ramfs_mount *rm)
 		    win_slot, rm->rm_meta_gen, rm->rm_nodes, rm->rm_pages);
 	} else {
 		printf("ramfs: /private/var backed by UFS (%llu MB data region, empty metadata)\n",
-		    (part_bytes - RDWFS_DATA_OFFSET) >> 20);
+		    (part_bytes - ANNFS_DATA_OFFSET) >> 20);
 	}
-	for (unsigned i = 0; i < 2; i++) kfree_type(struct rdwfs_super, sup[i]);
+	for (unsigned i = 0; i < 2; i++) kfree_type(struct annfs_super, sup[i]);
 	ramfs_disk_restore_panic_log(rm);
 	return 0;
 
 fail:
 	for (unsigned i = 0; i < 2; i++) {
-		if (sup[i] != NULL) kfree_type(struct rdwfs_super, sup[i]);
+		if (sup[i] != NULL) kfree_type(struct annfs_super, sup[i]);
 	}
 	ramfs_disk_clear_nodes(rm);
 	ramfs_disk_release_buffers(rm);

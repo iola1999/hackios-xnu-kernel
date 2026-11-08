@@ -127,7 +127,7 @@ def run_device(name):
            f'export CAP_RECORD="$PWD/make-record.json" SHIM_HEX="{SHIM_STUB.hex()}"; '
            f'export PATH="$PWD/bin:$PATH"; {first} {call}')
     with tempfile.TemporaryDirectory(prefix='capwire-') as td:
-        fx = fixture(td, vars_['UEFI_TARGET'] or 'redwood', fd_size)
+        fx = fixture(td, vars_['UEFI_TARGET'], fd_size)
         r = subprocess.run(['bash', '-c', cmd], cwd=fx, capture_output=True, text=True)
         if r.returncode != 0:
             die(f'{name}: build.sh line failed: {r.stderr[-300:]}')
@@ -155,27 +155,27 @@ def test_annibale():
     ok('wiring: annibale.conf PAYLOAD_CAP reaches mkxnuimg env and the make macros')
 
 
-def test_legacy_redwood():
-    vars_, rec, blob = run_device('redwood')
+def test_legacy_template():
+    vars_, rec, blob = run_device('_template')
     if 'PAYLOAD_CAP' not in vars_ or vars_['PAYLOAD_CAP'] != '':
-        die(f'redwood conf gained a CAP: {vars_}')
+        die(f'_template conf gained a CAP: {vars_}')
     argv = ' '.join(rec['argv'])
     if '-DPAYLOAD_CAP' in argv:
-        die(f'redwood make got a CAP macro: {argv}')
+        die(f'_template make got a CAP macro: {argv}')
     if '-DPAYLOAD_BASE=0xf0000000' not in argv or 'FD_BASE=0x9fd00000' not in argv:
-        die(f'redwood make macros wrong: {argv}')
+        die(f'_template make macros wrong: {argv}')
     if rec['env']['PAYLOAD_CAP'] != '':
-        die(f"redwood env PAYLOAD_CAP not empty-as-forwarded: {rec['env']}")
+        die(f"_template env PAYLOAD_CAP not empty-as-forwarded: {rec['env']}")
     cont = container()
     fd = b'\xEE' * int(vars_['FD_SIZE'], 0)
     pad = (-len(SHIM_STUB + fd + cont)) % 16
     if blob != SHIM_STUB + fd + cont + b'\0' * pad:
-        die('redwood image: legacy blob (container appended unvalidated) mismatch')
+        die('_template image: legacy blob (container appended unvalidated) mismatch')
     ok('wiring: legacy device stays CAP-free in env, make macros, and blob shape')
 
 
-def test_prebuilt_refused():
-    """Strict CAP must not fall back to the 176-byte prebuilt shim."""
+def test_no_mu_refused():
+    """Strict CAP refuses to run without a BootShim built from Mu-Silicium/."""
     vars_ = conf_vars('annibale')
     first, second = mkxnuimg_line()
     call = second.split(' || ')[0]
@@ -185,9 +185,9 @@ def test_prebuilt_refused():
     with tempfile.TemporaryDirectory(prefix='capwire-') as td:
         fixture(td, vars_['UEFI_TARGET'], int(vars_['FD_SIZE'], 0), strict_no_fd=True)
         r = subprocess.run(['bash', '-c', cmd], cwd=td, capture_output=True, text=True)
-    if r.returncode == 0 or 'SHOULD-NOT-REACH' in r.stdout or 'predates the strict contract' not in r.stdout + r.stderr:
-        die(f'strict prebuilt fallback not refused: rc={r.returncode}')
-    ok('wiring: PAYLOAD_CAP refuses the legacy prebuilt shim path')
+    if r.returncode == 0 or 'SHOULD-NOT-REACH' in r.stdout or 'needs the BootShim built from Mu-Silicium/' not in r.stdout + r.stderr:
+        die(f'strict build without Mu-Silicium/ not refused: rc={r.returncode}')
+    ok('wiring: PAYLOAD_CAP refuses a build without Mu-Silicium/')
 
 
 def test_conf_audit():
@@ -230,27 +230,27 @@ def load_device_env(pre_export, seq):
 
 def test_load_device_inherit():
     # inherited annibale CAP, then pick a legacy device: stays legacy
-    s = load_device_env('0x03700000', ['redwood'])
+    s = load_device_env('0x03700000', ['_template'])
     if s[0] != '<unset>':
-        die(f'inherited CAP not cleared for redwood: {s[0]!r}')
-    ok('load_device: a CAP inherited in the environment clears when redwood is selected')
-    # same shell: annibale then redwood -> the annibale CAP does not leak
-    s = load_device_env('', ['annibale', 'redwood'])
+        die(f'inherited CAP not cleared for _template: {s[0]!r}')
+    ok('load_device: a CAP inherited in the environment clears when _template is selected')
+    # same shell: annibale then _template -> the annibale CAP does not leak
+    s = load_device_env('', ['annibale', '_template'])
     if s[0] != '0x03700000' or s[1] != '<unset>':
-        die(f'annibale->redwood same shell: {s}')
-    ok('load_device: annibale then redwood in one shell clears the CAP')
-    # redwood then annibale -> annibale's own CAP applies
-    s = load_device_env('', ['redwood', 'annibale'])
+        die(f'annibale->_template same shell: {s}')
+    ok('load_device: annibale then _template in one shell clears the CAP')
+    # _template then annibale -> annibale's own CAP applies
+    s = load_device_env('', ['_template', 'annibale'])
     if s[1] != '0x03700000':
-        die(f'redwood->annibale lost the CAP: {s[1]!r}')
-    ok('load_device: redwood then annibale selects the 0x03700000 CAP')
+        die(f'_template->annibale lost the CAP: {s[1]!r}')
+    ok('load_device: _template then annibale selects the 0x03700000 CAP')
     # a CAP inherited from the parent, then annibale -> the profile CAP applies
     s = load_device_env('0x09990000', ['annibale'])
     if s[0] != '0x03700000':
         die(f'inherited CAP overrode the annibale profile: {s[0]!r}')
     ok('load_device: the device profile CAP overrides an inherited CAP value')
     # only PAYLOAD_CAP is cleared: an unrelated parent variable survives
-    script = (f'. "{ROOT}/common/lib.sh"; load_device redwood >/dev/null; '
+    script = (f'. "{ROOT}/common/lib.sh"; load_device _template >/dev/null; '
               'printf "%s|%s" "${MYSENT-<gone>}" "${FD_BASE-<gone>}"')
     env = dict(os.environ, MYSENT='keep-me')
     env.pop('PAYLOAD_CAP', None)
@@ -265,8 +265,8 @@ def main():
         die('python3 >= 3.8')
     test_conf_audit()
     test_annibale()
-    test_legacy_redwood()
-    test_prebuilt_refused()
+    test_legacy_template()
+    test_no_mu_refused()
     test_load_device_inherit()
     print('ALL CAP WIRING CHECKS PASSED')
 

@@ -25,9 +25,9 @@ index e37762bce352..4016937e1ae4 100644
  LD_KERNEL_LIBS	   = -lcc_kext
 -LD_KERNEL_ARCHIVES = $(LDFLAGS_KERNEL_SDK) -lfirehose_kernel
 +LD_KERNEL_ARCHIVES = $(LDFLAGS_KERNEL_SDK) -lfirehose_kernel -lpthread_kext
-+# Darwin-on-redwood: objects made outside this tree, linked when the build is given any (the
-+# Wi-Fi driver, see bsd/dev/redwood_lx.c)
-+LD_KERNEL_ARCHIVES += $(REDWOOD_OBJECTS)
++# Darwin-on-annibale: objects made outside this tree, linked when the build is given any (the
++# Wi-Fi driver, see bsd/dev/annibale_lx.c)
++LD_KERNEL_ARCHIVES += $(ANNIBALE_OBJECTS)
  
  # Link binary support library
 -ifneq ($(CURRENT_MACHINE_CONFIG),NONE)

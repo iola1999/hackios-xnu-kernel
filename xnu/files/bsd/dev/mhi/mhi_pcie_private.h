@@ -33,7 +33,7 @@ void mhi_pcie_wake(void);
 void annibale_bt_start(void);
 void annibale_bt_ios_early(void);
 
-/* step 10: the card for the Wi-Fi driver (redwood_lx.c), set up by mhi_pcie.c when pcie=10 starts it */
+/* step 10: the card for the Wi-Fi driver (annibale_lx.c), set up by mhi_pcie.c when pcie=10 starts it */
 bool mhi_pcie_radio(void);                                      /* the driver runs on the card */
 int mhi_pcie_radio_boot(void);                                  /* its firmware to mission mode, QRTR up: 0 or an errno */
 void *mhi_pcie_radio_memory(uint64_t bytes, uint64_t *pa);      /* pages below 4 GB, the card's address = pa */

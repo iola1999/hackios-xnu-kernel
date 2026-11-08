@@ -29,9 +29,9 @@ static const struct platform platform_qemu_virt = {
 	.timeout_scale = 20,
 };
 
-static const struct platform platform_redwood = {
+static const struct platform platform_poco = {
 	/* io_base must be non-zero: XNU treats a zero SoC base as "no SoC" and skips clock setup. */
-	.name = "redwood", .io_base = 0x00400000, .io_size = 0x3FC00000,
+	.name = "poco", .io_base = 0x00400000, .io_size = 0x3FC00000,
 	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 1,
 	.cores = 8, .core_mpidr = {0, 0x100, 0x200, 0x300, 0x400, 0x500, 0x600, 0x700},
 	/*
@@ -73,7 +73,7 @@ static const struct platform platform_annibale = {
  * where each value comes from); a display that matches none is QEMU's ramfb.
  */
 static const struct platform *const platforms[] = {
-	&platform_redwood,
+	&platform_poco,
 	&platform_annibale,
 };
 

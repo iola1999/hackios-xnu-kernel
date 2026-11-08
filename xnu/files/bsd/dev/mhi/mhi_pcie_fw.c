@@ -20,7 +20,7 @@
  *     (the image's first 512 KiB) through BHI, the MHI contexts at READY, M0, the whole image through
  *     BHIe, mission mode. Everything is polled.
  *
- * The image is fw/amss20.bin of the RAM disk (redwood_image.c; package.py WIFI_FW=1) when the SoC
+ * The image is fw/amss20.bin of the RAM disk (annibale_image.c; package.py WIFI_FW=1) when the SoC
  * version register says hardware 2.0, the only WCN7850 ath12k knows, else fw/amss.bin; pcie_fw=1 or 2
  * picks one. pcie_fw=3 takes fw/lfw-amss.bin, linux-firmware's ath12k/WCN7850/hw2.0/amss.bin (the build
  * made for ath12k; with its m3.bin as fw/lfw-m3.bin, mhi_pcie.c), copied there by hand. Nothing is undone: the card keeps running, the streams stay matched and the memory stays
@@ -37,7 +37,7 @@
 #include <sys/errno.h>
 #include <sys/param.h>
 #include <sys/systm.h>
-#include <sys/redwood_qrtr.h>
+#include <sys/annibale_qrtr.h>
 #include <vm/vm_kern.h>
 #include "mhi_boot.h"
 #include "mhi_pcie_private.h"
@@ -45,7 +45,7 @@
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern uint64_t kvtophys(vm_offset_t va);
-extern const uint8_t *redwood_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+extern const uint8_t *annibale_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 
 #define printf mhi_pcie_say
 #define rd mhi_pcie_rd
@@ -197,7 +197,7 @@ mhi_pcie_dma_alloc(uint64_t bytes, uint64_t *pa)
 	return dma_alloc(bytes, pa);
 }
 
-/* for the driver (redwood_lx.c): its memory for the card, in pages; the card sees it at its physical address */
+/* for the driver (annibale_lx.c): its memory for the card, in pages; the card sees it at its physical address */
 void *
 mhi_pcie_radio_memory(uint64_t bytes, uint64_t *pa)
 {
@@ -504,7 +504,7 @@ stage_image(uint64_t *seg_pa, uint32_t *size, uint32_t *segments)
 	if (which == 0 || which >= sizeof(names) / sizeof(names[0])) {
 		which = ((soc_version >> 8) & 0xf) == 2 ? 2 : 1;
 	}
-	image = redwood_image_file("fw", names[which], &disk_size, &disk);
+	image = annibale_image_file("fw", names[which], &disk_size, &disk);
 	printf("pcie: step 7: SoC version %#llx (major %llu minor %llu): %s, %llu bytes from md%d\n", soc_version,
 	    (soc_version >> 8) & 0xf, (soc_version >> 4) & 0xf, names[which], disk_size, disk);
 	if (image == NULL || disk_size == 0 || disk_size > MAX_SEGMENTS * SEGMENT) {
@@ -716,7 +716,7 @@ mhi_pcie_firmware(const struct mhi_pcie_card *card)
  *
  * QRTR runs over the MHI channel pair IPCR (ath12k mhi.c: channel 20 to the card, 21 from it, both reporting on event
  * ring 1). Their contexts are filled and each is started with a command (MHI_CMD_START_CHAN, completed on event ring
- * 0); receive buffers wait on 21. The router (redwood_qrtr.c) is attached to channel 20 and becomes the QMI helpers'
+ * 0); receive buffers wait on 21. The router (annibale_qrtr.c) is attached to channel 20 and becomes the QMI helpers'
  * transport; a thread of ours then reads both event rings for as long as the phone runs, handing what arrives on 21
  * to the router: the card's HELLO is answered there, and its name service tells of the Wi-Fi firmware's service
  * (WLFW, 69). Ring elements and events after Linux drivers/bus/mhi/common.h and internal.h.
@@ -837,7 +837,7 @@ event(unsigned r, const uint8_t *el)
 	    pointer < dl.pa + IPCR_ELEMENTS * ELEMENT) {
 		uint8_t i = dl_at[(pointer - dl.pa) / ELEMENT];
 
-		redwood_qrtr_input(dl_buffer[i], MIN(d0 & 0xffff, IPCR_BUFFER));
+		annibale_qrtr_input(dl_buffer[i], MIN(d0 & 0xffff, IPCR_BUFFER));
 		dl_queue(i);
 		doorbell(MHI_CHDB(IPCR_DL), dl.wp);
 	} else if (type == EV_TRANSFER && (d1 >> 24) == IPCR_UL) {
@@ -937,7 +937,7 @@ ipcr_thread(__unused void *parameter, __unused wait_result_t result)
 	for (;;) {
 		events(0);
 		events(1);
-		redwood_qrtr_fresh();
+		annibale_qrtr_fresh();
 		ms(5);
 	}
 }
@@ -973,8 +973,8 @@ mhi_pcie_ipcr(void)
 		printf("pcie: step 8: the IPCR channels did not start\n");
 		return false;
 	}
-	redwood_qrtr_attach(ipcr_send);
-	redwood_qmi_set_transport(&redwood_qrtr);
+	annibale_qrtr_attach(ipcr_send);
+	annibale_qmi_set_transport(&annibale_qrtr);
 	for (uint8_t i = 0; i < IPCR_ELEMENTS - 1; i++) {
 		dl_queue(i);
 	}

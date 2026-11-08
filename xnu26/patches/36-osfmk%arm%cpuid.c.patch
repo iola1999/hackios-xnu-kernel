@@ -6,7 +6,7 @@ index 2b838e729142..202048aae44a 100644
  
  #if defined(HAS_APPLE_PAC)
  	cpuid_cpu_info.arm_info.arm_arch = CPU_ARCH_ARMv8E;
-+#elif defined(REDWOOD_ARM64E_USERLAND)
++#elif defined(ANNIBALE_ARM64E_USERLAND)
 +	/* (see pexpert/arm64/BCM2837.h) boot-arg arm64e=0: arm64, for a system without arm64e programs */
 +	uint32_t arm64e = 1;
 +

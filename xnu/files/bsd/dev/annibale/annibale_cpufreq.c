@@ -36,7 +36,7 @@
 #include <machine/machine_routines.h>
 #include <os/atomic_private.h>
 #include <pexpert/pexpert.h>
-#include <sys/redwood_input.h>
+#include <sys/annibale_input.h>
 #include <sys/systm.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -661,7 +661,7 @@ governor_thread(void *arg __unused, wait_result_t wr __unused)
 
 		assert_wait_timeout((event_t)&touch_at, THREAD_UNINT, TICK_MS, NSEC_PER_MSEC);
 		thread_block(THREAD_CONTINUE_NULL);
-		redwood_freeze_check(redwood_touch_last());
+		annibale_freeze_check(annibale_touch_last());
 		now = mach_absolute_time();
 		span = now - then;
 		if (span == 0) {
@@ -744,7 +744,7 @@ governor_thread(void *arg __unused, wait_result_t wr __unused)
 	}
 }
 
-/* A touch (redwood_input.c's touch_post()): the governor raises the level now rather than at its next tick. */
+/* A touch (annibale_input.c's touch_post()): the governor raises the level now rather than at its next tick. */
 void
 annibale_cpufreq_touch(void)
 {

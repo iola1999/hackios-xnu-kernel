@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test production RDWFS recovery, unmount retries, and callout lifetime with UFS faults."""
+"""Test production ANNFS recovery, unmount retries, and callout lifetime with UFS faults."""
 from pathlib import Path
 import subprocess
 import tempfile
@@ -9,7 +9,7 @@ SRC = ROOT / 'xnu/files/bsd/miscfs/ramfs'
 main = (SRC / 'ramfs.c').read_text()
 disk = (SRC / 'ramfs_disk.inc').read_text()
 structs = main[main.index('struct ramfs_mount;'):main.index('/* file pages in use')]
-format_defs = disk[disk.index('#define RDWFS_MAGIC_STR'):disk.index('static void ramfs_disk_dirty_locked')]
+format_defs = disk[disk.index('#define ANNFS_MAGIC_STR'):disk.index('static void ramfs_disk_dirty_locked')]
 find_ino = disk[disk.index('static struct ramfs_node *\nramfs_disk_find_ino'):disk.index('#include "ramfs_disk_restore.inc"')]
 pack_sync = disk[disk.index('static void\nramfs_disk_dirty_locked'):disk.index('void ramfs_disk_flush_all(void);')]
 source = r'''
@@ -166,8 +166,8 @@ static int64_t io_fail = -1;
 static uint64_t partial_write;
 static unsigned writes, panic_calls;
 static uint64_t last_write;
-static bool redwood_ufs_var_info(uint64_t *size) { *size = 1ULL << 30; return device_present; }
-static int redwood_ufs_var_io(bool write, uint64_t offset, void *buf, uint64_t len) {
+static bool annibale_ufs_var_info(uint64_t *size) { *size = 1ULL << 30; return device_present; }
+static int annibale_ufs_var_io(bool write, uint64_t offset, void *buf, uint64_t len) {
     assert(offset + len <= 64ULL << 20);
     if (write) {
         lck_mtx_lock(&event_lock);
@@ -274,24 +274,24 @@ static void cleanup(struct ramfs_mount *rm) {
     assert(allocations == 0 && ramfs_var_used_pages == 0 && rm->rm_pages == 0);
 }
 static void checkpoint(unsigned slot, uint64_t gen, bool partial) {
-    uint8_t *base = device + slot * RDWFS_SLOT_MAX;
-    struct rdwfs_super *s = (void *)base;
-    struct rdwfs_inode_rec root = { .ino = 2, .type = VDIR, .nlink = 2, .parent_ino = 2 };
-    memcpy(base + RDWFS_SUPER_BYTES, &root, sizeof(root));
+    uint8_t *base = device + slot * ANNFS_SLOT_MAX;
+    struct annfs_super *s = (void *)base;
+    struct annfs_inode_rec root = { .ino = 2, .type = VDIR, .nlink = 2, .parent_ino = 2 };
+    memcpy(base + ANNFS_SUPER_BYTES, &root, sizeof(root));
     uint64_t bytes = sizeof(root);
     if (partial) {
-        struct rdwfs_inode_rec file = { .ino = 3, .type = VREG, .nlink = 1, .size = 1, .nblocks = 1 };
-        memcpy(base + RDWFS_SUPER_BYTES + bytes, &file, sizeof(file)); bytes += sizeof(file);
+        struct annfs_inode_rec file = { .ino = 3, .type = VREG, .nlink = 1, .size = 1, .nblocks = 1 };
+        memcpy(base + ANNFS_SUPER_BYTES + bytes, &file, sizeof(file)); bytes += sizeof(file);
         uint32_t block = 1;
-        memcpy(base + RDWFS_SUPER_BYTES + bytes, &block, sizeof(block)); bytes += 8;
-        struct rdwfs_inode_rec bad = { .ino = 4, .type = VBAD, .nlink = 1 };
-        memcpy(base + RDWFS_SUPER_BYTES + bytes, &bad, sizeof(bad)); bytes += sizeof(bad);
+        memcpy(base + ANNFS_SUPER_BYTES + bytes, &block, sizeof(block)); bytes += 8;
+        struct annfs_inode_rec bad = { .ino = 4, .type = VBAD, .nlink = 1 };
+        memcpy(base + ANNFS_SUPER_BYTES + bytes, &bad, sizeof(bad)); bytes += sizeof(bad);
     }
-    memcpy(s->magic, RDWFS_MAGIC_STR, 8); s->version = RDWFS_VERSION;
+    memcpy(s->magic, ANNFS_MAGIC_STR, 8); s->version = ANNFS_VERSION;
     s->page_size = PAGE_SIZE; s->generation = gen; s->next_ino = 5;
     s->node_count = partial ? 3 : 1; s->payload_bytes = bytes;
-    s->payload_crc = (uint32_t)crc32(0, base + RDWFS_SUPER_BYTES, (uInt)bytes);
-    s->super_crc = (uint32_t)crc32(0, (void *)s, __builtin_offsetof(struct rdwfs_super, super_crc));
+    s->payload_crc = (uint32_t)crc32(0, base + ANNFS_SUPER_BYTES, (uInt)bytes);
+    s->super_crc = (uint32_t)crc32(0, (void *)s, __builtin_offsetof(struct annfs_super, super_crc));
 }
 static struct ramfs_mount *mounted_checkpoint(struct test_mount *mp) {
     assert(allocations == 0 && ramfs_var_used_pages == 0);
@@ -323,20 +323,20 @@ static void unmount_retry_tests(void) {
         void *meta = rm->rm_meta_buf, *io_page = rm->rm_io_page, *bmap = rm->rm_bmap;
         struct ramfs_node *root = rm->rm_root;
         uint8_t committed[8192];
-        memcpy(committed, device + RDWFS_SLOT1_OFFSET, sizeof(committed));
+        memcpy(committed, device + ANNFS_SLOT1_OFFSET, sizeof(committed));
         dirty_mode(rm, 0700);
         assert(call->pending);
         vflush_error = EBUSY;
         assert(ramfs_unmount(&mp, 0, NULL) == EBUSY && writes == 0 && call->pending);
         vflush_error = 0;
-        io_fail = fault == 0 ? RDWFS_SUPER_BYTES : RDWFS_SLOT0_OFFSET;
+        io_fail = fault == 0 ? ANNFS_SUPER_BYTES : ANNFS_SLOT0_OFFSET;
         partial_write = fault == 0 ? 128 : 0;
         assert(ramfs_unmount(&mp, 0, NULL) == EIO);
         assert(mp.private == rm && ramfs_disk_rm == rm && ramfs_disk_claimed);
         assert(rm->rm_disk_backed && rm->rm_meta_dirty && rm->rm_meta_gen == 4);
         assert(rm->rm_meta_call == call && rm->rm_meta_buf == meta && rm->rm_io_page == io_page);
         assert(rm->rm_bmap == bmap && rm->rm_root == root && !call->pending && !call->running);
-        assert(memcmp(committed, device + RDWFS_SLOT1_OFFSET, sizeof(committed)) == 0);
+        assert(memcmp(committed, device + ANNFS_SLOT1_OFFSET, sizeof(committed)) == 0);
         dirty_mode(rm, 0600);
         assert(call->pending);
         io_fail = -1; partial_write = 0;
@@ -348,8 +348,8 @@ static void unmount_retry_tests(void) {
         }
         assert(ramfs_unmount(&mp, 0, NULL) == 0);
         assert_released(&mp);
-        assert(((struct rdwfs_super *)device)->generation == 5);
-        assert(((struct rdwfs_inode_rec *)(device + RDWFS_SUPER_BYTES))->mode == 0600);
+        assert(((struct annfs_super *)device)->generation == 5);
+        assert(((struct annfs_inode_rec *)(device + ANNFS_SUPER_BYTES))->mode == 0600);
     }
 }
 static int unmount_result;
@@ -409,7 +409,7 @@ static void callout_tests(void) {
         }
         assert_released(&mp);
         unsigned slot = stage == 0 ? 0 : 1;
-        struct rdwfs_inode_rec *root = (void *)(device + slot * RDWFS_SLOT_MAX + RDWFS_SUPER_BYTES);
+        struct annfs_inode_rec *root = (void *)(device + slot * ANNFS_SLOT_MAX + ANNFS_SUPER_BYTES);
         assert(root->mode == 0600);
     }
 }
@@ -423,11 +423,11 @@ int main(void) {
         assert(ramfs_disk_mount(&rm) == ENOMEM && writes == 0 && !ramfs_disk_claimed);
         cleanup(&rm);
     }
-    setup(&rm); io_fail = RDWFS_SLOT1_OFFSET;
+    setup(&rm); io_fail = ANNFS_SLOT1_OFFSET;
     assert(ramfs_disk_mount(&rm) == EIO && writes == 0); cleanup(&rm);
     setup(&rm); device[65536] = 1;
     assert(ramfs_disk_mount(&rm) == EINVAL && writes == 0); cleanup(&rm);
-    setup(&rm); device[0] = device[RDWFS_SLOT1_OFFSET] = 1;
+    setup(&rm); device[0] = device[ANNFS_SLOT1_OFFSET] = 1;
     assert(ramfs_disk_mount(&rm) == EINVAL && writes == 0); cleanup(&rm);
     setup(&rm); assert(ramfs_disk_mount(&rm) == 0 && !rm.rm_seed_done && writes == 0); cleanup(&rm);
     setup(&rm); checkpoint(0, 3, false); checkpoint(1, 4, false);
@@ -437,24 +437,24 @@ int main(void) {
     assert(ramfs_disk_mount(&rm) == 0 && rm.rm_nodes == 1 && rm.rm_pages == 0);
     assert(rm.rm_meta_slot == 1 && rm.rm_meta_gen == 3 && ramfs_var_used_pages == 0 && writes == 0);
     rm.rm_meta_dirty = true;
-    assert(ramfs_disk_sync_impl(&rm) == 0 && last_write == RDWFS_SLOT0_OFFSET && rm.rm_meta_gen == 4);
+    assert(ramfs_disk_sync_impl(&rm) == 0 && last_write == ANNFS_SLOT0_OFFSET && rm.rm_meta_gen == 4);
     cleanup(&rm);
     /* A failed target-slot write must preserve the last committed checkpoint. */
     for (unsigned stop = 0; stop < 2; stop++) {
         setup(&rm); checkpoint(0, 3, false); checkpoint(1, 4, false);
         assert(ramfs_disk_mount(&rm) == 0 && rm.rm_meta_slot == 1);
         uint8_t committed[8192];
-        memcpy(committed, device + RDWFS_SLOT1_OFFSET, sizeof(committed));
+        memcpy(committed, device + ANNFS_SLOT1_OFFSET, sizeof(committed));
         rm.rm_root->rn_mode = 0700; rm.rm_meta_dirty = true;
-        io_fail = stop == 0 ? RDWFS_SUPER_BYTES : RDWFS_SLOT0_OFFSET;
+        io_fail = stop == 0 ? ANNFS_SUPER_BYTES : ANNFS_SLOT0_OFFSET;
         partial_write = stop == 0 ? 128 : 0;
         assert(ramfs_disk_sync_impl(&rm) == EIO && rm.rm_meta_dirty);
         assert(rm.rm_meta_gen == 4 && rm.rm_meta_slot == 1);
-        assert(memcmp(committed, device + RDWFS_SLOT1_OFFSET, sizeof(committed)) == 0);
+        assert(memcmp(committed, device + ANNFS_SLOT1_OFFSET, sizeof(committed)) == 0);
         io_fail = -1; partial_write = 0;
-        struct rdwfs_super *old_header = (void *)device;
+        struct annfs_super *old_header = (void *)device;
         assert(old_header->generation == 3 && ramfs_disk_super_valid(old_header));
-        assert(ramfs_disk_read_slot(&rm, RDWFS_SLOT0_OFFSET, old_header) == EINVAL);
+        assert(ramfs_disk_read_slot(&rm, ANNFS_SLOT0_OFFSET, old_header) == EINVAL);
         cleanup(&rm);
 
         memset(&rm, 0, sizeof(rm));
@@ -466,22 +466,22 @@ int main(void) {
         assert(rm.rm_root->rn_mode == 0);
         rm.rm_root->rn_mode = 0600; rm.rm_meta_dirty = true;
         assert(ramfs_disk_sync_impl(&rm) == 0 && rm.rm_meta_gen == 5 && rm.rm_meta_slot == 0);
-        assert(ramfs_disk_read_slot(&rm, RDWFS_SLOT0_OFFSET, (void *)device) == 0);
+        assert(ramfs_disk_read_slot(&rm, ANNFS_SLOT0_OFFSET, (void *)device) == 0);
         cleanup(&rm);
     }
     setup(&rm); checkpoint(0, 5, true); checkpoint(1, 3, false); fail_alloc = 7;
     assert(ramfs_disk_mount(&rm) == ENOMEM && writes == 0 && ramfs_var_used_pages == 0); cleanup(&rm);
     setup(&rm); checkpoint(1, 3, false);
     assert(ramfs_disk_mount(&rm) == 0 && rm.rm_meta_slot == 1);
-    rm.rm_meta_dirty = true; io_fail = RDWFS_SUPER_BYTES;
+    rm.rm_meta_dirty = true; io_fail = ANNFS_SUPER_BYTES;
     assert(ramfs_disk_sync_impl(&rm) == EIO && rm.rm_meta_gen == 3 && rm.rm_meta_slot == 1);
     assert(rm.rm_meta_dirty && writes == 0);
     io_fail = -1;
-    assert(ramfs_disk_sync_impl(&rm) == 0 && rm.rm_meta_gen == 4 && last_write == RDWFS_SLOT0_OFFSET);
+    assert(ramfs_disk_sync_impl(&rm) == 0 && rm.rm_meta_gen == 4 && last_write == ANNFS_SLOT0_OFFSET);
     cleanup(&rm);
     setup(&rm); checkpoint(0, 5, true); checkpoint(1, 3, true);
     assert(ramfs_disk_mount(&rm) == EINVAL && writes == 0 && ramfs_var_used_pages == 0); cleanup(&rm);
-    setup(&rm); checkpoint(0, 1, false); io_fail = RDWFS_SUPER_BYTES;
+    setup(&rm); checkpoint(0, 1, false); io_fail = ANNFS_SUPER_BYTES;
     assert(ramfs_disk_mount(&rm) == EIO && writes == 0); cleanup(&rm);
     for (unsigned mode = 0; mode < 3; mode++) {
         assert(allocations == 0);

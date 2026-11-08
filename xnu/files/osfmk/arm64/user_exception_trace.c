@@ -446,7 +446,7 @@ again:
 	}
 }
 
-/* The same at once, for whoever asks (a debugging key sequence, see bsd/dev/redwood_virtio_input.c). */
+/* The same at once, for whoever asks (a debugging key sequence, see bsd/dev/annibale_virtio_input.c). */
 void ustacks_now(const char *name);
 
 void

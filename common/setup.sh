@@ -67,10 +67,10 @@ need gcc "by ios165/fetch.sh (builds the LZBITMAP decoder)"
 need qemu-system-aarch64 "to run in QEMU (DEVICE=qemu-virt)"
 need fastboot "to boot a phone"
 need adb "to take a phone's own firmware off it"
-need clang "to build the kernel and the loader (not needed with prebuilt/)"
-need lld-link "to build the loader (not needed with prebuilt/)"
+need clang "to build the kernel and the loader"
+need lld-link "to build the loader"
 [ -d "${THEOS:-$HOME/theos}/sdks/iPhoneOS16.5.sdk" ] ||
-	echo "  theos + iPhoneOS16.5.sdk missing -- needed only to rebuild the kernel and our programs (prebuilt/ has them)"
+	echo "  theos + iPhoneOS16.5.sdk missing -- needed to build the iOS 16.5 kernel and our programs"
 [ $MISSING = 0 ] && echo "  all there"
 cat <<EOF
 

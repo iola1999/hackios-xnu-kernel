@@ -35,7 +35,7 @@ f338113110533a9f41bf3ffa8a44a6bb42dc8dbf36271144bf907cfd633a8db6 qmi.c
 ac2590222ab4e51d7553d41fcb669ab8991f89b35f83818a5146b1b5cb19bc7c wifi7/hw.c
 71a17ab6ca84b1445d38ae8467d28e4bd96ca58d692002807c7a393ddc537d59 wifi7/ce.c
 PINS
-python3 - "$B" "$TAG" > "$OUT/redwood_wlfw_ath12k.h.new" <<'PY'
+python3 - "$B" "$TAG" > "$OUT/annibale_wlfw_ath12k.h.new" <<'PY'
 import re
 import sys
 
@@ -87,6 +87,6 @@ print('#define WLFW_PIPES\t\t%s\n#define WLFW_PIPE_COUNT\t\t%s' % (of('target_ce
 print('#define WLFW_SERVICES\t\t%s\n#define WLFW_SERVICE_COUNT\t%s' % (of('svc_to_ce_map'), of('svc_to_ce_map_len')))
 print('#define WLFW_SERVICE_INSTANCE\t%s' % of('qmi_service_ins_id'))
 PY
-cmp -s "$OUT/redwood_wlfw_ath12k.h.new" "$OUT/redwood_wlfw_ath12k.h" 2>/dev/null && rm "$OUT/redwood_wlfw_ath12k.h.new" ||
-	mv "$OUT/redwood_wlfw_ath12k.h.new" "$OUT/redwood_wlfw_ath12k.h"
-echo "mk-wlfw-ath12k.sh: $OUT/redwood_wlfw_ath12k.h ($(grep -c 'qmi_elem_info .*\[\] = {' "$OUT/redwood_wlfw_ath12k.h") tables)"
+cmp -s "$OUT/annibale_wlfw_ath12k.h.new" "$OUT/annibale_wlfw_ath12k.h" 2>/dev/null && rm "$OUT/annibale_wlfw_ath12k.h.new" ||
+	mv "$OUT/annibale_wlfw_ath12k.h.new" "$OUT/annibale_wlfw_ath12k.h"
+echo "mk-wlfw-ath12k.sh: $OUT/annibale_wlfw_ath12k.h ($(grep -c 'qmi_elem_info .*\[\] = {' "$OUT/annibale_wlfw_ath12k.h") tables)"

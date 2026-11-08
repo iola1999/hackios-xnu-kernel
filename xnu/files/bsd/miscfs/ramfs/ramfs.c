@@ -1,5 +1,5 @@
 /*
- * ramfs: writable files with optional RDWFS001 backing for /private/var.
+ * ramfs: writable files with optional ANNFS001 backing for /private/var.
  *
  * UFS system boots require /private/var to mount its physical backing.
  * Other mount points retain temporary, memory-only storage.
@@ -82,6 +82,7 @@ struct ramfs_node {
 	gid_t               rn_gid;
 	uint32_t            rn_bsdflags, rn_dataprotect_class, rn_nlink, rn_state, rn_vid, rn_nentries;
 	uint32_t            rn_iflags;          /* RAMFS_IF_*: saved with the node, not visible to chflags */
+	uint32_t            rn_docid;           /* document ID, given when UF_TRACKED is first set; 0 until then */
 	vnode_t             rn_vp;
 	struct timespec     rn_atime, rn_mtime, rn_ctime, rn_btime;
 	/* directory */
@@ -106,6 +107,7 @@ struct ramfs_mount {
 	lck_mtx_t           rm_lock, rm_rename_lock;
 	struct ramfs_node  *rm_root;
 	uint64_t            rm_next_ino, rm_nodes, rm_pages, rm_max_pages; /* rm_pages: file pages in use */
+	uint32_t            rm_next_docid;
 	struct ramfs_node **rm_hash;            /* every node by its number, for vfs_vget */
 	bool                rm_disk_backed, rm_disk_loading, rm_meta_dirty, rm_meta_syncing, rm_seed_done;
 	uint32_t            rm_bmap_words, rm_bmap_max, rm_bmap_next;
@@ -378,6 +380,20 @@ ramfs_touch(struct ramfs_node *node, bool modified)
 		node->rn_mtime = now;
 	}
 	ramfs_disk_dirty_locked(node->rn_mount);
+}
+
+/*
+ * APFS and HFS give a file or directory a document ID the first time UF_TRACKED is set on it: unique on
+ * the volume and kept with the node. revisiond's GSLibraryGetOrAllocateDocumentId sets UF_TRACKED and
+ * reads ATTR_CMN_DOCUMENT_ID back, and FileProvider's LocalStorage domain does that for every item it
+ * creates. Called with rm_lock held, after the flags changed.
+ */
+static void
+ramfs_track(struct ramfs_node *node)
+{
+	if ((node->rn_bsdflags & UF_TRACKED) && node->rn_docid == 0) {
+		node->rn_docid = node->rn_mount->rm_next_docid++;
+	}
 }
 
 static struct ramfs_dirent *
@@ -738,6 +754,7 @@ ramfs_mount(mount_t mp, __unused vnode_t devvp, __unused user_addr_t data, __unu
 	lck_mtx_init(&rm->rm_rename_lock, &ramfs_lck_grp, LCK_ATTR_NULL);
 	rm->rm_mp = mp;
 	rm->rm_next_ino = RAMFS_ROOT_INO + 1;
+	rm->rm_next_docid = 1;
 	/* a runaway writer must not be able to take the whole machine: a quarter of memory at most */
 	rm->rm_max_pages = (max_mem / 4) / PAGE_SIZE;
 

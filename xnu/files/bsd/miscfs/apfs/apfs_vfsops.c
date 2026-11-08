@@ -19,8 +19,8 @@
 #include <sys/sysctl.h>
 #include <sys/vnode_internal.h>
 #include <sys/fcntl.h>
-#include <sys/redwood_input.h>
-#include <sys/redwood_virtio_blk.h>
+#include <sys/annibale_input.h>
+#include <sys/annibale_virtio_blk.h>
 #include <sys/proc.h>
 #include <kern/thread.h>
 #include <libkern/OSAtomic.h>
@@ -458,21 +458,21 @@ apfs_stats_print(void)
 	}
 }
 
-/* kern.redwood_memory: the kernel's line about memory (osfmk/arm64/loader_return.c), for a job list to keep */
-extern void redwood_memory_line(char *buf, size_t len);
+/* kern.annibale_memory: the kernel's line about memory (osfmk/arm64/loader_return.c), for a job list to keep */
+extern void annibale_memory_line(char *buf, size_t len);
 
 static int
-sysctl_redwood_memory SYSCTL_HANDLER_ARGS
+sysctl_annibale_memory SYSCTL_HANDLER_ARGS
 {
 #pragma unused(oidp, arg1, arg2)
 	char line[256];
 
-	redwood_memory_line(line, sizeof(line));
+	annibale_memory_line(line, sizeof(line));
 	return SYSCTL_OUT(req, line, strlen(line) + 1);
 }
 
-SYSCTL_PROC(_kern, OID_AUTO, redwood_memory, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
-    0, 0, sysctl_redwood_memory, "A", "where the memory is, in MB");
+SYSCTL_PROC(_kern, OID_AUTO, annibale_memory, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+    0, 0, sysctl_annibale_memory, "A", "where the memory is, in MB");
 
 SYSCTL_PROC(_kern, OID_AUTO, apfs_stats, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
     0, 0, sysctl_apfs_stats, "A", "APFS: where the time goes; write to zero it");
@@ -1120,7 +1120,7 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 		dev_t rdev = vnode_specrdev(devvp);
 		uint32_t cheap;
 
-		am->am_nx.cheap_requests = !redwood_ufs_dev(rdev) && !redwood_virtio_blk_dev(rdev);
+		am->am_nx.cheap_requests = !annibale_ufs_dev(rdev) && !annibale_virtio_blk_dev(rdev);
 		if (PE_parse_boot_argn("apfs_cheap", &cheap, sizeof(cheap))) {
 			am->am_nx.cheap_requests = (cheap != 0);
 		}
@@ -1170,8 +1170,8 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 
 	sp = vfs_statfs(mp);
 	sp->f_bsize = sp->f_iosize = am->am_nx.block_size;
-	sp->f_blocks = redwood_container_total_bytes() / am->am_nx.block_size;
-	sp->f_bfree = sp->f_bavail = redwood_container_free_bytes() / am->am_nx.block_size;
+	sp->f_blocks = annibale_container_total_bytes() / am->am_nx.block_size;
+	sp->f_bfree = sp->f_bavail = annibale_container_free_bytes() / am->am_nx.block_size;
 	sp->f_bused = am->am_vol.alloc_count;
 	sp->f_files = am->am_vol.num_files + am->am_vol.num_dirs;
 	sp->f_ffree = 0;
@@ -1377,12 +1377,12 @@ apfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
 {
 	struct apfs_mount *am = APFS_MP(mp);
 	uint64_t files = am->am_vol.num_files + am->am_vol.num_dirs;
-	uint64_t free_blks = redwood_container_free_bytes() / am->am_nx.block_size;
+	uint64_t free_blks = annibale_container_free_bytes() / am->am_nx.block_size;
 
 	VFSATTR_RETURN(fsap, f_objcount, files);
 	VFSATTR_RETURN(fsap, f_bsize, am->am_nx.block_size);
 	VFSATTR_RETURN(fsap, f_iosize, am->am_nx.block_size);
-	VFSATTR_RETURN(fsap, f_blocks, redwood_container_total_bytes() / am->am_nx.block_size);
+	VFSATTR_RETURN(fsap, f_blocks, annibale_container_total_bytes() / am->am_nx.block_size);
 	VFSATTR_RETURN(fsap, f_bfree, free_blks);
 	VFSATTR_RETURN(fsap, f_bavail, free_blks);
 	VFSATTR_RETURN(fsap, f_bused, am->am_vol.alloc_count);

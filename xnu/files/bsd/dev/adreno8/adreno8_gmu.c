@@ -81,7 +81,7 @@ adreno8_block_new(struct adreno8_gpu_block *b, const char *name, uint32_t addres
 	return true;
 }
 
-/* The writes of this processor have reached memory before the GMU reads it (redwood: settle). */
+/* The writes of this processor have reached memory before the GMU reads it (annibale: settle). */
 
 void
 adreno8_settle(void)
@@ -253,7 +253,7 @@ adreno8_step_first_words(void)
 /* ---- step 7: its memory, in reset ------------------------------------------------------------------------ */
 
 /*
- * Two words into the GMU's data memory and back, while its processor is in reset -- redwood's
+ * Two words into the GMU's data memory and back, while its processor is in reset -- the POCO X5 Pro's
  * step 10 unchanged but for the window. The word the firmware leaves at the end of that memory
  * says whether firmware is running, and a running firmware's memory is not ours to scribble on.
  */
@@ -300,7 +300,7 @@ static const uint8_t *
 adreno8_image_file(const char *directory, const char *name, uint64_t *size)
 {
 	int disk = -1;
-	const uint8_t *data = redwood_image_file(directory, name, size, &disk);  /* (redwood_image.c) */
+	const uint8_t *data = annibale_image_file(directory, name, size, &disk);  /* (annibale_image.c) */
 
 	if (data != NULL) {
 		if (!adreno8_image_asked_quietly) {

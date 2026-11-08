@@ -26,7 +26,7 @@
  *  20  GPU scratch write/read verification
  *  21  Fault, queue, power and counter diagnostics
  *  22  Standard HWSCHED context: two non-privileged IBs, timestamps and unregister
- *  23  Enable external BO mappings and publish the RedwoodGPU service
+ *  23  Enable external BO mappings and publish the AnnibaleGPU service
  *
  * adreno8=N           execute steps 1..N
  * adreno8_only=K      execute only step K; its prerequisites must already exist in this kernel
@@ -55,7 +55,7 @@
  *                  read-only, the values enter no decision, off unless asked
  * gpu_coherent=1     map user buffers and surfaces into the GPU as cacheable, inner-shareable memory
  *                  (MAIR index 1), so the GPU snoops the processors' caches (vendor dt: kgsl_smmu is
- *                  dma-coherent) and RedwoodGPU stops cleaning caches before each submission
+ *                  dma-coherent) and AnnibaleGPU stops cleaning caches before each submission
  * adreno8_gpu_stall=1  diagnostic only: stall faults in GPU contexts 0 and 3; poll fault
  *                  registers with context fault interrupts disabled; GMU context 2 is unchanged
  * adreno8_arc_read=1  stage-1 diagnostic: Apps DRV2 cx.lvl then mx.lvl reads; requires explicit
@@ -468,7 +468,7 @@ adreno8_init(void)
 	printf("adreno8: over; the system goes on starting\n");
 	adreno8_init_done = true;
 	if (adreno8_gpu8_return) {
-		printf("adreno8: adreno8_return: the boot goes on from in here, as redwood's adreno_return does\n");
+		printf("adreno8: adreno8_return: the boot goes on from in here, as the POCO X5 Pro's adreno_return does\n");
 		loader_return();
 	}
 }

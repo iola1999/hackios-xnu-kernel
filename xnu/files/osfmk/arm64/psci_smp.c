@@ -386,7 +386,7 @@ psci_smp_stop_here(void)
 
 
 /*
- * For kern.redwood.cpus: whether processors may idle, and per processor the signal word (bit 31,
+ * For kern.annibale.cpus: whether processors may idle, and per processor the signal word (bit 31,
  * SIGPdisabled, keeps cpu_idle() from waiting in WFI: the core then spins in its idle loop) and the
  * interrupt, IPI, timer and WFE counts, which two readings a few seconds apart turn into rates.
  */
@@ -415,7 +415,7 @@ psci_smp_report(char *buf, size_t size)
 	return (int)(n < size ? n : size);
 }
 /*
- * kern.redwood.prof, read: the interrupt samples of all processors (gic_v3_irq.c) merged by
+ * kern.annibale.prof, read: the interrupt samples of all processors (gic_v3_irq.c) merged by
  * (pid, pc, lr, two return addresses above a kernel sample). First the samples per pid, user and
  * kernel apart (pid -2 is the idle threads, 0 the kernel's own), then the PROF_TOP most frequent
  * places: "count pid u|k pc lr up0 up1" (0 where a user sample or the walk has none).

@@ -520,7 +520,7 @@ write_logs(const char *klog, uint64_t klog_len)
 	int same = 0;
 
 	/*
-	 * Only through UEFI's own transfer list (see hc_take_back) -- that is the dance redwood needs
+	 * Only through UEFI's own transfer list (see hc_take_back) -- that is the dance annibale needs
 	 * because its kernel takes the UFS controller over. annibale's kernel boots from a ramdisk and
 	 * never touches the UFS controller, and while the loader waits on USB no kernel runs at all, so
 	 * UEFI's BlockIo owns the storage outright: write straight through it on annibale (k90-port).

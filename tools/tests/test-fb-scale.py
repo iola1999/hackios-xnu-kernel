@@ -128,7 +128,7 @@ static void compare(uint32_t sw, uint32_t sh, uint32_t pw, uint32_t ph, int32_t 
 
 int main(void)
 {
-    /* the iPhone picture on the K90 panel; with fbscale=2; on redwood's panel (smaller); odd layers */
+    /* the iPhone picture on the K90 panel; with fbscale=2; on the POCO X5 Pro's panel (smaller); odd layers */
     compare(1125, 2436, 1156, 2510, 0, 1156, 0, 2510, 0, 0);
     compare(750, 1624, 1156, 2510, 0, 1156, 0, 2510, 0, 0);
     compare(1125, 2436, 1080, 2400, 0, 1080, 0, 2400, 0, 0);

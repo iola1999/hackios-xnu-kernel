@@ -87,8 +87,8 @@ static uint64_t last_blocking_read_ns;
 static bool recording=true,dma_available=true;
 static uint32_t fed_frames;
 static int16_t fed[1920];
-static bool redwood_audio_recording_mic(void) { return recording; }
-static void redwood_audio_record_fed(const int16_t *samples,uint32_t frames) {
+static bool annibale_audio_recording_mic(void) { return recording; }
+static void annibale_audio_record_fed(const int16_t *samples,uint32_t frames) {
     assert(frames<=960);memcpy(fed,samples,frames*4);fed_frames=frames;
 }
 struct gpr_pkt { uint8_t buf[1024]; uint32_t len; };

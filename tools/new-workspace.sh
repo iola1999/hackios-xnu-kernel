@@ -9,7 +9,7 @@
 #   INSTANCE  the QEMU instance number of the copy (1, 2, ...; see qemu/run-ios.sh)
 #
 # The kernel tree is copied as it is now, uncommitted work included, and that state is recorded
-# (refs/redwood/baseline in the copy's kernel tree): tools/kernel-delta.sh, run in the workspace,
+# (refs/annibale/baseline in the copy's kernel tree): tools/kernel-delta.sh, run in the workspace,
 # prints what was changed in the kernel since. Files below ios165/rootfs, ios165/cryptex and
 # ios165/cryptex-app are hard links to this copy's: replace them, never edit them in place.
 # The phone is not part of a workspace: there is one, and ./xl belongs to the main copy.
@@ -39,7 +39,7 @@ rm -rf $K/BUILD
 	cd $K
 	export GIT_INDEX_FILE=$PWD/.git/index.baseline
 	git add -A . 2>/dev/null
-	git update-ref refs/redwood/baseline "$(git commit-tree "$(git write-tree)" -p HEAD -m 'the state the workspace started from')"
+	git update-ref refs/annibale/baseline "$(git commit-tree "$(git write-tree)" -p HEAD -m 'the state the workspace started from')"
 	rm -f "$GIT_INDEX_FILE"
 )
 # what the kernel build needs besides the tree

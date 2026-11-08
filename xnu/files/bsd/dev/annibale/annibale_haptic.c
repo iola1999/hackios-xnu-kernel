@@ -1,8 +1,6 @@
 /*
  * The vibration motor of the REDMI K90 (annibale, SM8750 "sun"): a linear resonant actuator driven by
- * the haptics block of the PMIC -- TI/Qualcomm's "hv-haptics" (HAP), not a chip on I2C as under the
- * POCO X5 Pro (redwood, bsd/dev/redwood_haptic.c). It is reached over SPMI, like the power and volume
- * keys of redwood (bsd/dev/redwood_buttons.c), but through the version 7 register layout of the
+ * the haptics block of the PMIC -- TI/Qualcomm's "hv-haptics" (HAP), not a chip on I2C. It is reached over SPMI through the version 7 register layout of the
  * arbiter, which Linux reads in drivers/spmi/spmi-pmic-arb.c and which nothing here had spoken to yet.
  *
  * Everything belonging to this phone is from its own device tree (the merged DT of docs/analysis,
@@ -22,15 +20,15 @@
  *              to the driver in steps of 5 us); 1300 mV (vmax-mv) in steps of 50 mV; the brake
  *              pattern ff 3f 1f over eight steps (qcom,brake-pattern), closed-loop brake mode 1,
  *              sine-shaped brake and drive waveforms (both sig-shape 1), sine gain 0.
- *   the motor for iOS (hv_haptic=4)  as for redwood: what iOS plays on its "Actuator" device
- *              (userland/src/audio_plugin.c) is written to /dev/redwood-haptic as samples of one
+ *   the motor for iOS (hv_haptic=4)  as for annibale: what iOS plays on its "Actuator" device
+ *              (userland/src/audio_plugin.c) is written to /dev/annibale-haptic as samples of one
  *              channel; a waveform after a pause is a tap, one that goes on longer a vibration, the
- *              strength following how loud the samples are. But where the redwood chip plays
+ *              strength following how loud the samples are. But where the POCO X5 Pro chip plays
  *              Android's own RAM waveforms, this one is driven directly: its pattern engine takes a
  *              single amplitude (DIRECT_PLAY) and drives the motor at that strength, so the
  *              loudness of iOS's waveform becomes the amplitude, refreshed as iOS's goes up and down.
  *
- * Nothing here is done unless a boot-arg asks for it (the redwood motor's `haptic=1..5' is its own):
+ * Nothing here is done unless a boot-arg asks for it (the POCO X5 Pro motor's `haptic=1..5' is its own):
  *
  *   hv_haptic=1  a look, reading only: the arbiter's table, the three SPMI peripherals' revisions,
  *                the driver's fault and status registers as Android's driver leaves them.
@@ -38,7 +36,7 @@
  *                period, brake, waveforms), every write read back; nothing played.
  *   hv_haptic=3  ... and one short direct drive for 30 ms at haptic_amp=N of 255 (0x60 by default):
  *                a blind test run says through the fault register whether the motor moved.
- *   hv_haptic=4  ... and the motor for iOS until the run ends, as redwood's level 5: /dev/redwood-haptic.
+ *   hv_haptic=4  ... and the motor for iOS until the run ends, as the POCO X5 Pro's level 5: /dev/annibale-haptic.
  *
  * Limits, whatever asks: a fault the driver reports (under-voltage, over-current, over-temperature,
  * the boost's short circuit), a write that does not read back, a channel nobody owns for us, and the
@@ -55,8 +53,8 @@
 #include <pexpert/pexpert.h>
 #include <miscfs/devfs/devfs.h>
 #include <sys/conf.h>
-#include <sys/redwood_audio.h>
-#include <sys/redwood_input.h>
+#include <sys/annibale_audio.h>
+#include <sys/annibale_input.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
 
@@ -589,7 +587,7 @@ drive(uint8_t amp, uint32_t ms)
 	return true;
 }
 
-/* ---- hv_haptic=4: the motor for iOS (the scheme of redwood's level 5, onto a direct drive) -------- */
+/* ---- hv_haptic=4: the motor for iOS (the scheme of the POCO X5 Pro's level 5, onto a direct drive) -------- */
 
 static volatile uint64_t heard_us, quiet_us, onset_us;
 static volatile uint32_t heard_peak;
@@ -686,7 +684,7 @@ static const struct cdevsw haptic_cdevsw = {
 };
 
 /*
- * How strong to drive with what iOS plays: the redwood driver's reasoning, onto an amplitude of 255 --
+ * How strong to drive with what iOS plays: the POCO X5 Pro driver's reasoning, onto an amplitude of 255 --
  * from a third of iOS's full scale at the haptic_amp of the boot-arg, down to five eighths of it for
  * the softest feedbacks, never above.
  */
@@ -706,11 +704,11 @@ serve(void)
 	uint8_t driving = 0;
 	int major = cdevsw_add(-1, &haptic_cdevsw);
 
-	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-haptic") == NULL) {
-		say("haptic: /dev/redwood-haptic cannot be made\n");
+	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "annibale-haptic") == NULL) {
+		say("haptic: /dev/annibale-haptic cannot be made\n");
 		return;
 	}
-	say("haptic: THE MOTOR PLAYS WHAT IOS PLAYS ON ITS ACTUATOR (/dev/redwood-haptic) from here on, until the run ends\n");
+	say("haptic: THE MOTOR PLAYS WHAT IOS PLAYS ON ITS ACTUATOR (/dev/annibale-haptic) from here on, until the run ends\n");
 	while (!broken) {
 		uint64_t now = now_us();
 		bool active = heard_us != 0 && now - heard_us < ACTIVE_US;
@@ -870,7 +868,7 @@ annibale_haptic_init(void)
 	thread_t thread;
 	int haptic_arg = -1;
 
-	if (!redwood_platform_is_annibale()) {
+	if (!annibale_platform_is_annibale()) {
 		return;
 	}
 	if (PE_parse_boot_argn("hv_haptic", &level, sizeof(level))) {

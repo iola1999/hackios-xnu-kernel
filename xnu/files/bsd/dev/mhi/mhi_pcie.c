@@ -1,6 +1,6 @@
 /*
  * The Wi-Fi card of the REDMI K90 (annibale, SM8750 "sun") hangs off a PCIe root complex, which
- * is the structural difference from redwood (the POCO X5 Pro): there bsd/dev/redwood_wifi.c
+ * is the structural difference from the POCO X5 Pro: there bsd/dev/annibale_wifi.c
  * talks to the WCN6750 over SMEM, SMP2P, IPCC and PIL with no PCI anywhere. On this phone the
  * device tree's pcie0 (qcom,pci-msm, the merged decompile's line 34449 onward, the node
  * pcie@1c00000) is a DesignWare root complex whose endpoint is the WCN7850's wifi function: the
@@ -63,7 +63,7 @@
  *           goes back to the card's config space for it and stays there.
  *   step 8  once step 7 reached mission mode: QRTR's MHI channels, the router on them (mhi_pcie_fw.c).
  *   step 9  the exchange with the firmware's WLFW service up to FW_READY (mhi_pcie_wlfw.c).
- *   step 10 in place of steps 7 to 9: the Wi-Fi driver (ath12k, tools/mk-ath12k.sh, through redwood_lx.c), which
+ *   step 10 in place of steps 7 to 9: the Wi-Fi driver (ath12k, tools/mk-ath12k.sh, through annibale_lx.c), which
  *           has steps 7 and 8 run when it powers the card up, and talks to the WLFW service itself.
  *
  * Without pcie_power=1 nothing persists -- everything written is restored -- so there is no quiesce on the
@@ -71,7 +71,7 @@
  * and 2 when step 1 finds them off (mhi_pcie_power.c); that is left on until the reset. Right after that
  * power-up, bt=N starts the chip's Bluetooth half in a thread of its own (annibale_bt_hci.c).
  *
- * The boot-arg is pcie= and not wifi= on purpose: bsd/dev/redwood_wifi.c takes wifi= for the old
+ * The boot-arg is pcie= and not wifi= on purpose: bsd/dev/annibale_wifi.c takes wifi= for the old
  * phone's WCN6750 (there wifi=1 is its production path, its line 4269) and stays as it is -- the
  * names cannot collide, the two drivers cannot be started by one command line by accident, and
  * this phone's command line carries pcie=N. An SoC guard for the old driver is on the backlog.
@@ -82,14 +82,14 @@
 #include <mach/mach_types.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
-#include <sys/redwood_input.h>
-#include <sys/redwood_qrtr.h>
+#include <sys/annibale_input.h>
+#include <sys/annibale_qrtr.h>
 #include <sys/systm.h>
 
 #include "mhi_pcie_private.h"
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
-extern const uint8_t *redwood_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+extern const uint8_t *annibale_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 extern kern_return_t thread_terminate(thread_t thread);
 extern void loader_log_putc(char c);
 
@@ -146,7 +146,7 @@ wr(vm_offset_t address, uint32_t value)
 #define GCC_SIZE                  0x006e000UL
 /*
  * The pin registers start 0x100000 above the vendor device tree's tlmm reg (0xf000000), as in
- * mainline sm8750.dtsi and redwood_goodix.c's board_setup(). Reading pin 16 at the vendor base
+ * mainline sm8750.dtsi and annibale_goodix.c's board_setup(). Reading pin 16 at the vendor base
  * plus 0x10000 stopped the SoC (kernel 76c1ad6, pcie_pause=8).
  */
 #define TLMM_PHYS                 0x0f100000UL
@@ -866,7 +866,7 @@ mhi_pcie_pause(const char *what)
 	thread_block(THREAD_CONTINUE_NULL);
 }
 
-/* ---- step 10: the card, for the driver (redwood_lx.c) ------------------------------------------------- */
+/* ---- step 10: the card, for the driver (annibale_lx.c) ------------------------------------------------- */
 
 static struct mhi_pcie_card radio_card;         /* set when the driver is started on it */
 
@@ -921,7 +921,7 @@ mhi_pcie_radio_file(const char *name, uint64_t *size)
 		file = firmware == 3 ? "lfw-m3.bin" : "phy_ucode20.elf";
 	}
 	printf("pcie: the driver asks for %s: %s\n", last, file == NULL ? "not there" : file);
-	return file == NULL ? NULL : redwood_image_file("fw", file, size, &disk);
+	return file == NULL ? NULL : annibale_image_file("fw", file, size, &disk);
 }
 
 static void
@@ -991,8 +991,8 @@ pcie_thread(void *parameter, __unused wait_result_t result)
 		if (steps >= 10) {
 			/* (the driver asks for the WLFW service before it powers the card up and the router has a link) */
 			radio_card = card;
-			redwood_qmi_set_transport(&redwood_qrtr);
-			printf("pcie: step 10: the driver starts (redwood_lx.c): %d\n", redwood_lx_start());
+			annibale_qmi_set_transport(&annibale_qrtr);
+			printf("pcie: step 10: the driver starts (annibale_lx.c): %d\n", annibale_lx_start());
 		} else if (mhi_pcie_firmware(&card) && steps >= 8 && mhi_pcie_ipcr() && steps >= 9) {
 			mhi_pcie_wlfw();
 		}

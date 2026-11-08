@@ -10,7 +10,7 @@
 # difference there: everything is compared with the base commit.
 #
 # One piece per file, so that two people changing two files no longer collide in one patch --
-# the single redwood.patch that used to hold all of Apple's changes is retired by this export.
+# the single annibale.patch that used to hold all of Apple's changes is retired by this export.
 #
 # The build container mounts the repository /src read-only, so running this there writes
 # nothing: copy the script to a writable place (/work, /tmp), run it on the kernel tree, and
@@ -40,7 +40,7 @@ while IFS= read -r f; do
 	echo "$piece" >> "$HERE/patches.new/series"
 done < "$HERE/patches.new/pieces.list"
 rm -f "$HERE/patches.new/pieces.list"
-rm -rf "$HERE/patches" "$HERE/redwood.patch"            # redwood.patch: retired, the series replaces it
+rm -rf "$HERE/patches" "$HERE/annibale.patch"            # annibale.patch: retired, the series replaces it
 mv "$HERE/patches.new" "$HERE/patches"
 
 rm -rf "$HERE/files.new"

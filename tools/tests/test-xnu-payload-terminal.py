@@ -240,7 +240,7 @@ PARSE_MUTATIONS = {
 
 # Length-contract mutation (review U1): the annibale cap bounds the declared
 # body by container minus header; dropping the subtraction re-opens the old
-# redwood off-by-eight window (body == container size read 8 bytes of tail).
+# annibale off-by-eight window (body == container size read 8 bytes of tail).
 BOUNDARY_MUTATIONS = {
     "cap_off_by_one": (CHECK_LINE, CAP_NO_HEADER, "FAIL body_over_by_one_events"),
 }
@@ -255,7 +255,7 @@ HEADER_MUTATIONS = {
 BODY_BOUNDARIES = r"""
     /* container-cap boundaries: the cap is XNU_PAYLOAD_MAX_SIZE minus the
        8-byte header, so body == cap - 8 loads, + 1 or the whole container
-       size does not (the old redwood check accepted the latter two). */
+       size does not (the old annibale check accepted the latter two). */
     reset(); { end = add_entry(8, "loader.efi", 64); put_u32(g_payload, XNU_PAYLOAD_MAGIC); put_u32(g_payload + 4, (UINT32)(XNU_PAYLOAD_MAX_SIZE - sizeof (XNU_PAYLOAD_HEADER))); }
     call_main(); expect("body_max_accepted", "LoadImage,StartImage,TERMINAL", 1, 0);
     CK(g_li_size == 64 && g_li_offset == 32, "body_max_accepted", "loader_bytes_passed");

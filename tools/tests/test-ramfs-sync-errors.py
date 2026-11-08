@@ -35,7 +35,13 @@ source = r'''
 #define F_FULLFSYNC 51
 #define RAMFS_ROOT_INO 2
 #define PROTECTION_CLASS_DEFAULT 0
-#define _IOWR(a,b,c) 1234
+#define _IOW(a,b,c) (2000 + (b))
+#define _IOR(a,b,c) (3000 + (b))
+#define _IOWR(a,b,c) (4000 + (b))
+#define FSIOC_CAS_BSDFLAGS 5000
+#define RAMFS_IF_SYNCROOT 1
+#define NULLVP NULL
+struct fsioc_cas_bsdflags { uint32_t expected_flags, new_flags, actual_flags; };
 typedef int64_t user_ssize_t;
 enum vtype { VREG, VDIR };
 struct ramfs_mount { int rm_lock; bool rm_seed_done; };
@@ -43,7 +49,8 @@ struct ramfs_node {
     struct ramfs_mount *rn_mount;
     enum vtype rn_type;
     uint64_t rn_ino, rn_size;
-    uint32_t rn_mode, rn_uid, rn_gid, rn_bsdflags, rn_dataprotect_class;
+    uint32_t rn_mode, rn_uid, rn_gid, rn_bsdflags, rn_dataprotect_class, rn_iflags;
+    struct ramfs_node *rn_parent;
     struct timespec rn_btime, rn_atime, rn_mtime, rn_ctime;
     bool rn_mapped_write;
     char data[32];
@@ -67,7 +74,7 @@ enum {
 struct vnop_setattr_args { vnode_t a_vp; struct vnode_attr *a_vap; };
 struct vnop_read_args { vnode_t a_vp; struct uio *a_uio; };
 struct vnop_write_args { vnode_t a_vp; struct uio *a_uio; int a_ioflag; };
-struct vnop_ioctl_args { vnode_t a_vp; unsigned long a_command; };
+struct vnop_ioctl_args { vnode_t a_vp; unsigned long a_command; void *a_data; };
 struct vnop_fsync_args { vnode_t a_vp; };
 static int mapped_error, metadata_error;
 static unsigned mapped_calls, metadata_calls, changes, allocations;
@@ -101,6 +108,9 @@ static int uiomove(void *data, int count, struct uio *uio) {
 }
 static void ramfs_resize(struct ramfs_node *node, uint64_t size) { node->rn_size = size; changes++; }
 static void ramfs_touch(struct ramfs_node *node, bool data) { (void)node; (void)data; changes++; }
+static void ramfs_track(struct ramfs_node *node) { (void)node; }
+static vnode_t vnode_getparent(vnode_t vp) { (void)vp; return NULLVP; }
+static void vnode_put(vnode_t vp) { (void)vp; }
 static void ramfs_disk_dirty_locked(struct ramfs_mount *rm) { (void)rm; changes++; }
 static int ubc_setsize(vnode_t vp, off_t size) { assert(size == (off_t)vp->rn_size); return 0; }
 static bool ubc_pages_resident(vnode_t vp) { (void)vp; return false; }
@@ -129,7 +139,7 @@ source += function((SRC / 'ramfs.c').read_text(), 'ramfs_sync_mapping')
 vnops = (SRC / 'ramfs_vnops.inc').read_text()
 for name in ('ramfs_setattr', 'ramfs_read', 'ramfs_write'):
     source += function(vnops, name)
-source += (SRC / 'ramfs_fsctl.inc').read_text()
+source += (SRC / 'ramfs_fsctl.inc').read_text().replace('#include <sys/fsctl.h>\n', '')
 source += r'''
 static void exercise(unsigned operation, int error, bool mapped) {
     struct ramfs_mount rm = { .rm_seed_done = true };
