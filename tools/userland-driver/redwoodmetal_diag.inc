@@ -239,29 +239,36 @@ rw_thumb_commit(NSArray *works, unsigned commit)
 		}
 }
 
-/* REDWOOD_THUMB_SCISSOR=x,y,w,h selects draws whose scissor lies inside this pixel rectangle.
- * A missing or empty scissor is excluded while this filter is enabled. */
+/* REDWOOD_THUMB_SCISSOR=x,y,w,h[,minw,minh] selects scissors inside a pixel rectangle,
+ * optionally requiring a minimum size. Missing and empty scissors are excluded. */
 static bool
 rw_thumb_scissor_wanted(RedwoodMetalWork *work)
 {
 	static int enabled = -1;
-	static uint64_t bounds[4];
+	static uint64_t bounds[6];
 
 	if (enabled < 0) {
 		const char *env = getenv("REDWOOD_THUMB_SCISSOR");
-		unsigned long long x, y, w, h;
+		unsigned long long x, y, w, h, minw = 1, minh = 1;
 		char extra;
 
 		enabled = 0;
 		if (env != NULL) {
+			int fields = sscanf(env, "%llu,%llu,%llu,%llu,%llu,%llu%c",
+			    &x, &y, &w, &h, &minw, &minh, &extra);
+			if (fields == 4)
+				fields = sscanf(env, "%llu,%llu,%llu,%llu%c", &x, &y, &w, &h, &extra);
 			enabled = 2;
-			if (sscanf(env, "%llu,%llu,%llu,%llu%c", &x, &y, &w, &h, &extra) == 4 &&
+			if ((fields == 4 || fields == 6) &&
 			    x <= UINT32_MAX && y <= UINT32_MAX && w > 0 && w <= UINT32_MAX - x &&
-			    h > 0 && h <= UINT32_MAX - y) {
+			    h > 0 && h <= UINT32_MAX - y && minw > 0 && minw <= w &&
+			    minh > 0 && minh <= h) {
 				bounds[0] = x;
 				bounds[1] = y;
 				bounds[2] = x + w;
 				bounds[3] = y + h;
+				bounds[4] = minw;
+				bounds[5] = minh;
 				enabled = 1;
 			} else {
 				rw_print("thumb: invalid REDWOOD_THUMB_SCISSOR; sampling disabled\n");
@@ -270,8 +277,8 @@ rw_thumb_scissor_wanted(RedwoodMetalWork *work)
 	}
 	if (enabled == 0)
 		return true;
-	return enabled == 1 && work->hasScissorRect && work->scissorRect[2] != 0 &&
-	    work->scissorRect[3] != 0 && work->scissorRect[0] >= bounds[0] &&
+	return enabled == 1 && work->hasScissorRect && work->scissorRect[2] >= bounds[4] &&
+	    work->scissorRect[3] >= bounds[5] && work->scissorRect[0] >= bounds[0] &&
 	    work->scissorRect[1] >= bounds[1] &&
 	    (uint64_t)work->scissorRect[0] + work->scissorRect[2] <= bounds[2] &&
 	    (uint64_t)work->scissorRect[1] + work->scissorRect[3] <= bounds[3];
