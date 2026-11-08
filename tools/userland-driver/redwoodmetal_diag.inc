@@ -239,11 +239,51 @@ rw_thumb_commit(NSArray *works, unsigned commit)
 		}
 }
 
+/* REDWOOD_THUMB_SCISSOR=x,y,w,h selects draws whose scissor lies inside this pixel rectangle.
+ * A missing or empty scissor is excluded while this filter is enabled. */
+static bool
+rw_thumb_scissor_wanted(RedwoodMetalWork *work)
+{
+	static int enabled = -1;
+	static uint64_t bounds[4];
+
+	if (enabled < 0) {
+		const char *env = getenv("REDWOOD_THUMB_SCISSOR");
+		unsigned long long x, y, w, h;
+		char extra;
+
+		enabled = 0;
+		if (env != NULL) {
+			enabled = 2;
+			if (sscanf(env, "%llu,%llu,%llu,%llu%c", &x, &y, &w, &h, &extra) == 4 &&
+			    x <= UINT32_MAX && y <= UINT32_MAX && w > 0 && w <= UINT32_MAX - x &&
+			    h > 0 && h <= UINT32_MAX - y) {
+				bounds[0] = x;
+				bounds[1] = y;
+				bounds[2] = x + w;
+				bounds[3] = y + h;
+				enabled = 1;
+			} else {
+				rw_print("thumb: invalid REDWOOD_THUMB_SCISSOR; sampling disabled\n");
+			}
+		}
+	}
+	if (enabled == 0)
+		return true;
+	return enabled == 1 && work->hasScissorRect && work->scissorRect[2] != 0 &&
+	    work->scissorRect[3] != 0 && work->scissorRect[0] >= bounds[0] &&
+	    work->scissorRect[1] >= bounds[1] &&
+	    (uint64_t)work->scissorRect[0] + work->scissorRect[2] <= bounds[2] &&
+	    (uint64_t)work->scissorRect[1] + work->scissorRect[3] <= bounds[3];
+}
+
 /* REDWOOD_THUMB_TEXTURE=WxH[,WxH...] further limits the sampled draws to those that bind a
  * fragment texture of one of those sizes, such as SpringBoard's reads of an icon layer (194x194). */
 static bool
 rw_thumb_work_wanted(RedwoodMetalWork *work, unsigned commit)
 {
+	if (!rw_thumb_scissor_wanted(work))
+		return false;
 	const char *size = getenv("REDWOOD_THUMB_TEXTURE");
 	bool bound = size == NULL;
 
