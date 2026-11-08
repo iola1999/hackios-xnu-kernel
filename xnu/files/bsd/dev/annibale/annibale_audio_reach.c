@@ -428,7 +428,8 @@ annibale_audio_reach_send_cmd(const void *raw_pkt, uint32_t raw_len, const char 
 	if (descr != NULL && strcmp(descr, "WRITE (AUDIO_PERIOD)") != 0) {
 		uint32_t tok = 0;
 		memcpy(&tok, p.buf + 16, 4);
-		say("APM command '%s' (len %u, token %u) -> rsp %#x\n", descr, p.len, tok, rop);
+		say("APM command '%s' (len %u, token %u) -> ok %u rsp %#x first %#x second %#x\n",
+		    descr, p.len, tok, ok, rop, rwords[0], rwords[1]);
 	}
 	return ok;
 }

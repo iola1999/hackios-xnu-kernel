@@ -218,6 +218,10 @@ static LCK_MTX_DECLARE(aadsp_rsc_lock, &aadsp_lck_grp);
 static LCK_MTX_DECLARE(aadsp_gpr_lock, &aadsp_lck_grp);
 static LCK_MTX_DECLARE(aadsp_tx_lock, &aadsp_lck_grp);
 static LCK_MTX_DECLARE(glink_tx_lock, &aadsp_lck_grp);
+static LCK_MTX_DECLARE(glink_rx_lock, &aadsp_lck_grp);
+static LCK_MTX_DECLARE(glink_intent_lock, &aadsp_lck_grp);
+/* RX may acquire the intent, GPR and GLINK TX locks. Release those locks before
+ * polling RX. Receive callbacks run under glink_rx_lock and must not send or poll. */
 
 static volatile uint8_t *smem_base;
 static const struct cmd_db_header *cmd_db_base;
@@ -229,6 +233,7 @@ static uint16_t glink_gpr_our_cid, glink_gpr_their_cid;
 static uint16_t glink_pmic_our_cid, glink_pmic_their_cid;
 #define GLINK_MAX_INTENTS 16
 struct glink_intent_pool {
+	/* size == 0 marks an unused slot; free only records transfer ownership. */
 	struct { uint32_t id, size; bool free; } list[GLINK_MAX_INTENTS];
 };
 static struct glink_intent_pool glink_gpr_intents, glink_pmic_intents;
@@ -710,60 +715,18 @@ static void handle_incoming_gpr(const uint8_t *data, uint32_t len)
 		return;
 	}
 	annibale_gpr_event_fn fn = gpr_event_handler;
+	if (waited_token != 0 && fn == NULL) {
+		say("unmatched GPR src %#x dst %#x token %u opcode %#x bytes %u; waiting src %#x dst %#x token %u\n",
+		    src_port, dst_port, token, opcode, len, waited_response_src, waited_response_dst, waited_token);
+	}
 	lck_mtx_unlock(&aadsp_gpr_lock);
 	if (fn != NULL) {
 		(void)fn(src_port, dst_port, opcode, token, payload, plen);
 	}
 }
 
-static void glink_add_their_intent(struct glink_intent_pool *pool, uint32_t id, uint32_t size)
-{
-	for (unsigned i = 0; i < GLINK_MAX_INTENTS; i++) {
-		if (pool->list[i].free && pool->list[i].id == id) {
-			pool->list[i].size = size;
-			return;
-		}
-	}
-	for (unsigned i = 0; i < GLINK_MAX_INTENTS; i++) {
-		if (!pool->list[i].free) {
-			pool->list[i].id = id;
-			pool->list[i].size = size;
-			pool->list[i].free = true;
-			return;
-		}
-	}
-}
-
 static void glink_poll_rx(void);
-
-static bool glink_take_their_intent(struct glink_intent_pool *pool, uint16_t our_cid, uint32_t need, uint32_t *id_out)
-{
-	for (unsigned attempt = 0; attempt < 2; attempt++) {
-		for (unsigned i = 0; i < GLINK_MAX_INTENTS; i++) {
-			if (pool->list[i].free && pool->list[i].size >= need) {
-				pool->list[i].free = false;
-				*id_out = pool->list[i].id;
-				return true;
-			}
-		}
-		if (attempt == 0 && our_cid != 0) {
-			glink_send_cmd2(GLINK_RX_INTENT_REQ, our_cid, need);
-			uint64_t t0 = now_us();
-			while (now_us() - t0 < 50000ULL) {
-				glink_poll_rx();
-				for (unsigned i = 0; i < GLINK_MAX_INTENTS; i++) {
-					if (pool->list[i].free && pool->list[i].size >= need) {
-						pool->list[i].free = false;
-						*id_out = pool->list[i].id;
-						return true;
-					}
-				}
-				sleep_us(200);
-			}
-		}
-	}
-	return false;
-}
+#include "annibale_adsp_intents.inc"
 
 static int adsp_pmic_glink_tx(const void *data, uint32_t len)
 {
@@ -783,7 +746,10 @@ static int adsp_pmic_glink_tx(const void *data, uint32_t len)
 	memcpy(tx + 8, &len, 4);
 	memcpy(tx + 12, &left, 4);
 	memcpy(tx + 16, data, len);
-	glink_q_write(glink_our_q, glink_our_q_size, &glink_tx_write_pos, tx, 16u + len);
+	if (!glink_q_write(glink_our_q, glink_our_q_size, &glink_tx_write_pos, tx, 16u + len)) {
+		glink_complete_their_intent(&glink_pmic_intents, iid, true);
+		return -1;
+	}
 	for (unsigned i = 0; i < 10; i++) {
 		sleep_us(200);
 		glink_poll_rx();
@@ -793,9 +759,12 @@ static int adsp_pmic_glink_tx(const void *data, uint32_t len)
 
 static void glink_poll_rx(void)
 {
+	/* Boot, GPR and PMIC callers share one receive cursor. */
+	lck_mtx_lock(&glink_rx_lock);
 	if (glink_their_q == 0) {
 		glink_their_q = smem_item(ITEM_GLINK_THEIR_Q, &glink_their_q_size);
 		if (glink_their_q == 0 || glink_their_q_size == 0) {
+			lck_mtx_unlock(&glink_rx_lock);
 			return;
 		}
 	}
@@ -863,16 +832,15 @@ static void glink_poll_rx(void)
 					glink_add_their_intent(&glink_pmic_intents, iid, sz);
 				} else if (param == glink_gpr_their_cid) {
 					glink_add_their_intent(&glink_gpr_intents, iid, sz);
+					say("GPR intent id %u size %u\n", iid, sz);
 				}
 			}
 			step_bytes = (8u + 8u * w1 + 7u) & ~7u;
 		} else if (cmd == GLINK_RX_DONE || cmd == GLINK_DONE_REUSE) {
-			if (cmd == GLINK_DONE_REUSE) {
-				if (param == glink_pmic_their_cid) {
-					glink_add_their_intent(&glink_pmic_intents, w1, 2048u);
-				} else if (param == glink_gpr_their_cid) {
-					glink_add_their_intent(&glink_gpr_intents, w1, 2048u);
-				}
+			if (param == glink_pmic_their_cid) {
+				glink_complete_their_intent(&glink_pmic_intents, w1, cmd == GLINK_DONE_REUSE);
+			} else if (param == glink_gpr_their_cid) {
+				glink_complete_their_intent(&glink_gpr_intents, w1, cmd == GLINK_DONE_REUSE);
 			}
 		} else if (cmd == GLINK_TX_DATA || cmd == GLINK_TX_DATA_CONT) {
 			uint32_t chunk = glink_q_read32(glink_their_q, glink_their_q_size, r + 8);
@@ -900,6 +868,7 @@ static void glink_poll_rx(void)
 		smem_poke(glink_their_read_at, r);
 		smem_peek(glink_their_write_at, &w, 4);
 	}
+	lck_mtx_unlock(&glink_rx_lock);
 }
 
 static bool glink_init_queues(bool cold_boot)
@@ -972,6 +941,12 @@ bool annibale_adsp_gpr_send(const void *pkt, uint32_t len, uint32_t wait_ms,
 			memcpy(tx + 12, &left, 4);
 			memcpy(tx + 16, bytes, len);
 			sent = glink_q_write(glink_our_q, glink_our_q_size, &glink_tx_write_pos, tx, 16u + len);
+			if (!sent) {
+				glink_complete_their_intent(&glink_gpr_intents, iid, true);
+				say("GPR queue full request %#x token %u intent %u bytes %u\n", request_opcode, token, iid, len);
+			}
+		} else {
+			say("GPR intent unavailable request %#x token %u bytes %u\n", request_opcode, token, len);
 		}
 	}
 	if (!sent) {
@@ -1018,6 +993,12 @@ bool annibale_adsp_gpr_send(const void *pkt, uint32_t len, uint32_t wait_ms,
 		sleep_us(200);
 	}
 	lck_mtx_lock(&aadsp_gpr_lock);
+	if (!ok) {
+		say("GPR wait failed request %#x token %u matched %u rsp %#x words %u first %#x second %#x elapsed %llu us\n",
+		    request_opcode, token, waited_done, waited_opcode, waited_word_count,
+		    waited_word_count > 0 ? waited_words[0] : 0, waited_word_count > 1 ? waited_words[1] : 0,
+		    now_us() - t0);
+	}
 	waited_token = 0;
 	lck_mtx_unlock(&aadsp_gpr_lock);
 	lck_mtx_unlock(&aadsp_tx_lock);
@@ -1035,8 +1016,11 @@ bool annibale_adsp_ready(void) { return adsp_inited; }
 bool annibale_adsp_is_hw_up(void) { return adsp_hw_up; }
 bool annibale_adsp_gpr_ready(void)
 {
-	return adsp_hw_up && glink_our_q != 0 && glink_gpr_our_cid != 0 && glink_gpr_their_cid != 0 &&
-	    glink_gpr_intents.list[0].size != 0;
+	bool ready = false;
+	lck_mtx_lock(&glink_intent_lock);
+	for (unsigned i = 0; i < GLINK_MAX_INTENTS; i++) ready |= glink_gpr_intents.list[i].size != 0;
+	lck_mtx_unlock(&glink_intent_lock);
+	return adsp_hw_up && glink_our_q != 0 && glink_gpr_our_cid != 0 && glink_gpr_their_cid != 0 && ready;
 }
 
 /* ---- Background ADSP boot & GLINK poll thread ------------------------------------------------ */
