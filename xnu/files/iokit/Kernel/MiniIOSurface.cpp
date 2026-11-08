@@ -59,6 +59,7 @@ enum {
 	kSurfaceMethodCreatePort        = 35,
 	kSurfaceMethodDetachModeCode    = 43,
 	kSurfaceMethodSetOwnershipIdentity = 44,
+	kSurfaceMethodSetCoreVideoBridgedKeys = 54, /* 23G90 */
 	kSurfaceMethodQueryTransactionList = 58,
 };
 
@@ -70,6 +71,8 @@ enum {
 	kSurfaceTrapUnlock              = 3,
 	kSurfaceTrapDetach              = 4,    /* the client is about to release: forget it has the surface */
 	kSurfaceTrapRelease             = 5,
+	kSurfaceTrapRemoveCoreVideoBridgedValues = 8,
+	kSurfaceTrapRemoveBulkAttachments = 9,
 	kSurfaceTrapCount
 };
 
@@ -880,6 +883,7 @@ class IOSurfaceRootUserClient : public IOUserClient
 	uint32_t                        fRefCount;
 	uint32_t                        fRefCapacity;
 	minisurf_abi                    fABI;
+	OSArray *                       fCoreVideoBridgedKeys;
 	IOExternalTrap                  fTraps[kSurfaceTrapCount];
 
 	struct minisurf_client_ref * findRef(uint32_t sid, bool detached);
@@ -896,6 +900,7 @@ class IOSurfaceRootUserClient : public IOUserClient
 	IOReturn methodCopyValue(IOExternalMethodArguments * args, const uint8_t * in, size_t inSize);
 	IOReturn methodRemoveValue(IOExternalMethodArguments * args, const uint8_t * in, size_t inSize);
 	IOReturn methodSetBulkAttachments(const uint8_t * in, size_t inSize);
+	IOReturn methodSetCoreVideoBridgedKeys(const uint8_t * in, size_t inSize);
 
 	IOReturn trapIncrementUseCount(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
 	IOReturn trapDecrementUseCount(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
@@ -903,6 +908,8 @@ class IOSurfaceRootUserClient : public IOUserClient
 	IOReturn trapUnlock(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
 	IOReturn trapDetach(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
 	IOReturn trapRelease(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
+	IOReturn trapRemoveCoreVideoBridgedValues(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
+	IOReturn trapRemoveBulkAttachments(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
 	IOReturn lockCommon(uint32_t sid, uint32_t options, user_addr_t seedOut);
 	IOReturn useCountCommon(uint32_t sid, uint32_t category, int delta);
 
@@ -927,6 +934,7 @@ IOSurfaceRootUserClient::initWithTask(task_t owningTask, void * securityID, UInt
 	}
 	fTask = owningTask;
 	fABI = MINISURF_UNCLAIMED;
+	fCoreVideoBridgedKeys = NULL;
 	return true;
 }
 
@@ -936,12 +944,15 @@ IOSurfaceRootUserClient::start(IOService * provider)
 	if (!IOUserClient::start(provider)) {
 		return false;
 	}
+	bzero(fTraps, sizeof(fTraps));
 	fTraps[kSurfaceTrapIncrementUseCount].func = (IOTrap) & IOSurfaceRootUserClient::trapIncrementUseCount;
 	fTraps[kSurfaceTrapDecrementUseCount].func = (IOTrap) & IOSurfaceRootUserClient::trapDecrementUseCount;
 	fTraps[kSurfaceTrapLock].func = (IOTrap) & IOSurfaceRootUserClient::trapLock;
 	fTraps[kSurfaceTrapUnlock].func = (IOTrap) & IOSurfaceRootUserClient::trapUnlock;
 	fTraps[kSurfaceTrapDetach].func = (IOTrap) & IOSurfaceRootUserClient::trapDetach;
 	fTraps[kSurfaceTrapRelease].func = (IOTrap) & IOSurfaceRootUserClient::trapRelease;
+	fTraps[kSurfaceTrapRemoveCoreVideoBridgedValues].func = (IOTrap) & IOSurfaceRootUserClient::trapRemoveCoreVideoBridgedValues;
+	fTraps[kSurfaceTrapRemoveBulkAttachments].func = (IOTrap) & IOSurfaceRootUserClient::trapRemoveBulkAttachments;
 	for (unsigned i = 0; i < kSurfaceTrapCount; i++) {
 		fTraps[i].object = this;
 	}
@@ -976,6 +987,7 @@ IOSurfaceRootUserClient::free(void)
 		IODelete(fRefs, struct minisurf_client_ref, fRefCapacity);
 		fRefs = NULL;
 	}
+	OSSafeReleaseNULL(fCoreVideoBridgedKeys);
 	IOUserClient::free();
 }
 
@@ -1347,153 +1359,7 @@ IOSurfaceRootUserClient::methodCreatePort(IOExternalMethodArguments * args)
 	return name != 0 ? kIOReturnSuccess : kIOReturnNoMemory;
 }
 
-/* Requests about values start with the surface number in 8 bytes; the reply to a change is the new seed. */
-static IOReturn
-returnSeed(IOExternalMethodArguments * args, uint32_t seed)
-{
-	if (args->structureOutput != NULL && args->structureOutputSize >= sizeof(seed)) {
-		memcpy(args->structureOutput, &seed, sizeof(seed));
-		args->structureOutputSize = sizeof(seed);
-	}
-	return kIOReturnSuccess;
-}
-
-IOReturn
-IOSurfaceRootUserClient::methodSetValue(IOExternalMethodArguments * args, const uint8_t * in, size_t inSize)
-{
-	uint32_t sid, seed = 0;
-	OSObject * obj;
-	OSArray * array;
-	struct minisurf_client_ref * ref;
-	IOReturn ret = kIOReturnBadArgument;
-
-	if (inSize < 12) {
-		return kIOReturnBadArgument;
-	}
-	memcpy(&sid, in, sizeof(sid));
-	obj = unserialize(in + 8, inSize - 8);
-	array = OSDynamicCast(OSArray, obj);
-	if (array == NULL) {
-		OSSafeReleaseNULL(obj);
-		return kIOReturnBadArgument;
-	}
-	IOLockLock(gSurfaceLock);
-	ref = findRef(sid, false);
-	if (ref == NULL) {
-		ret = kIOReturnNotFound;
-	} else if (ref->surface->values != NULL) {
-		MiniIOSurface * s = ref->surface;
-		OSString * key = OSDynamicCast(OSString, array->getObject(1));
-		OSDictionary * all = OSDynamicCast(OSDictionary, array->getObject(0));
-
-		if (array->getCount() == 2 && key != NULL) {
-			s->values->setObject(key, array->getObject(0));         /* [value, key] */
-			ret = kIOReturnSuccess;
-		} else if (array->getCount() == 1 && all != NULL) {
-			s->values->merge(all);                                   /* [all the values] */
-			ret = kIOReturnSuccess;
-		}
-		if (ret == kIOReturnSuccess) {
-			s->updateValuesState();
-			seed = s->shared()->valuesSeed;
-		}
-	}
-	IOLockUnlock(gSurfaceLock);
-	obj->release();
-	return ret == kIOReturnSuccess ? returnSeed(args, seed) : ret;
-}
-
-IOReturn
-IOSurfaceRootUserClient::methodRemoveValue(IOExternalMethodArguments * args, const uint8_t * in, size_t inSize)
-{
-	uint32_t sid, seed = 0;
-	struct minisurf_client_ref * ref;
-	IOReturn ret = kIOReturnNotFound;
-
-	if (inSize < 9 || in[inSize - 1] != 0) {
-		return kIOReturnBadArgument;
-	}
-	memcpy(&sid, in, sizeof(sid));
-	IOLockLock(gSurfaceLock);
-	ref = findRef(sid, false);
-	if (ref != NULL && ref->surface->values != NULL) {
-		MiniIOSurface * s = ref->surface;
-		const char * key = (const char *) in + 8;
-
-		if (key[0] == 0) {
-			s->values->flushCollection();
-		} else {
-			s->values->removeObject(key);
-		}
-		s->updateValuesState();
-		seed = s->shared()->valuesSeed;
-		ret = kIOReturnSuccess;
-	}
-	IOLockUnlock(gSurfaceLock);
-	return ret == kIOReturnSuccess ? returnSeed(args, seed) : ret;
-}
-
-/* The reply: 4 bytes unused, the seed, then the serialized value (a dictionary when all were asked for). */
-IOReturn
-IOSurfaceRootUserClient::methodCopyValue(IOExternalMethodArguments * args, const uint8_t * in, size_t inSize)
-{
-	uint32_t sid, header[2] = { 0, 0 };
-	struct minisurf_client_ref * ref;
-	OSSerialize * s = NULL;
-	IOReturn ret = kIOReturnNotFound;
-	uint32_t length = 0, total;
-
-	if (inSize < 9 || in[inSize - 1] != 0) {
-		return kIOReturnBadArgument;
-	}
-	memcpy(&sid, in, sizeof(sid));
-	IOLockLock(gSurfaceLock);
-	ref = findRef(sid, false);
-	if (ref != NULL && ref->surface->values != NULL) {
-		const char * key = (const char *) in + 8;
-		OSObject * value = key[0] ? ref->surface->values->getObject(key) : ref->surface->values;
-
-		header[1] = ref->surface->shared()->valuesSeed;
-		ret = kIOReturnSuccess;
-		if (value != NULL && (key[0] != 0 || ref->surface->values->getCount() != 0)) {
-			s = OSSerialize::binaryWithCapacity(4096);
-			if (s == NULL || !value->serialize(s)) {
-				ret = kIOReturnNoMemory;
-			} else {
-				length = s->getLength();
-			}
-		}
-	}
-	IOLockUnlock(gSurfaceLock);
-
-	total = (uint32_t) sizeof(header) + length;
-	if (ret == kIOReturnSuccess) {
-		if (args->structureOutputDescriptor != NULL) {
-			IOMemoryDescriptor * out = args->structureOutputDescriptor;
-
-			if (out->getLength() < total) {
-				ret = kIOReturnNoSpace;
-			} else if ((ret = out->prepare()) == kIOReturnSuccess) {
-				out->writeBytes(0, header, sizeof(header));
-				if (length != 0) {
-					out->writeBytes(sizeof(header), s->text(), length);
-				}
-				out->complete();
-				args->structureOutputDescriptorSize = total;
-			}
-		} else if (args->structureOutput == NULL || args->structureOutputSize < total) {
-			ret = kIOReturnNoSpace;
-		} else {
-			memcpy(args->structureOutput, header, sizeof(header));
-			if (length != 0) {
-				memcpy((uint8_t *) args->structureOutput + sizeof(header), s->text(), length);
-			}
-			args->structureOutputSize = total;
-		}
-	}
-	OSSafeReleaseNULL(s);
-	return ret;
-}
+#include "MiniIOSurfaceValues.inc"
 
 IOReturn
 IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * args,
@@ -1521,6 +1387,7 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 	case kSurfaceMethodCopyValue:
 	case kSurfaceMethodRemoveValue:
 	case kSurfaceMethodSetBulkAttachments:
+	case kSurfaceMethodSetCoreVideoBridgedKeys:
 		if (args->structureInputDescriptor != NULL) {
 			inMap = args->structureInputDescriptor->map(kIOMapReadOnly);
 			if (inMap == NULL) {
@@ -1537,6 +1404,8 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 			ret = methodCopyValue(args, in, inSize);
 		} else if (selector == kSurfaceMethodRemoveValue) {
 			ret = methodRemoveValue(args, in, inSize);
+		} else if (selector == kSurfaceMethodSetCoreVideoBridgedKeys) {
+			ret = methodSetCoreVideoBridgedKeys(in, inSize);
 		} else {
 			ret = methodSetBulkAttachments(in, inSize);
 		}
@@ -1625,7 +1494,7 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 IOExternalTrap *
 IOSurfaceRootUserClient::getTargetAndTrapForIndex(IOService ** targetP, UInt32 index)
 {
-	if (index >= kSurfaceTrapCount) {
+	if (index >= kSurfaceTrapCount || fTraps[index].func == NULL) {
 		return NULL;
 	}
 	*targetP = this;

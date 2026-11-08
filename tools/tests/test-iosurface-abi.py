@@ -151,6 +151,12 @@ static void test_bulk(void)
             for (unsigned j = 0; j < sizeof(shared); ++j)
                 assert(shared[j] == (j >= base+begin[i] && j < base+end[i] ? 0x3c : 0xa5));
             memset(shared, 0xa5, sizeof(shared));
+            assert(minisurfClearBulk(shared, abi, mask) == (abi == MINISURF_ABI26));
+            for (unsigned j = 0; j < sizeof(shared); ++j)
+                assert(shared[j] == (abi == MINISURF_ABI26 && j >= base+begin[i] && j < base+end[i] ? 0 : 0xa5));
+            memset(shared, 0xa5, sizeof(shared));
+            assert(!minisurfClearBulk(shared, abi, 1ULL << 63));
+            for (uint8_t byte : shared) assert(byte == 0xa5);
             minisurfApplyBulk(shared, abi, input, end[i] - 1, mask);
             for (uint8_t byte : shared) assert(byte == 0xa5);
         }

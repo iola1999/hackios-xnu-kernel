@@ -229,4 +229,18 @@ minisurfApplyBulk(void * shared, minisurf_abi abi, const uint8_t * in, uint64_t 
     }
 }
 
+/* 23G90 trap 9 uses the same 22 fields as selector 27. */
+#define MINISURF_BULK_MASK26 ((1ULL << 22) - 1)
+
+static inline bool
+minisurfClearBulk(void * shared, minisurf_abi abi, uint64_t mask)
+{
+    if (abi != MINISURF_ABI26 || (mask & ~MINISURF_BULK_MASK26) != 0) {
+        return false;
+    }
+    const uint8_t empty[0x84] = {};
+    minisurfApplyBulk(shared, abi, empty, sizeof(empty), mask);
+    return true;
+}
+
 #endif /* _MINI_IOSURFACE_ABI_H */
