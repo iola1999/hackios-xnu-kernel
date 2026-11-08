@@ -92,7 +92,7 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 		mesa.texture_destroy(texture);
 		return nil;
 	}
-	_owner = device;
+	_owner = [device retain];
 	_texture = texture;
 	_shape = *shape;
 	_iosurface = surface ? CFRetain(surface) : NULL;
@@ -111,6 +111,7 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 	}
 	[_parentTexture release];
 	[_buffer release];   /* after the texture, whose copy-back reads the buffer */
+	[_owner release];    /* AIR resources require the device through destruction. */
 	[super dealloc];
 }
 
