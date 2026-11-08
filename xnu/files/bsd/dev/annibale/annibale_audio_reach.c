@@ -613,6 +613,10 @@ send_audio_period(uint32_t slot)
 	}
 	reach_sent_count++;
 	reach_done_count++;
+	/* Confirm the first completed period, then sample progress once per second. */
+	if (reach_done_count == 1 || reach_done_count % 50 == 0) {
+		say("PCM periods: slot %u sent %u done %u\n", slot, reach_sent_count, reach_done_count);
+	}
 	return true;
 }
 

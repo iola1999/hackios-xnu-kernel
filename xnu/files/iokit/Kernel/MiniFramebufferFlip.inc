@@ -39,6 +39,7 @@ static TUNABLE(uint32_t, gFlip, "fb_flip", 0);
 #define FLIP_CTL_FLUSH_CTL      (1u << 17)
 #define FLIP_LM(n)              (FLIP_MDP + 0x44000u + 0x1000u * (n))
 #define FLIP_INTF(n)            (FLIP_MDP + 0x34000u + 0x1000u * (n))
+#define FLIP_INTF_FRAME_COUNT   0xac
 #define FLIP_SSPP_SRC_SIZE      0x00
 #define FLIP_SSPP_SRC_XY        0x08
 #define FLIP_SSPP_OUT_SIZE      0x0c
@@ -63,7 +64,7 @@ static const struct {
 
 static struct {
 	vm_offset_t     mdss;
-	uint32_t        ctl, pipes, flush;
+	uint32_t        ctl, pipes, flush, intf;
 	uint32_t        offset[FLIP_PIPES];     /* where each pipe reads, from the start of a buffer */
 	uint64_t        pa[2];                  /* A, the boot framebuffer, and B */
 	uint8_t *       va[2];
@@ -73,6 +74,10 @@ static struct {
 	int32_t         band0, band1;           /* the panel rows this frame changed */
 	int32_t         stale0, stale1;         /* the rows the buffer off screen lacks: what the last flip changed */
 	uint64_t        flips, late;
+	uint32_t        pending_swap;             /* the swap whose flush the panel has not taken yet */
+	uint64_t        taken;                    /* mach_absolute_time when CTL_FLUSH was observed clear */
+	uint32_t        taken_frame;              /* INTF_FRAME_COUNT at that same observation */
+	bool            taken_valid;
 } flip;
 
 static inline uint32_t
@@ -202,12 +207,22 @@ flip_look(uint64_t fb)
 	}
 }
 
+static void
+flip_note_taken(void)
+{
+	flip.taken = mach_absolute_time();
+	flip.taken_frame = flip.intf >= 1 && flip.intf <= 2 ? flip_rd(FLIP_INTF(flip.intf) + FLIP_INTF_FRAME_COUNT) : 0;
+	flip.taken_valid = true;
+}
+
 /* Until CTL has taken the last flush (its bits clear at the refresh that latches them), LIMIT_US at most. */
 static bool
 flip_taken(uint32_t limit_us, bool may_sleep)
 {
+	flip.taken_valid = false;
 	for (uint32_t waited = 0; waited < limit_us; waited += may_sleep && waited >= 200 ? 1000 : 50) {
 		if ((flip_rd(FLIP_CTL(flip.ctl) + FLIP_CTL_FLUSH) & flip.flush) == 0) {
+			flip_note_taken();
 			return true;
 		}
 		if (may_sleep && waited >= 200) {
@@ -216,7 +231,26 @@ flip_taken(uint32_t limit_us, bool may_sleep)
 			delay(50);
 		}
 	}
-	return (flip_rd(FLIP_CTL(flip.ctl) + FLIP_CTL_FLUSH) & flip.flush) == 0;
+	if ((flip_rd(FLIP_CTL(flip.ctl) + FLIP_CTL_FLUSH) & flip.flush) == 0) {
+		flip_note_taken();
+		return true;
+	}
+	return false;
+}
+
+/* The latch observed by flip_target, consumed once by the presenter. A timeout has no reading. */
+static bool
+flip_latch(uint32_t *swap, uint64_t *at, uint32_t *frame)
+{
+	if (!flip.taken_valid || flip.pending_swap == 0) {
+		return false;
+	}
+	*swap = flip.pending_swap;
+	*at = flip.taken;
+	*frame = flip.taken_frame;
+	flip.pending_swap = 0;
+	flip.taken_valid = false;
+	return true;
 }
 
 /* The pipes onto buffer WHICH, taken at the next refresh. */
@@ -278,6 +312,7 @@ flip_start(uint64_t fb, uint8_t * fbBase, uint32_t bytes, uint32_t rows)
 		    flip.pipes == 0 ? "no pipe reads the boot framebuffer" : "no CTL drives a DSI interface");
 		return;
 	}
+	flip.intf = (flip_rd(FLIP_CTL(flip.ctl) + FLIP_CTL_INTF_ACTIVE) & (1u << 2)) != 0 ? 2 : 1;
 	for (uint64_t at = b; at < b + bytes; at += 0x100000) {
 		if (pmap_valid_address(at)) {
 			IOLog("MiniIOMobileFramebuffer: flip: %#llx is the kernel's memory: no second buffer\n", at);
@@ -353,13 +388,14 @@ flip_whole(void)
 
 /* The frame drawn: the pipes onto it. A frame that drew nothing leaves the screen as it is. */
 static void
-flip_present(void)
+flip_present(uint32_t swap)
 {
 	if (!flip.ready || !flip.drew) {
 		return;
 	}
 	flip_point(flip.shown ^ 1);
 	flip.pending = true;
+	flip.pending_swap = swap;
 	flip.stale0 = flip.band0;
 	flip.stale1 = flip.band1;
 	flip.band0 = INT32_MAX;

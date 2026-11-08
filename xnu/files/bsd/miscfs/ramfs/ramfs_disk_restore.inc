@@ -95,6 +95,7 @@ ramfs_disk_unpack(struct ramfs_mount *rm, const struct rdwfs_super *sup)
 		node->rn_bsdflags = rec.bsdflags;
 		node->rn_dataprotect_class = rec.dataprotect_class ? rec.dataprotect_class : PROTECTION_CLASS_D;
 		node->rn_nlink = rec.nlink;
+		node->rn_iflags = rec.iflags & RAMFS_IF_SYNCROOT;
 		node->rn_atime.tv_sec = (time_t)rec.atime_sec;
 		node->rn_atime.tv_nsec = (long)rec.atime_nsec;
 		node->rn_mtime.tv_sec = (time_t)rec.mtime_sec;

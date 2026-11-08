@@ -185,7 +185,7 @@ IOMobileFramebuffer::settle(const uint8_t * swap, MiniIOSurface ** surfaces)
 		memcpy(dst, swap + SWAP_DEST(layer), sizeof(dst));
 		drawLayer(s, src, dst);
 	}
-	flip_present();
+	flip_present(0);                    /* the same swap filtered again: no new frame in the timeline */
 	fSettling = false;
 	fStatBandRows = bandRows;
 	fStatRowsFrom = rowsFrom;

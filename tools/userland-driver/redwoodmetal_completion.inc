@@ -20,6 +20,8 @@ struct rw_completion {
 	struct rw_completion *next;
 	RedwoodMetalCommandBuffer *buffer;      /* retained until it has completed */
 	struct rwa_fence *fence;                /* NULL: nothing was handed to the GPU */
+	unsigned commit;
+	uint64_t queued_us;
 };
 
 static pthread_mutex_t rw_completion_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -56,7 +58,7 @@ static void *rw_completion_main(void *unused);
 }
 
 /* From -commit, after the submission: the scheduled handlers now, the rest when the GPU is done. */
-- (void)redwoodCompleteLater
+- (void)redwoodCompleteLater:(unsigned)commit
 {
 	static dispatch_once_t once;
 	struct rw_completion *item = calloc(1, sizeof(*item));
@@ -79,6 +81,8 @@ static void *rw_completion_main(void *unused);
 		return;
 	}
 	item->buffer = [self retain];
+	item->commit = commit;
+	item->queued_us = rw_now_us();
 	item->fence = _status == RW_CB_ERROR || mesa.fence_take == NULL ? NULL :
 	    mesa.fence_take([[_queue device] mesaDevice]);
 	pthread_mutex_lock(&rw_completion_lock);
@@ -89,10 +93,11 @@ static void *rw_completion_main(void *unused);
 }
 
 /* On the completion thread. */
-- (void)redwoodCompleteWithFence:(struct rwa_fence *)fence
+- (void)redwoodCompleteWithFence:(struct rwa_fence *)fence commit:(unsigned)commit queued:(uint64_t)queued_us
 {
 	struct rwa_device *device = [[_queue device] mesaDevice];
 	NSArray *completed;
+	uint64_t began_us = rw_now_us(), fence_us, writeback_us = 0;
 
 	char why[256] = { 0 };
 
@@ -109,11 +114,15 @@ static void *rw_completion_main(void *unused);
 						      @"the GPU did not finish this command buffer in time" }] retain];
 		_status = RW_CB_ERROR;
 	}
+	fence_us = rw_now_us() - began_us;
 	if (fence != NULL) {
 		mesa.fence_release(device, fence);
 	}
 	if (_status != RW_CB_ERROR && mesa.buffer_textures_writeback != NULL) {
+		uint64_t writeback_began = rw_now_us();
+
 		mesa.buffer_textures_writeback(device);
+		writeback_us = rw_now_us() - writeback_began;
 	}
 	pthread_mutex_lock(&rw_completion_lock);
 	if (_status != RW_CB_ERROR) {
@@ -123,6 +132,7 @@ static void *rw_completion_main(void *unused);
 	_completed = nil;
 	pthread_cond_broadcast(&rw_completion_done);
 	pthread_mutex_unlock(&rw_completion_lock);
+	rw_timing_completion(commit, began_us - queued_us, fence_us, writeback_us, _status == RW_CB_COMPLETED);
 	[self redwoodDeliverLater:completed];
 	[completed release];
 }
@@ -176,7 +186,7 @@ rw_completion_main(void *unused)
 		item = rw_completion_head;
 		pthread_mutex_unlock(&rw_completion_lock);
 		@autoreleasepool {
-			[item->buffer redwoodCompleteWithFence:item->fence];
+			[item->buffer redwoodCompleteWithFence:item->fence commit:item->commit queued:item->queued_us];
 		}
 		pthread_mutex_lock(&rw_completion_lock);
 		rw_completion_head = item->next;

@@ -42,6 +42,16 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 #include "MiniIOSurface.h"
 #include "MiniFramebufferScale.h"
 #include "MiniFramebufferSwap.h"
+
+static inline uint64_t
+micros(uint64_t absolute)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(absolute, &ns);
+	return ns / 1000;
+}
+
 #include "MiniFramebufferFlip.inc"
 
 extern "C" void redwood_tl(const char * format, ...) __printflike(1, 2);
@@ -162,21 +172,14 @@ swapQueue(void)
 	return gQueue >= 1 && gQueue <= SWAP_QUEUE ? gQueue : 1;
 }
 /*
- * Boot-arg touch_lat=1: a line for every swap handed over ("tl: s ID at US") and for every frame
- * put on the panel ("tl: v ID ready US shown US done US": the GPU done with it, its beat come, the
- * pixels in the panel's memory), in microseconds of mach_absolute_time, for measuring how long a
- * touch takes to show (tools/latency.py; the touch's own lines: bsd/dev/redwood_input.c).
+ * Boot-arg touch_lat=1: a line for every swap handed over ("tl: s ID at US"), every frame copied
+ * ("tl: v ID ready US shown US done US": the GPU done with it, the copy beginning at the legacy
+ * `shown` field, and the copy done), and every flip the panel was observed taking ("tl: l ID at US
+ * frame N source ctl_flush"). All timestamps are microseconds converted from mach_absolute_time.
+ * The latch line comes only from CTL_FLUSH reading clear; a timeout produces no latch line.
+ * INTF_FRAME_COUNT supplies the refresh count, so host tools need not infer it from elapsed time.
  */
 static TUNABLE(uint32_t, gTouchLat, "touch_lat", 0);
-
-static inline uint64_t
-micros(uint64_t absolute)
-{
-	uint64_t ns;
-
-	absolutetime_to_nanoseconds(absolute, &ns);
-	return ns / 1000;
-}
 
 static inline uint32_t
 refreshHz(void)
@@ -268,8 +271,9 @@ public:
 	/* how the display is doing: frames and time spent drawing them here since fStatSince */
 	uint32_t        fStatFrames;
 	uint64_t        fStatSince, fStatDrawing;
-	/* ... and how evenly: the time from each frame to the next, counted by the millisecond (the last count: longer) */
+	/* ... and how evenly: hardware refresh intervals when available, copy-begin intervals otherwise */
 	uint64_t        fLastFrame;
+	uint32_t        fLastFrameRefresh;
 	uint32_t        fFrameTimes[FRAME_TIMES + 1], fFramePauses, fFrameLongest;
 	/* boot-arg fb_diff=1: which pixels of the panel each frame changed (it costs: the panel's memory is slow to read) */
 	bool            fDiff;
@@ -771,10 +775,10 @@ void
 IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 {
 	uint32_t set = swapWord(swap, SWAP_LAYERS_SET);
-	uint64_t began = mach_absolute_time(), nanos, ready, shown, drawn;
-	uint32_t layers = 0;
+	uint64_t began = mach_absolute_time(), nanos, ready, copy_began, drawn, latched = 0;
+	uint32_t layers = 0, latch_swap = 0, latch_frame = 0;
 	MiniIOSurface * recorded = NULL;
-	bool report;
+	bool report, has_latch;
 
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 		if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS)) {
@@ -808,19 +812,8 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			began = mach_absolute_time();
 		}
 	}
-	shown = began;
+	copy_began = began;
 	IOLockLock(fLock);
-	if (fLastFrame != 0) {
-		absolutetime_to_nanoseconds(began - fLastFrame, &nanos);
-		nanos /= NSEC_PER_MSEC;
-		if (nanos >= FRAME_PAUSE) {
-			fFramePauses++;
-		} else {
-			fFrameTimes[nanos < FRAME_TIMES ? nanos : FRAME_TIMES]++;
-			fFrameLongest = nanos > fFrameLongest ? (uint32_t) nanos : fFrameLongest;
-		}
-	}
-	fLastFrame = began;
 	report = fSwapsShown < 8;
 	fSingleLayer = swapWord(swap, SWAP_SURFACE(0)) != 0;
 	for (unsigned layer = 1; layer < SWAP_LAYERS; layer++) {
@@ -835,6 +828,34 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		    swapWord(swap, SWAP_SURFACE(2)), swapWord(swap, SWAP_SURFACE(3)), set, swapWord(swap, SWAP_LAYERS_CLEARED));
 	}
 	fBase = flip_target(fBase);
+	has_latch = flip_latch(&latch_swap, &latched, &latch_frame);
+	if (has_latch || !flip.ready) {
+		uint64_t frame_at = has_latch ? latched : copy_began;
+
+		if (fLastFrame != 0) {
+			uint32_t refreshes = has_latch ? latch_frame - fLastFrameRefresh : 0;
+			bool counted = fLastFrameRefresh != 0 && refreshes > 0 && refreshes <= 240;
+
+			if (counted) {
+				nanos = (uint64_t) refreshes * NSEC_PER_SEC / refreshHz();
+			} else {
+				absolutetime_to_nanoseconds(frame_at - fLastFrame, &nanos);
+			}
+			nanos /= NSEC_PER_MSEC;
+			if (nanos >= FRAME_PAUSE) {
+				fFramePauses++;
+			} else {
+				fFrameTimes[nanos < FRAME_TIMES ? nanos : FRAME_TIMES]++;
+				fFrameLongest = nanos > fFrameLongest ? (uint32_t) nanos : fFrameLongest;
+			}
+		}
+		fLastFrame = frame_at;
+		fLastFrameRefresh = has_latch ? latch_frame : 0;
+	}
+	if (gTouchLat && has_latch) {
+		redwood_tl("tl: l %u at %llu frame %u source ctl_flush\n", latch_swap,
+		    (unsigned long long)micros(latched), latch_frame);
+	}
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
 		int32_t src[4], dst[4];
@@ -884,7 +905,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			}
 		}
 	}
-	flip_present();
+	flip_present(swapWord(swap, SWAP_ID));
 	drawn = mach_absolute_time();
 	if (recorded != NULL) {
 		record(recorded);
@@ -898,7 +919,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	fSwapsShown++;
 	redwood_frames_shown = fSwapsShown;      /* (kern.redwood.frames: what a control run watches) */
 	if (gTouchLat) {
-		redwood_tl("tl: v %u ready %llu shown %llu done %llu\n", swapWord(swap, SWAP_ID), micros(ready), micros(shown),
+		redwood_tl("tl: v %u ready %llu shown %llu done %llu\n", swapWord(swap, SWAP_ID), micros(ready), micros(copy_began),
 		    micros(drawn));
 	}
 	if (layers != fLayersShown) {

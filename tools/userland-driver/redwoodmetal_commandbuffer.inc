@@ -101,6 +101,8 @@ rw_ticks_us(uint64_t ticks)
 	return ticks * tb.numer / tb.denom / 1000;
 }
 
+#include "redwoodmetal_timing.inc"
+
 static void *
 rw_stall_watch(void *ignored)
 {
@@ -145,6 +147,7 @@ rw_stall_watch(void *ignored)
 				    __atomic_exchange_n(&hb_wait, 0, __ATOMIC_RELAXED),
 				    __atomic_exchange_n(&hb_texwrite, 0, __ATOMIC_RELAXED),
 				    (unsigned long long)now);
+				rw_timing_dump(now);
 				while (hb_due_us <= now)
 					hb_due_us += RW_HEARTBEAT_US;
 			}
@@ -452,6 +455,7 @@ static pthread_mutex_t rw_commit_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 {
 	char why[512] = { 0 };
 	uint64_t started = mach_absolute_time();
+	uint64_t refresh_us = 0, encode_us = 0, flush_us = 0;
 
 	pthread_mutex_lock(&rw_commit_lock);
 	__atomic_add_fetch(&hb_commit, 1, __ATOMIC_RELAXED);
@@ -463,7 +467,7 @@ static pthread_mutex_t rw_commit_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 			 commit_count);
 	}
 	commit_started = started;
-	commit_count++;
+	unsigned this_commit = ++commit_count;
 	pthread_once(&rw_watch_once, rw_start_watch);
 	commit_progress_us = rw_now_us();
 	commit_in_flight = commit_count;
@@ -473,7 +477,10 @@ static pthread_mutex_t rw_commit_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 	 * promise is that a texture over a buffer reads what is there now.
 	 */
 	if (mesa.buffer_textures_refresh != NULL) {
+		uint64_t refresh_began = mach_absolute_time();
+
 		mesa.buffer_textures_refresh([[_queue device] mesaDevice]);
+		refresh_us = rw_ticks_us(mach_absolute_time() - refresh_began);
 	}
 	uint64_t say_after_us = RW_COMMIT_SLOW_US;
 
@@ -678,6 +685,7 @@ done:
 	 * submitted at once, because the present handler must not register a surface the GPU
 	 * has not been given yet.
 	 */
+	encode_us = rw_ticks_us(mach_absolute_time() - started);
 	if (mesa.flush != NULL) {
 		char flushed[256] = { 0 };
 		static unsigned long commits, window_commits, window_works, window_flushes;
@@ -687,7 +695,7 @@ done:
 		uint64_t encode;
 
 		mach_timebase_info(&tb);
-		encode = (mach_absolute_time() - started) * tb.numer / tb.denom / 1000;
+		encode = encode_us;
 		commits++;
 		window_commits++;
 		window_works += [_work count];
@@ -708,6 +716,7 @@ done:
 		{
 			uint64_t flushed_us = (mach_absolute_time() - before) * tb.numer / tb.denom / 1000;
 
+			flush_us = flushed_us;
 			if (flushed_us > RW_FLUSH_SLOW_US) {
 				rw_print("flush %u took %llu ms over %lu recorded works\n", commit_count,
 				    (unsigned long long)(flushed_us / 1000), (unsigned long)[_work count]);
@@ -744,6 +753,7 @@ done:
 			window_flush = 0;
 		}
 	}
+	rw_timing_commit(commit_count, encode_us, refresh_us, flush_us);
 	/* The queue's slot goes back here and on every way out of this method, a failed draw
 	 * included: a buffer that errored is as finished as one that drew, and a slot kept
 	 * because of an error would turn one bad draw into a queue that blocks for ever. */
@@ -755,7 +765,7 @@ done:
 	pthread_mutex_unlock(&rw_commit_lock);
 	/* and only then the handlers, so that a handler which makes the next command buffer
 	 * is not waiting for a slot this one still holds (redwoodmetal_completion.inc) */
-	[self redwoodCompleteLater];
+	[self redwoodCompleteLater:this_commit];
 	/* How long the whole commit took, said only when it was long enough to be a missed
 	 * frame. A commit that never returns leaves the "has run for" line above as the last
 	 * thing this process said, which names the work it was inside. */

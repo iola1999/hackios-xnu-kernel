@@ -71,7 +71,7 @@ struct rdwfs_inode_rec {
 	uint32_t nblocks;
 	uint32_t nxattrs;
 	uint32_t ndirents;
-	uint32_t reserved;
+	uint32_t iflags;                /* ramfs_node.rn_iflags; zero in images written before it existed */
 	int64_t  atime_sec, atime_nsec;
 	int64_t  mtime_sec, mtime_nsec;
 	int64_t  ctime_sec, ctime_nsec;
@@ -360,6 +360,7 @@ ramfs_disk_pack_locked(struct ramfs_mount *rm, uint64_t *payload_bytes_out, uint
 			rec.nblocks = nblocks;
 			rec.nxattrs = nxattrs;
 			rec.ndirents = ndirents;
+			rec.iflags = node->rn_iflags;
 			rec.atime_sec = node->rn_atime.tv_sec;
 			rec.atime_nsec = node->rn_atime.tv_nsec;
 			rec.mtime_sec = node->rn_mtime.tv_sec;

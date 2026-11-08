@@ -133,6 +133,13 @@ struct gpr_pkt { uint8_t buf[1024]; uint32_t len; };
 static uint32_t gpr_token, map_handle=0x1234, reach_sent_count, reach_done_count;
 static uint64_t dsp_address=0x1cf66f000ULL;
 static int fault;
+static unsigned summaries;
+static uint32_t summary_slot, summary_sent, summary_done;
+static void record_summary(const char *format, uint32_t slot, uint32_t sent, uint32_t done) {
+    assert(strcmp(format,"PCM periods: slot %u sent %u done %u\n")==0);
+    summaries++; summary_slot=slot; summary_sent=sent; summary_done=done;
+}
+#define say(...) record_summary(__VA_ARGS__)
 static bool annibale_audio_reach_send_cmd(const void *raw,uint32_t len,const char *descr,
  uint32_t *op,uint32_t *words,uint32_t count) {
     (void)descr; assert(len==24+11*4 && count==8);
@@ -153,11 +160,17 @@ static bool annibale_audio_reach_send_cmd(const void *raw,uint32_t len,const cha
 PCM_MAIN = r'''
 int main(void) {
  for(fault=0;fault<7;fault++) {
-    reach_sent_count=reach_done_count=0;
+    reach_sent_count=reach_done_count=summaries=0;
     assert(send_audio_period(2)==(fault==0));
+    assert(reach_sent_count==(fault==0));
     assert(reach_done_count==(fault==0));
+    assert(summaries==(fault==0));
  }
- puts("PASS: PCM V2 wire layout and matched completion required");
+ fault=0; reach_sent_count=reach_done_count=summaries=0;
+ for(unsigned period=1;period<=151;period++) assert(send_audio_period(2));
+ assert(summaries==4);
+ assert(summary_slot==2 && summary_sent==150 && summary_done==150);
+ puts("PASS: PCM V2 completion required; first and once-per-second summaries only on success");
 }
 '''
 
@@ -258,6 +271,10 @@ def main():
              'uint32_t pos = *write_at;\n\tlck_mtx_lock(&glink_tx_lock);'),
             (transport, 'if (wait == 199) {\n\t\t\t\tlck_mtx_unlock(&glink_tx_lock);\n\t\t\t\treturn false;\n\t\t\t}', 'if (wait == 199) break;'),
             (pcm, 'i < 4', 'i < 3'),
+            (pcm, 'reach_done_count == 1 || reach_done_count % 50 == 0',
+             'reach_done_count % 50 == 0'),
+            (pcm, 'reach_done_count == 1 || reach_done_count % 50 == 0',
+             'reach_done_count == 1 || reach_done_count % 10 == 0'),
             (graph, 'if (!gpr_send_command(&p, "OPEN SG_PLAY (0x4001)")) return false;',
              '(void)gpr_send_command(&p, "OPEN SG_PLAY (0x4001)");'),
         )

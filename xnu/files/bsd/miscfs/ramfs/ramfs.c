@@ -81,6 +81,7 @@ struct ramfs_node {
 	uid_t               rn_uid;
 	gid_t               rn_gid;
 	uint32_t            rn_bsdflags, rn_dataprotect_class, rn_nlink, rn_state, rn_vid, rn_nentries;
+	uint32_t            rn_iflags;          /* RAMFS_IF_*: saved with the node, not visible to chflags */
 	vnode_t             rn_vp;
 	struct timespec     rn_atime, rn_mtime, rn_ctime, rn_btime;
 	/* directory */
@@ -96,6 +97,7 @@ struct ramfs_node {
 	struct ramfs_node  *rn_hnext;           /* the next node in rm_hash's chain */
 	TAILQ_HEAD(, ramfs_xattr) rn_xattrs;
 };
+#define RAMFS_IF_SYNCROOT       0x1         /* a FileProvider sync root (APFS fsctl 'J' 72) */
 #define RAMFS_N_CREATING        0x1         /* a thread is in vnode_create() for this node */
 #define RAMFS_N_WANTED          0x2         /* somebody sleeps on the node */
 

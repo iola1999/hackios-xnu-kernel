@@ -198,6 +198,13 @@ struct apple80211_link_changed {
 	uint8_t unused_3[4];
 };
 
+/* LQM event data (iOS 26 requires 0x1d8 bytes and reads the RSSI valid flag at +0 and its value at +4) */
+struct apple80211_lqm_changed {
+	uint8_t rssi_known, unused_0[3];
+	int32_t rssi;
+	uint8_t unused_1[0x1d0];
+};
+
 /* the association-done event's data (IO80211 _dispatchAsyncAssocEvent reads +0x1c0, +0x1c4, +0x1c8) */
 struct apple80211_assoc_done {
 	uint8_t unused[0x1c0];
@@ -211,6 +218,8 @@ _Static_assert(sizeof(struct apple80211_assoc_26) == 908 && offsetof(struct appl
     offsetof(struct apple80211_assoc_26, key) == 0x4c, "the association request as iOS 26 has it");
 _Static_assert(sizeof(struct apple80211_link_changed) == 32 && offsetof(struct apple80211_link_changed, reason) == 0x14,
     "the link event as iOS 16.5 reads it");
+_Static_assert(sizeof(struct apple80211_lqm_changed) == 0x1d8 && offsetof(struct apple80211_lqm_changed, rssi) == 4,
+    "the LQM event as iOS 26 reads it");
 _Static_assert(sizeof(struct apple80211_assoc_done) == 0x1cc && offsetof(struct apple80211_assoc_done, result) == 0x1c4 &&
     offsetof(struct apple80211_assoc_done, flags) == 0x1c8, "the association event as iOS 26 reads it");
 _Static_assert(sizeof(struct apple80211_channels) == 4824, "the channel list as iOS 16.5 has it");
@@ -225,7 +234,7 @@ _Static_assert(sizeof(struct apple80211_scan_result) == 1164 && offsetof(struct 
 
 /* Apple80211's events (APPLE80211_M_...) */
 enum { EVENT_POWER_CHANGED = 1, EVENT_SSID_CHANGED = 2, EVENT_BSSID_CHANGED = 3, EVENT_LINK_CHANGED = 4, EVENT_ASSOC_DONE = 9,
-       EVENT_SCAN_DONE = 10 };
+       EVENT_SCAN_DONE = 10, EVENT_LQM_CHANGED = 39 };
 
 static const char interface_name[16] = "en0";   /* (bsd/dev/redwood_net.c makes one interface, and that is its name) */
 
@@ -761,6 +770,11 @@ redwood_apple80211_event(enum redwood_sta_event event, int status)
 		post(EVENT_SSID_CHANGED, NULL, 0);
 		post(EVENT_BSSID_CHANGED, NULL, 0);
 		post(EVENT_LINK_CHANGED, &link, sizeof(link));
+		if (status == 1) {
+			struct apple80211_lqm_changed lqm = { .rssi_known = 1, .rssi = link.rssi };
+
+			post(EVENT_LQM_CHANGED, &lqm, sizeof(lqm));
+		}
 		break;
 	}
 	}
