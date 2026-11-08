@@ -3,8 +3,9 @@
  * have its identity overwritten by this one. Drop rm_lock first: identity
  * updates may release a parent vnode and reenter ramfs_reclaim. */
 
+/* excl: VFS_RENAME_EXCL, the rename fails with EEXIST when the target name exists by now. */
 static int
-ramfs_rename(struct vnop_rename_args *ap)
+ramfs_rename_common(struct vnop_rename_args *ap, bool excl)
 {
 	struct ramfs_node *fdir = RAMFS_NODE(ap->a_fdvp);
 	struct ramfs_node *tdir = RAMFS_NODE(ap->a_tdvp);
@@ -26,6 +27,10 @@ ramfs_rename(struct vnop_rename_args *ap)
 
 	if (fde == NULL || fde->rd_node != node || tdir->rn_nlink == 0) {
 		error = ENOENT;
+		goto out;
+	}
+	if (excl && tde != NULL) {
+		error = EEXIST;
 		goto out;
 	}
 	if (node->rn_type == VDIR) {
@@ -92,16 +97,26 @@ out:
 }
 
 static int
+ramfs_rename(struct vnop_rename_args *ap)
+{
+	return ramfs_rename_common(ap, false);
+}
+
+static int
 ramfs_renamex(struct vnop_renamex_args *ap)
 {
-	/* VNOP_RENAMEX can also be called directly with no flags. */
-	if (ap->a_flags == 0) {
+	/*
+	 * VNOP_RENAMEX can also be called directly with no flags. renameatx_np(RENAME_EXCL) arrives
+	 * here once the VFS layer has found no target; APFS treats it as a rename that must not
+	 * replace anything.
+	 */
+	if (ap->a_flags == 0 || ap->a_flags == VFS_RENAME_EXCL) {
 		struct vnop_rename_args plain = {
 			.a_fdvp = ap->a_fdvp, .a_fvp = ap->a_fvp, .a_fcnp = ap->a_fcnp,
 			.a_tdvp = ap->a_tdvp, .a_tvp = ap->a_tvp, .a_tcnp = ap->a_tcnp,
 			.a_context = ap->a_context,
 		};
-		return ramfs_rename(&plain);
+		return ramfs_rename_common(&plain, ap->a_flags == VFS_RENAME_EXCL);
 	}
 	if (ap->a_flags != VFS_RENAME_SWAP) {
 		return ENOTSUP;

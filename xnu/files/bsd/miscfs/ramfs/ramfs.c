@@ -83,6 +83,7 @@ struct ramfs_node {
 	uint32_t            rn_bsdflags, rn_dataprotect_class, rn_nlink, rn_state, rn_vid, rn_nentries;
 	uint32_t            rn_iflags;          /* RAMFS_IF_*: saved with the node, not visible to chflags */
 	uint32_t            rn_docid;           /* document ID, given when UF_TRACKED is first set; 0 until then */
+	uint32_t            rn_write_gen;       /* ATTR_CMN_GEN_COUNT of a non-directory: 0 until its contents first change */
 	vnode_t             rn_vp;
 	struct timespec     rn_atime, rn_mtime, rn_ctime, rn_btime;
 	/* directory */
@@ -378,6 +379,10 @@ ramfs_touch(struct ramfs_node *node, bool modified)
 	node->rn_ctime = now;
 	if (modified) {
 		node->rn_mtime = now;
+		/* the write generation count, as APFS and HFS keep it: every content change, skipping 0 on wrap */
+		if (node->rn_type != VDIR && ++node->rn_write_gen == 0) {
+			node->rn_write_gen = 1;
+		}
 	}
 	ramfs_disk_dirty_locked(node->rn_mount);
 }

@@ -82,6 +82,7 @@ ramfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
 		    VOL_CAP_FMT_PATH_FROM_ID |
 		    VOL_CAP_FMT_CLONE_MAPPING |
 		    VOL_CAP_FMT_DOCUMENT_ID |
+		    VOL_CAP_FMT_WRITE_GENERATION_COUNT |
 		    (rm->rm_disk_backed ? (VOL_CAP_FMT_JOURNAL | VOL_CAP_FMT_JOURNAL_ACTIVE) : 0);
 		cap->capabilities[VOL_CAPABILITIES_INTERFACES] =
 		    VOL_CAP_INT_ADVLOCK |
@@ -106,7 +107,8 @@ ramfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
 		    VOL_CAP_FMT_HIDDEN_FILES |
 		    VOL_CAP_FMT_PATH_FROM_ID |
 		    VOL_CAP_FMT_CLONE_MAPPING |
-		    VOL_CAP_FMT_DOCUMENT_ID;
+		    VOL_CAP_FMT_DOCUMENT_ID |
+		    VOL_CAP_FMT_WRITE_GENERATION_COUNT;
 		cap->valid[VOL_CAPABILITIES_INTERFACES] =
 		    VOL_CAP_INT_SEARCHFS |
 		    VOL_CAP_INT_ATTRLIST |

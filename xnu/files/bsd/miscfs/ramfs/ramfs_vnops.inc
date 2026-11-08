@@ -268,6 +268,7 @@ ramfs_getattr(struct vnop_getattr_args *ap)
 	VATTR_RETURN(vap, va_mode, node->rn_mode);
 	VATTR_RETURN(vap, va_flags, node->rn_bsdflags);
 	VATTR_RETURN(vap, va_document_id, node->rn_docid);
+	VATTR_RETURN(vap, va_write_gencount, node->rn_write_gen);
 	VATTR_RETURN(vap, va_create_time, node->rn_btime);
 	VATTR_RETURN(vap, va_addedtime, node->rn_btime);
 	VATTR_RETURN(vap, va_access_time, node->rn_atime);

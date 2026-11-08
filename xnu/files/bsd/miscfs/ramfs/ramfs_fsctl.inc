@@ -14,10 +14,19 @@
  *     LocalStorage domain behind "On My iPhone" marks its "File Provider Storage" directory as a sync
  *     root and checks every item against it; without an answer its root item does not exist and Safari
  *     downloads have no destination. The mark is saved with the node.
+ *   - "maintain directory stats" ('J' 2 with a uint64_t of flags), which FileProvider's LocalStorage
+ *     extension sends for package items before it hands out their identifier. Safari's download
+ *     placeholder "NAME.download" is such an item, and BrowserEngineKit's intermediary creates it as an
+ *     empty regular file, so the request comes for files as well as directories; without an answer
+ *     identifierForItemAtURL fails with ENOTTY and the download is rolled back after its placeholder was
+ *     moved into "Downloads". ramfs keeps no directory stats, so the request is accepted and kept nowhere;
+ *     the stats query itself ('J' 32) stays unanswered, and FileProvider, like libc's dirstat_np(), then
+ *     walks the directory instead.
  * Everything else is ENOTTY.
  */
 #include <sys/fsctl.h>
 
+#define RAMFS_APFSIOC_MAINTAIN_DIR_STATS _IOW('J', 2, uint64_t)
 #define RAMFS_APFSIOC_MARK_PURGEABLE   _IOWR('J', 68, uint64_t)
 #define RAMFS_APFSIOC_SET_SYNCROOT     _IOW('J', 72, uint32_t)
 #define RAMFS_APFSIOC_GET_SYNCROOT     _IOR('J', 72, uint32_t)
@@ -124,7 +133,7 @@ ramfs_ioctl(struct vnop_ioctl_args *ap)
 		}
 		return ramfs_disk_sync(node->rn_mount);
 	}
-	if (ap->a_command == RAMFS_APFSIOC_MARK_PURGEABLE) {
+	if (ap->a_command == RAMFS_APFSIOC_MARK_PURGEABLE || ap->a_command == RAMFS_APFSIOC_MAINTAIN_DIR_STATS) {
 		return 0;
 	}
 	return ramfs_syncroot_ioctl(ap);

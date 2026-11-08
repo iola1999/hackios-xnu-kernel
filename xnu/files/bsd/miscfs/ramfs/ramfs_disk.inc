@@ -73,7 +73,7 @@ struct annfs_inode_rec {
 	uint32_t ndirents;
 	uint32_t iflags;                /* ramfs_node.rn_iflags */
 	uint32_t document_id;           /* ramfs_node.rn_docid */
-	uint32_t reserved;
+	uint32_t write_gen;             /* ramfs_node.rn_write_gen */
 	int64_t  atime_sec, atime_nsec;
 	int64_t  mtime_sec, mtime_nsec;
 	int64_t  ctime_sec, ctime_nsec;
@@ -364,6 +364,7 @@ ramfs_disk_pack_locked(struct ramfs_mount *rm, uint64_t *payload_bytes_out, uint
 			rec.ndirents = ndirents;
 			rec.iflags = node->rn_iflags;
 			rec.document_id = node->rn_docid;
+			rec.write_gen = node->rn_write_gen;
 			rec.atime_sec = node->rn_atime.tv_sec;
 			rec.atime_nsec = node->rn_atime.tv_nsec;
 			rec.mtime_sec = node->rn_mtime.tv_sec;

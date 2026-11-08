@@ -97,6 +97,7 @@ ramfs_disk_unpack(struct ramfs_mount *rm, const struct annfs_super *sup)
 		node->rn_nlink = rec.nlink;
 		node->rn_iflags = rec.iflags & RAMFS_IF_SYNCROOT;
 		node->rn_docid = rec.document_id;
+		node->rn_write_gen = rec.write_gen;
 		if (rec.document_id >= rm->rm_next_docid) {
 			rm->rm_next_docid = rec.document_id + 1;
 		}
