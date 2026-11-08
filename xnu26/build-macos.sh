@@ -146,7 +146,11 @@ for sub in subsystems:
 PY
 fi
 
+# Reproducible builds, part three: __FILE__ in panic and assert strings is the path clang was given,
+# which would put the build machine's directory (and its user name) into the kernel. RC_NONARCH_CFLAGS
+# reaches C, C++ and assembler (makedefs/MakeInc.def OTHER_CFLAGS); the strings become osfmk/kern/....
 ${MAKE:-gmake} XCRUN="$XNU26_ROOT/xnu26/xcrun" SDKROOT="$XNU26_SDK" REDWOOD_OBJECTS="$LX" \
+  RC_NONARCH_CFLAGS="-ffile-prefix-map=$SRC/=" \
   ARCH_CONFIGS=ARM64 MACHINE_CONFIGS=${MACHINE:-BCM2837} KERNEL_CONFIGS=${KERNEL_CONFIG:-DEVELOPMENT} \
   ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64 BUILD_WERROR=0 BUILD_LTO=0 DO_CTFMERGE=0 LOGCOLORS=n \
   KEXT_CREATE_SYMBOL_SET=/usr/bin/true "${make_args[@]}" || exit $?

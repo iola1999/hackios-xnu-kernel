@@ -97,8 +97,10 @@ CC="clang -target arm64-apple-ios16.5"
 LD=$ROOT/xnu-deps/host/bin/ld64
 # xnu-deps/setup.sh links the cctools ld64 there on Linux; on macOS Xcode's ld is that linker
 [ -e "$LD" ] || [ "$(uname -s)" != Darwin ] || LD=/usr/bin/ld
+# -ffile-prefix-map: __FILE__ and the debug info name files relative to this repository, so the
+# kernel this object is linked into does not carry the build machine's directory
 CFLAGS="-mkernel -mgeneral-regs-only -fno-builtin -fno-common -ffreestanding -fno-strict-aliasing
-	-funsigned-char -nostdinc -std=gnu17 -O2 -g -w -ferror-limit=0
+	-funsigned-char -nostdinc -std=gnu17 -O2 -g -w -ferror-limit=0 -ffile-prefix-map=$ROOT/=
 	-D__FreeBSD__=15 -D_KERNEL -DKLD_MODULE -DHAVE_KERNEL_OPTION_HEADERS -include opt_global.h
 	-I$W/include -Igen -I$S -I$S/contrib/ck/include
 	-I$S/compat/linuxkpi/common/include -I$S/compat/linuxkpi/dummy/include
