@@ -29,6 +29,7 @@ HEADER = r'''
 #define MIN(a,b) ((a)<(b)?(a):(b))
 #define __builtin_arm_dmb(x) ((void)0)
 #define __builtin_arm_dsb(x) ((void)0)
+#define say(...) ((void)0)
 #define IPCC_CLIENT_LPASS 3
 #define IPCC_SIGNAL_GLINK 0
 #define GLINK_TX_DATA 9
@@ -49,6 +50,7 @@ static int aadsp_gpr_lock, aadsp_tx_lock, glink_tx_lock, glink_gpr_intents, resp
 static uint32_t waited_response_src, waited_response_dst;
 static uint32_t reader;
 static uint64_t ticks;
+static unsigned returned_intents;
 static bool advance_on_lock;
 static void lck_mtx_lock(void *p) {
     if(p==&glink_tx_lock && advance_on_lock) { glink_tx_write_pos=128;advance_on_lock=false; }
@@ -61,6 +63,9 @@ static void smem_peek(uint32_t at, void *out, unsigned size) { (void)at; assert(
 static void smem_poke(uint32_t at, uint32_t value) { (void)at; (void)value; writes++; }
 static bool glink_take_their_intent(void *p, uint16_t cid, uint32_t len, uint32_t *id) {
     (void)p; (void)cid; (void)len; *id=1; return intents;
+}
+static void glink_complete_their_intent(void *p, uint32_t id, bool reusable) {
+    (void)p; assert(id==1 && reusable); returned_intents++;
 }
 static void glink_poll_rx(void) {
     if (!response_mode) return;
@@ -99,7 +104,9 @@ int main(void) {
     adsp_hw_up=true; intents=0;
     assert(!annibale_adsp_gpr_send(pkt,sizeof(pkt),0,0,0,0)); assert(writes==prior);
     intents=1; glink_tx_write_pos=1000; reader=0;
+    unsigned returned_before=returned_intents;
     assert(!annibale_adsp_gpr_send(pkt,sizeof(pkt),0,0,0,0)); assert(writes==prior);
+    assert(returned_intents==returned_before+1);
     glink_tx_write_pos=0; assert(annibale_adsp_gpr_send(pkt,sizeof(pkt),0,0,0,0));
     assert(writes>prior);
     glink_tx_write_pos=0;advance_on_lock=true;

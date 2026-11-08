@@ -413,7 +413,10 @@ annibale_audio_reach_send_cmd(const void *raw_pkt, uint32_t raw_len, const char 
 		__builtin_arm_dsb(0xf);
 	}
 
-	uint32_t wait_ms = 250u;
+	uint32_t request_opcode = 0;
+	memcpy(&request_opcode, p.buf + 20, sizeof(request_opcode));
+	/* AudioReach control requests use a five-second deadline in upstream Linux. */
+	uint32_t wait_ms = request_opcode == APM_CMD_GET_SPF_STATE ? 5000u : 250u;
 	uint32_t rop = 0;
 	uint32_t rwords[16] = { 0 };
 	bool ok = annibale_adsp_gpr_send(p.buf, p.len, wait_ms, &rop, rwords, 16);

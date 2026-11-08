@@ -1001,6 +1001,8 @@ bool annibale_adsp_gpr_send(const void *pkt, uint32_t len, uint32_t wait_ms,
 		    request_opcode, token, waited_done, waited_opcode, waited_word_count,
 		    waited_word_count > 0 ? waited_words[0] : 0, waited_word_count > 1 ? waited_words[1] : 0,
 		    now_us() - t0);
+	} else if (request_opcode == APM_CMD_GET_SPF_STATE) {
+		say("GPR state reply token %u elapsed %llu us\n", token, now_us() - t0);
 	}
 	waited_token = 0;
 	lck_mtx_unlock(&aadsp_gpr_lock);
