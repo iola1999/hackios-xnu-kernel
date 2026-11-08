@@ -50,6 +50,7 @@ __pycache__/
 !/xnuloader/loader.c
 !/xnuloader/loader_*.inc
 !/xnuloader/platform_private.h
+!/xnuloader/slot_choice.h
 !/xnuloader/mkidentity.py
 !/xnuloader/mkpayload.py
 !/xnuloader/mkstandalone.py

@@ -88,7 +88,8 @@ def build_standalone_payload(
     identity: str = DEFAULT_IDENTITY,
     memsize: str = DEFAULT_MEMSIZE,
     cmdline: str = DEFAULT_CMDLINE,
-) -> tuple[Path, Path]:
+    lz4: bool = True,
+) -> tuple[Path, Path | None]:
     here = Path(__file__).resolve().parent
     mkpayload_py = here / "mkpayload.py"
     if not mkpayload_py.is_file():
@@ -151,6 +152,8 @@ def build_standalone_payload(
     if res.returncode != 0:
         raise RuntimeError(f"mkpayload.py failed:\n{res.stderr}\n{res.stdout}")
 
+    if not lz4:
+        return output, None
     compress_lz4(output, lz4_output)
 
     return output, lz4_output
@@ -178,6 +181,8 @@ def main() -> int:
                         help="memsize in hex")
     parser.add_argument("--cmdline", default=DEFAULT_CMDLINE,
                         help="boot arguments cmdline")
+    parser.add_argument("--no-lz4", action="store_true",
+                        help="skip the LZ4 copy (reseal-loader-img.py takes the uncompressed payload)")
     parser.add_argument("--test", action="store_true",
                         help="Run self-test with dummy kernel/ramdisk")
 
@@ -219,17 +224,18 @@ def main() -> int:
         identity=args.identity,
         memsize=args.memsize,
         cmdline=args.cmdline,
+        lz4=not args.no_lz4,
     )
 
     bin_size = out_bin.stat().st_size
-    lz_size = out_lz.stat().st_size
     bin_sha = sha256_file(out_bin)
-    lz_sha = sha256_file(out_lz)
 
     print(f"Standalone payload generated:")
     print(f"  Raw: {out_bin} ({bin_size} bytes, {bin_size / 1048576:.2f} MiB), sha256: {bin_sha}")
-    print(f"  LZ4: {out_lz} ({lz_size} bytes, {lz_size / 1048576:.2f} MiB), sha256: {lz_sha}")
-    print(f"  Target partition: boot_a (96 MiB). Payload fits within limit: {lz_size < 96 * 1048576}")
+    if out_lz is not None:
+        lz_size = out_lz.stat().st_size
+        print(f"  LZ4: {out_lz} ({lz_size} bytes, {lz_size / 1048576:.2f} MiB), sha256: {sha256_file(out_lz)}")
+        print(f"  Target partition: boot_a (96 MiB). Payload fits within limit: {lz_size < 96 * 1048576}")
 
     return 0
 

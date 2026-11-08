@@ -73,79 +73,65 @@ class TestBootSafetyGPT(unittest.TestCase):
         struct.pack_into("<I", backup_header, 16, 0)
         self.assertEqual(zlib.crc32(backup_header[:92]) & 0xFFFFFFFF, backup_crc)
 
-    def test_slot_detect_and_switching_logic(self):
-        """Simulate GPT attribute parsing and slot-agnostic switching."""
-        # Attribute bit layout:
-        # bits 48..51: priority (4 bits)
-        # bits 52..54: tries_remaining (3 bits)
-        # bit 55: successful (1 bit)
+    def test_slot_choice_from_boot_images(self):
+        """Build slot_choice.h on the host and classify loader and Android boot images."""
+        def boot_image(version, page, kernel):
+            head = bytearray(8192)
+            head[:8] = b"ANDROID!"
+            struct.pack_into("<I", head, 36, page)
+            struct.pack_into("<I", head, 40, version)
+            if page:
+                head[page:page + len(kernel)] = kernel
+            else:
+                head[4096:4096 + len(kernel)] = kernel
+            return bytes(head)
 
-        def make_attr(priority, tries, successful):
-            val = ((priority & 0xF) << 48) | ((tries & 0x7) << 52)
-            if successful:
-                val |= (1 << 55)
-            return val
+        images = {
+            "loader": boot_image(1, 2048, b"\x1f\x8b\x08"),
+            "android_v4": boot_image(4, 0, b"MZ"),
+            "v1_raw_kernel": boot_image(1, 2048, b"MZ"),
+            "blank": bytes(8192),
+        }
+        harness = r"""
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "slot_choice.h"
+int main(int argc, char **argv) {
+    static uint8_t head[SLOT_HEAD_BYTES];
+    int in[2];
+    for (int i = 0; i < 2; i++) {
+        FILE *f = fopen(argv[1 + i], "rb");
+        size_t n = fread(head, 1, sizeof(head), f);
+        fclose(f);
+        in[i] = boot_image_is_loader(head, n);
+    }
+    char loader = 1, android = 1;
+    slot_choose(in[0], in[1], &loader, &android);
+    printf("%d %d %c %c\n", in[0], in[1], loader ? loader : '-', android ? android : '-');
+    return 0;
+}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, data in images.items():
+                (root / name).write_bytes(data)
+            (root / "harness.c").write_text(harness)
+            binary = root / "harness"
+            subprocess.run(["cc", "-std=c11", "-Wall", "-Werror", "-I", str(HERE), "-o", str(binary),
+                            str(root / "harness.c")], check=True)
 
-        def parse_attr(attr):
-            priority = (attr >> 48) & 0xF
-            tries = (attr >> 52) & 0x7
-            successful = (attr >> 55) & 1
-            return priority, tries, successful
+            def choose(a, b):
+                out = subprocess.run([str(binary), str(root / a), str(root / b)], check=True,
+                                     capture_output=True, text=True).stdout.split()
+                return out[0] == "1", out[1] == "1", out[2], out[3]
 
-        # Case 1: Slot A active, Slot B inactive
-        attr_a = make_attr(15, 7, 1)
-        attr_b = make_attr(14, 0, 0)
-
-        # Detect active slot
-        pri_a, tries_a, succ_a = parse_attr(attr_a)
-        pri_b, tries_b, succ_b = parse_attr(attr_b)
-        active_a = (pri_a > 0 and tries_a > 0) or succ_a
-        active_b = (pri_b > 0 and tries_b > 0) or succ_b
-
-        if pri_b > pri_a and active_b:
-            loader_slot = "b"
-        elif active_a:
-            loader_slot = "a"
-        elif active_b:
-            loader_slot = "b"
-        else:
-            loader_slot = "a"
-        android_slot = "b" if loader_slot == "a" else "a"
-
-        self.assertEqual(loader_slot, "a")
-        self.assertEqual(android_slot, "b")
-
-        # Test slot_maintain_current: refresh tries to 7, successful to 1
-        attr_a_maint = make_attr(pri_a, 7, 1)
-        self.assertEqual(parse_attr(attr_a_maint), (15, 7, 1))
-
-        # Test slot_set_active_other: promote android_slot to 15, lower loader_slot to 14
-        attr_b_target = make_attr(15, 7, 1)
-        attr_a_lower = make_attr(14, 0, 0)
-        self.assertEqual(parse_attr(attr_b_target), (15, 7, 1))
-        self.assertEqual(parse_attr(attr_a_lower), (14, 0, 0))
-
-        # Case 2: Slot B active (e.g. after Android OTA), Slot A inactive
-        attr_a = make_attr(14, 0, 0)
-        attr_b = make_attr(15, 7, 1)
-
-        pri_a, tries_a, succ_a = parse_attr(attr_a)
-        pri_b, tries_b, succ_b = parse_attr(attr_b)
-        active_a = (pri_a > 0 and tries_a > 0) or succ_a
-        active_b = (pri_b > 0 and tries_b > 0) or succ_b
-
-        if pri_b > pri_a and active_b:
-            loader_slot = "b"
-        elif active_a:
-            loader_slot = "a"
-        elif active_b:
-            loader_slot = "b"
-        else:
-            loader_slot = "a"
-        android_slot = "b" if loader_slot == "a" else "a"
-
-        self.assertEqual(loader_slot, "b")
-        self.assertEqual(android_slot, "a")
+            self.assertEqual(choose("loader", "android_v4"), (True, False, "a", "b"))
+            self.assertEqual(choose("android_v4", "loader"), (False, True, "b", "a"))
+            # Started from RAM by LK with Android in both slots: nothing names a slot.
+            self.assertEqual(choose("android_v4", "android_v4"), (False, False, "-", "-"))
+            self.assertEqual(choose("loader", "loader"), (True, True, "-", "-"))
+            self.assertEqual(choose("v1_raw_kernel", "blank"), (False, False, "-", "-"))
 
 
 class TestSourceContracts(unittest.TestCase):

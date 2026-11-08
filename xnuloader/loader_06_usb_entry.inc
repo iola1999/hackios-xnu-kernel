@@ -854,6 +854,8 @@ fb_command(char *cmd)
 			/* the firmware's memory map into the log (then "oem log" and fetch it) */
 			print_memory_map();
 			fb_reply("OKAY", "");
+		} else if (starts_with(cmd, "oem logwrite") && loader_slot != 'a') { /* it writes boot_a */
+			fb_reply("FAIL", "boot_a does not hold the loader");
 		} else if (starts_with(cmd, "oem logwrite")) {
 			/* Fallback that lets log land on boot_a when no logdump exists */
 			fb_reply("OKAY", "");
@@ -863,8 +865,9 @@ fb_command(char *cmd)
 		} else if (starts_with(cmd, "oem probe")) {
 			fb_reply("OKAY", "");
 			probe_boot_a();
-		} else if (str_eq(cmd, "flash:boot_a") || str_eq(cmd, "oem flash_boot")) {
-			const char *err = slot_flash_boot_image(payload_bytes);
+		} else if (str_eq(cmd, "flash:boot_a") || str_eq(cmd, "flash:boot_b") || str_eq(cmd, "oem flash_boot")) {
+			char slot = cmd[0] == 'f' ? cmd[11] : loader_slot; /* has to be the loader's own slot */
+			const char *err = slot_flash_boot_image(slot, payload_bytes);
 			fb_reply(err == NULL ? "OKAY" : "FAIL", err == NULL ? "" : err);
 		} else if (str_eq(cmd, "oem android")) {
 			if (kernel_resources_held) {

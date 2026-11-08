@@ -26,7 +26,8 @@ import tempfile
 import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MKBOOTIMG = os.path.join(HERE, '..', 'Mu-Silicium', 'Resources', 'Scripts', 'mkbootimg.py')
+# AOSP's mkbootimg, the same file as Mu-Silicium's Resources/Scripts/mkbootimg.py
+MKBOOTIMG = os.path.join(HERE, '..', 'prebuilt', 'uefi', 'mkbootimg.py')
 
 
 def validate_container(container):

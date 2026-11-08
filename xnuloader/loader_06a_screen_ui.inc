@@ -386,10 +386,13 @@ typedef struct efi_simple_text_input {
 #define MENU_CHOICE_ANDROID   1
 #define MENU_CHOICE_FASTBOOT  2
 
-static char loader_slot = 'a';
-static char android_slot = 'b';
-static char menu_item_ios[40] = "[1] BOOT IOS 26 (SLOT A)";
-static char menu_item_android[40] = "[2] BOOT ANDROID (SLOT B)";
+#include "slot_choice.h"
+
+/* 'a' or 'b' once slot_detect has found the slots, 0 while unknown (slot_choice.h) */
+static char loader_slot;
+static char android_slot;
+static char menu_item_ios[40] = "[1] BOOT IOS 26";
+static char menu_item_android[40] = "[2] BOOT ANDROID";
 static const char *const menu_item_fastboot = "[3] FASTBOOT USB DIAGNOSTICS";
 
 static const char *
@@ -400,27 +403,31 @@ menu_item_str(int i)
 	return menu_item_fastboot;
 }
 
+/* "LABEL (SLOT X)", or the label alone while the slot is unknown; fits the 40-byte menu items */
+static void
+menu_compose(char *dst, const char *label, char slot)
+{
+	static const char tail[] = " (SLOT ";
+	int n = 0;
+	while (label[n] != 0 && n < 30) {
+		dst[n] = label[n];
+		n++;
+	}
+	if (slot == 'a' || slot == 'b') {
+		for (int i = 0; tail[i] != 0; i++) {
+			dst[n++] = tail[i];
+		}
+		dst[n++] = (char)(slot - 'a' + 'A');
+		dst[n++] = ')';
+	}
+	dst[n] = 0;
+}
+
 static void
 slot_update_menu_text(void)
 {
-	char up_loader = (loader_slot >= 'a' && loader_slot <= 'z') ? (loader_slot - 32) : loader_slot;
-	char up_android = (android_slot >= 'a' && android_slot <= 'z') ? (android_slot - 32) : android_slot;
-
-	menu_item_ios[0] = '['; menu_item_ios[1] = '1'; menu_item_ios[2] = ']'; menu_item_ios[3] = ' ';
-	menu_item_ios[4] = 'B'; menu_item_ios[5] = 'O'; menu_item_ios[6] = 'O'; menu_item_ios[7] = 'T';
-	menu_item_ios[8] = ' '; menu_item_ios[9] = 'I'; menu_item_ios[10] = 'O'; menu_item_ios[11] = 'S';
-	menu_item_ios[12] = ' '; menu_item_ios[13] = '2'; menu_item_ios[14] = '6'; menu_item_ios[15] = ' ';
-	menu_item_ios[16] = '('; menu_item_ios[17] = 'S'; menu_item_ios[18] = 'L'; menu_item_ios[19] = 'O';
-	menu_item_ios[20] = 'T'; menu_item_ios[21] = ' '; menu_item_ios[22] = up_loader; menu_item_ios[23] = ')';
-	menu_item_ios[24] = 0;
-
-	menu_item_android[0] = '['; menu_item_android[1] = '2'; menu_item_android[2] = ']'; menu_item_android[3] = ' ';
-	menu_item_android[4] = 'B'; menu_item_android[5] = 'O'; menu_item_android[6] = 'O'; menu_item_android[7] = 'T';
-	menu_item_android[8] = ' '; menu_item_android[9] = 'A'; menu_item_android[10] = 'N'; menu_item_android[11] = 'D';
-	menu_item_android[12] = 'R'; menu_item_android[13] = 'O'; menu_item_android[14] = 'I'; menu_item_android[15] = 'D';
-	menu_item_android[16] = ' '; menu_item_android[17] = '('; menu_item_android[18] = 'S'; menu_item_android[19] = 'L';
-	menu_item_android[20] = 'O'; menu_item_android[21] = 'T'; menu_item_android[22] = ' ';
-	menu_item_android[23] = up_android; menu_item_android[24] = ')'; menu_item_android[25] = 0;
+	menu_compose(menu_item_ios, "[1] BOOT IOS 26", loader_slot);
+	menu_compose(menu_item_android, "[2] BOOT ANDROID", android_slot);
 }
 
 static efi_block_io *
@@ -507,57 +514,36 @@ safe_write_blocks(efi_block_io *bio, uint64_t lba, uint64_t num_blocks, uint32_t
 	return s;
 }
 
+static int
+slot_holds_loader(char slot)
+{
+	static uint8_t head[SLOT_HEAD_BYTES] __attribute__((aligned(4096)));
+	char16 name[] = u"boot_a";
+	name[5] = (char16)slot;
+	efi_block_io *bio = find_partition_named(name, sizeof(name) / sizeof(name[0]));
+	if (bio == NULL || bio->media == NULL) {
+		return 0;
+	}
+	uint32_t bs = bio->media->block_size;
+	if (bs < 512 || bs > sizeof(head) || sizeof(head) % bs != 0 ||
+	    EFI_ERROR(safe_read_blocks(bio, 0, sizeof(head) / bs, bs, head))) {
+		return 0;
+	}
+	return boot_image_is_loader(head, sizeof(head));
+}
+
 static void
 slot_detect(void)
 {
-	efi_block_io *bio = lun4_get_bio();
-	if (!bio || !bio->media) {
-		slot_update_menu_text();
-		return;
-	}
-	uint32_t bs = bio->media->block_size;
-	if (bs < 512 || bs > 4096) {
-		slot_update_menu_text();
-		return;
-	}
+	int in_a = slot_holds_loader('a');
+	int in_b = slot_holds_loader('b');
+	char loader_name[2] = { 0, 0 }, android_name[2] = { 0, 0 };
 
-	static uint8_t hdr[4096] __attribute__((aligned(4096)));
-	if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, 1, bs, hdr))) {
-		slot_update_menu_text();
-		return;
-	}
-	if (memcmp(hdr, "EFI PART", 8) != 0) {
-		slot_update_menu_text();
-		return;
-	}
-
-	uint64_t entries_lba = *(uint64_t *)(hdr + 72);
-	uint32_t num_entries = *(uint32_t *)(hdr + 80);
-	uint32_t entry_size = *(uint32_t *)(hdr + 84);
-	uint64_t total_bytes = (uint64_t)num_entries * entry_size;
-	uint64_t num_blocks = (total_bytes + bs - 1) / bs;
-
-	if (total_bytes == 0 || total_bytes > sizeof(ufs_buffer)) {
-		slot_update_menu_text();
-		return;
-	}
-
-	if (EFI_ERROR(safe_read_blocks(bio, entries_lba, num_blocks, bs, ufs_buffer))) {
-		slot_update_menu_text();
-		return;
-	}
-
-	uint8_t *ea = gpt_find_entry(ufs_buffer, num_entries, entry_size, "boot_a");
-	uint8_t *eb = gpt_find_entry(ufs_buffer, num_entries, entry_size, "boot_b");
-
-	uint64_t attr_a = ea ? *(uint64_t *)(ea + 48) : 0;
-	uint64_t attr_b = eb ? *(uint64_t *)(eb + 48) : 0;
-
-	loader_slot = 'a';
-	android_slot = 'b';
-
-	print("slot: loader_slot=a (boot_a), android_slot=b (boot_b) (attr_a=%x attr_b=%x)\n",
-	    attr_a, attr_b);
+	slot_choose(in_a, in_b, &loader_slot, &android_slot);
+	loader_name[0] = loader_slot ? loader_slot : '-';
+	android_name[0] = android_slot ? android_slot : '-';
+	print("slot: loader image in boot_a=%d boot_b=%d: loader_slot=%s android_slot=%s\n",
+	    (uint64_t)in_a, (uint64_t)in_b, loader_name, android_name);
 	slot_update_menu_text();
 }
 
@@ -920,6 +906,9 @@ gpt_swap_ab_type_guids(uint8_t *entries, uint32_t num_entries, uint32_t entry_si
 static void
 slot_apply_active(char target_slot)
 {
+	if (target_slot != 'a' && target_slot != 'b') {
+		return;
+	}
 	efi_block_io *bio = lun4_get_bio();
 	if (!bio || !bio->media) return;
 	uint32_t bs = bio->media->block_size;
@@ -993,13 +982,19 @@ slot_set_active_other(void)
 static void __attribute__((unused)) slot_maintain_a(void) { slot_maintain_current(); }
 static void __attribute__((unused)) slot_set_active_b(void) { slot_set_active_other(); }
 
+/* Only the boot partition that already holds the loader is ever written (slot_choice.h). */
 static const char *
-slot_flash_boot_image(uint64_t bytes)
+slot_flash_boot_image(char slot, uint64_t bytes)
 {
-	static const char16 want_a[] = u"boot_a";
-	loader_slot = 'a';
-	android_slot = 'b';
-	efi_block_io *bio = find_partition_named(want_a, 7);
+	char16 name[] = u"boot_a";
+	if (loader_slot == 0) {
+		return "no single boot partition holds the loader: flash it from LK";
+	}
+	if (slot != loader_slot) {
+		return "that boot partition does not hold the loader";
+	}
+	name[5] = (char16)slot;
+	efi_block_io *bio = find_partition_named(name, sizeof(name) / sizeof(name[0]));
 	if (bio == NULL || bio->media == NULL || bio->media->block_size == 0) {
 		return "boot partition not found";
 	}
