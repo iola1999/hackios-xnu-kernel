@@ -634,6 +634,8 @@ rw_surface_through_copy(RedwoodMetalDevice *device, MTLTextureDescriptor *d, voi
 	return texture;
 }
 
+#include "redwoodmetal_yuv.inc"
+
 @implementation RedwoodMetalDevice (Surface)
 
 /* fdl6_layout_image requires max(64 bytes, 16 pixels) for explicit linear
@@ -707,6 +709,8 @@ rw_surface_through_copy(RedwoodMetalDevice *device, MTLTextureDescriptor *d, voi
 	shape.mip_levels = (unsigned)[d mipmapLevelCount];
 	shape.sample_count = (unsigned)[d sampleCount];
 	shape.usage = (unsigned)[d usage];
+	if (shape.pixel_format == 500)
+		return rw_combined_yuv(self, d, s, p, &shape);
 	if (rwd_surface_plane(s, p, (const struct rwd_texture_shape *)&shape, &took,
 	    &allocation_base, why, sizeof(why)) != 0) {
 		rw_print("surface plane %lu: %s\n", (unsigned long)p, why);

@@ -4,6 +4,8 @@ struct rwa_fence;
 
 static struct {
 	void *handle;
+	struct rwa_texture *(*texture_combine_yuv)(struct rwa_texture *, struct rwa_texture *,
+		bool, unsigned, char *, size_t);
 	__typeof__(&rwa_buffer_copy) buffer_copy;
 	__typeof__(&rwa_texture_copy) texture_copy;
 	__typeof__(&rwa_texture_generate_mipmaps) texture_generate_mipmaps;
@@ -106,6 +108,7 @@ mesa_available(void)
 	*(void **)&mesa.buffer_textures_refresh = dlsym(mesa.handle, "rwa_buffer_textures_refresh");
 	*(void **)&mesa.buffer_textures_writeback = dlsym(mesa.handle,
 							  "rwa_buffer_textures_writeback");
+	*(void **)&mesa.texture_combine_yuv = dlsym(mesa.handle, "rwa_texture_combine_yuv");
 	*(void **)&mesa.texture_view = dlsym(mesa.handle, "rwa_texture_view");
 	*(void **)&mesa.texture_set_swizzle = dlsym(mesa.handle, "rwa_texture_set_swizzle");
 	*(void **)&mesa.texture_thumbnail = dlsym(mesa.handle, "rwa_texture_thumbnail");
