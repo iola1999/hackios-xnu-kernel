@@ -8,14 +8,20 @@
 source "$(dirname "${BASH_SOURCE[0]}")/env-macos.sh"
 cd "$XNU26_SRC" || exit 1
 SRC=$PWD
+# xnu/files is synced into the tree with the same exclusions as xnu26/apply.sh: the files that
+# xnu26/files.skip names are xnu-8796 versions, and copying them over the tree replaces 12377's own
+# (san/memory/ubsan_minimal.c no longer matches 12377's san/ubsan_minimal.h and does not compile).
 if [ -d "$XNU26_ROOT/xnu/files" ]; then
-  python3 - "$XNU26_ROOT/xnu/files" "$SRC" <<'PY'
+  python3 - "$XNU26_ROOT/xnu/files" "$SRC" "$XNU26_ROOT/xnu26/files.skip" <<'PY'
 import filecmp, os, shutil, sys
-src_root, dst_root = sys.argv[1], sys.argv[2]
+src_root, dst_root, skip_list = sys.argv[1:4]
+skip = set(open(skip_list).read().split())
 for dirpath, _, filenames in os.walk(src_root):
     for f in filenames:
         p1 = os.path.join(dirpath, f)
         rel = os.path.relpath(p1, src_root)
+        if rel in skip:
+            continue
         p2 = os.path.join(dst_root, rel)
         if not os.path.exists(p2) or not filecmp.cmp(p1, p2, shallow=False):
             os.makedirs(os.path.dirname(p2), exist_ok=True)
