@@ -4,19 +4,23 @@ static void glink_add_their_intent(struct glink_intent_pool *pool, uint32_t id, 
 {
 	if (size == 0) return;
 	lck_mtx_lock(&glink_intent_lock);
-	for (unsigned i = 0; i < GLINK_MAX_INTENTS; i++) {
-		if (pool->list[i].size != 0 && pool->list[i].id == id) {
+	struct glink_remote_intent **slot = &pool->head;
+	while (*slot != NULL) {
+		if ((*slot)->id == id) {
 			lck_mtx_unlock(&glink_intent_lock);
 			return;
 		}
+		slot = &(*slot)->next;
 	}
-	for (unsigned i = 0; i < GLINK_MAX_INTENTS; i++) {
-		if (pool->list[i].size == 0) {
-			pool->list[i].id = id;
-			pool->list[i].size = size;
-			pool->list[i].free = true;
-			break;
-		}
+	/* Firmware advertises multiple size classes; all remain eligible for TX. */
+	struct glink_remote_intent *intent = kalloc_type(struct glink_remote_intent, Z_WAITOK | Z_ZERO);
+	if (intent != NULL) {
+		intent->id = id;
+		intent->size = size;
+		intent->free = true;
+		*slot = intent;
+	} else {
+		say("cannot record GLINK intent %u size %u\n", id, size);
 	}
 	lck_mtx_unlock(&glink_intent_lock);
 }
@@ -24,10 +28,15 @@ static void glink_add_their_intent(struct glink_intent_pool *pool, uint32_t id, 
 static void glink_complete_their_intent(struct glink_intent_pool *pool, uint32_t id, bool reuse)
 {
 	lck_mtx_lock(&glink_intent_lock);
-	for (unsigned i = 0; i < GLINK_MAX_INTENTS; i++) {
-		if (pool->list[i].size != 0 && pool->list[i].id == id) {
-			pool->list[i].free = reuse;
-			if (!reuse) pool->list[i].size = 0;
+	for (struct glink_remote_intent **slot = &pool->head; *slot != NULL; slot = &(*slot)->next) {
+		struct glink_remote_intent *intent = *slot;
+		if (intent->id == id) {
+			if (reuse) {
+				intent->free = true;
+			} else {
+				*slot = intent->next;
+				kfree_type(struct glink_remote_intent, intent);
+			}
 			break;
 		}
 	}
@@ -39,10 +48,10 @@ static bool glink_take_their_intent(struct glink_intent_pool *pool, uint16_t our
 	uint64_t deadline = 0;
 	for (;;) {
 		lck_mtx_lock(&glink_intent_lock);
-		for (unsigned i = 0; i < GLINK_MAX_INTENTS; i++) {
-			if (pool->list[i].free && pool->list[i].size >= need) {
-				pool->list[i].free = false;
-				*id_out = pool->list[i].id;
+		for (struct glink_remote_intent *intent = pool->head; intent != NULL; intent = intent->next) {
+			if (intent->free && intent->size >= need) {
+				intent->free = false;
+				*id_out = intent->id;
 				lck_mtx_unlock(&glink_intent_lock);
 				return true;
 			}

@@ -231,10 +231,13 @@ static uint32_t aoss_our_box;
 static bool adsp_inited, adsp_hw_up;
 static uint16_t glink_gpr_our_cid, glink_gpr_their_cid;
 static uint16_t glink_pmic_our_cid, glink_pmic_their_cid;
-#define GLINK_MAX_INTENTS 16
+struct glink_remote_intent {
+	struct glink_remote_intent *next;
+	uint32_t id, size;
+	bool free;
+};
 struct glink_intent_pool {
-	/* size == 0 marks an unused slot; free only records transfer ownership. */
-	struct { uint32_t id, size; bool free; } list[GLINK_MAX_INTENTS];
+	struct glink_remote_intent *head;
 };
 static struct glink_intent_pool glink_gpr_intents, glink_pmic_intents;
 static uint32_t glink_our_read_at, glink_our_write_at, glink_their_read_at, glink_their_write_at;
@@ -1018,7 +1021,7 @@ bool annibale_adsp_gpr_ready(void)
 {
 	bool ready = false;
 	lck_mtx_lock(&glink_intent_lock);
-	for (unsigned i = 0; i < GLINK_MAX_INTENTS; i++) ready |= glink_gpr_intents.list[i].size != 0;
+	ready = glink_gpr_intents.head != NULL;
 	lck_mtx_unlock(&glink_intent_lock);
 	return adsp_hw_up && glink_our_q != 0 && glink_gpr_our_cid != 0 && glink_gpr_their_cid != 0 && ready;
 }

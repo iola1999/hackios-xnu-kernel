@@ -35,6 +35,16 @@ HEADER = r'''
 #define MIN(a,b) ((a)<(b)?(a):(b))
 #define __builtin_arm_dmb(x) ((void)0)
 #define say(...) fprintf(stderr, __VA_ARGS__)
+#define Z_WAITOK 0
+#define Z_ZERO 0
+static bool fail_allocation;
+static unsigned allocations;
+static void *allocate(size_t size) {
+    if(fail_allocation) return NULL;
+    void *p=calloc(1,size);assert(p);allocations++;return p;
+}
+#define kalloc_type(type, flags) ((type *)allocate(sizeof(type)))
+#define kfree_type(type, pointer) (free(pointer), allocations--)
 static pthread_mutex_t aadsp_gpr_lock=PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t aadsp_tx_lock=PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t glink_tx_lock=PTHREAD_MUTEX_INITIALIZER;
@@ -138,12 +148,15 @@ int main(int argc,char **argv) {
         receive_done(GLINK_DONE_REUSE,glink_gpr_their_cid,10);assert(!take(24,&id));
         receive_intent(glink_gpr_their_cid,10,512);assert(take(296,&id)&&id==10);
     } else if(scenario==4) {
-        for(unsigned i=0;i<GLINK_MAX_INTENTS;i++) { receive_intent(glink_gpr_their_cid,i+1,64);assert(take(24,&id)&&id==i+1); }
-        receive_intent(glink_gpr_their_cid,99,512);
-        for(unsigned i=0;i<GLINK_MAX_INTENTS;i++) {
-            receive_done(GLINK_DONE_REUSE,glink_gpr_their_cid,i+1);assert(take(24,&id)&&id==i+1);
-        }
-        assert(!take(296,&id));
+        /* Sizes and order from the SM8750 firmware's GPR advertisements. */
+        for(unsigned i=0;i<116;i++) receive_intent(glink_gpr_their_cid,i,
+            i<64?128:i<96?512:i<112?1024:4096);
+        assert(take(24,&id)&&id==0);assert(take(44,&id)&&id==1);
+        assert(take(296,&id)&&id==64);assert(take(4096,&id)&&id==112);
+        receive_done(GLINK_DONE_REUSE,glink_gpr_their_cid,64);
+        assert(take(296,&id)&&id==64);
+        for(unsigned i=0;i<116;i++) receive_done(GLINK_RX_DONE,glink_gpr_their_cid,i);
+        assert(!take(24,&id));assert(!annibale_adsp_gpr_ready());assert(allocations==0);
     } else if(scenario==5) {
         receive_intent(glink_gpr_their_cid,10,64);
         uint32_t pkt[]={0x1860,0x302,0x2001,1,7,0x01001000};
@@ -208,6 +221,13 @@ int main(int argc,char **argv) {
         response(7,1,1,2);response(8,1,0,2);pkt[4]=8;
         assert(annibale_adsp_gpr_send(pkt,sizeof(pkt),1,&opcode,payload,2));
         assert(waited_token==0&&payload[1]==0&&event_count==1);
+    } else if(scenario==18) {
+        fail_allocation=true;receive_intent(glink_gpr_their_cid,10,512);
+        assert(!take(296,&id));assert(allocations==0);
+        fail_allocation=false;receive_intent(glink_gpr_their_cid,10,512);
+        receive_intent(glink_gpr_their_cid,10,4096);assert(allocations==1);
+        assert(take(296,&id)&&id==10);receive_done(GLINK_RX_DONE,glink_gpr_their_cid,10);
+        assert(allocations==0);
     } else {
         unsigned mode=scenario-8;
         receive_intent(glink_gpr_their_cid,10,64);
@@ -227,7 +247,7 @@ class IntentTests(unittest.TestCase):
     def test_production_receive_and_ownership(self):
         constants = '\n'.join(line for line in SOURCE.splitlines() if re.match(
             r'#define (?:GLINK_|GPR_|IPCC_|ITEM_GLINK_THEIR_Q|APM_CMD_|OP_)\w*\s+(?:0x[\da-fA-F]+|\d+)u?$', line))
-        pool = re.search(r'struct glink_intent_pool \{.*?\n\};', SOURCE, re.S).group()
+        pool = '\n'.join(re.findall(r'struct glink_(?:remote_intent|intent_pool) \{.*?\n\};', SOURCE, re.S))
         source = HEADER.replace('static uint8_t smem', constants + '\n' + pool +
             '\nstatic struct glink_intent_pool glink_gpr_intents,glink_pmic_intents;\nstatic uint8_t smem')
         source += 'static void glink_poll_rx(void);\n'
@@ -240,14 +260,15 @@ class IntentTests(unittest.TestCase):
         source += ''.join(function(name) for name in ('adsp_pmic_glink_tx','glink_poll_rx','annibale_adsp_gpr_send',
                                                      'annibale_adsp_gpr_ready'))
         source += MAIN
-        names = ('capacity','in-flight','duplicate','retirement','full-pool','unsent-retry',
+        names = ('capacity','in-flight','duplicate','retirement','firmware-intents','unsent-retry',
                  'channel-isolation','concurrent-receive','basic-success','basic-error','token','port','short-result',
                  'pmic-unsent-retry','requested-intent','request-timeout-recovery','ready-after-retirement',
-                 'error-then-success')
+                 'error-then-success','allocation-recovery')
         with tempfile.TemporaryDirectory(prefix='audio-intents-') as directory:
             cfile,binary=Path(directory)/'test.c',Path(directory)/'test'
             cfile.write_text(source)
-            subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-Wno-unused-variable','-pthread',
+            subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-Wno-unused-variable','-Wno-unused-function','-pthread',
+                            '-fsanitize=address,undefined',
                             str(cfile),'-o',str(binary)],check=True)
             for scenario,name in enumerate(names):
                 with self.subTest(name=name):
