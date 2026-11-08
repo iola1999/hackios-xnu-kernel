@@ -116,7 +116,8 @@ ramfs_disk_mount(struct ramfs_mount *rm)
 		}
 		if (!loaded) goto fail;
 	}
-	rm->rm_meta_call = thread_call_allocate(ramfs_disk_meta_thread, (thread_call_param_t)rm);
+	rm->rm_meta_call = thread_call_allocate_with_options(ramfs_disk_meta_thread, (thread_call_param_t)rm,
+	    THREAD_CALL_PRIORITY_HIGH, THREAD_CALL_OPTIONS_ONCE);
 	if (rm->rm_meta_call == NULL) { error = ENOMEM; goto fail; }
 	/* Publish only after every allocation and recovery check has succeeded. */
 	rm->rm_disk_loading = false;
@@ -148,20 +149,36 @@ fail:
 	return error;
 }
 
-static void
+static int
 ramfs_disk_unmount(struct ramfs_mount *rm)
 {
-	if (!rm->rm_disk_backed) return;
-	if (rm->rm_meta_call != NULL) {
-		(void)thread_call_cancel_wait((thread_call_t)rm->rm_meta_call);
-		(void)thread_call_free((thread_call_t)rm->rm_meta_call);
-		rm->rm_meta_call = NULL;
+	thread_call_t call;
+	int error;
+
+	if (!rm->rm_disk_backed) return 0;
+	/* Detach before waiting so a running checkpoint cannot schedule another call. */
+	lck_mtx_lock(&rm->rm_lock);
+	call = (thread_call_t)rm->rm_meta_call;
+	rm->rm_meta_call = NULL;
+	lck_mtx_unlock(&rm->rm_lock);
+	if (call != NULL) {
+		(void)thread_call_cancel_wait(call);
 	}
-	(void)ramfs_disk_sync(rm);
+	error = ramfs_disk_sync(rm);
+	if (error != 0) {
+		lck_mtx_lock(&rm->rm_lock);
+		rm->rm_meta_call = call;
+		lck_mtx_unlock(&rm->rm_lock);
+		return error;
+	}
+	if (call != NULL) {
+		(void)thread_call_free(call);
+	}
 	if (rm == ramfs_disk_rm) {
 		ramfs_disk_rm = NULL;
 		ramfs_disk_claimed = false;
 	}
 	ramfs_disk_release_buffers(rm);
 	rm->rm_disk_backed = false;
+	return 0;
 }

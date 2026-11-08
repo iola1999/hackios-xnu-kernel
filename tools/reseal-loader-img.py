@@ -29,6 +29,33 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MKBOOTIMG = os.path.join(HERE, '..', 'Mu-Silicium', 'Resources', 'Scripts', 'mkbootimg.py')
 
 
+def validate_container(container):
+    if len(container) < 32 or container[:4] != b'XNUP':
+        raise ValueError('payload: not an XNUP container')
+    if struct.unpack_from('<I', container, 4)[0] != len(container) - 8:
+        raise ValueError('payload: declared length differs from file length')
+    at = 8
+    while at + 24 <= len(container):
+        header = container[at:at + 24]
+        name, size, reserved = struct.unpack('<16sII', header)
+        at += 24
+        if name[0] == 0:
+            if header != bytes(24) or at != len(container):
+                raise ValueError('payload: invalid terminator')
+            return
+        if b'\0' not in name or reserved:
+            raise ValueError('payload: invalid entry header')
+        name = name.split(b'\0', 1)[0]
+        if name == b'payload.lz4':
+            # The loader consumes kernel/ramdisk entries directly; it does not unpack this entry.
+            raise ValueError('payload: payload.lz4 is unsupported; pass the uncompressed standalone XNUP')
+        end = at + size
+        at += (size + 15) & ~15
+        if at > len(container) or any(container[end:at]):
+            raise ValueError('payload: truncated entry or nonzero padding')
+    raise ValueError('payload: missing terminator')
+
+
 def split(image):
     if image[:8] != b'ANDROID!':
         sys.exit('reference: not an Android boot image')
@@ -52,8 +79,10 @@ def main():
 
     prefix, dtb, ramdisk = split(open(args.reference, 'rb').read())
     container = open(args.payload, 'rb').read()
-    if container[:4] != b'XNUP':
-        sys.exit('payload: not an XNUP container')
+    try:
+        validate_container(container)
+    except ValueError as error:
+        sys.exit(str(error))
     blob = prefix + container + b'\0' * (-len(container) % 16)
     packer = zlib.compressobj(9, zlib.DEFLATED, 31, 8)
     with tempfile.TemporaryDirectory(prefix='reseal-') as tmp:

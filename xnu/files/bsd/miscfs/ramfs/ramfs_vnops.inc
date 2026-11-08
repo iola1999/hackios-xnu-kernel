@@ -317,7 +317,10 @@ ramfs_setattr(struct vnop_setattr_args *ap)
 			return EINVAL;
 		}
 		/* what a mapping changed must reach us before the size moves under it */
-		ramfs_sync_mapping(vp, node);
+		int error = ramfs_sync_mapping(vp, node);
+		if (error) {
+			return error;
+		}
 	}
 
 	lck_mtx_lock(&rm->rm_lock);
@@ -391,7 +394,10 @@ ramfs_read(struct vnop_read_args *ap)
 	if (node->rn_type != VREG || uio_offset(uio) < 0) {
 		return EINVAL;
 	}
-	ramfs_sync_mapping(vp, node);
+	error = ramfs_sync_mapping(vp, node);
+	if (error) {
+		return error;
+	}
 
 	bounce = kalloc_data(PAGE_SIZE, Z_WAITOK | Z_NOFAIL);
 	while (uio_resid(uio) > 0 && !error) {
@@ -434,7 +440,10 @@ ramfs_write(struct vnop_write_args *ap)
 	if (uio_resid(uio) == 0) {
 		return 0;
 	}
-	ramfs_sync_mapping(vp, node);
+	error = ramfs_sync_mapping(vp, node);
+	if (error) {
+		return error;
+	}
 
 	lck_mtx_lock(&rm->rm_lock);
 	old_size = node->rn_size;

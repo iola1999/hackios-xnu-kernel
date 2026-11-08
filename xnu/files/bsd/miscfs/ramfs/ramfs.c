@@ -638,12 +638,13 @@ ramfs_refresh_cache(vnode_t vp, struct ramfs_node *node, uint64_t start, uint64_
 }
 
 /* A mapping may hold changes that have not been paged out to us yet: get them. */
-static void
+static int
 ramfs_sync_mapping(vnode_t vp, struct ramfs_node *node)
 {
 	if (node->rn_mapped_write) {
-		(void)ubc_msync(vp, 0, ubc_getsize(vp), NULL, UBC_PUSHDIRTY | UBC_SYNC);
+		return ubc_msync(vp, 0, ubc_getsize(vp), NULL, UBC_PUSHDIRTY | UBC_SYNC);
 	}
+	return 0;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -803,7 +804,10 @@ ramfs_unmount(mount_t mp, int mntflags, __unused vfs_context_t ctx)
 	if (error) {
 		return error;
 	}
-	ramfs_disk_unmount(rm);
+	error = ramfs_disk_unmount(rm);
+	if (error) {
+		return error;
+	}
 	lck_mtx_lock(&rm->rm_lock);
 	ramfs_free_tree(rm->rm_root);
 	ramfs_node_free(rm->rm_root);

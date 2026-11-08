@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile the production checkpoint reader and mount code against fault-injected UFS I/O."""
+"""Test production RDWFS recovery, unmount retries, and callout lifetime with UFS faults."""
 from pathlib import Path
 import subprocess
 import tempfile
@@ -11,7 +11,7 @@ disk = (SRC / 'ramfs_disk.inc').read_text()
 structs = main[main.index('struct ramfs_mount;'):main.index('/* file pages in use')]
 format_defs = disk[disk.index('#define RDWFS_MAGIC_STR'):disk.index('static void ramfs_disk_dirty_locked')]
 find_ino = disk[disk.index('static struct ramfs_node *\nramfs_disk_find_ino'):disk.index('#include "ramfs_disk_restore.inc"')]
-pack_sync = disk[disk.index('static int\nramfs_disk_pack_locked'):disk.index('static void\nramfs_disk_meta_thread')]
+pack_sync = disk[disk.index('static void\nramfs_disk_dirty_locked'):disk.index('void ramfs_disk_flush_all(void);')]
 source = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -23,6 +23,7 @@ source = r'''
 #include <sys/types.h>
 #include <sys/queue.h>
 #include <time.h>
+#include <pthread.h>
 #include <zlib.h>
 #define PAGE_SIZE 16384
 #define PAGE_MASK (PAGE_SIZE - 1)
@@ -43,16 +44,16 @@ source = r'''
 #define __unused __attribute__((unused))
 #endif
 #define LCK_ATTR_NULL NULL
-#define lck_mtx_init(...) ((void)0)
-#define lck_mtx_destroy(...) ((void)0)
+#define lck_mtx_init(p, ...) assert(pthread_mutex_init(p, NULL) == 0)
+#define lck_mtx_destroy(p, ...) assert(pthread_mutex_destroy(p) == 0)
 #ifndef __APPLE__
 typedef uintptr_t user_addr_t;
 #endif
 typedef void *vfs_context_t;
-typedef int lck_mtx_t;
+typedef pthread_mutex_t lck_mtx_t;
 typedef void *mount_t;
 typedef void *vnode_t;
-typedef void *thread_call_t;
+typedef struct test_call *thread_call_t;
 typedef void *thread_call_param_t;
 enum vtype { VNON, VREG, VDIR, VBLK, VCHR, VLNK, VSOCK, VFIFO, VBAD };
 static size_t allocations, alloc_call, fail_alloc;
@@ -74,18 +75,91 @@ static void release(void *p) { if (p) { allocations--; free(p); } }
 #define ramfs_vm_free(p,n) release(p)
 #define ramfs_page_alloc(z) allocate(PAGE_SIZE)
 #define ramfs_page_free(p) release(p)
-#define lck_mtx_lock(p) ((void)0)
-#define lck_mtx_unlock(p) ((void)0)
-#define msleep(...) ((void)0)
-#define wakeup(p) ((void)0)
+#define lck_mtx_lock(p) assert(pthread_mutex_lock(p) == 0)
+#define lck_mtx_unlock(p) assert(pthread_mutex_unlock(p) == 0)
+static pthread_cond_t sync_cv = PTHREAD_COND_INITIALIZER;
+static void wait_cond(pthread_cond_t *cv, pthread_mutex_t *lock) {
+    struct timespec deadline;
+    assert(clock_gettime(CLOCK_REALTIME, &deadline) == 0);
+    deadline.tv_sec += 5;
+    assert(pthread_cond_timedwait(cv, lock, &deadline) == 0);
+}
+#define msleep(p, lock, ...) wait_cond(&sync_cv, lock)
+#define wakeup(p) assert(pthread_cond_broadcast(&sync_cv) == 0)
 #define clock_interval_to_deadline(a,b,p) (*(p) = 1)
-#define thread_call_enter_delayed(a,b) ((void)0)
-#define thread_call_cancel_wait(p) 0
-#define thread_call_free(p) (release(p), 0)
+#define THREAD_CALL_PRIORITY_HIGH 0
+#define THREAD_CALL_OPTIONS_ONCE 1
+struct test_call {
+    pthread_mutex_t lock;
+    pthread_cond_t cv;
+    void (*func)(void *, void *);
+    void *arg;
+    unsigned options;
+    bool pending, running;
+};
+static void *thread_call_allocate_with_options(void (*func)(void *, void *), void *arg,
+                                               unsigned priority, unsigned options) {
+    (void)priority;
+    struct test_call *call = allocate(sizeof(*call));
+    if (call) {
+        lck_mtx_init(&call->lock);
+        assert(pthread_cond_init(&call->cv, NULL) == 0);
+        call->func = func; call->arg = arg; call->options = options;
+    }
+    return call;
+}
+static void thread_call_enter_delayed(thread_call_t call, uint64_t deadline) {
+    (void)deadline;
+    lck_mtx_lock(&call->lock); call->pending = true; lck_mtx_unlock(&call->lock);
+}
+static bool thread_call_free(thread_call_t call) {
+    lck_mtx_lock(&call->lock);
+    assert(!call->pending && !call->running);
+    lck_mtx_unlock(&call->lock);
+    lck_mtx_destroy(&call->lock);
+    assert(pthread_cond_destroy(&call->cv) == 0);
+    release(call); return true;
+}
+static pthread_mutex_t event_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t event_cv = PTHREAD_COND_INITIALIZER;
+static bool pause_callback, callback_entered, release_callback;
+static bool pause_io, io_entered, release_io, cancel_entered, unmount_done;
 static uint64_t ramfs_var_used_pages;
 '''
 source += structs + format_defs
 source += r'''
+/* Match XNU's cancellation contract; production ONCE selection must wait for both states. */
+static bool thread_call_cancel_wait(thread_call_t call) {
+    struct ramfs_mount *rm = call->arg;
+    assert(pthread_mutex_trylock(&rm->rm_lock) == 0);
+    assert(rm->rm_meta_call == NULL);
+    lck_mtx_unlock(&rm->rm_lock);
+    lck_mtx_lock(&call->lock);
+    bool canceled = call->pending;
+    call->pending = false;
+    lck_mtx_lock(&event_lock); cancel_entered = true;
+    pthread_cond_broadcast(&event_cv); lck_mtx_unlock(&event_lock);
+    while (call->running && (!canceled || (call->options & THREAD_CALL_OPTIONS_ONCE))) {
+        wait_cond(&call->cv, &call->lock);
+    }
+    lck_mtx_unlock(&call->lock);
+    return canceled;
+}
+static void *run_call(void *arg) {
+    thread_call_t call = arg;
+    lck_mtx_lock(&call->lock);
+    assert(call->pending && !call->running);
+    call->pending = false; call->running = true;
+    lck_mtx_unlock(&call->lock);
+    lck_mtx_lock(&event_lock); callback_entered = true;
+    pthread_cond_broadcast(&event_cv);
+    while (pause_callback && !release_callback) wait_cond(&event_cv, &event_lock);
+    lck_mtx_unlock(&event_lock);
+    call->func(call->arg, NULL);
+    lck_mtx_lock(&call->lock); call->running = false;
+    pthread_cond_broadcast(&call->cv); lck_mtx_unlock(&call->lock);
+    return NULL;
+}
 static uint8_t *device;
 static bool device_present = true;
 static int64_t io_fail = -1;
@@ -95,6 +169,15 @@ static uint64_t last_write;
 static bool redwood_ufs_var_info(uint64_t *size) { *size = 1ULL << 30; return device_present; }
 static int redwood_ufs_var_io(bool write, uint64_t offset, void *buf, uint64_t len) {
     assert(offset + len <= 64ULL << 20);
+    if (write) {
+        lck_mtx_lock(&event_lock);
+        if (pause_io) {
+            io_entered = true; pthread_cond_broadcast(&event_cv);
+            while (!release_io) wait_cond(&event_cv, &event_lock);
+            pause_io = false;
+        }
+        lck_mtx_unlock(&event_lock);
+    }
     if ((int64_t)offset == io_fail) {
         if (write && partial_write != 0) {
             assert(partial_write < len);
@@ -141,14 +224,10 @@ static void ramfs_node_free(struct ramfs_node *n) {
     release(n->rn_pages); release(n->rn_blocks); release(n->rn_target);
     rm->rm_nodes--; release(n);
 }
-static void ramfs_disk_meta_thread(void *a, void *b) { (void)a; (void)b; }
-static void *thread_call_allocate(void (*f)(void *, void *), void *arg) {
-    (void)f; (void)arg; return allocate(1);
-}
 static void ramfs_disk_restore_panic_log(struct ramfs_mount *rm) { (void)rm; panic_calls++; }
 '''
-source += find_ino + (SRC / 'ramfs_disk_restore.inc').read_text() + pack_sync
 source += '#define ramfs_disk_sync(rm) ramfs_disk_sync_impl(rm)\n'
+source += find_ino + (SRC / 'ramfs_disk_restore.inc').read_text() + pack_sync
 source += (SRC / 'ramfs_disk_mount.inc').read_text()
 source += r'''
 struct vfsstatfs { char f_mntonname[64]; };
@@ -157,6 +236,11 @@ static uint64_t max_mem = 1ULL << 30;
 static bool ufs_boot = true;
 #define vfs_isupdate(mp) false
 #define vfs_setfsprivate(mp, p) (((struct test_mount *)(mp))->private = (p))
+#define vfs_fsprivate(mp) (((struct test_mount *)(mp))->private)
+#define RAMFS_MP(mp) ((struct ramfs_mount *)vfs_fsprivate(mp))
+#define NULLVP NULL
+#define MNT_FORCE 1
+#define FORCECLOSE 1
 #define vfs_setlocklocal(mp) ((void)0)
 #define vfs_setextendedsecurity(mp) ((void)0)
 #define vfs_getnewfsid(mp) ((void)0)
@@ -166,12 +250,17 @@ static bool ufs_boot = true;
 static bool PE_parse_boot_argn(const char *key, char *out, size_t size) {
     (void)key; if (ufs_boot) snprintf(out, size, "ufs_darwin"); return ufs_boot;
 }
+static int vflush_error;
+static int vflush(mount_t mp, vnode_t skip, int flags) {
+    (void)mp; (void)skip; (void)flags; return vflush_error;
+}
 '''
-source += main[main.index('static int\nramfs_mount('):main.index('/* Free a directory')]
+source += main[main.index('static int\nramfs_mount('):main.index('static int\nramfs_root(')]
 source += r'''
 static void setup(struct ramfs_mount *rm) {
     assert(allocations == 0 && ramfs_var_used_pages == 0);
     memset(device, 0, 64ULL << 20); memset(rm, 0, sizeof(*rm));
+    lck_mtx_init(&rm->rm_lock); lck_mtx_init(&rm->rm_rename_lock);
     device_present = true; io_fail = -1; partial_write = 0; writes = panic_calls = 0;
     ramfs_disk_claimed = false; ramfs_disk_rm = NULL;
     fail_alloc = alloc_call = 0;
@@ -179,8 +268,9 @@ static void setup(struct ramfs_mount *rm) {
     ramfs_disk_empty_root(rm);
 }
 static void cleanup(struct ramfs_mount *rm) {
-    if (rm->rm_meta_call) release(rm->rm_meta_call);
+    if (rm->rm_meta_call) thread_call_free(rm->rm_meta_call);
     ramfs_disk_clear_nodes(rm); ramfs_disk_release_buffers(rm); free(rm->rm_hash);
+    lck_mtx_destroy(&rm->rm_lock); lck_mtx_destroy(&rm->rm_rename_lock);
     assert(allocations == 0 && ramfs_var_used_pages == 0 && rm->rm_pages == 0);
 }
 static void checkpoint(unsigned slot, uint64_t gen, bool partial) {
@@ -202,6 +292,126 @@ static void checkpoint(unsigned slot, uint64_t gen, bool partial) {
     s->node_count = partial ? 3 : 1; s->payload_bytes = bytes;
     s->payload_crc = (uint32_t)crc32(0, base + RDWFS_SUPER_BYTES, (uInt)bytes);
     s->super_crc = (uint32_t)crc32(0, (void *)s, __builtin_offsetof(struct rdwfs_super, super_crc));
+}
+static struct ramfs_mount *mounted_checkpoint(struct test_mount *mp) {
+    assert(allocations == 0 && ramfs_var_used_pages == 0);
+    memset(device, 0, 64ULL << 20); memset(mp, 0, sizeof(*mp));
+    checkpoint(0, 3, false); checkpoint(1, 4, false);
+    ramfs_disk_claimed = false; ramfs_disk_rm = NULL;
+    device_present = ufs_boot = true; io_fail = -1; partial_write = 0;
+    fail_alloc = alloc_call = 0; writes = 0; vflush_error = 0;
+    pause_callback = callback_entered = release_callback = false;
+    pause_io = io_entered = release_io = cancel_entered = unmount_done = false;
+    strcpy(mp->stat.f_mntonname, "/private/var");
+    assert(ramfs_mount(mp, NULL, 0, NULL) == 0);
+    return mp->private;
+}
+static void dirty_mode(struct ramfs_mount *rm, uint32_t mode) {
+    lck_mtx_lock(&rm->rm_lock);
+    rm->rm_root->rn_mode = mode; ramfs_disk_dirty_locked(rm);
+    lck_mtx_unlock(&rm->rm_lock);
+}
+static void assert_released(struct test_mount *mp) {
+    assert(mp->private == NULL && ramfs_disk_rm == NULL && !ramfs_disk_claimed);
+    assert(allocations == 0 && ramfs_var_used_pages == 0);
+}
+static void unmount_retry_tests(void) {
+    for (unsigned fault = 0; fault < 2; fault++) {
+        struct test_mount mp;
+        struct ramfs_mount *rm = mounted_checkpoint(&mp);
+        thread_call_t call = rm->rm_meta_call;
+        void *meta = rm->rm_meta_buf, *io_page = rm->rm_io_page, *bmap = rm->rm_bmap;
+        struct ramfs_node *root = rm->rm_root;
+        uint8_t committed[8192];
+        memcpy(committed, device + RDWFS_SLOT1_OFFSET, sizeof(committed));
+        dirty_mode(rm, 0700);
+        assert(call->pending);
+        vflush_error = EBUSY;
+        assert(ramfs_unmount(&mp, 0, NULL) == EBUSY && writes == 0 && call->pending);
+        vflush_error = 0;
+        io_fail = fault == 0 ? RDWFS_SUPER_BYTES : RDWFS_SLOT0_OFFSET;
+        partial_write = fault == 0 ? 128 : 0;
+        assert(ramfs_unmount(&mp, 0, NULL) == EIO);
+        assert(mp.private == rm && ramfs_disk_rm == rm && ramfs_disk_claimed);
+        assert(rm->rm_disk_backed && rm->rm_meta_dirty && rm->rm_meta_gen == 4);
+        assert(rm->rm_meta_call == call && rm->rm_meta_buf == meta && rm->rm_io_page == io_page);
+        assert(rm->rm_bmap == bmap && rm->rm_root == root && !call->pending && !call->running);
+        assert(memcmp(committed, device + RDWFS_SLOT1_OFFSET, sizeof(committed)) == 0);
+        dirty_mode(rm, 0600);
+        assert(call->pending);
+        io_fail = -1; partial_write = 0;
+        if (fault == 1) {
+            pthread_t worker;
+            assert(pthread_create(&worker, NULL, run_call, call) == 0);
+            assert(pthread_join(worker, NULL) == 0);
+            assert(!rm->rm_meta_dirty && rm->rm_meta_gen == 5);
+        }
+        assert(ramfs_unmount(&mp, 0, NULL) == 0);
+        assert_released(&mp);
+        assert(((struct rdwfs_super *)device)->generation == 5);
+        assert(((struct rdwfs_inode_rec *)(device + RDWFS_SUPER_BYTES))->mode == 0600);
+    }
+}
+static int unmount_result;
+static void *run_unmount(void *arg) {
+    int error = ramfs_unmount(arg, 0, NULL);
+    lck_mtx_lock(&event_lock);
+    unmount_result = error; unmount_done = true;
+    pthread_cond_broadcast(&event_cv); lck_mtx_unlock(&event_lock);
+    return NULL;
+}
+static void wait_event(bool *flag) {
+    lck_mtx_lock(&event_lock);
+    while (!*flag) wait_cond(&event_cv, &event_lock);
+    lck_mtx_unlock(&event_lock);
+}
+static void assert_unmount_waits(void) {
+    wait_event(&cancel_entered);
+    lck_mtx_lock(&event_lock);
+    struct timespec deadline;
+    assert(clock_gettime(CLOCK_REALTIME, &deadline) == 0);
+    deadline.tv_nsec += 100000000;
+    if (deadline.tv_nsec >= 1000000000) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000; }
+    int error = 0;
+    while (!unmount_done && error == 0) {
+        error = pthread_cond_timedwait(&event_cv, &event_lock, &deadline);
+    }
+    assert(error == ETIMEDOUT && !unmount_done);
+    lck_mtx_unlock(&event_lock);
+}
+static void callout_tests(void) {
+    for (unsigned stage = 0; stage < 3; stage++) {
+        struct test_mount mp;
+        struct ramfs_mount *rm = mounted_checkpoint(&mp);
+        thread_call_t call = rm->rm_meta_call;
+        pthread_t worker, unmount_worker;
+        dirty_mode(rm, 0700);
+        pause_callback = stage == 0; pause_io = stage != 0;
+        assert(pthread_create(&worker, NULL, run_call, call) == 0);
+        wait_event(stage == 0 ? &callback_entered : &io_entered);
+        dirty_mode(rm, 0600);
+        if (stage < 2) {
+            assert(pthread_create(&unmount_worker, NULL, run_unmount, &mp) == 0);
+            assert_unmount_waits();
+        }
+        lck_mtx_lock(&event_lock); release_callback = release_io = true;
+        pthread_cond_broadcast(&event_cv); lck_mtx_unlock(&event_lock);
+        assert(pthread_join(worker, NULL) == 0);
+        if (stage < 2) {
+            assert(pthread_join(unmount_worker, NULL) == 0 && unmount_result == 0);
+        } else {
+            /* A checkpoint changed during I/O must still schedule its next commit. */
+            assert(call->pending && rm->rm_meta_dirty && rm->rm_meta_gen == 5);
+            assert(pthread_create(&worker, NULL, run_call, call) == 0);
+            assert(pthread_join(worker, NULL) == 0);
+            assert(!call->pending && !rm->rm_meta_dirty && rm->rm_meta_gen == 6);
+            assert(ramfs_unmount(&mp, 0, NULL) == 0);
+        }
+        assert_released(&mp);
+        unsigned slot = stage == 0 ? 0 : 1;
+        struct rdwfs_inode_rec *root = (void *)(device + slot * RDWFS_SLOT_MAX + RDWFS_SUPER_BYTES);
+        assert(root->mode == 0600);
+    }
 }
 int main(void) {
     device = calloc(1, 64ULL << 20); assert(device);
@@ -248,6 +458,7 @@ int main(void) {
         cleanup(&rm);
 
         memset(&rm, 0, sizeof(rm));
+        lck_mtx_init(&rm.rm_lock); lck_mtx_init(&rm.rm_rename_lock);
         rm.rm_hash = calloc(RAMFS_HASH_SIZE, sizeof(*rm.rm_hash)); assert(rm.rm_hash);
         ramfs_disk_empty_root(&rm); ramfs_disk_claimed = false; ramfs_disk_rm = NULL;
         io_fail = -1; partial_write = 0;
@@ -284,12 +495,12 @@ int main(void) {
         else {
             struct ramfs_mount *mounted = mp.private;
             assert(!mounted->rm_disk_backed && mounted->rm_nodes == 1);
-            ramfs_disk_clear_nodes(mounted);
-            release(mounted->rm_hash); release(mounted);
+            assert(ramfs_unmount(&mp, 0, NULL) == 0 && mp.private == NULL);
         }
         assert(allocations == 0);
     }
-    free(device); puts("ramfs recovery: missing device, allocation/I/O faults, interrupted writes, corrupt/empty slots, fallback and small checkpoints passed");
+    unmount_retry_tests(); callout_tests();
+    free(device); puts("ramfs recovery: recovery faults, unmount retries and callout lifetime passed");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='ramfs-recovery-') as tmp:
@@ -297,5 +508,5 @@ with tempfile.TemporaryDirectory(prefix='ramfs-recovery-') as tmp:
     exe = Path(tmp) / 'test'
     c.write_text(source)
     subprocess.run(['cc', '-std=gnu11', '-g', '-fsanitize=address,undefined', '-Wno-incompatible-pointer-types',
-                    str(c), '-lz', '-o', str(exe)], check=True)
+                    str(c), '-lz', '-pthread', '-o', str(exe)], check=True)
     subprocess.run([str(exe)], check=True)

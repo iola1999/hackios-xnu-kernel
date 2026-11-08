@@ -11,8 +11,11 @@ ramfs_ioctl(struct vnop_ioctl_args *ap)
 {
 	if (ap->a_command == F_FULLFSYNC || ap->a_command == 85 /* F_BARRIERFSYNC */) {
 		struct ramfs_node *node = RAMFS_NODE(ap->a_vp);
+		int error = ramfs_sync_mapping(ap->a_vp, node);
 
-		ramfs_sync_mapping(ap->a_vp, node);
+		if (error) {
+			return error;
+		}
 		return ramfs_disk_sync(node->rn_mount);
 	}
 	return ap->a_command == RAMFS_APFSIOC_MARK_PURGEABLE ? 0 : ENOTTY;
@@ -23,8 +26,11 @@ ramfs_fsync(struct vnop_fsync_args *ap)
 {
 	struct ramfs_node *node = RAMFS_NODE(ap->a_vp);
 	struct ramfs_mount *rm = node->rn_mount;
+	int error = ramfs_sync_mapping(ap->a_vp, node);
 
-	ramfs_sync_mapping(ap->a_vp, node);
+	if (error) {
+		return error;
+	}
 	if (rm != NULL && node->rn_ino == RAMFS_ROOT_INO && !rm->rm_seed_done) {
 		ramfs_disk_mark_seed_done(rm);
 	}
