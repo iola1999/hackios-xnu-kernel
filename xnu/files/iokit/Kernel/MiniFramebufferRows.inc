@@ -26,7 +26,9 @@ struct RowJob {
 	uint32_t        stride;
 	int32_t         sx, sy, sw, sh, px0, py0, px1, py1, cx0, cx1;
 	int32_t         by0, by1;       /* the panel rows this frame draws (dirtyBand), within py0..py1 */
-	bool            filter, unscaled;
+	uint32_t        bufferSeq;      /* fRowSeq when the target panel buffer was last updated */
+	bool            filter, unscaled, allDirty, hashPhase, hashKnown;
+	int32_t         hashFirst[8], hashLast[8];
 };
 
 void
@@ -47,14 +49,29 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 		}
 		to = (uint32_t *) (fBase + (size_t) y * fRowBytes);
 		if (job->unscaled) {
+			int32_t r = y - py0;
+
+			if (!job->allDirty && fRowChanged != NULL && (uint32_t) r < (uint32_t) sh &&
+			    fRowChanged[r] <= job->bufferSeq) {
+				continue;
+			}
 			/* not scaled at all */
-			memcpy(to + px0, pixels + (size_t) (sy + y - py0) * stride + (size_t) sx * 4, (size_t) sw * 4);
+			memcpy(to + px0, pixels + (size_t) (sy + r) * stride + (size_t) sx * 4, (size_t) sw * 4);
 			continue;
 		}
 		if (filter) {
 			int64_t at = sample_at(y - py0, sh, py1 - py0);
 			uint32_t row = (uint32_t) (at >> 8), weight = (uint32_t) (at & 255);
-			const uint32_t * upper = (const uint32_t *) (pixels + (size_t) (sy + row) * stride) + sx;
+			uint32_t r0 = row > 0 ? row - 1 : 0;
+			uint32_t r1 = row + 1 < (uint32_t) sh ? row + 1 : row;
+			const uint32_t * upper;
+
+			if (!job->allDirty && fRowChanged != NULL &&
+			    fRowChanged[r0] <= job->bufferSeq && fRowChanged[row] <= job->bufferSeq &&
+			    fRowChanged[r1] <= job->bufferSeq) {
+				continue;
+			}
+			upper = (const uint32_t *) (pixels + (size_t) (sy + row) * stride) + sx;
 
 			if (weight == 0 || row + 1 >= (uint32_t) sh) {
 				from = upper;
@@ -66,7 +83,13 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 				from = blendRow;
 			}
 		} else {
-			from = (const uint32_t *) (pixels + (size_t) (sy + (int64_t) (y - py0) * sh / (py1 - py0)) * stride);
+			uint32_t row = (uint32_t) ((int64_t) (y - py0) * sh / (py1 - py0));
+
+			if (!job->allDirty && fRowChanged != NULL && row < (uint32_t) sh &&
+			    fRowChanged[row] <= job->bufferSeq) {
+				continue;
+			}
+			from = (const uint32_t *) (pixels + (size_t) (sy + row) * stride);
 		}
 		if (fDiff) {
 			for (int32_t x = cx0; x < cx1; x++) {
@@ -116,11 +139,15 @@ IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
 		job = fb->fHelperJob;
 		IOLockUnlock(fb->fHelperLock);
 		/* share index + 1 of fThreads (the presenter takes share 0) */
-		rows = job->by1 - job->by0;
-		y0 = job->by0 + (int32_t) ((int64_t) rows * (index + 1) / fb->fThreads);
-		y1 = job->by0 + (int32_t) ((int64_t) rows * (index + 2) / fb->fThreads);
-		blend = fb->fHelperBlend[index];
-		fb->drawRows(job, y0, y1, blend);
+		if (job->hashPhase) {
+			fb->hashRows((RowJob *) job, index + 1, fb->fThreads);
+		} else {
+			rows = job->by1 - job->by0;
+			y0 = job->by0 + (int32_t) ((int64_t) rows * (index + 1) / fb->fThreads);
+			y1 = job->by0 + (int32_t) ((int64_t) rows * (index + 2) / fb->fThreads);
+			blend = fb->fHelperBlend[index];
+			fb->drawRows(job, y0, y1, blend);
+		}
 		IOLockLock(fb->fHelperLock);
 		fb->fHelpersBusy--;
 		if (fb->fHelpersBusy == 0) {
@@ -150,19 +177,80 @@ IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
 #define ROWS_SOON_NS    (25 * NSEC_PER_MSEC)
 #define ROWS_UNHASHED   16
 
+void
+IOMobileFramebuffer::hashRows(RowJob * job, unsigned share, unsigned shares)
+{
+	int32_t r0 = (int32_t) ((int64_t) job->sh * share / shares);
+	int32_t r1 = (int32_t) ((int64_t) job->sh * (share + 1) / shares);
+	int32_t words = job->sw / 2, first = -1, last = -1;
+	bool known = job->hashKnown;
+	uint32_t seq = fRowSeq;
+
+	for (int32_t r = r0; r < r1; r++) {
+		const uint64_t * w = (const uint64_t *) (job->pixels + (size_t) (job->sy + r) * job->stride + (size_t) job->sx * 4);
+		int32_t i = 0;
+		uint64_t h0;
+#if defined(__aarch64__) || defined(__x86_64__)
+		fb_u64x2 v0 = { 0xcbf29ce484222325ULL, 1ULL };
+		fb_u64x2 v1 = { 2ULL, 3ULL };
+		fb_u64x2 prime = { 0x100000001b3ULL, 0x100000001b3ULL };
+
+		for (; i + 8 <= words; i += 8) {
+			fb_u64x2 a0, a1, b0, b1;
+
+			__builtin_memcpy(&a0, w + i, 16);
+			__builtin_memcpy(&a1, w + i + 2, 16);
+			__builtin_memcpy(&b0, w + i + 4, 16);
+			__builtin_memcpy(&b1, w + i + 6, 16);
+			v0 = (v0 ^ a0) * prime ^ a1;
+			v1 = (v1 ^ b0) * prime ^ b1;
+		}
+		h0 = v0[0] ^ (v0[1] * 3) ^ (v1[0] * 5) ^ (v1[1] * 7);
+#else
+		uint64_t h[4] = { 0xcbf29ce484222325ULL, 1, 2, 3 };
+
+		for (; i + 8 <= words; i += 8) {
+			h[0] = (h[0] ^ w[i]) * 0x100000001b3ULL ^ w[i + 1];
+			h[1] = (h[1] ^ w[i + 2]) * 0x100000001b3ULL ^ w[i + 3];
+			h[2] = (h[2] ^ w[i + 4]) * 0x100000001b3ULL ^ w[i + 5];
+			h[3] = (h[3] ^ w[i + 6]) * 0x100000001b3ULL ^ w[i + 7];
+		}
+		h0 = h[0] ^ (h[1] * 3) ^ (h[2] * 5) ^ (h[3] * 7);
+#endif
+		for (; i < words; i++) {
+			h0 = (h0 ^ w[i]) * 0x100000001b3ULL;
+		}
+		if (job->sw & 1) {
+			h0 = (h0 ^ ((const uint32_t *) w)[job->sw - 1]) * 0x100000001b3ULL;
+		}
+		if (!known || h0 != fRowHash[r]) {
+			first = first < 0 ? r : first;
+			last = r;
+			fRowChanged[r] = seq;
+		}
+		fRowHash[r] = h0;
+	}
+	job->hashFirst[share] = first;
+	job->hashLast[share] = last;
+}
+
 bool
 IOMobileFramebuffer::dirtyBand(RowJob * job)
 {
 	int32_t geometry[8] = { job->sx, job->sy, job->sw, job->sh, job->px0, job->py0, job->px1, job->py1 };
-	int32_t first = -1, last = -1, words = job->sw / 2;
+	int32_t first = -1, last = -1;
 	int64_t span = job->py1 - job->py0;
 	uint64_t now = mach_absolute_time(), gap;
 	bool known;
 
 	job->by0 = job->py0;
 	job->by1 = job->py1;
+	job->allDirty = true;
+	job->hashPhase = false;
+	fRowSeq++;
 	if (!gRows || !fSingleLayer || fDiff || (job->sx & 1) != 0 || (job->stride & 7) != 0) {
 		fRowHashRows = 0;
+		fAllChangedSeq = fRowSeq;
 		return true;
 	}
 	absolutetime_to_nanoseconds(now - fBandAt, &gap);
@@ -174,50 +262,71 @@ IOMobileFramebuffer::dirtyBand(RowJob * job)
 		fUnhashed++;
 		fStatUnhashed++;
 		fRowHashRows = 0;
+		fAllChangedSeq = fRowSeq;
 		return true;
 	}
 	if (fRowHashSize != (uint32_t) job->sh) {
 		if (fRowHash != NULL) {
 			IODelete(fRowHash, uint64_t, fRowHashSize);
 			fRowHash = NULL;
-			fRowHashSize = 0;
 		}
+		if (fRowChanged != NULL) {
+			IODelete(fRowChanged, uint32_t, fRowHashSize);
+			fRowChanged = NULL;
+		}
+		fRowHashSize = 0;
 		fRowHash = IONew(uint64_t, (uint32_t) job->sh);
-		fRowHashSize = fRowHash != NULL ? (uint32_t) job->sh : 0;
-		fRowHashRows = 0;
-		if (fRowHash == NULL) {
+		fRowChanged = IONew(uint32_t, (uint32_t) job->sh);
+		if (fRowHash == NULL || fRowChanged == NULL) {
+			if (fRowHash != NULL) {
+				IODelete(fRowHash, uint64_t, (uint32_t) job->sh);
+				fRowHash = NULL;
+			}
+			if (fRowChanged != NULL) {
+				IODelete(fRowChanged, uint32_t, (uint32_t) job->sh);
+				fRowChanged = NULL;
+			}
+			fRowHashRows = 0;
+			fAllChangedSeq = fRowSeq;
 			return true;
 		}
+		memset(fRowChanged, 0, (size_t) job->sh * sizeof(uint32_t));
+		fRowHashSize = (uint32_t) job->sh;
+		fRowHashRows = 0;
 	}
 	known = fRowHashRows == (uint32_t) job->sh && memcmp(geometry, fRowHashGeometry, sizeof(geometry)) == 0;
-	for (int32_t r = 0; r < job->sh; r++) {
-		const uint64_t * w = (const uint64_t *) (job->pixels + (size_t) (job->sy + r) * job->stride + (size_t) job->sx * 4);
-		/* four separate sums, so that the multiplications do not wait for each other */
-		uint64_t h[4] = { 0xcbf29ce484222325ULL, 1, 2, 3 };
-		int32_t i;
-
-		for (i = 0; i + 8 <= words; i += 8) {
-			h[0] = (h[0] ^ w[i]) * 0x100000001b3ULL ^ w[i + 1];
-			h[1] = (h[1] ^ w[i + 2]) * 0x100000001b3ULL ^ w[i + 3];
-			h[2] = (h[2] ^ w[i + 4]) * 0x100000001b3ULL ^ w[i + 5];
-			h[3] = (h[3] ^ w[i + 6]) * 0x100000001b3ULL ^ w[i + 7];
+	job->hashKnown = known;
+	if (fThreads > 1 && fHelpersStarted + 1 == fThreads) {
+		job->hashPhase = true;
+		IOLockLock(fHelperLock);
+		fHelperJob = job;
+		fHelpersBusy = fThreads - 1;
+		fHelperGeneration++;
+		IOLockWakeup(fHelperLock, &fHelperGeneration, false);
+		IOLockUnlock(fHelperLock);
+		hashRows(job, 0, fThreads);
+		IOLockLock(fHelperLock);
+		while (fHelpersBusy > 0) {
+			IOLockSleep(fHelperLock, &fHelpersBusy, THREAD_UNINT);
 		}
-		for (; i < words; i++) {
-			h[0] = (h[0] ^ w[i]) * 0x100000001b3ULL;
+		IOLockUnlock(fHelperLock);
+		job->hashPhase = false;
+		for (unsigned s = 0; s < fThreads; s++) {
+			if (job->hashFirst[s] >= 0) {
+				first = first < 0 ? job->hashFirst[s] : first;
+				last = job->hashLast[s];
+			}
 		}
-		if (job->sw & 1) {
-			h[0] = (h[0] ^ ((const uint32_t *) w)[job->sw - 1]) * 0x100000001b3ULL;
-		}
-		h[0] ^= (h[1] * 3) ^ (h[2] * 5) ^ (h[3] * 7);
-		if (!known || h[0] != fRowHash[r]) {
-			first = first < 0 ? r : first;
-			last = r;
-		}
-		fRowHash[r] = h[0];
+	} else {
+		hashRows(job, 0, 1);
+		first = job->hashFirst[0];
+		last = job->hashLast[0];
 	}
 	fRowHashRows = (uint32_t) job->sh;
 	memcpy(fRowHashGeometry, geometry, sizeof(geometry));
-	if (known) {
+	if (!known) {
+		fAllChangedSeq = fRowSeq;
+	} else {
 		fWholeFrames = first >= 0 && (int64_t) (last - first + 1) * 10 >= (int64_t) job->sh * 9 ? fWholeFrames + 1 : 0;
 		fUnhashed = 0;
 	}
@@ -231,5 +340,6 @@ IOMobileFramebuffer::dirtyBand(RowJob * job)
 	job->by1 = job->py0 + (int32_t) ((int64_t) (last + 2) * span / job->sh) + 2;
 	job->by0 = job->by0 < job->py0 ? job->py0 : job->by0;
 	job->by1 = job->by1 > job->py1 ? job->py1 : job->by1;
+	job->allDirty = !known;
 	return true;
 }

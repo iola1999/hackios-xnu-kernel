@@ -36,35 +36,65 @@ def fixed_nits(millinits: int) -> int:
     return (millinits << 16) // 1000
 
 class MiniAppleARMBacklightSimulator:
-    def __init__(self):
-        self.last_v = kBLValueMax
-        self.last_millinits = kBLMilliNitsMax
+    def __init__(self, boot_v: int = kBLValueMax, boot_millinits: int = kBLMilliNitsMax):
+        self.last_v = boot_v
+        self.last_millinits = boot_millinits
         self.user_until = 0
-        self.initialized = False
-        self.active_level = kBLLevelFull
+        self.initialized = True
+        self.slider_initialized = False
+        self.last_slider_pos = 0
+        self.touched_ns = 0
+        self.saved = None
+        self.active_level = (boot_millinits * kBLLevelFull) // kBLMilliNitsMax
         self.log_messages = []
 
-    def bl_take(self, dict_keys: dict, value_key: str | None, nits_key: str | None, now_ns: int):
+    def bl_take(self, dict_keys: dict, value_key: str | None, nits_key: str | None, now_ns: int, touch_override: bool = True):
         """Exact replica of bl_take logic in MiniAppleARMBacklight.cpp."""
         nits = dict_keys.get(nits_key) if nits_key else None
         value = dict_keys.get(value_key) if value_key else None
+        slider_moved = False
+        slider_pos = 0
 
         if value_key is not None and nits is None and value is None:
             nits = dict_keys.get("DisplayBrightnessNitsNVRAM")
 
         if value_key is not None:
             active_win_ns = 500 * 1_000_000
+            touch_win_ns = 2000 * 1_000_000
             if "DisplayBrightnessSliderPosition" in dict_keys:
-                self.user_until = now_ns + active_win_ns
+                if touch_override and self.touched_ns == 0:
+                    self.touched_ns = now_ns
+                touch_recent = (
+                    (self.touched_ns != 0 and 0 <= now_ns - self.touched_ns <= touch_win_ns)
+                    or (self.user_until != 0 and now_ns <= self.user_until)
+                )
+                pos = min(65536, max(0, dict_keys["DisplayBrightnessSliderPosition"]))
+                slider_pos = pos
+                if not self.slider_initialized and not touch_override:
+                    self.slider_initialized = True
+                    self.last_slider_pos = slider_pos
+                elif not touch_recent:
+                    self.last_slider_pos = slider_pos
+                else:
+                    self.slider_initialized = True
+                    if not touch_override and abs(slider_pos - self.last_slider_pos) < 64:
+                        pass
+                    else:
+                        self.user_until = now_ns + active_win_ns
+                        self.last_slider_pos = slider_pos
+                        slider_moved = not touch_override
             elif "DisplayBrightness" in dict_keys and now_ns <= self.user_until:
                 self.user_until = now_ns + active_win_ns
 
-        if value_key is None:
+        if value_key is None and (self.user_until == 0 or now_ns > self.user_until):
             msg = f"framebuffer brightness ignored, keeping {self.last_millinits / 1000:.3f} nits"
             self.log_messages.append(msg)
             return ("IGNORED_FRAMEBUFFER", self.last_millinits)
 
-        if nits is not None:
+        if slider_moved:
+            millinits = kBLMilliNitsMin + slider_pos * (kBLMilliNitsMax - kBLMilliNitsMin) // 65536
+            v = kBLValueMin + (millinits - kBLMilliNitsMin) * (kBLValueMax - kBLValueMin) // (kBLMilliNitsMax - kBLMilliNitsMin)
+        elif nits is not None:
             n16 = nits
             s16 = nits
             if s16 <= 0:
@@ -97,7 +127,7 @@ class MiniAppleARMBacklightSimulator:
             self.log_messages.append("nothing taken")
             return ("NOTHING_TAKEN", self.last_millinits)
 
-        if now_ns > self.user_until:
+        if self.initialized and not slider_moved and (self.user_until == 0 or now_ns > self.user_until):
             msg = f"autonomous update ignored (no slider active), keeping {self.last_millinits // 1000} nits"
             self.log_messages.append(msg)
             return ("IGNORED_AUTONOMOUS", self.last_millinits)
@@ -105,6 +135,7 @@ class MiniAppleARMBacklightSimulator:
         self.last_v = v
         self.last_millinits = millinits
         self.initialized = True
+        self.saved = (v, millinits)
         self.active_level = (millinits * kBLLevelFull) // kBLMilliNitsMax
         return ("APPLIED", self.last_millinits)
 
@@ -149,7 +180,34 @@ def run_tests():
         action, current_nits = sim.bl_take(req, "brightness", "brightness-nits", t0)
         assert action == "IGNORED_AUTONOMOUS", f"Step {ramp_nits} nits failed: got {action}"
         assert current_nits == 400000, f"Brightness changed to {current_nits}!"
-    print("  ✓ Full autonomous ramp rejected; 400 nits strictly preserved")
+    # 3b. Autonomous FreezeBrightness=NO unfreeze fade with DisplayBrightnessSliderPosition but NO touch
+    print("[3b] Testing 33s FreezeBrightness=NO autonomous slider-position fade without user touch...")
+    sim_unfreeze = MiniAppleARMBacklightSimulator()
+    # Initial backboardd start packet at 21s
+    sim_unfreeze.bl_take({"DisplayBrightnessSliderPosition": 0, "brightness-nits": fixed_nits(5000)}, "brightness", "brightness-nits", 21_000_000_000, touch_override=False)
+    # 33s FreezeBrightness=NO unfreeze fade packets with DisplayBrightnessSliderPosition ramping down to 3656 (13.475 nits)
+    for pos in [65536, 50000, 30000, 15000, 3656]:
+        action, current_nits = sim_unfreeze.bl_take(
+            {"DisplayBrightnessSliderPosition": pos, "brightness-nits": fixed_nits(13475)},
+            "brightness",
+            "brightness-nits",
+            33_000_000_000,
+            touch_override=False,
+        )
+        assert action == "IGNORED_AUTONOMOUS", f"Unfreeze fade without touch should be ignored, got {action}"
+        assert current_nits == 400000
+    # Now user touches screen at 40s and drags slider to 32768 (~50%)
+    sim_unfreeze.touched_ns = 40_000_000_000
+    action, current_nits = sim_unfreeze.bl_take(
+        {"DisplayBrightnessSliderPosition": 32768},
+        "brightness",
+        "brightness-nits",
+        40_050_000_000,
+        touch_override=False,
+    )
+    assert action == "APPLIED"
+    assert sim_unfreeze.saved is not None
+    print("  ✓ 33s autonomous unfreeze fade rejected without touch; real touched slider persisted")
 
     # 4. User Slider Interaction
     print("[4] Testing slider drag activation and decay...")

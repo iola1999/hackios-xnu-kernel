@@ -281,7 +281,9 @@ public:
 	uint32_t        fDiffLeft, fDiffTop, fDiffRight, fDiffBottom;
 	/* dirtyBand(): a hash of every source row of the frame before, and what that frame was */
 	uint64_t *      fRowHash;
+	uint32_t *      fRowChanged;
 	uint32_t        fRowHashSize, fRowHashRows;
+	uint32_t        fRowSeq, fAllChangedSeq, fBufferSeq[2];
 	int32_t         fRowHashGeometry[8];
 	uint64_t        fBandAt;                /* when the frame before came; frames in a row that changed whole, frames unhashed since */
 	uint32_t        fWholeFrames, fUnhashed, fStatUnhashed;
@@ -292,6 +294,8 @@ public:
 	/* the screen recording, if one was asked for */
 	uint32_t *      fColumn;                /* drawLayer(): source column for every panel column */
 	uint16_t *      fColumnWeight;          /* ... with fb_filter: how much of the column after it, of 256 */
+	int32_t         fColumnGeometry[5];
+	bool            fColumnValid;
 	uint32_t *      fBlendRow;              /* ... and a row of the picture blended from two (fBlendRowSize pixels) */
 	uint32_t        fBlendRowSize;
 	uint8_t *       fRecBase;
@@ -321,12 +325,13 @@ public:
 	void reportFrameTimes(void);
 	void drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
 	void drawRows(const struct RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow);
+	void hashRows(struct RowJob * job, unsigned share, unsigned shares);
 	bool dirtyBand(struct RowJob * job);
 	static void helperMain(void * self, wait_result_t result);
 	/* the scaling shared out (fb_threads): fThreads drawers, the presenter and fThreads - 1 helpers */
 	unsigned        fThreads;
 	IOLock *        fHelperLock;
-	const struct RowJob * fHelperJob;
+	struct RowJob * fHelperJob;
 	uint64_t        fHelperGeneration;
 	unsigned        fHelpersBusy, fHelpersStarted;
 	uint32_t *      fHelperBlend[7];
@@ -635,19 +640,8 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 		}
 	}
 	filter = filter && fBlendRow != NULL;
-	/* which pixel of a source row each pixel of a panel row takes: worked out once, not 2.6 million times */
 	cx0 = px0 < 0 ? 0 : px0;
 	cx1 = (uint32_t) px1 > fPanelWidth ? (int32_t) fPanelWidth : px1;
-	for (int32_t x = cx0; x < cx1; x++) {
-		if (filter) {
-			int64_t at = sample_at(x - px0, sw, px1 - px0);
-
-			fColumn[x] = (uint32_t) (at >> 8);              /* (in the blended row: from sx on) */
-			fColumnWeight[x] = (uint16_t) (fColumn[x] + 1 < (uint32_t) sw ? at & 255 : 0);
-		} else {
-			fColumn[x] = (uint32_t) (sx + (int64_t) (x - px0) * sw / (px1 - px0));
-		}
-	}
 	job.pixels = s->pixels();
 	job.stride = s->info.bytesPerRow;
 	job.sx = sx;
@@ -666,11 +660,30 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 		fStatUnchanged++;
 		return;
 	}
+	/* which pixel of a source row each pixel of a panel row takes: worked out once per geometry */
+	{
+		int32_t colGeom[5] = { sx, sw, px0, px1, (int32_t) filter };
+		if (!fColumnValid || memcmp(colGeom, fColumnGeometry, sizeof(colGeom)) != 0) {
+			for (int32_t x = cx0; x < cx1; x++) {
+				if (filter) {
+					int64_t at = sample_at(x - px0, sw, px1 - px0);
+
+					fColumn[x] = (uint32_t) (at >> 8);
+					fColumnWeight[x] = (uint16_t) (fColumn[x] + 1 < (uint32_t) sw ? at & 255 : 0);
+				} else {
+					fColumn[x] = (uint32_t) (sx + (int64_t) (x - px0) * sw / (px1 - px0));
+				}
+			}
+			memcpy(fColumnGeometry, colGeom, sizeof(colGeom));
+			fColumnValid = true;
+		}
+	}
 	fDrewNearest = fDrewNearest || (gFilter == 2 && !fSettling && !fFilterFrame);
 	flip_band(&job.by0, &job.by1, job.py0, job.py1);
 	fStatBandRows += (uint64_t) (job.by1 - job.by0);
 	if (fThreads <= 1 || fDiff || fHelpersStarted + 1 < fThreads) {
 		drawRows(&job, job.by0, job.by1, fBlendRow);
+		fBufferSeq[flip.ready ? (flip.shown ^ 1) : 0] = fRowSeq;
 		return;
 	}
 	/* shared out: the helpers take their rows, this thread the first share, then waits for them */
@@ -686,6 +699,7 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 		IOLockSleep(fHelperLock, &fHelpersBusy, THREAD_UNINT);
 	}
 	IOLockUnlock(fHelperLock);
+	fBufferSeq[flip.ready ? (flip.shown ^ 1) : 0] = fRowSeq;
 }
 
 /*
@@ -876,6 +890,8 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 					bzero(fBase + (size_t) y * fRowBytes, (size_t) fPanelWidth * 4);
 				}
 				flip_whole();
+				fAllChangedSeq = ++fRowSeq;
+				fBufferSeq[flip.ready ? (flip.shown ^ 1) : 0] = fRowSeq;
 			}
 			continue;
 		}

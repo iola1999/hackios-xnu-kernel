@@ -28,6 +28,7 @@ extern int annibale_ufs_var_io(bool write, uint64_t offset, void *buf, uint64_t 
 #define KLOG_MAGIC               0x474f4c4bU     /* 'KLOG' */
 #define KLOG_MAGIC_ARCHIVED      0x474f4c44U     /* 'DLOG' */
 #define KLOG_VERSION             1U
+#define ANNFS_BL_MAGIC           0x424c5356U     /* 'BLSV' */
 
 struct klog_head {
 	uint32_t magic;
@@ -52,7 +53,10 @@ struct annfs_super {
 	uint32_t node_count;
 	uint32_t payload_crc;
 	uint32_t super_crc;
-	uint8_t  reserved[4096 - 52];
+	uint32_t bl_magic;
+	uint32_t bl_panel_v;
+	uint32_t bl_millinits;
+	uint8_t  reserved[4096 - 64];
 };
 _Static_assert(sizeof(struct annfs_super) == 4096, "annfs_super must be 4096 bytes");
 
@@ -95,6 +99,10 @@ static struct ramfs_mount *ramfs_disk_rm;
 static bool ramfs_disk_claimed;
 static int ramfs_var_disk_loaded;
 static int ramfs_var_seed_done = 1;
+static bool ramfs_bl_probed;
+static bool ramfs_bl_saved;
+static uint32_t ramfs_bl_panel_v;
+static uint32_t ramfs_bl_millinits;
 
 static void ramfs_disk_dirty_locked(struct ramfs_mount *rm);
 static int ramfs_disk_sync_impl(struct ramfs_mount *rm);
@@ -516,6 +524,11 @@ ramfs_disk_sync_impl(struct ramfs_mount *rm)
 	sup->node_count = node_count;
 	sup->payload_crc = crc32(0, (uint8_t *)rm->rm_meta_buf + ANNFS_SUPER_BYTES, (size_t)payload_bytes);
 	sup->super_crc = crc32(0, sup, __builtin_offsetof(struct annfs_super, super_crc));
+	if (ramfs_bl_saved) {
+		sup->bl_magic = ANNFS_BL_MAGIC;
+		sup->bl_panel_v = ramfs_bl_panel_v;
+		sup->bl_millinits = ramfs_bl_millinits;
+	}
 
 	/* Preserve the recovered slot even when generations have unusual parity. */
 	slot_off = rm->rm_meta_slot == 0 ? ANNFS_SLOT1_OFFSET : ANNFS_SLOT0_OFFSET;
@@ -573,8 +586,39 @@ void ramfs_disk_flush_all(void);
 void
 ramfs_disk_flush_all(void)
 {
-	if (ramfs_disk_rm != NULL) {
-		(void)ramfs_disk_sync(ramfs_disk_rm);
+	struct ramfs_mount *rm = ramfs_disk_rm;
+
+	if (rm != NULL) {
+		if (rm->rm_disk_enabled && rm->rm_seed_done && !rm->rm_disk_loading) {
+			lck_mtx_lock(&rm->rm_lock);
+			for (uint32_t h = 0; h < RAMFS_HASH_SIZE; h++) {
+				vnode_t vps[8];
+				uint32_t vids[8];
+				unsigned n = 0;
+
+				for (struct ramfs_node *node = rm->rm_hash[h]; node != NULL && n < 8; node = node->rn_hnext) {
+					if (node->rn_type == VREG && node->rn_nlink > 0 &&
+					    node->rn_mapped_write && node->rn_vp != NULLVP) {
+						vps[n] = node->rn_vp;
+						vids[n] = node->rn_vid;
+						n++;
+					}
+				}
+				if (n == 0) {
+					continue;
+				}
+				lck_mtx_unlock(&rm->rm_lock);
+				for (unsigned i = 0; i < n; i++) {
+					if (vnode_getwithvid(vps[i], vids[i]) == 0) {
+						(void)ubc_msync(vps[i], 0, ubc_getsize(vps[i]), NULL, UBC_PUSHDIRTY | UBC_SYNC);
+						vnode_put(vps[i]);
+					}
+				}
+				lck_mtx_lock(&rm->rm_lock);
+			}
+			lck_mtx_unlock(&rm->rm_lock);
+		}
+		(void)ramfs_disk_sync(rm);
 	}
 }
 
@@ -590,6 +634,73 @@ ramfs_disk_find_ino(struct ramfs_mount *rm, uint64_t ino)
 }
 
 #include "ramfs_disk_restore.inc"
+
+bool ramfs_backlight_load(uint32_t *panel_v_out, uint32_t *millinits_out);
+void ramfs_backlight_save(uint32_t panel_v, uint32_t millinits);
+
+bool
+ramfs_backlight_load(uint32_t *panel_v_out, uint32_t *millinits_out)
+{
+	if (!ramfs_bl_probed) {
+		uint64_t part_bytes = 0, offsets[2] = { ANNFS_SLOT0_OFFSET, ANNFS_SLOT1_OFFSET };
+		struct annfs_super *sup = kalloc_type(struct annfs_super, Z_WAITOK | Z_ZERO);
+		uint64_t best_gen = 0;
+
+		if (sup != NULL && annibale_ufs_var_info(&part_bytes) &&
+		    part_bytes >= ANNFS_DATA_OFFSET + 2 * PAGE_SIZE) {
+			for (unsigned i = 0; i < 2; i++) {
+				if (annibale_ufs_var_io(false, offsets[i], sup, sizeof(*sup)) == 0 &&
+				    ramfs_disk_super_valid(sup) && sup->generation >= best_gen) {
+					best_gen = sup->generation;
+					if (sup->bl_magic == ANNFS_BL_MAGIC &&
+					    sup->bl_panel_v != 0 && sup->bl_millinits != 0) {
+						ramfs_bl_saved = true;
+						ramfs_bl_panel_v = sup->bl_panel_v;
+						ramfs_bl_millinits = sup->bl_millinits;
+					} else {
+						ramfs_bl_saved = false;
+					}
+				}
+			}
+			ramfs_bl_probed = true;
+		}
+		if (sup != NULL) {
+			kfree_type(struct annfs_super, sup);
+		}
+	}
+	if (!ramfs_bl_saved) {
+		return false;
+	}
+	if (panel_v_out != NULL) {
+		*panel_v_out = ramfs_bl_panel_v;
+	}
+	if (millinits_out != NULL) {
+		*millinits_out = ramfs_bl_millinits;
+	}
+	return true;
+}
+
+void
+ramfs_backlight_save(uint32_t panel_v, uint32_t millinits)
+{
+	struct ramfs_mount *rm = ramfs_disk_rm;
+
+	if (panel_v == 0 || millinits == 0) {
+		return;
+	}
+	if (ramfs_bl_saved && ramfs_bl_panel_v == panel_v && ramfs_bl_millinits == millinits) {
+		return;
+	}
+	ramfs_bl_probed = true;
+	ramfs_bl_saved = true;
+	ramfs_bl_panel_v = panel_v;
+	ramfs_bl_millinits = millinits;
+	if (rm != NULL) {
+		lck_mtx_lock(&rm->rm_lock);
+		ramfs_disk_dirty_locked(rm);
+		lck_mtx_unlock(&rm->rm_lock);
+	}
+}
 
 static struct ramfs_node *
 ramfs_disk_find_child(struct ramfs_node *dir, const char *name, size_t len)

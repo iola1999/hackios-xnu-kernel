@@ -648,7 +648,14 @@ rw_bind_slot(id *slots, unsigned *count, id object, NSUInteger index)
 }
 - (void)setScissorRects:(const MTLScissorRect *)rects count:(NSUInteger)count
 {
-	(void)rects; (void)count;
+	if (count > 1 && !_complained) {
+		rw_print("%lu scissor rects are not implemented; the first one is "
+		         "taken\n", (unsigned long)count);
+		_complained = YES;
+	}
+	if (count >= 1 && rects != NULL) {
+		[self setScissorRect:rects[0]];
+	}
 }
 /* MTLDepthClipModeClip is what the library's rasterizer state does (depth_clip_near and
  * _far are both on); MTLDepthClipModeClamp, which keeps a primitive outside the depth range

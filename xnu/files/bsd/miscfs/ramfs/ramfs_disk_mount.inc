@@ -129,6 +129,13 @@ ramfs_disk_mount(struct ramfs_mount *rm)
 	ramfs_var_seed_done = loaded ? 1 : 0;
 	ramfs_disk_rm = rm;
 	ramfs_disk_claimed = true;
+	if (loaded && !ramfs_bl_saved && sup[win_slot]->bl_magic == ANNFS_BL_MAGIC &&
+	    sup[win_slot]->bl_panel_v != 0 && sup[win_slot]->bl_millinits != 0) {
+		ramfs_bl_saved = true;
+		ramfs_bl_panel_v = sup[win_slot]->bl_panel_v;
+		ramfs_bl_millinits = sup[win_slot]->bl_millinits;
+	}
+	ramfs_bl_probed = true;
 	if (loaded) {
 		printf("ramfs: loaded /private/var from disk (slot %u, gen %llu, %llu nodes, %llu pages)\n",
 		    win_slot, rm->rm_meta_gen, rm->rm_nodes, rm->rm_pages);

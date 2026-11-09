@@ -105,11 +105,11 @@ def test_layer_b_ir3_uuid_cache():
     assert match is not None, "otool did not find LC_UUID"
     assert match.group(1).upper() == uuid_str, f"UUID mismatch: parsed={uuid_str} otool={match.group(1)}"
 
-    # setup-mesa-arm64e.py keeps the disk cache off until reading it back is shown to draw correctly
+    # setup-mesa-arm64e.py enables the ir3 disk cache with cross-UID permissions in patch 0015
     setup_py = os.path.join(TOP_ROOT, "tools/k90auto/setup-mesa-arm64e.py")
     with open(setup_py, "r", encoding="utf-8") as f:
         setup_content = f.read()
-    assert "-Dshader-cache=disabled" in setup_content, "setup-mesa-arm64e.py missing -Dshader-cache=disabled"
+    assert "-Dshader-cache=enabled" in setup_content, "setup-mesa-arm64e.py missing -Dshader-cache=enabled"
 
     # Check patch exists
     patch_path = os.path.join(KERNEL_ROOT, "tools/mesa/rebase-26/0015-ir3-disk-cache-darwin-uuid.patch")
@@ -118,6 +118,8 @@ def test_layer_b_ir3_uuid_cache():
         patch_content = f.read()
     assert "get_darwin_macho_uuid" in patch_content
     assert "ANNIBALE_IR3_CACHE_DIR" in patch_content
+    assert "0777" in patch_content
+    assert "0666" in patch_content
 
     print(f"PASS Layer B: ir3 Mach-O LC_UUID verified ({uuid_str}) and patch validated")
 

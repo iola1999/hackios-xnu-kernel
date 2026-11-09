@@ -28,6 +28,15 @@ typedef uint8_t  fb_u8x16 __attribute__((vector_size(16)));
 typedef uint8_t  fb_u8x8 __attribute__((vector_size(8)));
 typedef uint16_t fb_u16x8 __attribute__((vector_size(16)));
 typedef uint16_t fb_u16x4 __attribute__((vector_size(8)));
+typedef uint64_t fb_u64x2 __attribute__((vector_size(16)));
+
+static inline int
+same4(fb_u8x16 a, fb_u8x16 b)
+{
+	fb_u64x2 d = (fb_u64x2) a ^ (fb_u64x2) b;
+
+	return (d[0] | d[1]) == 0;
+}
 
 /* blend() of four pixels: `wl` the weights of the channels of the first two, `wh` of the last two. */
 static inline fb_u8x16
@@ -69,7 +78,9 @@ mixRows(const uint32_t * upper, const uint32_t * lower, uint32_t * __restrict mi
 	uint32_t c = first;
 
 	for (; c + 3 <= last; c += 4) {
-		store4(mixed + c, blend4(load4(upper + c), load4(lower + c), weight, weight));
+		fb_u8x16 a = load4(upper + c), b = load4(lower + c);
+
+		store4(mixed + c, same4(a, b) ? a : blend4(a, b, weight, weight));
 	}
 	for (; c <= last; c++) {
 		uint32_t a = upper[c], b = lower[c];
@@ -94,10 +105,16 @@ scaleRow(const uint32_t * from, uint32_t * __restrict out, const uint32_t * __re
 
 		/* (column[] goes up by the same one or two steps all along: three in three is one each) */
 		if (column[i + 3] == c + 3 && c + 4 < width) {
+			fb_u8x16 a = load4(from + c), b = load4(from + c + 1);
+
+			if (same4(a, b)) {
+				store4(out + i, a);
+				continue;
+			}
 			fb_u16x4 w;
 
 			__builtin_memcpy(&w, weights + i, sizeof(w));
-			store4(out + i, blend4(load4(from + c), load4(from + c + 1), __builtin_shufflevector(w, w, 0, 0, 0, 0, 1, 1, 1, 1),
+			store4(out + i, blend4(a, b, __builtin_shufflevector(w, w, 0, 0, 0, 0, 1, 1, 1, 1),
 			    __builtin_shufflevector(w, w, 2, 2, 2, 2, 3, 3, 3, 3)));
 			continue;
 		}

@@ -697,11 +697,11 @@ adreno8_step_gx_power(void)
  * adreno8_speed=N above 1: the GPU's speed follows its load between the floor and speed N of
  * adreno8_boot_speeds (1 the slowest). Called with each submission under AnnibaleGPU's lock and
  * acting at most every 100 ms, on the GPU time of the submissions retired since (TS_RETIRE):
- *  - up to N at once when that time, scaled to speed 1, is 20% of the interval or more, or within
- *    adreno8_touch_ms (default 1500) of a touch (annibale_cpufreq.c's boost);
- *  - back to the floor, adreno8_floor (default 3, 342 MHz), once it would have stayed below 10% at
- *    speed 1 for 500 ms; adreno8_floor=1 adreno8_touch_ms=300 gives the load rule before 12377-cmd50,
- *    which went back to 160 MHz and drew the first frames of the next swipe there;
+ *  - up to the lowest speed from speed 3 up to N that keeps the load under 35% of that speed when
+ *    that time, scaled to speed 1, is 20% of the interval or more, or up to N within adreno8_touch_ms
+ *    (default 300) of a touch (annibale_cpufreq.c's boost), waking from speed 1 immediately on touch;
+ *  - back to the floor, adreno8_floor (default 1, 160 MHz), once it would have stayed below 10% at
+ *    speed 1 for 500 ms, or down to speed 3 after 500 ms when a higher speed is no longer needed;
  *  - a thermal limit moved a step at a time, as annibale_cpufreq.c does for the processors: one
  *    speed down each tick that a GPU sensor reads 70 C or more, one up every 2 ticks while all read
  *    under 60 C; at 75 C, or without a reading, speed 1 at once. The limit goes under the floor.
@@ -709,6 +709,7 @@ adreno8_step_gx_power(void)
  */
 #define SPEED_TICK_NS           100000000ull
 #define SPEED_UP_PERMILLE       200
+#define SPEED_TARGET_PERMILLE   350
 #define SPEED_DOWN_PERMILLE     100
 #define SPEED_DOWN_NS           500000000ull
 #define SPEED_HOT_TENTHS        700
@@ -716,7 +717,7 @@ adreno8_step_gx_power(void)
 #define SPEED_CUT_TENTHS        750
 #define SPEED_RISE_TICKS        2
 
-uint32_t adreno8_speed_floor = 3, adreno8_touch_ms = 1500;
+uint32_t adreno8_speed_floor = 1, adreno8_touch_ms = 300;
 static uint32_t adreno8_speed_now = 1, adreno8_speed_changes, adreno8_speed_limit, adreno8_speed_cool_ticks;
 static uint64_t adreno8_speed_ticked, adreno8_speed_busy_seen, adreno8_speed_light_since;
 
@@ -732,23 +733,29 @@ void
 adreno8_speed_tick(void)
 {
 	uint64_t now = mach_absolute_time(), since, light, touched, touch_age, permille, busy_ns;
-	uint32_t want = adreno8_speed_now, msg[3], floor;
+	uint32_t want = adreno8_speed_now, msg[3], floor, step_floor, load_want;
 	int32_t tenths = 0;
+	bool touch_boost;
 
 	if (adreno8_speed_asked <= 1 || adreno8_speed_asked >= adreno8_gx_count || !adreno8_hfi_tables_sent) {
 		return;
 	}
-	absolutetime_to_nanoseconds(now - adreno8_speed_ticked, &since);
-	if (adreno8_speed_ticked != 0 && since < SPEED_TICK_NS) {
-		return;
-	}
-	busy_ns = (adreno8_retired_total - adreno8_speed_busy_seen) * 10000 / 192;
-	permille = adreno8_speed_ticked != 0 && since != 0 ?
-	    busy_ns * 1000 / since * adreno8_gx_hz[adreno8_speed_now] / adreno8_gx_hz[1] : 0;
-	adreno8_speed_ticked = now;
-	adreno8_speed_busy_seen = adreno8_retired_total;
 	touched = annibale_cpufreq_touched();
 	absolutetime_to_nanoseconds(now - touched, &touch_age);
+	touch_boost = touched != 0 && touched <= now && touch_age < (uint64_t)adreno8_touch_ms * 1000000;
+	absolutetime_to_nanoseconds(now - adreno8_speed_ticked, &since);
+	if (adreno8_speed_ticked != 0 && since < SPEED_TICK_NS) {
+		if (!touch_boost || adreno8_speed_now > 1 || adreno8_speed_limit == 1) {
+			return;
+		}
+		permille = 0;
+	} else {
+		busy_ns = (adreno8_retired_total - adreno8_speed_busy_seen) * 10000 / 192;
+		permille = adreno8_speed_ticked != 0 && since != 0 ?
+		    busy_ns * 1000 / since * adreno8_gx_hz[adreno8_speed_now] / adreno8_gx_hz[1] : 0;
+		adreno8_speed_ticked = now;
+		adreno8_speed_busy_seen = adreno8_retired_total;
+	}
 	if (adreno8_speed_limit == 0) {
 		adreno8_speed_limit = adreno8_speed_asked;
 	}
@@ -764,17 +771,29 @@ adreno8_speed_tick(void)
 		adreno8_speed_cool_ticks = 0;
 	}
 	floor = adreno8_speed_floor < 1 ? 1 : adreno8_speed_floor > adreno8_speed_asked ? adreno8_speed_asked : adreno8_speed_floor;
-	if (permille >= SPEED_UP_PERMILLE ||
-	    (touched != 0 && touched <= now && touch_age < (uint64_t)adreno8_touch_ms * 1000000)) {
-		want = adreno8_speed_asked;
-		adreno8_speed_light_since = 0;
+	step_floor = MIN(MAX(floor, 3u), adreno8_speed_asked);
+	if (permille >= SPEED_UP_PERMILLE || touch_boost) {
+		load_want = touch_boost ? adreno8_speed_asked : step_floor;
+		while (load_want < adreno8_speed_asked &&
+		    (uint64_t)adreno8_gx_hz[load_want] * SPEED_TARGET_PERMILLE < permille * adreno8_gx_hz[1]) {
+			load_want++;
+		}
 	} else if (permille < SPEED_DOWN_PERMILLE) {
+		load_want = floor;
+	} else {
+		load_want = MIN(adreno8_speed_now, step_floor);
+	}
+	if (load_want > adreno8_speed_now) {
+		want = load_want;
+		adreno8_speed_light_since = 0;
+	} else if (load_want < adreno8_speed_now) {
 		if (adreno8_speed_light_since == 0) {
 			adreno8_speed_light_since = now;
 		}
 		absolutetime_to_nanoseconds(now - adreno8_speed_light_since, &light);
 		if (light >= SPEED_DOWN_NS) {
-			want = floor;
+			want = load_want;
+			adreno8_speed_light_since = 0;
 		}
 	} else {
 		adreno8_speed_light_since = 0;
