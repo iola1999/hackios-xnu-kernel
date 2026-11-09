@@ -265,7 +265,16 @@ int main(void) {
     if (count_nonzero_in_band(fb, 200, 1520) < 50000) return 1;
 
     ui_draw_ios_boot_splash();
-    if (count_nonzero_in_band(fb, 1000, 1450) < 2000) return 2;
+    if (count_nonzero_in_band(fb, 450, 2380) < 10000) return 2;
+    const char *boot_log =
+        "Darwin Kernel Version 25.6.0\n"
+        "vm_page_bootstrap: 774811 free pages\n"
+        "adreno8: step 14: configure gpu SMMU context 0\n"
+        "[ ok ] mount the persistent data volume on /private/var\n"
+        "2026-11-09 20:38:36.810879+0800 backboardd[41:276]  IOMobileFramebufferOpen:  success, return 0\n";
+    ui_boot_watch_step(boot_log, (uint32_t)strlen(boot_log));
+    if (UI_BOOT.pct != 100 || UI_BOOT.done != 1) return 5;
+    if (count_nonzero_in_band(fb, 900, 1450) < 5000) return 6;
 
     const char *klog = "panic(cpu 0): kernel trap\nhalting cpu 0 and returning to xnuloader stub\n";
     loader_ctx[CTX_LOG_PA] = (uint64_t)(uintptr_t)klog;

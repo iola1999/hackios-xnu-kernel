@@ -835,6 +835,32 @@ lc_watch_round(const struct kernel_live *live, uint64_t slide, uint64_t started,
 }
 /* LC-WATCH-END */
 
+static int ui_boot_watch_due(uint64_t now, uint64_t freq, uint32_t *prev_len);
+static void ui_boot_watch_step(const char *klog, uint32_t len);
+
+static void
+ui_watch_kernel_boot(const struct kernel_live *live, uint64_t slide)
+{
+	uint32_t prev_len = 0;
+	if (live == NULL || !ui_boot_watch_due(READ_SYSREG(CNTVCT_EL0), READ_SYSREG(CNTFRQ_EL0), &prev_len)) {
+		return;
+	}
+	flush_dcache(live->log_len + slide, live->log_len + slide + 4);
+	uint32_t len = *(volatile uint32_t *)(live->log_len + slide);
+	if (len > live->log_head + live->log_ring) {
+		len = 0;
+	}
+	const char *klog = (const char *)(live->log + slide);
+	if (len > 0 && len != prev_len) {
+		uint32_t from = (prev_len <= len && prev_len > 256) ? prev_len - 256 : 0;
+		if (len - from > 65536 && len > 65536) {
+			from = len - 65536;
+		}
+		flush_dcache((uint64_t)(uintptr_t)(klog + from), (uint64_t)(uintptr_t)(klog + len));
+	}
+	ui_boot_watch_step(klog, len);
+}
+
 /* Run the kernel on mpidr: 0 = returned, negative = PSCI refused, OTHER_CPU_NOT_STARTED
  * or OTHER_CPU_HUNG = incomplete. loader_ctx retains the available log for a hung kernel.
  * live holds its shared status; budget is the requested run duration in seconds. */
@@ -910,6 +936,7 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 		    &last_beat_at, &status) != 0) {
 			break;  /* returned, or a timeout decided at once: the hold stands, no service after it */
 		}
+		ui_watch_kernel_boot(live, slide);
 	}
 	/* LC-TAIL-BEGIN -- extracted verbatim by tools/test-loader-lifecycle.py: the loop tail
 	 * after a round decided the hold, where the mask lands before the caller writes. */

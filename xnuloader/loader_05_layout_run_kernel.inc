@@ -353,6 +353,7 @@ lc_after_return_collect(const struct kernel_live *live, uint64_t slide, uint64_t
 static void usb_command_loop(void);
 static int usb_start(void);
 static void ui_stage(const char *word);
+static void ui_boot_progress(int pct, const char *stage, const char *klog, uint32_t klog_len);
 
 static int
 run_kernel(int have_checkpoint, uint64_t checkpoint)
@@ -408,6 +409,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		print("unexpected kernel layout\n");
 		return 0;
 	}
+	if (checkpoint != CHECKPOINT_SELFTEST) ui_boot_progress(8, "Allocating 12 GB physical memory window...", log_buf, log_len);
 	if (!choose_window(&pi)) {
 		return 0;
 	}
@@ -435,18 +437,21 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	uint64_t ba_pa = L.ba_pa, top = L.top;
 
 	if (L.res_pa != 0 && pi.rdfile_size != 0) {
+		if (checkpoint != CHECKPOINT_SELFTEST) ui_boot_progress(12, "Loading resident boot volume (md0)...", log_buf, log_len);
 		print("rdfile: loading %x bytes to %x\n", pi.rdfile_size, L.res_pa);
 		if (!rdfile_load(pi.rdfile_part, pi.rdfile_off, pi.rdfile_size, L.res_pa)) {
 			print("rdfile: giving up on the staged system image\n");
 			return 0;
 		}
 	} else if (L.res_pa != 0 && pi.resident_image_size != 0) {
+		if (checkpoint != CHECKPOINT_SELFTEST) ui_boot_progress(12, "Loading resident boot volume (md0)...", log_buf, log_len);
 		print("rdimage: copying %x bytes to %x\n", pi.resident_image_size, L.res_pa);
 		memset((void *)L.res_pa, 0, L.res_size);
 		memcpy((void *)L.res_pa, pi.resident_image, pi.resident_image_size);
 	}
 
 	/* --- load segments -------------------------------------------------- */
+	if (checkpoint != CHECKPOINT_SELFTEST) ui_boot_progress(18, "Loading Darwin XNU kernel segments...", log_buf, log_len);
 	lc = (const struct load_command *)(mh + 1);
 	for (uint32_t i = 0; i < mh->ncmds; i++, lc = (const void *)((const uint8_t *)lc + lc->cmdsize)) {
 		const struct segment_command_64 *sg = (const void *)lc;
@@ -460,6 +465,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	if (rd_resident) {
 		print("resident ramdisk at pa %x size %x\n", rd_pa, rd_size);
 	} else if (rd_size != 0) {
+		if (checkpoint != CHECKPOINT_SELFTEST) ui_boot_progress(23, "Staging helper ramdisk (md1)...", log_buf, log_len);
 		memset((void *)rd_pa, 0, rd_size);
 		memcpy((void *)rd_pa, pi.ramdisk, pi.ramdisk_size);
 		print("ramdisk at pa %x size %x\n", rd_pa, rd_size);
@@ -958,6 +964,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		print("the kernel will run on core %x (this is core %x)\n", kernel_mpidr, this_mpidr);
 	}
 	print("jumping to %x\n", entry_va + slide);
+	if (checkpoint != CHECKPOINT_SELFTEST) ui_boot_progress(28, "Building Apple DeviceTree & starting Core 7...", log_buf, log_len);
 	flush_log();
 	/* From here on the kernel feeds the watchdog (boot-arg hv_wdt_pet, see loader_return.c in XNU). */
 	wdt_set_ms(60000);

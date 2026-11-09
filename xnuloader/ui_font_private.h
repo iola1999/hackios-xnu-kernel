@@ -545,26 +545,312 @@ ui_draw_top_pill(const char *text, uint32_t dot_col)
 	ui_draw_text_ex(px + 56, py + 16, text, 2, 48, UI_TEXT_PRI, UI_CARD_BG, 0, 1);
 }
 
+static struct {
+	int active;
+	int done;
+	int pct;
+	const char *stage;
+	uint64_t t0;
+	uint64_t last_tick;
+	uint32_t last_len;
+	int last_tenth;
+} UI_BOOT;
+
+struct ui_boot_milestone {
+	const char *needle;
+	int pct;
+	const char *stage;
+	int stop;
+};
+
+static const struct ui_boot_milestone ui_boot_milestones[] = {
+	{ "Darwin Kernel Version",               32, "Darwin XNU kernel bootstrap...",                   0 },
+	{ "vm_page_bootstrap:",                  36, "Initializing XNU virtual memory & pmap...",        0 },
+	{ "MiniIOMobileFramebuffer:",            40, "Configuring DPU display pipes...",                 0 },
+	{ "apfs: volume 0",                      44, "Mounting resident APFS boot volume...",            0 },
+	{ "ufs: native: transfer list switched", 48, "Switching UFS 4.0 to native kernel queue...",      0 },
+	{ "adreno8: step 1:",                    53, "Adreno 830 GPU: probing speed bin & RPMh...",      0 },
+	{ "adreno8: step 6:",                    58, "Adreno 830 GPU: starting GMU & clocks...",         0 },
+	{ "adreno8: step 14:",                   64, "Adreno 830 GPU: configuring SMMU & pagetables...", 0 },
+	{ "adreno8: step 20:",                   70, "Adreno 830 GPU: booting CP & preemption rings...", 0 },
+	{ "ramfs: loaded /private/var",          75, "Mounting persistent /private/var (ANNFS001)...",   0 },
+	{ "aadsp: SM8750 LPASS",                 80, "Starting SM8750 LPASS audio & Bluetooth...",       0 },
+	{ "devfs is mounted on /dev",            84, "Populating /dev nodes & preflight checks...",      0 },
+	{ "libignition:",                        87, "Mounting APFS System volume & Cryptex...",         0 },
+	{ "com.apple.xpc.launchd",               90, "Starting launchd (PID 1) & earlyboot tasks...",    0 },
+	{ "STARTING EARLYBOOT SETUP",            93, "Running MobileKeyBag & earlyboot setup...",        0 },
+	{ "starting /usr/libexec/backboardd",    96, "Starting backboardd & HID event system...",        0 },
+	{ "StartWindowServer:",                  98, "Initializing iOS WindowServer & Metal cache...",   0 },
+	{ "IOMobileFramebufferOpen:",           100, "Handing display to iOS WindowServer...",           1 },
+	{ "MiniIOMobileFramebuffer: backboardd",100, "Handing display to iOS WindowServer...",           1 },
+	{ "MiniIOMobileFramebuffer: swap ",     100, "Handing display to iOS WindowServer...",           1 },
+};
+
+static int
+ui_mem_find(const char *hay, uint32_t hay_len, const char *needle)
+{
+	uint32_t nlen = 0;
+	while (needle[nlen]) nlen++;
+	if (nlen == 0 || hay_len < nlen) return 0;
+	for (uint32_t i = 0; i <= hay_len - nlen; i++) {
+		if (hay[i] == needle[0] && memcmp(hay + i, needle, nlen) == 0) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static void
+ui_boot_trim_line(const char *s, int n, const char **out_s, int *out_n)
+{
+	while (n > 0 && (*s == ' ' || *s == '\t')) { s++; n--; }
+	/* Skip ls -l directory listing lines ("-rwxr-xr-x", "drwxr-xr-x", "crw-", "brw-") */
+	if (n > 10 && (s[0] == '-' || s[0] == 'd' || s[0] == 'c' || s[0] == 'b' || s[0] == 'l') &&
+	    (s[1] == 'r' || s[1] == '-') && (s[2] == 'w' || s[2] == '-') &&
+	    (s[3] == 'x' || s[3] == '-' || s[3] == 's')) {
+		*out_s = s;
+		*out_n = 0;
+		return;
+	}
+	if (n > 32 && s[0] == '2' && s[1] == '0' && s[4] == '-' && s[7] == '-' && s[10] == ' ') {
+		int sp = 0, i = 0;
+		while (i < n && sp < 2) {
+			if (s[i++] == ' ') sp++;
+		}
+		while (i < n && s[i] == ' ') i++;
+		s += i;
+		n -= i;
+	} else if (n > 44 && s[0] == 'c' && s[3] == '.' && s[21] == '|') {
+		int i = 22;
+		while (i < n && s[i] != ' ') i++;
+		if (i < n) i++;
+		while (i < n && s[i] != ' ') i++;
+		while (i < n && s[i] == ' ') i++;
+		s += i;
+		n -= i;
+	}
+	*out_s = s;
+	*out_n = n;
+}
+
+static void
+ui_draw_boot_console(const char *src, uint32_t slen)
+{
+	int card_x = 70;
+	int card_w = (int)SCREEN.width - 140;
+	int body_y = 918;
+	int step = 38;
+	int max_lines = 36;
+	int maxc = 82;
+	const char *line_ptrs[36];
+	int line_lens[36];
+	int count = 0;
+
+	char kbbuf[24];
+	int kbn = 0;
+	if (slen < 1024) {
+		kbn += ui_dec(kbbuf + kbn, slen);
+		kbbuf[kbn++] = ' ';
+		kbbuf[kbn++] = 'B';
+	} else {
+		kbn += ui_dec(kbbuf + kbn, slen >> 10);
+		kbbuf[kbn++] = ' ';
+		kbbuf[kbn++] = 'K';
+		kbbuf[kbn++] = 'B';
+	}
+	kbbuf[kbn] = 0;
+	int kw = ui_measure_text_ex(kbbuf, kbn, 2, 0);
+	ui_fill(card_x + card_w - 220, 846, 190, 36, UI_TERM_BG);
+	ui_draw_text_ex(card_x + card_w - 32 - kw, 852, kbbuf, 2, kbn, UI_TEXT_SEC, UI_TERM_BG, 0, 1);
+
+	uint32_t end = slen;
+	while (end > 0 && src[end - 1] != '\n') {
+		end--;
+	}
+	if (end == 0) end = slen;
+	while (end > 0 && count < max_lines) {
+		while (end > 0 && (src[end - 1] == '\n' || src[end - 1] == '\r' || src[end - 1] == 0)) {
+			end--;
+		}
+		if (end == 0) break;
+		uint32_t ls = end;
+		while (ls > 0 && src[ls - 1] != '\n') {
+			ls--;
+		}
+		const char *ts = NULL;
+		int tn = 0;
+		ui_boot_trim_line(src + ls, (int)(end - ls), &ts, &tn);
+		if (tn > 0) {
+			if (tn > maxc) tn = maxc;
+			if (count == 0 || tn != line_lens[count - 1] || memcmp(ts, line_ptrs[count - 1], (size_t)tn) != 0) {
+				line_ptrs[count] = ts;
+				line_lens[count] = tn;
+				count++;
+			}
+		}
+		end = ls;
+	}
+
+	for (int r = 0; r < max_lines; r++) {
+		int y = body_y + r * step;
+		ui_fill(card_x + 16, y, card_w - 32, step, UI_TERM_BG);
+		if (r < count) {
+			int idx = count - 1 - r;
+			const char *ls = line_ptrs[idx];
+			int ln = line_lens[idx];
+			uint32_t col = (r >= count - 3) ? UI_TEXT_PRI : UI_TEXT_SEC;
+			if (ln >= 6 && ls[0] == '[' && ls[2] == 'o' && ls[3] == 'k') {
+				col = UI_GREEN;
+			}
+			ui_draw_text_ex(card_x + 28, y + 6, ls, 2, ln, col, UI_TERM_BG, 1, r >= count - 2 ? 1 : 0);
+		}
+	}
+}
+
+static void
+ui_boot_progress(int pct, const char *stage, const char *klog, uint32_t klog_len)
+{
+	if (SCREEN.base == 0 || UI_BOOT.done) return;
+
+	int card_x = 70;
+	int card_w = (int)SCREEN.width - 140;
+	int bw = 640, bh = 14;
+	int bx = ((int)SCREEN.width - bw) / 2;
+	int by = 628;
+
+	if (!UI_BOOT.active) {
+		UI_BOOT.active = 1;
+		UI_BOOT.pct = -1;
+		UI_BOOT.stage = NULL;
+		UI_BOOT.t0 = READ_SYSREG(CNTVCT_EL0);
+		UI_BOOT.last_tick = UI_BOOT.t0;
+		UI_BOOT.last_len = ~0u;
+		UI_BOOT.last_tenth = -1;
+
+		ui_fill(0, 0, (int)SCREEN.width, (int)SCREEN.height, UI_BG);
+		ui_draw_icon24(((int)SCREEN.width - 96) / 2, 460, ui_icon_apple, 4, UI_WHITE, UI_BG);
+		ui_round_rect(bx, by, bw, bh, 7, 0, UI_TRACK_BG, UI_TRACK_BG, UI_BG);
+
+		/* Live kernel boot console card in the lower half */
+		ui_round_rect(card_x, 830, card_w, 1540, 32, 2, UI_TERM_BG, UI_TERM_BORDER, UI_BG);
+		ui_round_rect(card_x + 28, 860, 16, 16, 8, 0, UI_RED, UI_RED, UI_TERM_BG);
+		ui_round_rect(card_x + 54, 860, 16, 16, 8, 0, UI_AMBER, UI_AMBER, UI_TERM_BG);
+		ui_round_rect(card_x + 80, 860, 16, 16, 8, 0, UI_GREEN, UI_GREEN, UI_TERM_BG);
+		ui_draw_text_ex(card_x + 116, 852, "KERNEL BOOT CONSOLE", 2, 32, UI_TEXT_DIM, UI_TERM_BG, 0, 1);
+		ui_fill(card_x + 4, 906, card_w - 8, 2, UI_TERM_BORDER);
+	}
+
+	if (pct < 0) pct = 0;
+	if (pct > 100) pct = 100;
+	if (pct > UI_BOOT.pct) {
+		UI_BOOT.pct = pct;
+		int fill = bw * pct / 100;
+		if (fill > 0) {
+			if (fill < 14) fill = 14;
+			ui_round_rect(bx, by, fill, bh, 7, 0, UI_WHITE, UI_WHITE, UI_TRACK_BG);
+		}
+	}
+
+	if (stage != NULL && stage != UI_BOOT.stage) {
+		UI_BOOT.stage = stage;
+		int mw = ui_measure_text_ex(stage, 64, 2, 0);
+		ui_fill(40, 670, (int)SCREEN.width - 80, 38, UI_BG);
+		ui_draw_text_ex(((int)SCREEN.width - mw) / 2, 674, stage, 2, 64, UI_TEXT_PRI, UI_BG, 0, 1);
+	}
+
+	uint64_t freq = READ_SYSREG(CNTFRQ_EL0);
+	if (freq == 0) freq = 19200000;
+	int tenths = (int)((READ_SYSREG(CNTVCT_EL0) - UI_BOOT.t0) * 10 / freq);
+	if (tenths != UI_BOOT.last_tenth || pct == 100) {
+		UI_BOOT.last_tenth = tenths;
+		char pbuf[48];
+		int pn = 0;
+		pn += ui_dec(pbuf + pn, (uint64_t)(UI_BOOT.pct > 0 ? UI_BOOT.pct : 0));
+		pbuf[pn++] = '%';
+		pbuf[pn++] = ' '; pbuf[pn++] = ' '; pbuf[pn++] = '-'; pbuf[pn++] = ' '; pbuf[pn++] = ' ';
+		pn += ui_dec(pbuf + pn, (uint64_t)(tenths / 10));
+		pbuf[pn++] = '.';
+		pbuf[pn++] = (char)('0' + (tenths % 10));
+		pbuf[pn++] = 's';
+		pbuf[pn] = 0;
+		int pw = ui_measure_text_ex(pbuf, pn, 2, 0);
+		ui_fill(160, 720, (int)SCREEN.width - 320, 36, UI_BG);
+		ui_draw_text_ex(((int)SCREEN.width - pw) / 2, 724, pbuf, 2, pn, UI_TEXT_SEC, UI_BG, 0, 0);
+	}
+
+	if (klog != NULL && klog_len != UI_BOOT.last_len) {
+		UI_BOOT.last_len = klog_len;
+		ui_draw_boot_console(klog, klog_len);
+	}
+}
+
 static void
 ui_draw_ios_boot_splash(void)
 {
-	if (SCREEN.base == 0) return;
-	ui_fill(0, 0, (int)SCREEN.width, (int)SCREEN.height, UI_BG);
+	memset(&UI_BOOT, 0, sizeof(UI_BOOT));
+	ui_boot_progress(4, "Preparing iOS 26 boot environment...", log_buf, log_len);
+}
 
-	int icon_sz = 96;
-	int ix = ((int)SCREEN.width - icon_sz) / 2;
-	int iy = (int)SCREEN.height / 2 - 180;
-	ui_draw_icon24(ix, iy, ui_icon_apple, 4, UI_WHITE, UI_BG);
+static int
+ui_boot_watch_due(uint64_t now, uint64_t freq, uint32_t *prev_len)
+{
+	if (!UI_BOOT.active || UI_BOOT.done || SCREEN.base == 0) {
+		return 0;
+	}
+	if (freq == 0) freq = 19200000;
+	if (now - UI_BOOT.last_tick < freq / 12) {
+		return 0;
+	}
+	UI_BOOT.last_tick = now;
+	*prev_len = UI_BOOT.last_len;
+	return 1;
+}
 
-	int bw = 480, bh = 12;
-	int bx = ((int)SCREEN.width - bw) / 2;
-	int by = iy + icon_sz + 96;
-	ui_round_rect(bx, by, bw, bh, 6, 0, UI_TRACK_BG, UI_TRACK_BG, UI_BG);
-	ui_round_rect(bx, by, bw * 35 / 100, bh, 6, 0, UI_WHITE, UI_WHITE, UI_TRACK_BG);
-
-	const char *msg = "Starting iOS 26...";
-	int mw = ui_measure_text_ex(msg, 32, 2, 0);
-	ui_draw_text_ex(((int)SCREEN.width - mw) / 2, by + 36, msg, 2, 32, UI_TEXT_SEC, UI_BG, 0, 0);
+static void
+ui_boot_watch_step(const char *klog, uint32_t len)
+{
+	if (!UI_BOOT.active || UI_BOOT.done || SCREEN.base == 0) {
+		return;
+	}
+	if (len == 0) {
+		ui_boot_progress(UI_BOOT.pct, UI_BOOT.stage, log_buf, log_len);
+		return;
+	}
+	if (len != UI_BOOT.last_len) {
+		uint32_t prev = (UI_BOOT.last_len <= len) ? UI_BOOT.last_len : 0;
+		uint32_t from = prev > 256 ? prev - 256 : 0;
+		if (len - from > 65536 && len > 65536) {
+			from = len - 65536;
+		}
+		int pct = UI_BOOT.pct;
+		int stop_after = 0;
+		const char *stage = UI_BOOT.stage;
+		for (unsigned i = 0; i < sizeof(ui_boot_milestones) / sizeof(ui_boot_milestones[0]); i++) {
+			if ((ui_boot_milestones[i].pct > pct || ui_boot_milestones[i].stop) &&
+			    ui_mem_find(klog + from, len - from, ui_boot_milestones[i].needle)) {
+				if (ui_boot_milestones[i].pct > pct) {
+					pct = ui_boot_milestones[i].pct;
+					stage = ui_boot_milestones[i].stage;
+				}
+				if (ui_boot_milestones[i].stop) {
+					stop_after = 1;
+				}
+			}
+		}
+		int byte_pct = 30 + (int)((uint64_t)len * 68 / 263000);
+		if (byte_pct > 98) byte_pct = 98;
+		if (byte_pct > pct) pct = byte_pct;
+		if (len >= 270000) {
+			pct = 100;
+			stop_after = 1;
+		}
+		ui_boot_progress(pct, stage, klog, len);
+		if (stop_after) {
+			UI_BOOT.done = 1;
+		}
+	} else {
+		ui_boot_progress(UI_BOOT.pct, UI_BOOT.stage, NULL, UI_BOOT.last_len);
+	}
 }
 
 #endif

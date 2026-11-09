@@ -263,6 +263,7 @@ ui_init(void)
 	}
 	const char *prev_stage = UI.stage;
 	memset(&UI, 0, sizeof(UI));
+	memset(&UI_BOOT, 0, sizeof(UI_BOOT));
 	UI.pct = -1;
 	UI.ready = 1;
 	UI.spin_at = ui_now();
@@ -853,6 +854,7 @@ ui_boot_menu(void)
 		}
 		if (usb_menu_interrupted) {
 			choice = MENU_CHOICE_FASTBOOT;
+			UI_BOOT.active = 0;
 			ui_fill(0, 0, (int)SCREEN.width, (int)SCREEN.height, UI_BG);
 		}
 	} else {
