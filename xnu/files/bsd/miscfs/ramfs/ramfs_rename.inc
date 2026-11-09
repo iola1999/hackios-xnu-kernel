@@ -3,6 +3,18 @@
  * have its identity overwritten by this one. Drop rm_lock first: identity
  * updates may release a parent vnode and reenter ramfs_reclaim. */
 
+/* True when dir is node itself or lies below it; a directory cannot move there. Needs rm_lock. */
+static bool
+ramfs_dir_below(struct ramfs_mount *rm, struct ramfs_node *dir, struct ramfs_node *node)
+{
+	for (struct ramfs_node *up = dir; up != NULL; up = (up == rm->rm_root) ? NULL : up->rn_parent) {
+		if (up == node) {
+			return true;
+		}
+	}
+	return false;
+}
+
 /* excl: VFS_RENAME_EXCL, the rename fails with EEXIST when the target name exists by now. */
 static int
 ramfs_rename_common(struct vnop_rename_args *ap, bool excl)
@@ -33,14 +45,9 @@ ramfs_rename_common(struct vnop_rename_args *ap, bool excl)
 		error = EEXIST;
 		goto out;
 	}
-	if (node->rn_type == VDIR) {
-		/* a directory cannot move into itself or below itself */
-		for (struct ramfs_node *up = tdir; up != NULL; up = (up == rm->rm_root) ? NULL : up->rn_parent) {
-			if (up == node) {
-				error = EINVAL;
-				goto out;
-			}
-		}
+	if (node->rn_type == VDIR && ramfs_dir_below(rm, tdir, node)) {
+		error = EINVAL;
+		goto out;
 	}
 	if (tde != NULL && tde->rd_node == node) {
 		/* two names of the same file: POSIX wants the rename to do nothing */
@@ -135,10 +142,6 @@ ramfs_renamex(struct vnop_renamex_args *ap)
 	int error = 0;
 	bool changed = false;
 
-	/* Directory swaps also require ancestor checks and parent link accounting. */
-	if (from->rn_type == VDIR || to->rn_type == VDIR) {
-		return ENOTSUP;
-	}
 	lck_mtx_lock(&rm->rm_rename_lock);
 	lck_mtx_lock(&rm->rm_lock);
 	fde = ramfs_dir_find(fdir, fcnp->cn_nameptr, (size_t)fcnp->cn_namelen);
@@ -147,10 +150,31 @@ ramfs_renamex(struct vnop_renamex_args *ap)
 	if (fde == NULL || tde == NULL || fde->rd_node != from || tde->rd_node != to ||
 	    fdir->rn_nlink == 0 || tdir->rn_nlink == 0) {
 		error = ENOENT;
+	} else if (from != to && ((from->rn_type == VDIR && ramfs_dir_below(rm, tdir, from)) ||
+	    (to->rn_type == VDIR && ramfs_dir_below(rm, fdir, to)))) {
+		error = EINVAL;
 	} else if (from != to) {
 		/* Both links remain present, including any other hard links to these nodes. */
 		fde->rd_node = to;
 		tde->rd_node = from;
+		/*
+		 * A directory's rn_parent is what ".." and the on-disk parent_ino report, and each
+		 * subdirectory holds one link on its parent. launchd's dirs_cleaner swaps /private/var/tmp
+		 * and other directories with fresh ones at boot.
+		 */
+		if (fdir != tdir && (from->rn_type == VDIR) != (to->rn_type == VDIR)) {
+			struct ramfs_node *gains = (from->rn_type == VDIR) ? tdir : fdir;
+			struct ramfs_node *loses = (gains == tdir) ? fdir : tdir;
+
+			gains->rn_nlink++;
+			loses->rn_nlink--;
+		}
+		if (from->rn_type == VDIR) {
+			from->rn_parent = tdir;
+		}
+		if (to->rn_type == VDIR) {
+			to->rn_parent = fdir;
+		}
 		ramfs_touch(fdir, true);
 		if (fdir != tdir) {
 			ramfs_touch(tdir, true);

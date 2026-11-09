@@ -225,9 +225,10 @@ class TestStandalonePackager(unittest.TestCase):
             self.assertNotIn('rdres', entries)
             self.assertTrue(entries['cmdline'].endswith(b'\0'))
             args = entries['cmdline'][:-1].decode().split()
-            for expected in ('rd=md0', 'rootdev=md0', 'root_apfs=ufs_darwin', 'ufs=2', 'ufs_native=1'):
+            for expected in ('rootdev=md0', 'root_apfs=ufs_darwin', 'ufs=2', 'ufs_native=1'):
                 key = expected.split('=', 1)[0]
                 self.assertEqual([arg for arg in args if arg.split('=', 1)[0] == key], [expected])
+            self.assertEqual([arg for arg in args if arg.split('=', 1)[0] == 'rd'], [])
 
     def test_invalid_boot_size_refused_before_output_or_subprocess(self):
         module = self.packager()

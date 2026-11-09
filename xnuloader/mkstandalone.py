@@ -16,7 +16,7 @@ MAX_RESIDENT_BOOT_BYTES = 64 * 1024 * 1024
 DEFAULT_IDENTITY = "v57"
 DEFAULT_MEMSIZE = "300000000"
 DEFAULT_CMDLINE = (
-    "debug=0x10e rd=md0 rootdev=md0 root_apfs=ufs_darwin launchd_unsecure_cache=1 cpus=4 bootcpu=7 "
+    "debug=0x10e rootdev=md0 root_apfs=ufs_darwin launchd_unsecure_cache=1 cpus=4 bootcpu=7 "
     "small_cores_after=0 adreno8=23 adreno8_pause=0 adreno8_fine=0 adreno8_watch=0 "
     "adreno8_keep=1 adreno8_return=0 adreno8_speed=14 adreno8_secure_preflight=4 "
     "touchscreen=2 buttons=1 battery=1 gpu_log=0 metal=1 cpufreq=1 fb_threads=2 "
@@ -105,10 +105,13 @@ def build_standalone_payload(
         raise FileNotFoundError(f"boot image not found at {boot_image}; build it with FLASHBOOT=1 CRYPTEXES=flash")
     if not 0 < boot_image.stat().st_size <= MAX_RESIDENT_BOOT_BYTES:
         raise ValueError(f"boot image is {boot_image.stat().st_size} bytes; the limit is {MAX_RESIDENT_BOOT_BYTES}")
-    for key, value in (("rd", "md0"), ("rootdev", "md0"), ("root_apfs", "ufs_darwin"),
-                       ("ufs", "2"), ("ufs_native", "1")):
+    for key, value in (("rootdev", "md0"), ("root_apfs", "ufs_darwin"), ("ufs", "2"), ("ufs_native", "1")):
         if [arg for arg in cmdline.split() if arg.split("=", 1)[0] == key] != [f"{key}={value}"]:
             raise ValueError(f"cmdline requires exactly one {key}={value}")
+    # The kernel takes rd= and rootdev= alike, but launchd reads "rd=md0" as a restore environment and
+    # skips the boot tasks that allocate personas and clean /private/var/tmp.
+    if any(arg.split("=", 1)[0] == "rd" for arg in cmdline.split()):
+        raise ValueError("cmdline names the RAM disk root with rootdev=md0 alone; rd= makes launchd boot as a restore environment")
 
     output.parent.mkdir(parents=True, exist_ok=True)
     if lz4_output is None:
@@ -134,8 +137,6 @@ def build_standalone_payload(
         "rdfile",
         "--forbid-entry",
         "rdres",
-        "--require-cmd",
-        "rd=md0",
         "--require-cmd",
         "rootdev=md0",
         "--require-cmd",
