@@ -1,5 +1,5 @@
 # A whitelist: the working tree also holds gigabytes of downloads, build output, logs, third-party
-# clones, files of iOS and the hackios-xnu-userland checkout (common/setup.sh), none of which belongs
+# clones, files of iOS and hackios-xnu-userland links, none of which belongs
 # in this repository. Nothing is tracked unless it is named here.
 /*
 !/.gitignore
@@ -10,8 +10,6 @@
 !/docs/
 !/xl
 !/mkxnuimg.py
-!/xnu-build.sh
-!/xnu-env.sh
 !/xnuloader/
 !/qemu/
 !/tools/
@@ -28,18 +26,17 @@ __pycache__/
 *.orig
 *.rej
 
-# hackios-xnu-userland's files share this working tree (common/setup.sh)
+# hackios-xnu-userland's files
 /docs/air.md
 /docs/air-report.md
-/tools/apfs/
-/tools/air/
-/tools/mesa/
-/tools/metal/
+/tools/apfs
+/tools/air
+/tools/mesa
+/tools/metal
 /tools/mk-mesa.sh
 /tools/mesa-stamp.sh
 /tools/mk-jb.sh
 /tools/jb-preinstall.py
-/tools/font_trim.py
 /tools/metallib.py
 
 /xnuloader/*

@@ -2,10 +2,10 @@
  * Direct UFS persistence for /private/var (ANNFS001).
  *
  * File data pages are written straight through to 16 KB blocks on /dev/ufs_darwin_var
- * (or /dev/rufs_dsu_store) at ANNFS_DATA_OFFSET + dblk * PAGE_SIZE, and faulted in on
- * demand when read. Metadata (inodes, directories, symlinks, extended attributes, and
- * per-file block tables) is checkpointed to two alternating 32 MiB slots at the start
- * of the partition (0 MiB and 32 MiB), each protected by superblock and payload CRC32s.
+ * at ANNFS_DATA_OFFSET + dblk * PAGE_SIZE, and faulted in on demand when read.
+ * Metadata (inodes, directories, symlinks, extended attributes, and per-file block
+ * tables) is checkpointed to two alternating 32 MiB slots at the start of the
+ * partition (0 MiB and 32 MiB), each protected by superblock and payload CRC32s.
  */
 
 extern bool annibale_ufs_var_info(uint64_t *size_bytes_out);

@@ -41,7 +41,7 @@ index 19e7e67a276c..ac9f640fcd3c 100644
  	case VM_WIMG_WCOMB:
 +#if defined(ARM64_BOARD_CONFIG_BCM2837)
 +		/*
-+		 * Normal non-cacheable outside DRAM as well, as in xnu-8796: the panic region and
++		 * Normal non-cacheable outside DRAM as well: the panic region and
 +		 * the framebuffers lie outside the kernel's memory window and are accessed
 +		 * unaligned (the panic header is packed), which faults on Device memory.
 +		 */

@@ -1727,7 +1727,7 @@ lookup_cb(void *ctx, const char *name, size_t name_len, uint64_t file_id, uint8_
  * caseless form (case-folded NFD), Unicode 9.0 as APFS has it. For the decomposition and folding
  * the kernel's own (bsd/vfs/vfs_unicode.c, utf8_normalizeOptCaseFoldAndHash, which is APFS's);
  * a name of plain ASCII needs neither and is hashed directly. Checked against the hash stored
- * with every name of the iOS 16.5 root volume, ASCII and not (tools/apfs/test_namehash.py,
+ * with every name of the root volume, ASCII and not (tools/apfs/test_namehash.py,
  * apfs-tool namehash).
  */
 static const uint32_t crc32c_nibble[16] = {

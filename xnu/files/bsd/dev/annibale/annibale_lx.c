@@ -1,15 +1,13 @@
 /*
  * Darwin-on-annibale: the kernel's side of the Wi-Fi driver's object.
  *
- * The driver of the phone's radio is Linux's ath11k, compiled unmodified outside this tree on a
+ * The driver of the phone's radio is Linux's ath12k, compiled unmodified outside this tree on a
  * layer that gives it the kernel interfaces it expects, and tied into one object that the
- * kernel links when it is there (tools/mk-ath11k.sh and wifi/lx in the repository; the kernel
- * is built with that object when xnu-build.sh finds it). The object shows one name, lx_start(),
+ * kernel links when it is there (tools/mk-ath12k.sh and wifi/lx in the repository; the kernel
+ * is built with that object when build-macos.sh finds it). The object shows one name, lx_start(),
  * and asks for the calls of sys/annibale_lx.h, which are here: memory, time, threads, one lock
  * to sleep under, the kernel's options. What it asks of the radio itself -- its firmware's
- * files, its view of memory, the processor its firmware runs on -- is annibale_wifi.c's to
- * answer, which knows the phone; on the K90 (ath12k, tools/mk-ath12k.sh, started by pcie=10)
- * it is mhi_pcie.c's, which knows the card on PCIe.
+ * files, its view of memory, the card on PCIe -- is mhi_pcie.c's to answer.
  *
  * A kernel built without the object has the lx_start() at the end of this file, which says so.
  */
@@ -28,6 +26,7 @@
 #include <sys/annibale_input.h>
 #include <sys/annibale_lx.h>
 #include <sys/annibale_net.h>
+#include <sys/annibale_sta.h>
 #include <sys/systm.h>
 #include <vm/memory_types.h>
 #include <vm/vm_kern.h>
@@ -37,11 +36,123 @@ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, u
 extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
 extern kern_return_t thread_terminate(thread_t thread);
 extern void thread_set_thread_name(thread_t thread, const char *name);
+extern void loader_log_putc(char c);
 
 #define say annibale_wifi_say
 
 static LCK_GRP_DECLARE(lx_lock_group, "annibale-lx");
 static LCK_MTX_DECLARE(lx_lock, &lx_lock_group);
+static LCK_MTX_DECLARE(say_lock, &lx_lock_group);
+static bool leaving;
+
+int
+annibale_wifi_say(const char *format, ...)
+{
+	char line[400];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	if (leaving) {
+		for (const char *c = line; *c != 0; c++) {
+			loader_log_putc(*c);
+		}
+		return 0;
+	}
+	lck_mtx_lock(&say_lock);
+	for (const char *c = line; *c != 0; c++) {
+		loader_log_putc(*c);
+	}
+	printf("%s", line);
+	lck_mtx_unlock(&say_lock);
+	return 0;
+}
+
+int
+annibale_wifi_tell(const char *format, ...)
+{
+	char line[400];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	if (leaving) {
+		for (const char *c = line; *c != 0; c++) {
+			loader_log_putc(*c);
+		}
+		return 0;
+	}
+	lck_mtx_lock(&say_lock);
+	for (const char *c = line; *c != 0; c++) {
+		loader_log_putc(*c);
+	}
+	printf("%s", line);
+	lck_mtx_unlock(&say_lock);
+	return 0;
+}
+
+uint32_t
+annibale_wifi_option(const char *name)
+{
+	uint32_t value = 0;
+
+	if (PE_parse_boot_argn(name, &value, sizeof(value))) {
+		return value;
+	}
+	return 0;
+}
+
+bool
+annibale_wifi_radio_address(uint8_t *address)
+{
+	char text[32] = "";
+	uint8_t bytes[6];
+	unsigned count = 0, digits = 0, value = 0;
+	bool good;
+
+	if (!PE_parse_boot_arg_str("wifi_mac", text, sizeof(text)) || text[0] == 0) {
+		say("wifi: the driver asks for the radio's address: none was given (wifi_mac)\n");
+		return false;
+	}
+	good = true;
+	for (const char *c = text;; c++) {
+		int digit = *c >= '0' && *c <= '9' ? *c - '0' : *c >= 'a' && *c <= 'f' ? *c - 'a' + 10 : *c >= 'A' && *c <= 'F' ?
+		    *c - 'A' + 10 : -1;
+
+		if (digit >= 0 && digits < 2) {
+			value = value << 4 | (unsigned)digit;
+			digits++;
+		} else if ((*c == ':' || *c == 0) && digits != 0 && count < 6) {
+			bytes[count++] = (uint8_t)value;
+			digits = value = 0;
+		} else {
+			good = false;
+		}
+		if (*c == 0 || !good) {
+			break;
+		}
+	}
+	good = good && count == 6 && !(bytes[0] & 1) && (bytes[0] | bytes[1] | bytes[2] | bytes[3] | bytes[4] | bytes[5]) != 0;
+	if (good) {
+		memcpy(address, bytes, sizeof(bytes));
+	}
+	return good;
+}
+
+void
+annibale_wifi_stop(void)
+{
+	annibale_apple80211_summary();
+}
+
+void
+annibale_wifi_quiesce(void)
+{
+	leaving = true;
+	annibale_apple80211_summary();
+}
 
 /* ---- memory ------------------------------------------------------------------------------------------ */
 
@@ -57,15 +168,9 @@ lx_os_free(void *memory, unsigned long size)
 	kfree_data(memory, size);
 }
 
-/*
- * In one physical piece, so that it can be mapped a second time without this processor's cache
- * in between (as annibale_adreno.c does with what it shares with the GPU); the first, cached
- * view is written out and never used again.
- */
 void *
 lx_os_radio_memory(unsigned long size, unsigned long long *address)
 {
-	vm_offset_t cached = 0, uncached;
 	uint64_t physical;
 
 	if (mhi_pcie_radio()) {
@@ -74,23 +179,7 @@ lx_os_radio_memory(unsigned long size, unsigned long long *address)
 		*address = physical;
 		return memory;
 	}
-	size = round_page(size);
-	if (kmem_alloc_contig(kernel_map, &cached, size, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
-	    KERN_SUCCESS) {
-		say("lx: no %lu bytes of memory in one piece\n", size);
-		return NULL;
-	}
-	physical = kvtophys(cached);
-	bzero((void *)cached, size);
-	for (vm_offset_t line = cached; line < cached + size; line += 64) {
-		__asm__ volatile ("dc civac, %0" : : "r" (line));
-	}
-	__asm__ volatile ("dsb sy");
-	uncached = ml_io_map_unmappable(physical, size, VM_WIMG_WCOMB);
-	if (uncached == 0 || !annibale_wifi_radio_map(physical, size, address)) {
-		return NULL;
-	}
-	return (void *)uncached;
+	return NULL;
 }
 
 void *
@@ -236,7 +325,7 @@ int
 lx_os_firmware(const char *name, const void **data, unsigned long *size)
 {
 	uint64_t length = 0;
-	const uint8_t *file = mhi_pcie_radio() ? mhi_pcie_radio_file(name, &length) : annibale_wifi_driver_file(name, &length);
+	const uint8_t *file = mhi_pcie_radio() ? mhi_pcie_radio_file(name, &length) : NULL;
 
 	if (file == NULL) {
 		return ENOENT;
@@ -252,7 +341,7 @@ lx_os_rproc_boot(void)
 	if (mhi_pcie_radio()) {
 		return mhi_pcie_radio_boot();
 	}
-	return annibale_wifi_dsp_is_up() ? 0 : ENXIO;
+	return ENXIO;
 }
 
 int
@@ -331,7 +420,7 @@ lx_link_transmit(mbuf_t packet, size_t length)
 }
 
 static struct annibale_net_link lx_link = {
-	.name = "the phone's radio (ath11k)",
+	.name = "the phone's radio (ath12k)",
 	.wireless = true,
 	.transmit = lx_link_transmit,
 };
@@ -453,15 +542,9 @@ lx_irq_runs(__unused void *parameter, __unused wait_result_t result)
 }
 
 int
-lx_os_irq_msi(unsigned long long *address, unsigned *data)
+lx_os_irq_msi(__unused unsigned long long *address, __unused unsigned *data)
 {
-	uint32_t first = 0;
-
-	if (!annibale_wifi_radio_msi(address, data, &first)) {
-		return 0;
-	}
-	lx_irq_first = first;
-	return 1;
+	return 0;
 }
 
 int
@@ -566,7 +649,7 @@ lx_os_station_lost(int error)
 __attribute__((weak)) int
 lx_start(void)
 {
-	say("lx: THE DRIVER IS NOT BUILT IN: its object was not there when this kernel was built (tools/mk-ath11k.sh, then "
+	say("lx: THE DRIVER IS NOT BUILT IN: its object was not there when this kernel was built (tools/mk-ath12k.sh, then "
 	    "build the kernel again)\n");
 	return ENXIO;
 }

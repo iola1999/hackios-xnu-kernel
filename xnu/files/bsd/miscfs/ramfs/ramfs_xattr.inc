@@ -29,8 +29,8 @@ ramfs_getxattr(struct vnop_getxattr_args *ap)
 
 	/*
 	 * The copy is made with the lock dropped, where the allocation may wait: a Z_NOWAIT one under
-	 * the lock answered ENOMEM in bursts of reads (kernel-12377-cmd30-warm4, var_store restoring
-	 * access lists). The attribute may change meanwhile, so it is looked up again after.
+	 * the lock answered ENOMEM in bursts of reads when restoring access lists.
+	 * The attribute may change meanwhile, so it is looked up again after.
 	 */
 	for (;;) {
 		lck_mtx_lock(&rm->rm_lock);

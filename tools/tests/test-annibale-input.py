@@ -64,7 +64,6 @@ int main(void) {
     for (int i = 0; i < 8; i++) {
         assert(platform_annibale.core_mpidr[i] == expected[i]);
         assert(platform_core_index(&platform_annibale, expected[i]) == i);
-        assert(platform_poco.core_mpidr[i] == (uint32_t)i * 0x100);
         assert(platform_qemu_virt.core_mpidr[i] == (uint32_t)i);
     }
     assert(platform_core_index(&platform_annibale, 0x700) == -1);

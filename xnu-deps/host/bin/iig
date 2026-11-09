@@ -1,6 +1,6 @@
 #!/bin/bash
 # Stand-in for Apple's closed-source iig (DriverKit interface generator).
-# Headers: taken pre-generated from the macOS 13.3 SDK (same xnu-8796 family).
+# Headers: taken pre-generated from the macOS SDK.
 # Implementation: taken from $XNUDEPS/iig-impl/<name>.iig.cpp if present, else an empty TU.
 XNUDEPS=${XNUDEPS:-$(cd "$(dirname "$0")/../.." && pwd)}
 SDKH="$XNUDEPS/MacOSX13.3.sdk/System/Library/Frameworks/Kernel.framework/Headers"

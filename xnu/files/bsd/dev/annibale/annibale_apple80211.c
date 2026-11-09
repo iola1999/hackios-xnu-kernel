@@ -338,7 +338,7 @@ get(struct apple80211req *request)
 	switch (request->req_type) {
 	case 43:
 	case 44: {                              /* the driver's and the hardware's name: the text alone, in 256 bytes */
-		static const char name[256] = "annibale: ath11k for the WCN6750";
+		static const char name[256] = "annibale: ath12k for the WCN7850";
 
 		return give(request, name, sizeof(name));
 	}

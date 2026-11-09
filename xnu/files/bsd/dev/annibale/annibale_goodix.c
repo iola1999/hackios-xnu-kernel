@@ -1,23 +1,18 @@
 /*
- * The touch screen of the POCO X5 Pro: either a Goodix GT9916 ("Berlin-D") or a
- * FocalTech FT3680 on the SPI bus of the SoC's serial engine 13, as a source of touches for
- * /dev/annibale-touch (sys/annibale_input.h). Only with the boot-arg touchscreen=1 for this phone,
- * or touchscreen=2 for the REDMI K90 (annibale), whose numbers are all in the table near the end.
+ * The touch screen of the REDMI K90 (annibale, SM8750): a Goodix GT9916K ("Berlin-D")
+ * on the SPI bus of the SoC's serial engine 6 ("qup1_se2"), as a source of touches for
+ * /dev/annibale-touch (sys/annibale_input.h). Enabled with boot-arg touchscreen=2 (or 1).
  *
  * There is no clock, pin, regulator or SPI framework in this kernel, so the driver does all of
  * it itself, in the order the vendor's Linux drivers do:
- *   power    the chip's I/O supply is LDO2 of the PM8350C, switched through RPMh (one request
+ *   power    the chip's I/O supply is L12B ("ldob12"), switched through RPMh (one request
  *            written into the "always on" processor's command slots); the analog supply is
  *            behind a GPIO
- *   clocks   the serial engine's three clocks, by vote in the global clock controller
+ *   clocks   the serial engine's clocks, by vote in the global clock controller
  *   pins     four GPIOs to the serial engine, plus reset, interrupt and the analog supply switch
  *   SPI      the serial engine ("GENI") in FIFO mode, polled; or, if the engine cannot be used,
  *            the same four pins driven by hand
- *   panel    GPIO96=1 and GPIO68=0 identify the FocalTech variant; everything else is Goodix,
- *            the same discriminator the vendor sm8350-kernel-OKX uses
- *   chip     Goodix: find where it keeps the touch report, then read it when the IRQ line signals;
- *            FocalTech: read the report at register 0x01 with FTS 5.x SPI framing (cmd 0xC1 for
- *            read, 0xC0 for write, two-byte CRC-16/Kermit)
+ *   chip     Goodix: find where it keeps the touch report, then read it when the IRQ line signals
  * No interrupt is used: a thread looks at the interrupt line 125 times a second (boot-arg
  * touch_poll_us=N: every N microseconds instead of 8000), and on the K90 at the edge the TLMM
  * latched for it (int_latch_on). With touch_lat=1 a line for every report
@@ -25,9 +20,8 @@
  * report read), for measuring how long a touch takes to show (tools/latency.py).
  *
  * Register layouts: Linux drivers/spi/spi-geni-qcom.c, drivers/soc/qcom/{qcom-geni-se,rpmh-rsc,
- * cmd-db}.c, drivers/clk/qcom/gcc-sc7280.c, drivers/pinctrl/qcom/pinctrl-sc7280.c,
- * drivers/input/touchscreen/{goodix_berlin_*,focaltech_touch/focaltech_core}.c, and the phone's
- * own device tree.
+ * cmd-db}.c, drivers/clk/qcom/gcc-sm8750.c, drivers/pinctrl/qcom/pinctrl-sm8750.c,
+ * drivers/input/touchscreen/goodix_berlin_*, and the phone's own device tree.
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -240,7 +234,7 @@ goodix_command(uint8_t command, uint16_t data, unsigned data_bytes)
 static bool
 goodix_coordinate_mode(void)
 {
-	return !board_annibale || (goodix_command(0x90, 0x0002, 2) && goodix_command(0x91, 0x01, 1));
+	return goodix_command(0x90, 0x0002, 2) && goodix_command(0x91, 0x01, 1);
 }
 
 /* What has been seen so far: said once a minute, so that the end of the log always tells. */
@@ -310,18 +304,6 @@ goodix_report(const uint8_t *touches, uint32_t count)
 	}
 }
 
-static bool
-goodix_touching(void)
-{
-	for (uint32_t i = 0; i < GOODIX_MAX_TOUCHES; i++) {
-		if (contact[i].down) {
-			return true;
-		}
-	}
-	return false;
-}
-
-
 /* Read the report if there is one, and tell the chip it has been read. */
 static void
 goodix_poll(void)
@@ -372,32 +354,9 @@ goodix_poll(void)
 	goodix_report(report + 8, count);
 }
 
-#include "annibale_focaltech_private.h"
-
-/* Which touch chip is on this board. */
-enum touch_chip { TOUCH_GOODIX, TOUCH_FOCALTECH };
-static enum touch_chip touch_chip;
-
-static enum touch_chip
-touch_chip_detect(void)
-{
-	if (pin_ft_id == NO_STRAP || pin_gx_id == NO_STRAP) {
-		return TOUCH_GOODIX;   /* this phone has one touch chip and no way to tell: annibale's is a Goodix */
-	}
-	gpio_configure(PIN_FOCALTECH_ID, 0, PULL_NONE, 2, false);
-	gpio_configure(PIN_GOODIX_ID, 0, PULL_NONE, 2, false);
-	if (gpio_get(PIN_GOODIX_ID) && !gpio_get(PIN_FOCALTECH_ID)) {
-		return TOUCH_FOCALTECH;
-	}
-	return TOUCH_GOODIX;
-}
-
 static bool
 chip_probe(bool verbose)
 {
-	if (touch_chip == TOUCH_FOCALTECH) {
-		return focaltech_probe(verbose);
-	}
 	touch_reset();
 	return goodix_probe(verbose);
 }
@@ -405,34 +364,19 @@ chip_probe(bool verbose)
 static void
 chip_poll(void)
 {
-	if (touch_chip == TOUCH_FOCALTECH) {
-		focaltech_poll();
-	} else {
-		goodix_poll();
-	}
+	goodix_poll();
 }
-
-static bool
-chip_touching(void)
-{
-	if (touch_chip == TOUCH_FOCALTECH) {
-		return focaltech_touching();
-	}
-	return goodix_touching();
-}
-
 
 /* ---- all of it together ---------------------------------------------------------------------------- */
 
 static void
 show_state(const char *when)
 {
-	printf("goodix: %s: votes %#x, clocks %#x %#x %#x, rate cfg %#x dfs %#x; pins cs/clk/mosi/miso cfg %#x %#x %#x %#x,"
-	    " reset %#x/%u, int %#x/%u, avdd %#x/%u, straps %u %u\n", when, rd(GCC_VOTE), rd(GCC_QUP1_M_AHB_CBCR),
-	    rd(GCC_QUP1_S_AHB_CBCR), rd(board_annibale ? A_SE2_HALT : GCC_QUP1_SE5_CBCR), rd(board_annibale ? A_QSPI_REF_CFG : GCC_QUP1_SE5_CFG), board_annibale ? 0 : rd(GCC_QUP1_SE5_DFSR), rd(GPIO_CFG(PIN_CS)),
+	printf("goodix: %s: votes %#x, clocks %#x %#x %#x, rate cfg %#x; pins cs/clk/mosi/miso cfg %#x %#x %#x %#x,"
+	    " reset %#x/%u, int %#x/%u, avdd %#x/%u\n", when, rd(GCC_VOTE), rd(GCC_QUP1_M_AHB_CBCR),
+	    rd(GCC_QUP1_S_AHB_CBCR), rd(A_SE2_HALT), rd(A_QSPI_REF_CFG), rd(GPIO_CFG(PIN_CS)),
 	    rd(GPIO_CFG(PIN_CLK)), rd(GPIO_CFG(PIN_MOSI)), rd(GPIO_CFG(PIN_MISO)), rd(GPIO_CFG(PIN_RESET)),
-	    rd(GPIO_IO(PIN_RESET)), rd(GPIO_CFG(PIN_INT)), rd(GPIO_IO(PIN_INT)), rd(GPIO_CFG(PIN_AVDD)), rd(GPIO_IO(PIN_AVDD)),
-	    pin_ft_id == NO_STRAP ? 0 : gpio_get(PIN_FOCALTECH_ID), pin_gx_id == NO_STRAP ? 0 : gpio_get(PIN_GOODIX_ID));
+	    rd(GPIO_IO(PIN_RESET)), rd(GPIO_CFG(PIN_INT)), rd(GPIO_IO(PIN_INT)), rd(GPIO_CFG(PIN_AVDD)), rd(GPIO_IO(PIN_AVDD)));
 }
 
 /* Power the chip up from nothing, in the vendor driver's order. */
@@ -459,7 +403,7 @@ use_engine_pins(void)
 static const char *
 chip_name(void)
 {
-	return touch_chip == TOUCH_FOCALTECH ? "focaltech" : "goodix";
+	return "goodix";
 }
 
 static bool
@@ -469,9 +413,6 @@ bring_up(void)
 	printf("goodix: checking GPIO and clock state\n");
 	show_state("as found");
 	if (touch_steps < 3) { return false; }
-	touch_chip = touch_chip_detect();
-	printf("goodix: ID gpio96=%u gpio68=%u: selected %s\n", gpio_get(PIN_GOODIX_ID),
-	    gpio_get(PIN_FOCALTECH_ID), chip_name());
 	printf("goodix: enabling panel supplies\n");
 	power_on();
 	if (touch_steps < 4) { return false; }
@@ -526,34 +467,6 @@ micros_now(void)
 	return ns / 1000;
 }
 
-/* Which phone this is, from the boot-arg's value: 1 is annibale, the shape of every constant
- * above; 2 is annibale, whose every number comes from its own device tree or mainline gcc-sm8750.c. */
-static void
-board_setup(uint32_t which)
-{
-	vote_qup_bus = 1u << 18 | 1u << 19 | 1u << 20 | 1u << 21;   /* both phones: core 2x, core, m_ahb, s_ahb */
-	if (which == 2) {
-		board_annibale = 1;
-		tlmm_phys = 0x0f100000UL;  tlmm_size = 0x102000UL;   /* vendor TLMM base + 0x100000, as in sm8750.dtsi */
-		se_phys = 0x00a88000UL;                             /* serial engine 6: "qup1_se2", the touch chip's SPI */
-		rsc_phys = 0x16520000UL;                            /* apps_rsc "drv-2"; its slots too start at 0xd00 */
-		cmd_db_phys = 0x81c60000UL;  cmd_db_size = 0x20000UL;  /* aop_cmd_db_region, qcom,cmd-db */
-		supply_name = "ldob12";                             /* L12B, the goodix vdd-supply of the device tree */
-		pin_miso = 40;  pin_mosi = 41;  pin_clk = 42;  pin_cs = 43;   /* mux 1 each: "qup1_se2" */
-		pin_int = 162;  pin_reset = 161;  pin_avdd = 114;   /* the interrupt, reset, and avdd-switch of that tree */
-		vote_se = 1u << 24;                                 /* gcc_qupv3_wrap1_s2_clk: the engine's branch */
-	} else {
-		tlmm_phys = 0x0f100000UL;  tlmm_size = 0x100000UL;
-		se_phys = 0x00a94000UL;
-		rsc_phys = 0x18220000UL;
-		cmd_db_phys = 0x80860000UL;  cmd_db_size = 0x20000UL;
-		pin_miso = 52;  pin_mosi = 53;  pin_clk = 54;  pin_cs = 55;
-		pin_int = 81;  pin_reset = 105;  pin_avdd = 107;
-		pin_ft_id = 68;  pin_gx_id = 96;
-		vote_se = 1u << 27;
-	}
-}
-
 /*
  * On the K90 the interrupt line does not stay low until the report is read: with the level looked at
  * every 9 ms, a moving finger's reports were taken 36 to 90 ms apart, most of them by the 80 ms
@@ -600,7 +513,7 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 	se = ml_io_map(SE_PHYS, SE_SIZE);
 	rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
 	rsc_version = (rd(rsc) >> 16) & 0xff;
-	printf("goodix: command database at %#llx (%#llx bytes)\n", CMD_DB_PHYS, CMD_DB_SIZE);
+	printf("goodix: command database at %#lx (%#lx bytes)\n", CMD_DB_PHYS, CMD_DB_SIZE);
 	cmd_db = ml_io_map_wcomb(CMD_DB_PHYS, CMD_DB_SIZE);      /* memory, not registers: no alignment rules */
 	printf("goodix: command database resource %s = %#x\n", supply_name, rpmh_address(supply_name));
 	if (touch_steps == 1) { thread_terminate(current_thread()); return; }
@@ -609,20 +522,18 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 		thread_terminate(current_thread());
 		return;
 	}
-	if (touch_chip == TOUCH_GOODIX && !goodix_coordinate_mode()) {
+	if (!goodix_coordinate_mode()) {
 		printf("goodix: coordinate mode was not acknowledged\n");
 		thread_terminate(current_thread());
 		return;
 	}
-	if (board_annibale) {
-		int_latch_on();
-	}
+	int_latch_on();
 	printf("goodix: %s touch screen ready; the interrupt line is looked at every %u us\n", chip_name(), poll_us);
 	{
 		uint32_t rate = 0;
 
 		/* boot-arg touch_rate=480: the chip reports twice as often (Xiaomi's game mode; 240 otherwise) */
-		if (PE_parse_boot_argn("touch_rate", &rate, sizeof(rate)) && rate == 480 && touch_chip == TOUCH_GOODIX) {
+		if (PE_parse_boot_argn("touch_rate", &rate, sizeof(rate)) && rate == 480) {
 			bool done = goodix_command(GOODIX_CMD_HIGH_RATE, 1, 1);
 
 			report_rate = done ? "480 (acknowledged)" : "240 (480 NOT ACKNOWLEDGED)";
@@ -677,11 +588,6 @@ annibale_goodix_init(void)
 	if (!PE_parse_boot_argn("touchscreen", &enabled, sizeof(enabled)) || !enabled) {
 		return;
 	}
-	if (enabled != 2 && annibale_platform_blocks_legacy_drivers()) {
-		printf("goodix: legacy panel initialization skipped; touchscreen=2 selects the annibale driver\n");
-		return;
-	}
-	board_setup(enabled);
 	PE_parse_boot_argn("touch_hv_steps", &touch_steps, sizeof(touch_steps));
 	if (touch_steps < 1 || touch_steps > 5) { touch_steps = 1; }
 	PE_parse_boot_argn("touch_flip", &flip, sizeof(flip));

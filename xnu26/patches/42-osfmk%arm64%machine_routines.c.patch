@@ -2,13 +2,12 @@ diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
 index 07143d539042..966e8ef38d3a 100644
 --- a/osfmk/arm64/machine_routines.c
 +++ b/osfmk/arm64/machine_routines.c
-@@ -907,17 +907,33 @@ ml_get_machine_mem(void)
+@@ -907,17 +907,31 @@ ml_get_machine_mem(void)
  	return machine_info.memory_size;
  }
  
 +extern void loader_return(void);
 +extern void annibale_var_save_on_return(void);
-+extern void annibale_adreno_stop(void);
 +extern void annibale_wifi_stop(void);
 +extern void MiniIOMobileFramebufferPowerOff(void);
 +extern boolean_t annibale_halting_poweroff;
@@ -21,7 +20,6 @@ index 07143d539042..966e8ef38d3a 100644
 +		annibale_halting_poweroff = TRUE;
 +	}
 +	annibale_var_save_on_return();
-+	annibale_adreno_stop();
 +	annibale_wifi_stop();
  	if (reboot) {
  		printf("MACH Reboot\n");

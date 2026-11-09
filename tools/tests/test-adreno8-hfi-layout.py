@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-DEV = ROOT / "xnu/files/bsd/dev/adreno8/adreno8"
+DEV = ROOT / "xnu/files/bsd/dev/adreno8"
 PIN = "d50b305f7da9e14715a25120a4ac7b1a4b8b97c3"
 HASHES = {
     "adreno_hfi.h": "cf44ef07a460d74a24486ed0ac9495acf07d8074e6eaf8bf190c55ac374ac2b1",

@@ -72,25 +72,15 @@ latency_lines(void)
 }
 
 /*
- * The two answers below are worked out once and kept, the first time by annibale_input_init(),
+ * The answer below is worked out once and kept, the first time by annibale_input_init(),
  * before the GPU paths that ask on every frame and every submission are up: pe_arm_get_soc_base_phys()
  * looks through the device tree with SecureDTFindEntry(), whose walk keeps its place in one static
  * variable, and two threads asking at the same time move each other's walk out of the tree (the
  * panic "Device tree pointer outside of device tree region").
  */
-static int8_t blocks_legacy = -1, is_annibale = -1;
+static int8_t is_annibale = -1;
 
-static bool platform_blocks_legacy_drivers(void);
 static bool platform_is_annibale(void);
-
-bool
-annibale_platform_blocks_legacy_drivers(void)
-{
-	if (blocks_legacy < 0) {
-		blocks_legacy = platform_blocks_legacy_drivers();
-	}
-	return blocks_legacy;
-}
 
 bool
 annibale_platform_is_annibale(void)
@@ -101,33 +91,9 @@ annibale_platform_is_annibale(void)
 	return is_annibale;
 }
 
-/* Preserve the existing POCO X5 Pro and QEMU paths using their loader GIC descriptions.
- * Other or incomplete descriptions block legacy drivers without probing hardware. */
-static bool
-platform_blocks_legacy_drivers(void)
-{
-	DTEntry entry;
-	const void *property;
-	unsigned int size;
-
-	if (SecureDTLookupEntry(NULL, "/arm-io/gic", &entry) != kSuccess ||
-	    SecureDTGetProperty(entry, "reg", &property, &size) != kSuccess || size != 4 * sizeof(uint64_t)) {
-		return true;
-	}
-	const uint64_t *reg = property;
-	vm_offset_t base = pe_arm_get_soc_base_phys();
-	if (reg[1] != 0x10000 || reg[3] != 0x100000) {
-		return true;
-	}
-	bool poco = base == 0x00400000 && reg[0] == 0x17600000 && reg[2] == 0x17660000;
-	bool qemu = base == 0x08000000 && reg[0] == 0 && reg[2] == 0xa0000;
-	return !poco && !qemu;
-}
-
-/* The same description again, for the phone whose own blocks some annibale drivers do belong
- * to: annibale's GIC distributor is at 0x16000000 and its redistributors at 0x16080000
+/* annibale's GIC distributor is at 0x16000000 and its redistributors at 0x16080000
  * (span 0x200000) inside a block that starts at 0x00400000, so its reg entry reads
- * {0x15C00000, 0x10000, 0x15C80000, 0x200000}. Taken from the loader's device tree, as above,
+ * {0x15C00000, 0x10000, 0x15C80000, 0x200000}. Taken from the loader's device tree,
  * so nothing is read from hardware to answer this. */
 static bool
 platform_is_annibale(void)
@@ -169,7 +135,6 @@ static void
 exit_hold_elapsed(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
 	printf("\n--- %d fingers held on the screen for %d ms: back to the loader ---\n", EXIT_FINGERS, EXIT_HOLD_MS);
-	annibale_adreno_stop();
 	loader_return();
 }
 
@@ -374,7 +339,6 @@ annibale_input_init(void)
 {
 	int major = cdevsw_add(-1, &touch_cdevsw);
 
-	(void)annibale_platform_blocks_legacy_drivers();         /* (worked out here, on one thread: see above) */
 	(void)annibale_platform_is_annibale();
 	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "annibale-touch") == NULL) {
 		printf("annibale-touch: cannot create the device\n");
@@ -382,10 +346,7 @@ annibale_input_init(void)
 	exit_call = thread_call_allocate(exit_hold_elapsed, NULL);
 	annibale_virtio_input_init();
 	annibale_goodix_init();
-	annibale_battery_state_init();
 	annibale_ufs_init();
 	annibale_net_init();
 	annibale_bt_probe_init();
-	annibale_adreno_init();
-	annibale_wifi_init();
 }

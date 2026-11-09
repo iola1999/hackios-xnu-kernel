@@ -1,7 +1,7 @@
 /*
  * Step 9 of the PCIe survey (pcie=9): the exchange with the WCN7850 firmware's service (WLFW, QMI service 69)
  * that ath12k's qmi.c makes before the rest of the driver touches the chip, in its order and with its values for
- * this chip, as bsd/dev/annibale_wlfw.c does for the WCN6750 and ath11k. A STAND-IN: it is here to learn from the
+ * this chip. A STAND-IN: it is here to learn from the
  * phone whether this firmware takes ath12k's messages, which board data file is this phone's and what memory the
  * firmware asks for, before ath12k's own qmi.c is made to run.
  *

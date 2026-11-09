@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-DEV = ROOT / "xnu/files/bsd/dev/adreno8/adreno8"
+DEV = ROOT / "xnu/files/bsd/dev/adreno8"
 ORDER = "return adreno8_gpu_prepare() && adreno8_gpu_memory_enable() &&\n\t    (adreno8_direct_ring ? adreno8_ordinary_start() : adreno8_hwsched_start());"
 
 WRAPPER_TEST = r'''

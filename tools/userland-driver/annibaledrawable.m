@@ -80,12 +80,12 @@
  * kDrmGemClose is Linux's. Repeated here rather than shared for the reason the structs are
  * repeated, and it is two lines.
  */
-#define RWD_REQUEST_SURFACE   0x7e
-#define RWD_REQUEST_GEM_CLOSE 0x09
+#define ANN_REQUEST_SURFACE   0x7e
+#define ANN_REQUEST_GEM_CLOSE 0x09
 
 /* A sentence into a caller's buffer, once, with no dependency on the caller having one. */
 static void
-rwd_say(char *why, size_t why_size, const char *format, ...)
+ann_say(char *why, size_t why_size, const char *format, ...)
 {
 	va_list arguments;
 
@@ -98,18 +98,18 @@ rwd_say(char *why, size_t why_size, const char *format, ...)
 }
 
 int
-rwd_gpu_open(io_connect_t *connection, char *why, size_t why_size)
+ann_gpu_open(io_connect_t *connection, char *why, size_t why_size)
 {
 	io_service_t service = IOServiceGetMatchingService(0, IOServiceMatching("AnnibaleGPU"));
 	kern_return_t result;
 
 	if (connection == NULL) {
-		rwd_say(why, why_size, "rwd_gpu_open was given nowhere to put the connection");
+		ann_say(why, why_size, "ann_gpu_open was given nowhere to put the connection");
 		return -1;
 	}
 	*connection = 0;
 	if (service == IO_OBJECT_NULL) {
-		rwd_say(why, why_size, "no AnnibaleGPU service: this kernel was booted without "
+		ann_say(why, why_size, "no AnnibaleGPU service: this kernel was booted without "
 		    "gpu=1, so there is no GPU to give a surface to");
 		return -1;
 	}
@@ -117,14 +117,14 @@ rwd_gpu_open(io_connect_t *connection, char *why, size_t why_size)
 	IOObjectRelease(service);
 	if (result != KERN_SUCCESS) {
 		*connection = 0;
-		rwd_say(why, why_size, "AnnibaleGPU refused a user client: %#x", result);
+		ann_say(why, why_size, "AnnibaleGPU refused a user client: %#x", result);
 		return -1;
 	}
 	return 0;
 }
 
 void
-rwd_gpu_close(io_connect_t connection)
+ann_gpu_close(io_connect_t connection)
 {
 	if (connection != 0) {
 		IOServiceClose(connection);
@@ -145,7 +145,7 @@ rwd_gpu_close(io_connect_t connection)
  * case rather than a fault; the sentence is printed once, by whoever asked first.
  */
 static io_connect_t
-rwd_shared_connection(void)
+ann_shared_connection(void)
 {
 	static io_connect_t connection;
 	static int opened;
@@ -154,7 +154,7 @@ rwd_shared_connection(void)
 		char why[256] = { 0 };
 
 		opened = 1;
-		if (rwd_gpu_open(&connection, why, sizeof(why)) != 0) {
+		if (ann_gpu_open(&connection, why, sizeof(why)) != 0) {
 			connection = 0;
 			printf("annibaledrawable: %s\n", why);
 		}
@@ -169,18 +169,18 @@ rwd_shared_connection(void)
  * tail of the answer -- which is the one way to misuse this request.
  */
 static int
-rwd_surface_call(io_connect_t connection, struct rwd_surface *surface, const char *what,
+ann_surface_call(io_connect_t connection, struct ann_surface *surface, const char *what,
 		 char *why, size_t why_size)
 {
-	struct rwd_surface reply;
+	struct ann_surface reply;
 	size_t size = sizeof(reply);
 	kern_return_t result;
 
 	if (connection == 0) {
-		rwd_say(why, why_size, "no connection to AnnibaleGPU to %s a surface with", what);
+		ann_say(why, why_size, "no connection to AnnibaleGPU to %s a surface with", what);
 		return -1;
 	}
-	result = IOConnectCallStructMethod(connection, RWD_REQUEST_SURFACE, surface,
+	result = IOConnectCallStructMethod(connection, ANN_REQUEST_SURFACE, surface,
 	    sizeof(*surface), &reply, &size);
 	if (result != KERN_SUCCESS) {
 		/*
@@ -192,7 +192,7 @@ rwd_surface_call(io_connect_t connection, struct rwd_surface *surface, const cha
 		 * memory the process already had, which is neither whole pages nor in rows the
 		 * GPU takes.
 		 */
-		rwd_say(why, why_size, "the kernel would not %s surface %u: %#x%s", what,
+		ann_say(why, why_size, "the kernel would not %s surface %u: %#x%s", what,
 		    surface->surface, result,
 		    result == kIOReturnUnsupported
 			? " (that surface wraps memory of the process's own; the GPU cannot "
@@ -203,7 +203,7 @@ rwd_surface_call(io_connect_t connection, struct rwd_surface *surface, const cha
 		return -1;
 	}
 	if (size < sizeof(reply)) {
-		rwd_say(why, why_size, "the kernel answered %zu bytes about surface %u, not %zu",
+		ann_say(why, why_size, "the kernel answered %zu bytes about surface %u, not %zu",
 		    size, surface->surface, sizeof(reply));
 		return -1;
 	}
@@ -212,35 +212,35 @@ rwd_surface_call(io_connect_t connection, struct rwd_surface *surface, const cha
 }
 
 int
-rwd_surface_describe(io_connect_t connection, uint32_t surfaceID, struct rwd_surface *surface,
+ann_surface_describe(io_connect_t connection, uint32_t surfaceID, struct ann_surface *surface,
 		     char *why, size_t why_size)
 {
 	if (surface == NULL) {
-		rwd_say(why, why_size, "rwd_surface_describe was given nowhere to answer into");
+		ann_say(why, why_size, "ann_surface_describe was given nowhere to answer into");
 		return -1;
 	}
 	memset(surface, 0, sizeof(*surface));
 	surface->surface = surfaceID;
-	surface->handle = RWD_DESCRIBE;
-	return rwd_surface_call(connection, surface, "describe", why, why_size);
+	surface->handle = ANN_DESCRIBE;
+	return ann_surface_call(connection, surface, "describe", why, why_size);
 }
 
 int
-rwd_surface_take(io_connect_t connection, uint32_t surfaceID, struct rwd_surface *surface,
+ann_surface_take(io_connect_t connection, uint32_t surfaceID, struct ann_surface *surface,
 		 char *why, size_t why_size)
 {
 	if (surface == NULL) {
-		rwd_say(why, why_size, "rwd_surface_take was given nowhere to answer into");
+		ann_say(why, why_size, "ann_surface_take was given nowhere to answer into");
 		return -1;
 	}
 	memset(surface, 0, sizeof(*surface));
 	surface->surface = surfaceID;
 	surface->handle = 0;
-	if (rwd_surface_call(connection, surface, "take", why, why_size) != 0) {
+	if (ann_surface_call(connection, surface, "take", why, why_size) != 0) {
 		return -1;
 	}
 	if (surface->handle == 0) {
-		rwd_say(why, why_size, "the kernel took surface %u and gave back buffer 0, "
+		ann_say(why, why_size, "the kernel took surface %u and gave back buffer 0, "
 		    "which is no buffer", surfaceID);
 		return -1;
 	}
@@ -248,7 +248,7 @@ rwd_surface_take(io_connect_t connection, uint32_t surfaceID, struct rwd_surface
 }
 
 int
-rwd_surface_give_back(io_connect_t connection, uint32_t handle, char *why, size_t why_size)
+ann_surface_give_back(io_connect_t connection, uint32_t handle, char *why, size_t why_size)
 {
 	struct {
 		uint32_t handle, pad;
@@ -258,10 +258,10 @@ rwd_surface_give_back(io_connect_t connection, uint32_t handle, char *why, size_
 	if (connection == 0 || handle == 0) {
 		return 0;                 /* nothing was taken, so nothing is owed */
 	}
-	result = IOConnectCallStructMethod(connection, RWD_REQUEST_GEM_CLOSE, &close,
+	result = IOConnectCallStructMethod(connection, ANN_REQUEST_GEM_CLOSE, &close,
 	    sizeof(close), NULL, NULL);
 	if (result != KERN_SUCCESS) {
-		rwd_say(why, why_size, "the kernel would not take buffer %u back: %#x", handle,
+		ann_say(why, why_size, "the kernel would not take buffer %u back: %#x", handle,
 		    result);
 		return -1;
 	}
@@ -269,7 +269,7 @@ rwd_surface_give_back(io_connect_t connection, uint32_t handle, char *why, size_
 }
 
 uint32_t
-rwd_surface_id(void *iosurface)
+ann_surface_id(void *iosurface)
 {
 	static uint32_t (*get_id)(void *);
 	static int looked;
@@ -296,7 +296,7 @@ rwd_surface_id(void *iosurface)
 }
 
 int
-rwd_surface_fits_adreno(const struct rwd_surface *surface, unsigned bytes_per_pixel,
+ann_surface_fits_adreno(const struct ann_surface *surface, unsigned bytes_per_pixel,
 			char *why, size_t why_size)
 {
 	/*
@@ -307,25 +307,25 @@ rwd_surface_fits_adreno(const struct rwd_surface *surface, unsigned bytes_per_pi
 	uint64_t least;
 
 	if (surface == NULL || bytes_per_pixel == 0) {
-		rwd_say(why, why_size, "rwd_surface_fits_adreno needs a surface and a pixel size");
+		ann_say(why, why_size, "ann_surface_fits_adreno needs a surface and a pixel size");
 		return -1;
 	}
 	least = (uint64_t)surface->width * bytes_per_pixel;
 	if (surface->rowBytes < least) {
-		rwd_say(why, why_size, "surface %u has %u bytes a row, and %ux%u pixels of %u "
+		ann_say(why, why_size, "surface %u has %u bytes a row, and %ux%u pixels of %u "
 		    "bytes need at least %llu", surface->surface, surface->rowBytes,
 		    surface->width, surface->height, bytes_per_pixel,
 		    (unsigned long long)least);
 		return -1;
 	}
 	if (surface->rowBytes % bytes_per_pixel != 0) {
-		rwd_say(why, why_size, "surface %u has %u bytes a row, which is not a whole "
+		ann_say(why, why_size, "surface %u has %u bytes a row, which is not a whole "
 		    "number of %u-byte pixels", surface->surface, surface->rowBytes,
 		    bytes_per_pixel);
 		return -1;
 	}
 	if (surface->size < (uint64_t)surface->rowBytes * surface->height + surface->offset) {
-		rwd_say(why, why_size, "surface %u is %llu bytes, and %u rows of %u bytes from "
+		ann_say(why, why_size, "surface %u is %llu bytes, and %u rows of %u bytes from "
 		    "offset %u need %llu", surface->surface, (unsigned long long)surface->size,
 		    surface->height, surface->rowBytes, surface->offset,
 		    (unsigned long long)((uint64_t)surface->rowBytes * surface->height +
@@ -367,7 +367,7 @@ rwd_surface_fits_adreno(const struct rwd_surface *surface, unsigned bytes_per_pi
  *   the combined YCbCr formats (500-629) require a multi-plane texture and YCbCr sampling.
  *       NV12 planes can be imported separately as R8Unorm and RG8Unorm.
  */
-struct rwd_format {
+struct ann_format {
 	unsigned metal;
 	uint32_t fourcc;
 	unsigned bytes_per_pixel;
@@ -375,7 +375,7 @@ struct rwd_format {
 	const char *name;
 };
 
-static const struct rwd_format rwd_formats[] = {
+static const struct ann_format ann_formats[] = {
 	{  10, 'A008', 1, 0, "MTLPixelFormatR8Unorm" },
 	{  11, 'A008', 1, 0, "MTLPixelFormatR8Unorm_sRGB" },
 	{  30, 'LA08', 2, 0, "MTLPixelFormatRG8Unorm" },
@@ -395,17 +395,17 @@ static const struct rwd_format rwd_formats[] = {
 };
 
 int
-rwd_format_of_metal(unsigned metal_pixel_format, uint32_t *fourcc, unsigned *bytes_per_pixel,
+ann_format_of_metal(unsigned metal_pixel_format, uint32_t *fourcc, unsigned *bytes_per_pixel,
 		    char *why, size_t why_size)
 {
-	for (size_t i = 0; i < sizeof(rwd_formats) / sizeof(rwd_formats[0]); i++) {
-		const struct rwd_format *f = &rwd_formats[i];
+	for (size_t i = 0; i < sizeof(ann_formats) / sizeof(ann_formats[0]); i++) {
+		const struct ann_format *f = &ann_formats[i];
 
 		if (f->metal != metal_pixel_format) {
 			continue;
 		}
 		if (f->substituted) {
-			rwd_say(why, why_size, "pixel format %u is %s, whose surface this "
+			ann_say(why, why_size, "pixel format %u is %s, whose surface this "
 			    "kernel makes as ordinary BGRA of the same geometry "
 			    "(MiniIOSurface.cpp substitutes '%c%c%c%c'); a texture of the asked-"
 			    "for format over such a surface would write wrong colours rather "
@@ -431,7 +431,7 @@ rwd_format_of_metal(unsigned metal_pixel_format, uint32_t *fourcc, unsigned *byt
 	 * times in one boot, all for one surface, out of backboardd.
 	 */
 	if (metal_pixel_format >= 500 && metal_pixel_format <= 629) {
-		rwd_say(why, why_size, "pixel format %u requires combined YCbCr texture sampling; "
+		ann_say(why, why_size, "pixel format %u requires combined YCbCr texture sampling; "
 		    "NV12 plane imports accept R8Unorm and RG8Unorm", metal_pixel_format);
 		return -1;
 	}
@@ -451,18 +451,18 @@ rwd_format_of_metal(unsigned metal_pixel_format, uint32_t *fourcc, unsigned *byt
 	char served[160] = "", refused[160] = "";
 	size_t sn = 0, rn = 0;
 
-	for (size_t i = 0; i < sizeof(rwd_formats) / sizeof(rwd_formats[0]); i++) {
-		char *into = rwd_formats[i].substituted ? refused : served;
-		size_t *at = rwd_formats[i].substituted ? &rn : &sn;
-		int wrote = snprintf(into + *at, (rwd_formats[i].substituted ? sizeof(refused)
+	for (size_t i = 0; i < sizeof(ann_formats) / sizeof(ann_formats[0]); i++) {
+		char *into = ann_formats[i].substituted ? refused : served;
+		size_t *at = ann_formats[i].substituted ? &rn : &sn;
+		int wrote = snprintf(into + *at, (ann_formats[i].substituted ? sizeof(refused)
 								            : sizeof(served)) - *at,
-		    "%s%u", *at ? ", " : "", rwd_formats[i].metal);
+		    "%s%u", *at ? ", " : "", ann_formats[i].metal);
 
 		if (wrote > 0) {
 			*at += (size_t)wrote;
 		}
 	}
-	rwd_say(why, why_size, "pixel format %u is not one this import can lay over a single "
+	ann_say(why, why_size, "pixel format %u is not one this import can lay over a single "
 	    "linear plane. It serves %s; it refuses %s because this kernel substitutes BGRA for "
 	    "those FourCCs, and 500-629 because they are two planes", metal_pixel_format, served,
 	    refused);
@@ -471,8 +471,8 @@ rwd_format_of_metal(unsigned metal_pixel_format, uint32_t *fourcc, unsigned *byt
 
 /* IOSurface offsets are relative to the allocation, including for a nonzero plane 0 offset. */
 int
-rwd_surface_plane(void *iosurface, unsigned long plane, const struct rwd_texture_shape *want,
-    struct rwd_surface *selected, void **allocation_base, char *why, size_t why_size)
+ann_surface_plane(void *iosurface, unsigned long plane, const struct ann_texture_shape *want,
+    struct ann_surface *selected, void **allocation_base, char *why, size_t why_size)
 {
 	static size_t (*count)(void *), (*size)(void *);
 	static uint32_t (*format)(void *);
@@ -494,12 +494,12 @@ rwd_surface_plane(void *iosurface, unsigned long plane, const struct rwd_texture
 	if (iosurface == NULL || want == NULL || selected == NULL || count == NULL || size == NULL ||
 	    format == NULL || width == NULL || height == NULL || row == NULL || offset == NULL ||
 	    element == NULL || address == NULL) {
-		rwd_say(why, why_size, "IOSurface plane geometry is unavailable");
+		ann_say(why, why_size, "IOSurface plane geometry is unavailable");
 		return -1;
 	}
 	size_t planes = count(iosurface);
 	if (plane >= (planes ? planes : 1) || planes > UINT32_MAX) {
-		rwd_say(why, why_size, "plane %lu is outside surface plane count %zu", plane, planes);
+		ann_say(why, why_size, "plane %lu is outside surface plane count %zu", plane, planes);
 		return -1;
 	}
 	uint32_t fourcc = format(iosurface), expected;
@@ -507,18 +507,18 @@ rwd_surface_plane(void *iosurface, unsigned long plane, const struct rwd_texture
 	if ((fourcc == '420v' || fourcc == '420f') && planes == 2) {
 		unsigned pixel_format = plane == 0 ? 10 : 30;
 		if (want->pixel_format != pixel_format) {
-			rwd_say(why, why_size, "NV12 plane %lu requires Metal format %u; requested %u",
+			ann_say(why, why_size, "NV12 plane %lu requires Metal format %u; requested %u",
 			    plane, pixel_format, want->pixel_format);
 			return -1;
 		}
 		bpp = plane == 0 ? 1 : 2;
 	} else if (planes > 1) {
-		rwd_say(why, why_size, "unsupported planar surface FourCC %#x with %zu planes", fourcc, planes);
+		ann_say(why, why_size, "unsupported planar surface FourCC %#x with %zu planes", fourcc, planes);
 		return -1;
-	} else if (rwd_format_of_metal(want->pixel_format, &expected, &bpp, why, why_size) != 0) {
+	} else if (ann_format_of_metal(want->pixel_format, &expected, &bpp, why, why_size) != 0) {
 		return -1;
 	} else if (fourcc != expected) {
-		rwd_say(why, why_size, "surface FourCC %#x does not match Metal format %u",
+		ann_say(why, why_size, "surface FourCC %#x does not match Metal format %u",
 		    fourcc, want->pixel_format);
 		return -1;
 	}
@@ -530,13 +530,13 @@ rwd_surface_plane(void *iosurface, unsigned long plane, const struct rwd_texture
 	    want->width == 0 || want->height == 0 || want->width > w || want->height > h ||
 	    want->type != 2 || want->depth != 1 || want->array_length != 1 ||
 	    want->mip_levels != 1 || want->sample_count != 1) {
-		rwd_say(why, why_size, "invalid surface plane %lu geometry or texture shape", plane);
+		ann_say(why, why_size, "invalid surface plane %lu geometry or texture shape", plane);
 		return -1;
 	}
-	*selected = (struct rwd_surface){ .surface = rwd_surface_id(iosurface), .size = size(iosurface),
+	*selected = (struct ann_surface){ .surface = ann_surface_id(iosurface), .size = size(iosurface),
 	    .offset = (uint32_t)begin, .rowBytes = (uint32_t)stride, .width = (uint32_t)w,
 	    .height = (uint32_t)h, .pixelFormat = fourcc, .planes = (uint32_t)planes };
-	if (selected->surface == 0 || rwd_surface_fits_adreno(selected, bpp, why, why_size) != 0)
+	if (selected->surface == 0 || ann_surface_fits_adreno(selected, bpp, why, why_size) != 0)
 		return -1;
 	if (allocation_base != NULL)
 		*allocation_base = (void *)(pixels - begin);
@@ -557,15 +557,15 @@ rwd_surface_plane(void *iosurface, unsigned long plane, const struct rwd_texture
  * the row length and offset the kernel reported, because fd_resource_from_handle takes those
  * from the caller and does not ask the kernel again.
  */
-typedef struct rwa_texture *(*rwd_import_call)(struct rwa_device *device,
-					       const struct rwd_texture_shape *shape,
+typedef struct rwa_texture *(*ann_import_call)(struct rwa_device *device,
+					       const struct ann_texture_shape *shape,
 					       int surface_id, unsigned offset,
 					       unsigned row_bytes, char *why, size_t why_size);
 
-static rwd_import_call
-rwd_import(void)
+static ann_import_call
+ann_import(void)
 {
-	static rwd_import_call import;
+	static ann_import_call import;
 	static int looked;
 
 	if (!looked) {
@@ -584,37 +584,37 @@ rwd_import(void)
 }
 
 int
-rwd_import_available(void)
+ann_import_available(void)
 {
-	return rwd_import() != NULL;
+	return ann_import() != NULL;
 }
 
 struct rwa_texture *
-rwd_texture_for_surface(struct rwa_device *mesa_device, const struct rwd_surface *selected,
-    unsigned long plane, const struct rwd_texture_shape *want, char *why, size_t why_size)
+ann_texture_for_surface(struct rwa_device *mesa_device, const struct ann_surface *selected,
+    unsigned long plane, const struct ann_texture_shape *want, char *why, size_t why_size)
 {
-	struct rwd_surface surface = *selected, kernel;
+	struct ann_surface surface = *selected, kernel;
 	io_connect_t connection;
-	rwd_import_call import;
+	ann_import_call import;
 	struct rwa_texture *texture;
 	uint32_t id = surface.surface;
 
-	connection = rwd_shared_connection();
+	connection = ann_shared_connection();
 	if (connection == 0) {
-		rwd_say(why, why_size, "no connection to AnnibaleGPU: this kernel was booted "
+		ann_say(why, why_size, "no connection to AnnibaleGPU: this kernel was booted "
 		    "without gpu=1, so a surface's memory cannot be given to the GPU");
 		return NULL;
 	}
-	if (rwd_surface_describe(connection, id, &kernel, why, why_size) != 0)
+	if (ann_surface_describe(connection, id, &kernel, why, why_size) != 0)
 		return NULL;
 	if (surface.size > kernel.size || surface.pixelFormat != kernel.pixelFormat ||
 	    surface.planes != kernel.planes) {
-		rwd_say(why, why_size, "surface %u geometry differs from the kernel allocation", id);
+		ann_say(why, why_size, "surface %u geometry differs from the kernel allocation", id);
 		return NULL;
 	}
-	import = rwd_import();
+	import = ann_import();
 	if (import == NULL) {
-		rwd_say(why, why_size, "surface %u fits (%ux%u '%c%c%c%c', %u bytes a row, "
+		ann_say(why, why_size, "surface %u fits (%ux%u '%c%c%c%c', %u bytes a row, "
 		    "%llu bytes from offset %u) and the kernel would hand its memory over as a "
 		    "GPU buffer, but the compiler library in this image has no "
 		    "rwa_texture_from_surface: that image was built before the call existed, and "
@@ -631,7 +631,7 @@ rwd_texture_for_surface(struct rwa_device *mesa_device, const struct rwd_surface
 	 * per user client -- and then there would be two owners of one surface and only one
 	 * release.
 	 */
-	struct rwd_texture_shape import_shape = *want;
+	struct ann_texture_shape import_shape = *want;
 	if (import_shape.pixel_format == 94 ||
 	    (import_shape.pixel_format >= 550 && import_shape.pixel_format <= 555)) {
 		import_shape.pixel_format = (import_shape.pixel_format == 551 ||

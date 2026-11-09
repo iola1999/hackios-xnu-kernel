@@ -1,5 +1,5 @@
 /*
- * What ath12k asks of mac80211 beyond what ath11k did, next to src/lx_80211.c: the work that
+ * What ath12k asks of mac80211 next to src/lx_80211.c: the work that
  * mac80211 runs for a driver under the radio's lock ("wiphy work": ath12k sends its management
  * frames and cleans up after a scan this way), and a question about the queues.
  */

@@ -12,7 +12,6 @@ ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "xnu/files/iokit/Kernel/AnnibaleGPU.cpp"
 MEMORY = SOURCE.with_name("AnnibaleGPUMemory.inc")
 SUBMIT = SOURCE.with_name("AnnibaleGPUSubmit.inc")
-LEGACY = ROOT / "xnu/files/bsd/dev/annibale/annibale_gpu_service.inc"
 
 
 def function(source, name):
@@ -436,13 +435,11 @@ def main():
     parser.add_argument("--mutations", action="store_true")
     args = parser.parse_args()
     source = SOURCE.read_text().replace('#include "AnnibaleGPUSubmit.inc"', SUBMIT.read_text())
-    memory, legacy = MEMORY.read_text(), LEGACY.read_text()
-    legacy_functions = function(legacy, "legacy_gpu_mapped") + function(legacy, "legacy_gpu_unmap")
+    memory = MEMORY.read_text()
     with tempfile.TemporaryDirectory(prefix="annibale-gpu-lifetime-") as temporary:
         folder = Path(temporary)
         execute(unit(source, memory), folder, "lifecycle_4k", page_size=4096)
         execute(unit(source, memory), folder, "lifecycle_16k")
-        execute(LEGACY_MODEL + legacy_functions + LEGACY_CASES.replace("annibale_gpu_", "legacy_gpu_"), folder, "legacy")
         if args.mutations:
             changes = [
                 ("release_stopped", memory, "busy = gGPUReported || !annibale_gpu_ready() || (last", "busy = gGPUReported || (last", False),
@@ -459,10 +456,7 @@ def main():
                 assert old in original, name
                 changed = original.replace(old, new, 1)
                 execute(unit(changed if in_source else source, memory if in_source else changed), folder, name, False)
-            changed = legacy_functions.replace("return cleared && synced;", "return true;")
-            assert changed != legacy_functions
-            execute(LEGACY_MODEL + changed + LEGACY_CASES.replace("annibale_gpu_", "legacy_gpu_"), folder, "ignore_tlb", False)
-            print(f"{len(changes) + 1} lifecycle mutations detected")
+            print(f"{len(changes)} lifecycle mutations detected")
 
 
 if __name__ == "__main__":

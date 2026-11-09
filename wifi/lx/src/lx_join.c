@@ -118,7 +118,7 @@ rates_of(const struct ieee80211_supported_band *band, const uint8_t *rates, unsi
 
 /*
  * What the access point says it can do, into the form the driver reads it in when it tells the
- * firmware about the peer (mac.c: ath11k_peer_assoc_prepare()): rates, the HT and VHT
+ * firmware about the peer (mac.c: ath12k_peer_assoc_prepare()): rates, the HT and VHT
  * capabilities, WMM. `elements` are the association response's, or the beacon's before that.
  */
 static void

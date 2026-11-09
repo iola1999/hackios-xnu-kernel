@@ -478,10 +478,6 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	int camera_requested = 0;
 	/* (the loader stays for run after run: what the last run's arguments said must not hold for this one) */
 	gamut_p3 = 0;
-	/* a run that does not ask for writes does not get them, whatever an earlier run of this
-	 * loader asked for (the loader stays resident across runs) */
-	block_write_requested = 0;
-	block_write_part = -1;
 	for (const char *c = pi.cmdline; *c; c++) {
 		if (starts_with(c, "bootcpu=") && (c == pi.cmdline || c[-1] == ' ') && c[8] >= '0' && c[8] <= '7') {
 			kernel_mpidr = PLAT->core_mpidr[c[8] - '0'];
@@ -500,8 +496,6 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			ufs_requested = c[4] - '0';
 		}
 		block_probe_requested |= starts_with(c, "ufs_probe=1") && (c == pi.cmdline || c[-1] == ' ');
-		block_write_requested |= starts_with(c, "ufs_write=1") && (c == pi.cmdline || c[-1] == ' ') &&
-		    (c[11] == 0 || c[11] == ' ');
 		hc_requested |= starts_with(c, "ufs_native=") && (c == pi.cmdline || c[-1] == ' ') && c[11] >= '1' &&
 		    c[11] <= '9';
 	}
@@ -1022,10 +1016,6 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 				/* the kernel still has that core; what it logged can be had all the same */
 				print("THE KERNEL HUNG on core %x: no sign of life for %d seconds; its log follows\n", kernel_mpidr,
 				    (uint64_t)SILENCE_SECONDS);
-				if (block_write_requested) {
-					print("ufs: %d writes into dsu_store, %d bytes, read back the same; %d refused\n", block_writes,
-					    block_write_bytes, block_writes_refused);
-				}
 				set_result(kernel_resources_held ? "hung-held" : "hung", loader_ctx[CTX_LOG_LEN], 0);
 				write_logs((const char *)loader_ctx[CTX_LOG_PA], loader_ctx[CTX_LOG_LEN]);
 				return 1;
@@ -1060,10 +1050,6 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	/* the cores this run handed to XNU are asked whether each is off; only on every yes do
 	 * memory and devices release (LC-RETURN block, same ruling for both run kinds) */
 	lc_after_return(ran_other_core, cpu_mpidr, cpu_count);
-	if (block_write_requested) {
-		print("ufs: %d writes into dsu_store, %d bytes, read back the same; %d refused\n", block_writes,
-		    block_write_bytes, block_writes_refused);
-	}
 	lc_after_return_collect(kernel_live, slide, checkpoint);
 	const char *klog = (const char *)loader_ctx[CTX_LOG_PA];
 	uint64_t klog_len = loader_ctx[CTX_LOG_LEN];

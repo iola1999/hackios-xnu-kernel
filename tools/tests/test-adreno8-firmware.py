@@ -211,7 +211,7 @@ with tempfile.TemporaryDirectory(prefix="adreno8-firmware-") as directory:
         src.write_text(body)
         for page_size in (4096, 16384):
             binary = Path(directory) / f"check-{page_size}"
-            subprocess.run(["cc", "-std=c11", f"-DPAGE_SIZE={page_size}u", "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-I", str(ROOT / "xnu/files/bsd/dev/adreno8/adreno8"), str(src), "-o", str(binary)], check=True)
+            subprocess.run(["cc", "-std=c11", f"-DPAGE_SIZE={page_size}u", "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-I", str(ROOT / "xnu/files/bsd/dev/adreno8"), str(src), "-o", str(binary)], check=True)
             result = subprocess.run([str(binary), str(args.firmware.resolve())], capture_output=True, text=True)
             if label == "baseline":
                 assert result.returncode == 0, result.stdout + result.stderr

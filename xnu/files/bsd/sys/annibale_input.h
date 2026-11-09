@@ -53,17 +53,14 @@ struct annibale_touch {
 /* For drivers; not from interrupt context. */
 void annibale_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
 
-/* Block legacy register access unless the loader describes annibale or QEMU. */
-bool annibale_platform_blocks_legacy_drivers(void);
-/* The loader's GIC description of annibale, whose EPSS and RPMh blocks a annibale driver does drive. */
+/* The loader's GIC description of annibale, whose EPSS and RPMh blocks an annibale driver does drive. */
 bool annibale_platform_is_annibale(void);
 void annibale_input_init(void);
 void annibale_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virtio pointer and keyboard */
-void annibale_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */
+void annibale_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix touch screen */
 void annibale_ufs_init(void);           /* ufs=2 to xnuloader: the phone's storage, read only, through the loader (ufs_shared_pa=) */
 void annibale_ufs_report(const char *when); /* where reading the storage has spent its time so far */
 bool annibale_ufs_dev(dev_t dev);           /* one of the storage's devices */
-void annibale_battery_state_init(void);  /* boot-arg battery=1: Qualcomm UEFI charger state shared by xnuloader */
 int annibale_battery_temperature(void);  /* the battery's temperature in C, -273 while it is not known */
 /*
  * How the battery is, as the audio DSP's battery manager says (bsd/dev/annibale_adsp.c, with adsp=1):
@@ -94,34 +91,20 @@ uint64_t annibale_cpufreq_touched(void);        /* mach_absolute_time() of the l
 void annibale_freeze_check(uint64_t touched);    /* bsd/dev/annibale_threads.c: thread dumps when a touched screen gets no frame */
 uint32_t annibale_touch_unread(void);              /* bsd/dev/annibale_input.c: touch samples the input service has not read */
 uint64_t annibale_touch_last(void);                /* ... mach_absolute_time() of the last finger sample (no buttons), 0 for none */
-void annibale_adreno_init(void);         /* boot-arg adreno=N: the first N steps of waking the phone's GPU */
-void annibale_adreno_quiesce(void);      /* on the way back to the loader: the GPU block stopped, out of our memory */
-void annibale_adreno_stop(void);         /* before that, where the ending is no panic's: the GPU given back in order */
-void annibale_adreno_minute(void);       /* once a minute: a line about how warm the GPU is, if it is in use */
-void annibale_wifi_init(void);           /* boot-arg wifi=1: the phone's Wi-Fi; wifi_step=N: the first N steps of it */
-void annibale_wifi_stop(void);           /* where a run ends in order: the Wi-Fi DSP, if it was started, shut down */
+void annibale_wifi_stop(void);           /* where a run ends in order */
 int annibale_wifi_say(const char *format, ...) __printflike(1, 2);      /* a line of the Wi-Fi steps' log */
 int annibale_wifi_tell(const char *format, ...) __printflike(1, 2);     /* ... one that is said even with wifi=1 */
-uint32_t annibale_wifi_option(const char *name);                         /* a boot-arg's number, or what wifi=1 stands for */
-const uint8_t *annibale_wifi_file(const char *name, uint64_t *size);     /* a file of fw/ in the small image, in place */
-bool annibale_wlfw_exchange(uint32_t step);                              /* step 15 of wifi_step=N: annibale_wlfw.c */
-bool annibale_wlfw_registers(uint64_t *address, uint32_t *size, bool *mission); /* ... and what it learnt for step 16 */
-void annibale_wlfw_stop(uint32_t step);                                  /* ... and its end, before the DSP is stopped */
-void annibale_wifi_quiesce(void);        /* on the way back to the loader: the Wi-Fi DSP, if it still runs, shut down */
-/* ath11k's object and the kernel's side of it (bsd/dev/annibale_lx.c), and what that asks of the phone's radio */
+uint32_t annibale_wifi_option(const char *name);                         /* a boot-arg's number */
+void annibale_wifi_quiesce(void);        /* on the way back to the loader */
+/* ath12k's object and the kernel's side of it (bsd/dev/annibale_lx.c), and what that asks of the phone's radio */
 int annibale_lx_start(void);             /* the driver brought up on the radio as far as it is built: 0 or an errno */
 void annibale_lx_stop(void);             /* ... and down again, if it stayed up (a network joined) */
 int annibale_lx_prepare(void);           /* before all that: the memory the radio will be shown, taken; 0 or an errno */
 void annibale_lx_net_early(void);        /* ... and en0 made on the radio now, if the kernel was given its address */
-bool annibale_wifi_dsp_is_up(void);      /* the DSP that runs the radio's firmware has been started and has a link */
-const uint8_t *annibale_wifi_driver_file(const char *name, uint64_t *size);     /* a file by the name Linux has for it */
-bool annibale_wifi_radio_map(uint64_t physical, uint64_t size, unsigned long long *address); /* memory shown to the radio */
-bool annibale_wifi_radio_msi(unsigned long long *address, uint32_t *data, uint32_t *first_spi); /* where the radio raises its interrupts */
 bool annibale_wifi_radio_address(uint8_t *address);      /* the radio's own address (boot-arg wifi_mac), if one was given */
 
 /*
- * The GPU kept on (boot-arg adreno_keep=1), for iokit/Kernel/AnnibaleGPU.cpp: see "the GPU kept on"
- * in bsd/dev/annibale_adreno.c. One caller at a time.
+ * The GPU kept on, for iokit/Kernel/AnnibaleGPU.cpp (implemented in bsd/dev/annibale/annibale_gpu_dispatch.c).
  */
 bool annibale_gpu_ready(void);
 bool annibale_gpu_parameter(uint32_t which, uint64_t *value);

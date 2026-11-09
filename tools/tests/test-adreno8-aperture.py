@@ -10,7 +10,7 @@ import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DEV = ROOT / "xnu/files/bsd/dev/adreno8/adreno8"
+DEV = ROOT / "xnu/files/bsd/dev/adreno8"
 # MiCode/Xiaomi_Kernel_OpenSource, annibale-w-oss, f66f8c8bcbe38044fab61d44ea7f7c224f82b3ea.
 HASHES = {
     "drivers/firmware/qcom_scm.c": "619418ae82a4547d2ad2fdd0d2119434b35b77b2964ef3a6d1ebd2d30f11ba9e",

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Reader for split dyld shared caches: address space, backing files, pointer decoding.
 
-Header field offsets and the pointer rules were measured on the two caches under
-ios165/ and ios26/ (both started at 0x180000000):
+Header field offsets and the pointer rules were measured on the dyld shared cache under
+ios26/ (started at 0x180000000):
 
   - every subcache file carries its own dyld_cache_header and a 32-byte-entry
     mapping table at header+0x10;

@@ -40,8 +40,9 @@ extern kern_return_t thread_terminate(thread_t thread);
 extern const uint8_t *annibale_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 extern bool annibale_ufs_fat16_fw_read(const char *name, uint64_t *size_out, volatile void *dst_buf, uint64_t dst_cap);
 
-extern lck_mtx_t annibale_aop_mailbox_lock;
-extern lck_mtx_t annibale_smem_alloc_lock;
+static LCK_GRP_DECLARE(annibale_ipc_lock_group, "annibale-ipc");
+LCK_MTX_DECLARE(annibale_aop_mailbox_lock, &annibale_ipc_lock_group);
+LCK_MTX_DECLARE(annibale_smem_alloc_lock, &annibale_ipc_lock_group);
 
 #define say(...) printf("aadsp: " __VA_ARGS__)
 

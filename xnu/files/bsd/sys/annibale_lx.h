@@ -1,7 +1,7 @@
 /*
  * The whole of what the Wi-Fi driver's object asks of the kernel it is linked into. That object
- * (tools/mk-ath11k.sh in the repository: Linux's ath11k on FreeBSD's LinuxKPI headers and our
- * wifi/lx) is compiled as FreeBSD kernel code, bsd/dev/annibale_lx.c on this side as XNU's;
+ * (tools/mk-ath12k.sh in the repository: Linux's ath12k on FreeBSD's LinuxKPI headers and our
+ * wifi/lx) is compiled as FreeBSD kernel code, bsd/dev/annibale/annibale_lx.c on this side as XNU's;
  * neither sees the other's headers, so nothing but C's own types crosses (and the station
  * boundary's, annibale_sta.h, which is written for both). Everything the
  * driver's side knows of locks, timers, work queues and buffers is built in wifi/lx/src on the

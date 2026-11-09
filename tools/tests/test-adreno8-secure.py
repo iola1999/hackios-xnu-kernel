@@ -577,7 +577,7 @@ if __name__ == "__main__":
         target = Path(directory)
         (target / "adreno8_private.h").write_text(stub)
         for name in ("adreno8_smmu_private.h", "adreno8_memory_private.h", "adreno8_secure_private.h", "adreno8_bo_private.h"):
-            (target / name).write_text((ROOT / "xnu/files/bsd/dev/adreno8/adreno8" / name).read_text())
+            (target / name).write_text((ROOT / "xnu/files/bsd/dev/adreno8" / name).read_text())
         (target / "adreno8_smmu.c").write_text(fixture["driver"])
         (target / "adreno8_secure.c").write_text(driver)
         (target / "check.c").write_text('#include "adreno8_smmu.c"\n' + fakes +
@@ -706,8 +706,8 @@ if __name__ == "__main__":
                     assert "secure handover complete: 1 pages owned by CP_PIXEL" in result.stdout
             print(f"XNU PAGE_SIZE={page_size}: PASS")
         # PAGE_SIZE coming from an extern variable, the shape the upstream
-        # osfmk/mach/arm/vm_param.h of xnu-8796.121.2 gives it (PAGE_SHIFT_CONST
-        # is declared there, not defined as a constant).  The same production
+        # osfmk/mach/arm/vm_param.h gives it (PAGE_SHIFT_CONST is declared
+        # there, not defined as a constant).  The same production
         # file, layout and asserts must compile without a constant PAGE_SIZE.
         (target / "runtime-page.h").write_text(
             "extern unsigned long vm_page_size;\n"

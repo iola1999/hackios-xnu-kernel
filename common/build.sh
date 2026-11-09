@@ -5,7 +5,7 @@
 #   common/build.sh qemu-virt
 #   common/build.sh annibale GL=1
 #
-#   1. kernel   xnu/apply.sh, xnu-deps/setup.sh, xnu-build.sh   -- only with theos + iPhoneOS16.5.sdk
+#   1. kernel   xnu26/apply.sh, xnu26/build-macos.sh
 #   2. loader   xnuloader/build.sh                              -- only with clang + lld-link; a
 #                                                                  profile may set LOADER_CFLAGS
 #                                                                  (-DDIRECT_PHONE_PLAT for phones:
@@ -13,7 +13,7 @@
 #                                                                  xnuloader/loader-phone.efi and
 #                                                                  never touches loader.efi)
 #   3. images   userland/build.sh (REST=1 and the profile's USERLAND_VARS)
-#                                                               -- needs ios165/fetch.sh to have run
+#                                                               -- needs ios26/fetch.sh to have run
 #   4. boot     mkxnuimg.py -> out/<device>-boot.img             -- phones: the UEFI image for `fastboot boot`
 #
 #   SKIP="kernel loader images boot"   leave steps out
@@ -29,19 +29,11 @@ LOADER_OUT=loader.efi
 case " $LOADER_CFLAGS " in *" -DDIRECT_PHONE_PLAT "*) LOADER_OUT=loader-phone.efi ;; esac
 
 if ! skip kernel; then
-	if [ -d "${THEOS:-$HOME/theos}/sdks/iPhoneOS16.5.sdk" ] && command -v clang >/dev/null; then
-		[ -d xnu-src ] || xnu/apply.sh
-		[ -x xnu-deps/host/bin/ld64 ] || xnu-deps/setup.sh
-		# Wi-Fi radio driver (phones with a WCN6750): fetched and built once
-		[ "$WIFI_ATH11K" = 1 ] && [ ! -f xnu-deps/build/ath11k/out/ath11k.o ] && { tools/mk-ath11k.sh && tools/mk-wlfw.sh; }
-		# the export check fails after the kernel is linked, on purpose (xnu/README.md): judge by the file
-		touch out/.kernel-start
-		./xnu-build.sh -j"$(nproc)" -k > out/kernel-build.log 2>&1 || true
-		K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
-		[ -f $K ] && { [ $K -nt out/.kernel-start ] || ! grep -q "error:" out/kernel-build.log; } &&
-			echo "build: kernel $(stat -c %s $K) bytes" || die "kernel build failed, see out/kernel-build.log"
+	if [ -x xnu26/build-macos.sh ] && command -v clang >/dev/null; then
+		[ -d xnu-src/xnu-12377.121.6 ] || xnu26/apply.sh
+		./xnu26/build-macos.sh || die "kernel build failed"
 	else
-		echo "build: no theos/iPhoneOS16.5.sdk: the kernel is not built"
+		echo "build: xnu26/build-macos.sh not available: the kernel is not built"
 	fi
 fi
 
@@ -56,8 +48,8 @@ fi
 
 if ! skip images; then
 	have_userland
-	[ -d ios165/rootfs ] || die "no iOS files yet: run ios165/fetch.sh first (it downloads them from Apple to this machine)"
-	env REST=1 $USERLAND_VARS "$@" userland/build.sh || die "userland/build.sh failed"
+	[ -d ../hackios-xnu-userland/ios26/rootfs ] || die "no iOS files yet: run ios26/fetch.sh first"
+	(cd ../hackios-xnu-userland/userland && env REST=1 $USERLAND_VARS "$@" ./build.sh) || die "userland/build.sh failed"
 fi
 
 if ! skip boot && [ "$KIND" = phone ]; then

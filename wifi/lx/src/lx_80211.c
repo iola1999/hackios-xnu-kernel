@@ -86,8 +86,8 @@ linuxkpi_ieee80211_ifattach(struct ieee80211_hw *hw)
 	char bands[96] = "";
 
 	/*
-	 * ath12k takes the radio's address only from the firmware's ready event (ath11k asks the device first, which
-	 * is the kernel's wifi_mac), and the WCN7850's firmware on this phone has none: the kernel's, then.
+	 * ath12k takes the radio's address from the firmware's ready event, and when the WCN7850's
+	 * firmware on this phone has none, falls back to the kernel's wifi_mac.
 	 */
 	if (is_zero_ether_addr(hw->wiphy->perm_addr)) {
 		(void)lx_os_radio_address(hw->wiphy->perm_addr);
@@ -149,7 +149,7 @@ linuxkpi_wiphy_free(struct wiphy *wiphy)
  * What cfg80211 does with a domain (Linux: net/wireless/reg.c, handle_channel()): a channel
  * may be used if a rule covers its 20 MHz, and takes the rule's limits; otherwise it is
  * disabled. The driver reads the result off the channels when it tells the firmware which it
- * may use (reg.c: ath11k_reg_update_chan_list()), and so does the scan below.
+ * may use (reg.c: ath12k_reg_update_chan_list()), and so does the scan below.
  */
 static void
 regd_apply(struct lx_radio *radio)
@@ -347,7 +347,7 @@ linuxkpi_ieee80211_find_sta_by_ifaddr(struct ieee80211_hw *hw, const uint8_t *ad
 /*
  * What a scan has learnt of an access point. The driver asks this of the one it is associating
  * with, to see whether that announces RSN: it then tells the firmware to let nothing but the
- * handshake through until the keys are set (mac.c: ath11k_peer_assoc_h_crypto()).
+ * handshake through until the keys are set (mac.c: ath12k_peer_assoc_h_crypto()).
  */
 struct cfg80211_bss *
 linuxkpi_cfg80211_get_bss(struct wiphy *wiphy, struct linuxkpi_ieee80211_channel *channel, const uint8_t *bssid,
@@ -704,7 +704,7 @@ lx_ethernet_send(struct lx_radio *radio, const uint8_t *frame, unsigned length)
 /*
  * An 802.11 data frame made into the Ethernet frame it carries, in place: the driver hands two
  * kinds over in 802.11 although the firmware had them as Ethernet -- the handshake's, and what
- * was sent to everybody and deciphered (dp_rx.c: ath11k_dp_rx_h_undecap()). The header is 24
+ * was sent to everybody and deciphered (dp_rx.c: ath12k_dp_rx_h_undecap()). The header is 24
  * bytes, more with a fourth address, the QoS field, the HT field and, if the driver left it
  * there, the cipher's 8 bytes; then 8 bytes of LLC and SNAP whose last two are the type.
  */

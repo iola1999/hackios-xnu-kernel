@@ -1,2 +1,0 @@
-osfmk/arm64/kpc.c
-san/memory/ubsan_minimal.c

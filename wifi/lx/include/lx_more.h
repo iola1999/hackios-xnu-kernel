@@ -1,5 +1,5 @@
 /*
- * What ath11k uses of Linux and LinuxKPI's headers (FreeBSD 15.1) do not declare. Small things
+ * What the Wi-Fi driver uses of Linux and LinuxKPI's headers (FreeBSD 15.1) do not declare. Small things
  * each; where one needs a function, it is in src/.
  */
 #ifndef _LX_MORE_H_

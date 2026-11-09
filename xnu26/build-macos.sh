@@ -8,19 +8,15 @@
 source "$(dirname "${BASH_SOURCE[0]}")/env-macos.sh"
 cd "$XNU26_SRC" || exit 1
 SRC=$PWD
-# xnu/files, except what xnu26/files.skip names, as xnu26/apply.sh copies it: those files are
-# Apple's 12377 originals (with their pieces from patches/), and the 8796 versions do not compile here.
+# Copy xnu/files into the xnu-12377 source tree when files change.
 if [ -d "$XNU26_ROOT/xnu/files" ]; then
-  python3 - "$XNU26_ROOT/xnu/files" "$SRC" "$XNU26_ROOT/xnu26/files.skip" <<'PY'
+  python3 - "$XNU26_ROOT/xnu/files" "$SRC" <<'PY'
 import filecmp, os, shutil, sys
 src_root, dst_root = sys.argv[1], sys.argv[2]
-skip = set(open(sys.argv[3]).read().split())
 for dirpath, _, filenames in os.walk(src_root):
     for f in filenames:
         p1 = os.path.join(dirpath, f)
         rel = os.path.relpath(p1, src_root)
-        if rel in skip:
-            continue
         p2 = os.path.join(dst_root, rel)
         if not os.path.exists(p2) or not filecmp.cmp(p1, p2, shallow=False):
             os.makedirs(os.path.dirname(p2), exist_ok=True)
@@ -51,7 +47,7 @@ export KERNEL_BUILD_OBJROOT=${KERNEL_BUILD_OBJROOT:-xnu12377[xnu-12377.121.6-1-g
 export KERNEL_UUID=${KERNEL_UUID:-c71f02b3-2965-3ecc-9398-8915830464c4}
 
 # The Wi-Fi driver's object (tools/mk-ath12k.sh) is linked into the kernel when it is there; make does not see it
-# change, so the linked kernel is thrown away when it has (as xnu-build.sh does for ath11k's).
+# change, so the linked kernel is thrown away when it has.
 LX=$XNU26_ROOT/xnu-deps/build/ath12k/out/ath12k.o
 if [ -d "$XNU26_ROOT/wifi/lx" ] && [ -f "$LX" ]; then
   if [ -n "$(find "$XNU26_ROOT/wifi/lx" -type f -newer "$LX" 2>/dev/null | head -1)" ]; then
@@ -182,8 +178,4 @@ for _ in range(ncmds):
 else:
     sys.exit("%s: no LC_UUID to stamp" % path)
 PY
-  mkdir -p "$XNU26_ROOT/out"
-  cp -f "$kernel" "$XNU26_ROOT/out/xnu12377-st4.bin"
-  cp -f "$kernel" "$XNU26_ROOT/out/xnu12377-st10.bin"
-  echo "Staged $kernel -> $XNU26_ROOT/out/xnu12377-st4.bin and xnu12377-st10.bin"
 fi

@@ -1,31 +1,16 @@
 /*
  * The phone's storage: one block device and one character device for every GPT partition of its
- * UFS (/dev/ufs_NAME and /dev/rufs_NAME, NAME as the partition table has it). Read only, but for
- * the one place the data of iOS lives (ufs_write=1, below).
+ * UFS (/dev/ufs_NAME and /dev/rufs_NAME, NAME as the partition table has it). Read only, except
+ * for /dev/ufs_darwin_var and /dev/rufs_darwin_var where the iOS data volume lives.
  *
- * There is no UFS driver here, and none is needed. UEFI never exits on this port: Qualcomm's own
- * UFS driver (UFSDxe) has brought up the controller, its PHY, its clocks and power, and stays
- * resident, and xnuloader keeps serving the kernel from core 0 while the kernel runs on another
- * core (it already does for the battery). So with ufs=2 on its command line the loader publishes a
- * page (ufs_shared_pa=) with the table of partitions, a request and an answer, and a buffer; this
- * driver writes a request -- which partition, which blocks -- and core 0 reads them with that
- * driver's ReadBlocks into the buffer (xnuloader/loader.c, block_poll). Nothing in this kernel
- * touches the storage controller.
+ * With ufs=2 on its command line the loader publishes a page (ufs_shared_pa=) with the table of
+ * partitions, a request and an answer, and a buffer; when ufs_native=1 is enabled, reads and
+ * darwin_var writes go directly through the kernel's native UFS host controller driver
+ * (annibale_ufshc.c), falling back to the loader's Block I/O mailbox otherwise.
  *
- * Read only wherever a write could do harm, by construction. The block devices never write: the
- * strategy routine refuses, so no filesystem mounted from one can write, and opening one for
- * writing is refused. With ufs_write=1 one character device alone takes writes --
- * /dev/rufs_dsu_store, the last 4 GiB of the slot Android's DSU installer keeps the iOS system
- * image in, which the loader lists as a partition of its own (xnuloader/loader_dsu.inc); that is
- * where the data volume of iOS is kept between runs (userland/src/var_store.c). The loader lists
- * it only when the slot holds this run's system image, offers it for writing only when its two
- * header blocks hold zeros or headers, refuses writes anywhere else and reads every write back
- * before it answers. Without ufs_write=1 nothing writes at all.
- *
- * One request at a time (the page has one), so requests are serialized by a mutex and split into
- * pieces of the buffer's size. The kernel writes only the request's cache lines and core 0 only
- * the answer's (see the loader), both through a mapping that does not cache here, so neither side
- * ever overwrites the other's. The data buffer, which only core 0's reads fill, is mapped cacheable
+ * One mailbox request at a time (the page has one), serialized by a mutex and split into pieces
+ * of the buffer's size. The kernel writes only the request's cache lines and core 0 only the
+ * answer's, both through a mapping that does not cache here. The data buffer is mapped cacheable
  * and the part of it an answer covers is invalidated here before it is copied out.
  *
  * ufs_check=1 reads, once at start, the partitions there are images of in the ROM's
@@ -68,10 +53,6 @@ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);   /* osfmk/arm
 #define BLOCK_PART_UNIT    1u                          /* a whole logical unit, not a partition */
 #define BLOCK_OP_READ      0u
 #define BLOCK_OP_WRITE     1u
-
-/* Where a write may go, and nowhere else: the loader's dsu_store, all of it (xnuloader/loader_dsu.inc). */
-#define UFS_STORE_NAME     "dsu_store"
-#define UFS_STORE_BLOCKS   (4ULL << 30 >> 12)          /* 4 GiB in blocks of 4096 */
 
 struct loader_block_part {
 	char name[36];
@@ -163,47 +144,11 @@ static uint64_t ufs_native_fallbacks, ufs_mailbox_refused;
 
 static LCK_GRP_DECLARE(ufs_lck_grp, "annibale-ufs");
 static LCK_MTX_DECLARE(ufs_lock, &ufs_lck_grp);
-/* One writer at a time; never held while the mailbox is, nor while user memory is touched. */
-static LCK_MTX_DECLARE(ufs_write_mtx, &ufs_lck_grp);
 
-/*
- * Saving the data volume without being asked (userland/src/var_store.c).
- *
- * The volume is packed and written by a program, not by this kernel, so the kernel's part is to
- * say when and to let only one program at a time do it:
- *
- *   kern.annibale.var_save   the handshake. The saver writes VAR_SAVE_IDLE when it starts and is
- *                           then the one that will be asked; on the orderly way back to the loader
- *                           (loader_return_after expired, or "xl stop") the kernel writes
- *                           VAR_SAVE_WANTED and waits, and the saver writes VAR_SAVE_DONE when the
- *                           volume is in the flash. Nobody registered: nothing is asked and
- *                           nothing waited for, so a run without a saver returns as it always did.
- *                           A panic does not come this way at all -- there is no program left to
- *                           ask -- and then the store simply keeps what it had.
- *   kern.annibale.var_busy   the claim. A write to /dev/rufs_dsu_store is refused unless the writer
- *                           holds it, so two savers cannot interleave into one slot. It is held by
- *                           process number, and a claimant may take it from a process that is gone
- *                           (a saver killed in the middle leaves no lock behind for the rest of the
- *                           run). What the one that was killed half-wrote is not lost either: the
- *                           slot it was writing is not the one holding the newest good archive.
- */
-#define VAR_SAVE_NONE      0
-#define VAR_SAVE_IDLE      1
-#define VAR_SAVE_WANTED    2
-#define VAR_SAVE_DONE      3
-#define VAR_SAVE_MS        20000        /* at most this long on the way out (var_save_ms=N) */
-
-static volatile int ufs_var_save = VAR_SAVE_NONE;
-static int ufs_var_busy_pid;
-
-/* ufs_write=1 and the one partition it is for: everything else answers EROFS as it always did */
-static int ufs_write_part = -1;
 static int ufs_darwin_part = -1, ufs_darwin_var_part = -1;
 uint64_t ufs_darwin_bytes, ufs_darwin_var_bytes;
 extern void AnnibaleDiskStart(uint64_t size_bytes);
 #include "annibale_disk_nodes.inc"
-static volatile bool ufs_write_busy;            /* a write of ours has this kernel's list out: not a failure */
-static bool ufs_write_out, ufs_write_was_native;        /* the list is out for writing, and was in before */
 static uint64_t ufs_writes, ufs_write_bytes, ufs_write_errors, ufs_write_refused;
 
 SYSCTL_DECL(_kern_annibale);
@@ -218,82 +163,17 @@ SYSCTL_QUAD(_kern_annibale, OID_AUTO, ufs_wait_us, CTLFLAG_RD | CTLFLAG_LOCKED, 
 SYSCTL_QUAD(_kern_annibale, OID_AUTO, ufs_copy_us, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_copy_us,
     "microseconds spent copying out of the loader's buffer");
 SYSCTL_QUAD(_kern_annibale, OID_AUTO, ufs_writes, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_writes,
-    "requests written into the DSU store and read back by the loader");
+    "requests written into darwin_var through the loader");
 SYSCTL_QUAD(_kern_annibale, OID_AUTO, ufs_write_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_write_bytes,
-    "bytes written into the DSU store");
+    "bytes written into darwin_var through the loader");
 SYSCTL_QUAD(_kern_annibale, OID_AUTO, ufs_write_errors, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_write_errors,
     "writes the loader refused or did not finish");
 SYSCTL_QUAD(_kern_annibale, OID_AUTO, ufs_write_refused, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_write_refused,
-    "writes refused here: not the DSU store, or past its end");
+    "writes refused here: not darwin_var, or past its end");
 SYSCTL_QUAD(_kern_annibale, OID_AUTO, darwin_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_darwin_bytes,
     "bytes in the darwin partition");
 SYSCTL_QUAD(_kern_annibale, OID_AUTO, darwin_var_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_darwin_var_bytes,
     "bytes in the darwin_var partition");
-
-/* The handshake: 1 to register as the saver, 3 to say the volume is in the flash. 2 is the kernel's. */
-static int
-ufs_sysctl_var_save(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
-{
-	int value = ufs_var_save, error;
-
-	error = sysctl_io_number(req, value, sizeof(value), &value, NULL);
-	if (error != 0 || req->newptr == 0) {
-		return error;
-	}
-	if (value == VAR_SAVE_IDLE && ufs_var_save != VAR_SAVE_WANTED) {
-		ufs_var_save = VAR_SAVE_IDLE;           /* a saver is there; it is the one that will be asked */
-	} else if (value == VAR_SAVE_DONE && ufs_var_save == VAR_SAVE_WANTED) {
-		ufs_var_save = VAR_SAVE_DONE;           /* and it has finished: the way out may go on */
-	} else if (value == VAR_SAVE_NONE) {
-		ufs_var_save = VAR_SAVE_NONE;
-	} else {
-		return EINVAL;
-	}
-	return 0;
-}
-
-SYSCTL_PROC(_kern_annibale, OID_AUTO, var_save, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
-    ufs_sysctl_var_save, "I", "the data volume's saver: 1 registers, 2 is the kernel asking, 3 is done");
-
-/* The claim on the store: 1 takes it, 0 gives it back; reading says which process holds it. */
-static int
-ufs_sysctl_var_busy(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
-{
-	int value = ufs_var_busy_pid, error, me = proc_selfpid();
-
-	error = sysctl_io_number(req, value, sizeof(value), &value, NULL);
-	if (error != 0 || req->newptr == 0) {
-		return error;
-	}
-	lck_mtx_lock(&ufs_write_mtx);
-	if (value == 1) {
-		if (ufs_var_busy_pid != 0 && ufs_var_busy_pid != me) {
-			proc_t held = proc_find(ufs_var_busy_pid);
-
-			if (held != NULL) {
-				proc_rele(held);
-				lck_mtx_unlock(&ufs_write_mtx);
-				return EBUSY;   /* another saver has it and is alive: one at a time */
-			}
-			printf("var_store: the claim on the store was left by process %d, which is gone\n",
-			    ufs_var_busy_pid);
-		}
-		ufs_var_busy_pid = me;
-	} else if (value == 0) {
-		if (ufs_var_busy_pid == me || ufs_var_busy_pid == 0) {
-			ufs_var_busy_pid = 0;
-		} else {
-			error = EPERM;
-		}
-	} else {
-		error = EINVAL;
-	}
-	lck_mtx_unlock(&ufs_write_mtx);
-	return error;
-}
-
-SYSCTL_PROC(_kern_annibale, OID_AUTO, var_busy, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
-    ufs_sysctl_var_busy, "I", "the claim a writer of /dev/rufs_dsu_store must hold: 1 takes it, 0 gives it back");
 
 /*
  * Native blocks [lba, lba + count) of partition part, one request of at most the buffer's size:
@@ -429,8 +309,8 @@ annibale_ufs_report(const char *when)
 	    "the one before), %llu errors, %llu bytes; waiting %llu ms, of it in ReadBlocks %llu ms; "
 	    "copying %llu ms\n", when, ufs_requests, ufs_small, ufs_medium, ufs_large, ufs_sequential,
 	    ufs_errors, ufs_bytes, ufs_wait_us / 1000, loader_ns / 1000000, ufs_copy_us / 1000);
-	if (ufs_write_part >= 0 || ufs_writes != 0 || ufs_write_refused != 0) {
-		printf("ufs: %s: %llu writes into the DSU store, %llu bytes, read back by the loader; %llu did not "
+	if (ufs_writes != 0 || ufs_write_refused != 0) {
+		printf("ufs: %s: %llu writes into darwin_var, %llu bytes, read back by the loader; %llu did not "
 		    "finish, %llu refused here\n", when, ufs_writes, ufs_write_bytes, ufs_write_errors,
 		    ufs_write_refused);
 	}
@@ -446,40 +326,17 @@ ufs_part_bytes(uint32_t part)
 
 /*
  * The orderly end of a run, from osfmk/arm64/loader_return.c, in the thread that is about to hand
- * control back: ask the saver for the data volume and wait for it, so that a run need not have
- * been told to save. Bounded, and only when a saver registered -- the loader goes on feeding the
- * watchdog for a minute past the run's own budget, and the host waits a hundred seconds past it,
- * so twenty seconds here is well inside both. Nothing else of the way out has happened yet: the
- * GPU, the DSPs and this kernel's transfer list are still as the run had them.
+ * control back: flush any dirty metadata and blocks of /private/var to /dev/ufs_darwin_var.
  */
 extern void ramfs_disk_flush_all(void);
 
 void
 annibale_var_save_on_return(void)
 {
-	uint32_t ms = VAR_SAVE_MS;
-	uint64_t waited = 0;
-
-	if (!ufs_ready || (ufs_write_part < 0 && ufs_darwin_var_part < 0)) {
+	if (!ufs_ready || ufs_darwin_var_part < 0) {
 		return;
 	}
 	ramfs_disk_flush_all();
-	if (ufs_var_save != VAR_SAVE_IDLE) {
-		return;
-	}
-	PE_parse_boot_argn("var_save_ms", &ms, sizeof(ms));
-	printf("var_store: the run is ending: the data volume is asked for\n");
-	ufs_var_save = VAR_SAVE_WANTED;
-	while (ufs_var_save != VAR_SAVE_DONE && waited < ms) {
-		IOSleep(20);
-		waited += 20;
-	}
-	if (ufs_var_save == VAR_SAVE_DONE) {
-		/* what it made of it is in its own lines: this only says it answered */
-		printf("var_store: the saver has finished after %llu ms\n", waited);
-	} else {
-		printf("var_store: the saver did not answer in %u ms: the store keeps what it had\n", ms);
-	}
 }
 
 /* ---- the check: the partitions there are images of, hashed as the loader hashes them ---- */
@@ -1060,36 +917,6 @@ annibale_ufs_init(void)
 	annibale_create_disk_nodes(ufs_bmajor, ufs_cmajor, ufs_darwin_part, ufs_darwin_var_part);
 	printf("ufs: %u partitions of the phone's storage as /dev/ufs_NAME and /dev/rufs_NAME, read only, "
 	    "through the loader's page at %llx and its %u KB buffer\n", made, pa, ufs_buffer_size >> 10);
-
-	/*
-	 * ufs_write=1: /dev/rufs_dsu_store takes writes, if the loader offers it: it lists the store
-	 * only for a slot holding this run's system image and offers it only when both var_store
-	 * headers there are zeros or headers. Its size and block size are checked here once more.
-	 */
-	check = 0;
-	if (PE_parse_boot_argn("ufs_write", &check, sizeof(check)) && check == 1) {
-		uint32_t offered = ufs_page->write_part_plus_one;
-		const char *why = NULL;
-
-		if (offered == 0 || offered > ufs_parts || ufs_page->write_first != 0) {
-			why = "the loader offers nothing to write into (ufs_write=1 on its command line too, and a DSU slot that checks out)";
-		} else if (strncmp((const char *)ufs_page->part[offered - 1].name, UFS_STORE_NAME,
-		    sizeof(UFS_STORE_NAME)) != 0) {
-			why = "the loader offers another partition";
-		} else if (ufs_page->part[offered - 1].flags & BLOCK_PART_UNIT) {
-			why = "it is a whole logical unit";
-		} else if (ufs_page->part[offered - 1].block_size != 4096 ||
-		    ufs_page->part[offered - 1].blocks != UFS_STORE_BLOCKS) {
-			why = "it is not 4 GiB in blocks of 4096";
-		}
-		if (why == NULL) {
-			ufs_write_part = (int)(offered - 1);
-			printf("ufs: /dev/rufs_" UFS_STORE_NAME " takes writes (%llu MB); everything else of the "
-			    "storage is read only\n", UFS_STORE_BLOCKS * 4096 >> 20);
-		} else {
-			printf("ufs: nothing takes writes: %s\n", why);
-		}
-	}
 
 	/*
 	 * ufs_native=1: through this kernel's own driver instead, its own transfer list in the

@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-DEV = ROOT / "xnu/files/bsd/dev/adreno8/adreno8"
+DEV = ROOT / "xnu/files/bsd/dev/adreno8"
 PIN = "d50b305f7da9e14715a25120a4ac7b1a4b8b97c3"
 KGSL_SHA256 = "14aea73aa60814273a51f8e145e3b491471600466ddf6f42b7c45e1716b2bfd7"
 HASHES = {

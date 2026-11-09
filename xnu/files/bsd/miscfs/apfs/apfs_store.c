@@ -1,16 +1,7 @@
 /*
  * A store of a few fixed-length files of an APFS volume, overwritten where they lie.
  *
- * What this is instead of
- * -----------------------
- * The data of iOS survives a boot today by being packed into an archive and written into the
- * phone's flash at a number in a comment: two slots of two gigabytes each at byte 8589934592 of
- * the partition darwin, straight onto a character device (userland/src/var_store.c,
- * bsd/dev/annibale_ufs.c).  It works, and its weakness is not the writing but the addressing --
- * nothing on the medium says those bytes are a store, how long a slot is, or that something else
- * may not have them.  Only the constant does, in two places that have to agree.
- *
- * Here the same bytes live in named files of an APFS volume, and where they are comes from the
+ * The bytes live in named files of an APFS volume, and where they are comes from the
  * volume's own records: the slots are two files of the volume's root, a slot's length is its
  * inode's length, and every write goes through apfs_write_in_place(), which will not touch a
  * block unless the file's extents and the extent-reference tree both say it is that file's.
@@ -21,18 +12,12 @@
  *
  * Who makes the volume
  * --------------------
- * Not this code, and not the kernel: a writable APFS would be needed for that and it is a piece
- * of work of its own (tools/apfs/txn-probe.py measures why).  The volume is built on the build
- * machine by tools/apfs/mkstore.py -- which is tools/apfs/mkapfs.py, the same program that makes
- * every other image this port uses -- and put on the flash once, in the free space of darwin past
- * the blocks the loader and the kernel refuse to write before.  After that its structure never
- * changes again.  That is the whole escape from needing a writable APFS, and it costs one
- * preparation step on a computer.
+ * The volume is built on the build machine by tools/apfs/mkstore.py -- which is
+ * tools/apfs/mkapfs.py, the same program that makes every other image this port uses --
+ * and put on the flash once.  After that its structure never changes again.
  *
  * Finding the newest good slot, without a transaction
  * ---------------------------------------------------
- * Unchanged from var_store.c, because it never depended on the medium:
- *
  *   - a save goes into the slot that does not hold the newest good header;
  *   - that slot's header block is zeroed first, so from then until the commit the slot holds
  *     nothing good and a reader takes the other one;

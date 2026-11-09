@@ -761,7 +761,7 @@ iounmap(void *address)
  */
 #ifndef LX_POOL_MB				/* (the build may say otherwise: ath12k's firmware takes 16 MB of rings' memory) */
 #define LX_POOL_MB	44u
-#define LX_RINGS_MB	12u			/* (ath11k's data path's rings and link descriptors come to about 6 MB) */
+#define LX_RINGS_MB	12u			/* (the data path's rings and link descriptors come to about 6 MB) */
 #endif
 #define POOL_SIZE	(LX_POOL_MB << 20)
 #define POOL_RINGS	(LX_RINGS_MB << 20)

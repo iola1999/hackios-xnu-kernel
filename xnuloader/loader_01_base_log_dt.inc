@@ -420,7 +420,7 @@ lc_blocked_cmd(const char *cmd)
 {
 	static const char *const blocked[] = { "oem ramdisk", "download:", "oem run", "oem selftest",
 		"oem recording", "oem sound", "oem clearscreen", "oem memmap", "oem probe",
-		"oem logwrite", "oem dsu", "flash:", "oem flash_boot", "oem android" };
+		"oem logwrite", "flash:", "oem flash_boot", "oem android" };
 
 	for (unsigned i = 0; i < sizeof(blocked) / sizeof(blocked[0]); i++) {
 		if (lc_starts(cmd, blocked[i])) {

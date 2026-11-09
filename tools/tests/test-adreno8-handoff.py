@@ -18,7 +18,7 @@ import adreno8_logcheck as logcheck
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-DEV = ROOT / "xnu/files/bsd/dev/adreno8/adreno8"
+DEV = ROOT / "xnu/files/bsd/dev/adreno8"
 fixture = runpy.run_path(str(ROOT / "tools/tests/test-adreno8-smmu.py"))
 stub = fixture["stub"].replace("assert(size == 4096);", "assert(size != 0);")
 stub = stub.replace("static int adreno8_say", r'''

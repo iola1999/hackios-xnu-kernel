@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-DEV = ROOT / "xnu/files/bsd/dev/adreno8/adreno8"
+DEV = ROOT / "xnu/files/bsd/dev/adreno8"
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--micode-dir", required=True, type=Path)
 args = parser.parse_args()

@@ -1,45 +1,18 @@
 /*
- * The battery state the kernel publishes. With boot-arg battery=1 it polls the read-only charger cache
- * that xnuloader publishes from the Qualcomm UEFI charger drivers it keeps on core 0; a battery driver
- * hands its readings to annibale_battery_report(). Either way the state is kept for the
- * kern.annibale.battery_* sysctls and passed on to iokit/Kernel/AnnibaleBattery.cpp. Charger limits and
- * JEITA protection remain firmware-owned.
+ * The battery state the kernel publishes. A battery driver hands its readings to
+ * annibale_battery_report(), which keeps the state for the kern.annibale.battery_* sysctls
+ * and passes it on to iokit/Kernel/AnnibaleBattery.cpp.
  */
-#include <kern/clock.h>
-#include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
-#include <pexpert/pexpert.h>
 #include <sys/annibale_input.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
 
-extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
-
-#define LOADER_BATTERY_MAGIC            0x21545441424e4e41ULL
-#define LOADER_BATTERY_VERSION          1
-#define LOADER_BATTERY_VALID            (1u << 0)
-#define LOADER_BATTERY_PRESENT          (1u << 1)
-#define LOADER_BATTERY_CHARGER_PRESENT  (1u << 2)
-#define LOADER_BATTERY_VOLTAGE_VALID    (1u << 3)
-#define LOADER_BATTERY_CHARGING         (1u << 4)
-#define LOADER_BATTERY_SOC_ESTIMATED    (1u << 5)
-#define LOADER_PAGE_SIZE                0x4000UL
-
-struct loader_battery {
-	uint64_t magic;
-	uint32_t version, size;
-	volatile uint32_t sequence;
-	uint32_t flags;
-	int32_t soc_percent, voltage_mv, current_ma, temperature_c;
-	uint32_t charger_action, polls, failures, reserved;
-};
-
-static volatile struct loader_battery *shared_battery;
 static int battery_soc_percent = -1, battery_voltage_mv = -1, battery_current_ma;
 static int battery_temperature_c = -273, battery_present, battery_charger_present;
 static int battery_charging, battery_soc_estimated, battery_charger_action = -1;
-static uint64_t battery_updates, battery_failures;
+static uint64_t battery_updates;
 
 /* for others in the kernel (the flashlight's thermal guard): -273 while it is not known */
 int
@@ -67,46 +40,6 @@ SYSCTL_INT(_kern_annibale, OID_AUTO, battery_soc_estimated, CTLFLAG_RD | CTLFLAG
     &battery_soc_estimated, 0, "1 only when SOC had to be estimated from voltage");
 SYSCTL_INT(_kern_annibale, OID_AUTO, battery_charger_action, CTLFLAG_RD | CTLFLAG_LOCKED,
     &battery_charger_action, 0, "last Qualcomm charger action, for diagnostics");
-
-static bool
-battery_snapshot(struct loader_battery *out)
-{
-	uint32_t before, after;
-
-	for (unsigned retry = 0; retry < 4; retry++) {
-		before = shared_battery->sequence;
-		if (before & 1) continue;
-		__asm__ volatile ("dmb ishld" ::: "memory");
-		memcpy(out, (const void *)(uintptr_t)shared_battery, sizeof(*out));
-		__asm__ volatile ("dmb ishld" ::: "memory");
-		after = shared_battery->sequence;
-		if (before == after && !(after & 1)) return true;
-	}
-	return false;
-}
-
-static void
-battery_poll(void)
-{
-	struct loader_battery sample;
-
-	if (!battery_snapshot(&sample) || sample.magic != LOADER_BATTERY_MAGIC ||
-	    sample.version != LOADER_BATTERY_VERSION || sample.size < sizeof(sample) ||
-	    !(sample.flags & LOADER_BATTERY_VALID) || sample.soc_percent < 0 || sample.soc_percent > 100) {
-		battery_failures++;
-		return;
-	}
-	battery_soc_percent = sample.soc_percent;
-	battery_voltage_mv = (sample.flags & LOADER_BATTERY_VOLTAGE_VALID) ? sample.voltage_mv : -1;
-	battery_current_ma = sample.current_ma;
-	battery_temperature_c = sample.temperature_c;
-	battery_present = (sample.flags & LOADER_BATTERY_PRESENT) != 0;
-	battery_charger_present = (sample.flags & LOADER_BATTERY_CHARGER_PRESENT) != 0;
-	battery_charging = (sample.flags & LOADER_BATTERY_CHARGING) != 0;
-	battery_soc_estimated = (sample.flags & LOADER_BATTERY_SOC_ESTIMATED) != 0;
-	battery_charger_action = (int)sample.charger_action;
-	battery_updates++;
-}
 
 /*
  * What the audio DSP's battery manager says (bsd/dev/annibale_adsp.c, with adsp=1 unless battmgr=0):
@@ -152,45 +85,4 @@ annibale_battery_report(const struct annibale_battery_state *b)
 	battery_source_dsp = 1;
 	battery_updates++;
 	AnnibaleBatteryReport(b, sizeof(*b));
-}
-
-static void
-battery_thread(__unused void *parameter, __unused wait_result_t result)
-{
-	for (unsigned tick = 0;; tick++) {
-		battery_poll();
-		if (tick % 12 == 0) {
-			printf("battery: SOC=%d%%%s, V=%d mV, I=%d mA, T=%d C, battery=%d charger=%d charging=%d "
-			    "action=%d (%llu reads, %llu failed)\n", battery_soc_percent,
-			    battery_soc_estimated ? " (voltage estimate)" : "", battery_voltage_mv,
-			    battery_current_ma, battery_temperature_c, battery_present, battery_charger_present,
-			    battery_charging, battery_charger_action, battery_updates, battery_failures);
-		}
-		delay_for_interval(5000, NSEC_PER_MSEC);
-	}
-}
-
-void
-annibale_battery_state_init(void)
-{
-	uint32_t enabled = 0;
-	uint64_t shared_pa = 0;
-	vm_offset_t page;
-	thread_t thread;
-
-	if (!PE_parse_boot_argn("battery", &enabled, sizeof(enabled)) || !enabled) return;
-	if (!PE_parse_boot_argn("battery_shared_pa", &shared_pa, sizeof(shared_pa)) || shared_pa == 0) {
-		printf("battery: xnuloader did not provide battery_shared_pa\n");
-		return;
-	}
-	page = ml_io_map((vm_offset_t)(shared_pa & ~(LOADER_PAGE_SIZE - 1)), LOADER_PAGE_SIZE);
-	shared_battery = (volatile struct loader_battery *)(page + (shared_pa & (LOADER_PAGE_SIZE - 1)));
-	if (shared_battery->magic != LOADER_BATTERY_MAGIC || shared_battery->version != LOADER_BATTERY_VERSION ||
-	    shared_battery->size < sizeof(struct loader_battery)) {
-		printf("battery: bad xnuloader cache at %#llx (magic %#llx version %u size %u)\n", shared_pa,
-		    shared_battery->magic, shared_battery->version, shared_battery->size);
-		return;
-	}
-	printf("battery: Qualcomm UEFI cache at pa %#llx; polling every 5 seconds\n", shared_pa);
-	if (kernel_thread_start(battery_thread, NULL, &thread) == KERN_SUCCESS) thread_deallocate(thread);
 }

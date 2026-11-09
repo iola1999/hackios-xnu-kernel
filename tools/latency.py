@@ -17,7 +17,7 @@ all in microseconds of mach_absolute_time (the kernel's clock, which user space 
                                            pixels in the panel's memory (MiniIOMobileFramebuffer.cpp)
 
 With rec_secs=... rec_ring=1 the frames themselves are in the screen recording, each with the time it
-was put in the panel's memory. A "zigzag" of rwtouch (the finger up and down over a scrolling list
+was put in the panel's memory. A "zigzag" of anntouch (the finger up and down over a scrolling list
 without letting go) then gives the latency from end to end: the list follows the finger, and the
 time by which the list's movement lags the finger's is found by fitting the one to the other (a
 constant offset -- the scroll view's slop before it starts to follow -- does not matter; the turns do).

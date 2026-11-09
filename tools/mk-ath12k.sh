@@ -1,12 +1,12 @@
 #!/bin/bash
 # Build the driver of the K90's Wi-Fi radio for the xnu-12377 kernel: ath12k, Qualcomm's driver for
-# the WCN7850, as it is in Linux, unmodified, on the layer tools/mk-ath11k.sh builds ath11k on.
+# the WCN7850, as it is in Linux, unmodified, on FreeBSD LinuxKPI and wifi/lx.
 # The same three things meet here:
 #
 #   Linux's ath12k        drivers/net/wireless/ath/ath12k of Linux 7.0.14 (BSD-3-Clause-Clear),
 #                         the files shared by its chips and those of its Wi-Fi 7 family (wifi7/);
 #   FreeBSD's LinuxKPI    the headers of FreeBSD 15.1, patched with wifi/lx/patches/*.patch;
-#   wifi/lx               ours: src/ as for ath11k, and ath12k/, which stands where ath12k's own
+#   wifi/lx               ours: src/ and ath12k/, which stands where ath12k's own
 #                         pci.c and mhi.c would: the card on PCIe root complex 0, which the
 #                         kernel's bsd/dev/mhi_pcie*.c power, boot and link to the driver's QMI.
 #
@@ -48,7 +48,7 @@ fi
 [ "$1" = fetch ] && { echo "mk-ath12k.sh: ath12k of Linux $VERSION: $B/src/ath12k"; exit 0; }
 W=$ROOT/wifi/lx
 
-# --- FreeBSD's LinuxKPI and the kernel headers under it, with our patches on top (as mk-ath11k.sh)
+# --- FreeBSD's LinuxKPI and the kernel headers under it, with our patches on top
 FREEBSD=15.1
 FREEBSD_SHA256=cf5762da53fd52e1eaf0f9ceee9bf58cbe314c821031d0d9ffa76823185a89e1
 FSYS="compat/linuxkpi sys arm64/include net net80211 netinet netinet6 vm kern tools libkern ddb
@@ -128,7 +128,6 @@ for f in $DRIVER; do
 	compile src/ath12k/$f.c $o $DFLAGS &
 done
 for f in "$W"/src/*.c "$W"/ath12k/*.c; do
-	[ "$(basename "$f")" = lx_bus.c ] && continue		# (ath11k's)
 	o=obj/$(basename "$(dirname "$f")")_$(basename "$f" .c).o
 	OBJECTS="$OBJECTS $o"
 	compile "$f" $o $DFLAGS -I$W/src &
@@ -140,7 +139,7 @@ for f in obj/*.err; do
 done
 [ -z "$bad" ] || exit 1
 
-# --- one object, as mk-ath11k.sh ties ath11k's
+# --- one object
 KERNEL="memcmp memcpy memmove memset strcmp strncmp strlen strchr strrchr strlcpy strlcat bzero
 	snprintf vsnprintf __stack_chk_fail __stack_chk_guard"
 $LD -r -arch arm64 $OBJECTS -o out/all.o 2> out/ld.err || { cat out/ld.err; exit 1; }

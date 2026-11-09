@@ -2,9 +2,8 @@
 # Get Apple's xnu-12377.121.6 (macOS 26.5; the kernel interfaces iOS 26 uses, see
 # docs/analysis/2026-10-26-ios26-27-kernel-abi.md in the top-level repository) and put the annibale
 # work on top of it: xnu26/patches/ changes Apple's files, one piece per file, in the order
-# xnu26/patches/series names them; the new files are those of xnu/files/ (shared with the
-# xnu-8796 kernel) except the ones xnu26/files.skip names, then xnu26/files/ (what 12377 needs
-# in a version of its own).
+# xnu26/patches/series names them; the new files are those of xnu/files/, then xnu26/files/ (what
+# 12377 needs in a version of its own).
 # usage: xnu26/apply.sh [DIR]        (default: $XNU26_SRC, else xnu-src/xnu-12377.121.6)
 # env:   XNU_URL   where to fetch from (default: Apple's repository on GitHub)
 # The result is a git tree on the branch "annibale26" with the work uncommitted, as
@@ -30,7 +29,7 @@ echo 'BUILD/' >> .git/info/exclude
 while IFS= read -r piece; do
 	git apply --whitespace=nowarn "$HERE/patches/$piece" || { echo "apply.sh: $piece did not apply" >&2; exit 1; }
 done < "$HERE/patches/series"
-(cd "$HERE/../xnu/files" && find . -type f -o -type l) | sed 's|^\./||' | grep -vxF -f "$HERE/files.skip" |
+(cd "$HERE/../xnu/files" && find . -type f -o -type l) | sed 's|^\./||' |
 	while IFS= read -r f; do
 		mkdir -p "$(dirname "$f")"
 		cp -P -p "$HERE/../xnu/files/$f" "$f"

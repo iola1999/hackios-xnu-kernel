@@ -4,7 +4,7 @@
  * are tried on the phone, for music-like noise, and for the tone once it stops (the cooling).
  *
  *   cc -O2 -DKERNEL -I<a directory with sys/annibale_audio.h and a sys/ioccom.h> tools/guard_test.c \
- *      xnu-src/xnu-8796.121.2/bsd/dev/annibale_guard.c -lm -o guard_test && ./guard_test
+ *      xnu-src/xnu-12377.121.6/bsd/dev/annibale/annibale_guard.c -lm -o guard_test && ./guard_test
  * (tools/guard-test.sh does that.)
  */
 #include <math.h>

@@ -38,8 +38,8 @@ mkdir "$HERE/files.new"
 	mkdir -p "$HERE/files.new/$(dirname "$f")"
 	cp -P -p "$f" "$HERE/files.new/$f"
 done
-(cd "$SHARED" && find . -type f -o -type l) | sed 's|^\./||' | grep -vxF -f "$HERE/files.skip" | while IFS= read -r f; do
-	[ -e "$f" ] || echo "export.sh: $f (xnu/files) is not in the tree: delete it there or name it in xnu26/files.skip" >&2
+(cd "$SHARED" && find . -type f -o -type l) | sed 's|^\./||' | while IFS= read -r f; do
+	[ -e "$f" ] || echo "export.sh: $f (xnu/files) is not in the tree: delete it there" >&2
 done
 rm -rf "$HERE/files"
 mv "$HERE/files.new" "$HERE/files"

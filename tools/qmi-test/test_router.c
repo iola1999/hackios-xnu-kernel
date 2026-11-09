@@ -168,7 +168,7 @@ static struct {
 	struct news last_news;
 	struct sockaddr_qrtr news_from;
 	uint16_t news_transaction;
-	bool news_sends;                /* the handler sends a request of its own, as ath11k's handlers may */
+	bool news_sends;                /* the handler sends a request of its own, as ath12k's handlers may */
 } seen;
 
 static int
@@ -182,7 +182,7 @@ on_new_server(struct qmi_handle *qmi, struct qmi_service *service)
 	if (seen.answer < 0) {
 		return seen.answer;
 	}
-	/* what ath11k does here, word for word but for the type its Linux has for an address */
+	/* what ath12k does here, word for word but for the type its Linux has for an address */
 	return kernel_connect(qmi->sock, (void *)&sq, sizeof(sq), 0);
 }
 

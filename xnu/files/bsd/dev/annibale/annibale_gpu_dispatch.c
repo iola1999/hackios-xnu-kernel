@@ -1,12 +1,14 @@
-/* Existing AnnibaleGPU C ABI, selected by the immutable loader platform description. */
+/* AnnibaleGPU C ABI backed by the SM8750 Adreno 830 driver. */
 #include "../adreno8/adreno8_private.h"
 #include "../adreno8/adreno8_bo_private.h"
 #include "../adreno8/adreno8_context_private.h"
 #include "../adreno8/adreno8_hwsched_private.h"
-#include "annibale_gpu_private.h"
 #include <sys/annibale_input.h>
 
 extern bool AnnibaleGPUStart(void);
+
+uint32_t gpu_va;
+uint32_t gpu_log;
 
 bool
 adreno8_step_service(void)
@@ -34,14 +36,15 @@ adreno8_step_service(void)
 bool
 annibale_gpu_ready(void)
 {
-	return annibale_platform_is_annibale() ? adreno8_bo_ready() : legacy_gpu_ready();
+	return annibale_platform_is_annibale() && adreno8_bo_ready();
 }
 
 bool
 annibale_gpu_parameter(uint32_t which, uint64_t *value)
 {
-	if (!annibale_platform_is_annibale()) return legacy_gpu_parameter(which, value);
-	if (!value || !adreno8_bo_ready()) return false;
+	if (!annibale_platform_is_annibale() || !value || !adreno8_bo_ready()) {
+		return false;
+	}
 	switch (which) {
 	case 0x01: *value = 830; break;                 /* GPU_ID */
 	case 0x02: *value = 0xc00000; break;            /* GMEM_SIZE: vendor gen8_0_1 */
@@ -49,11 +52,11 @@ annibale_gpu_parameter(uint32_t which, uint64_t *value)
 	case 0x04: *value = adreno8_gx_hz[adreno8_gx_count - 1]; break; /* MAX_FREQ: the fastest speed of the table */
 	case 0x06: *value = 0x04000000; break;          /* GMEM_BASE: GPU setup */
 	case 0x07: *value = 1; break;                   /* PRIORITIES: RB0 only */
-	case 0x08:                                    /* PP_PGTABLE */
-	case 0x09:                                    /* FAULTS: unhealthy state is rejected above */
-	case 0x0a:                                    /* SUSPENDS: no suspend transition */
-	case 0x11: *value = 0; break;                  /* RAYTRACING: unavailable */
-	case 0x10: *value = 16; break;                 /* HIGHEST_BANK_BIT: vendor gen8_0_1 */
+	case 0x08:                                      /* PP_PGTABLE */
+	case 0x09:                                      /* FAULTS: unhealthy state is rejected above */
+	case 0x0a:                                      /* SUSPENDS: no suspend transition */
+	case 0x11: *value = 0; break;                   /* RAYTRACING: unavailable */
+	case 0x10: *value = 16; break;                  /* HIGHEST_BANK_BIT: vendor gen8_0_1 */
 	case 0x14: *value = 0x1fffffffff000ULL; break;  /* UCHE_TRAP_BASE: GPU setup */
 	default: return false;
 	}
@@ -63,7 +66,7 @@ annibale_gpu_parameter(uint32_t which, uint64_t *value)
 uint64_t
 annibale_gpu_address(uint64_t size)
 {
-	return annibale_platform_is_annibale() ? adreno8_bo_reserve(size) : legacy_gpu_address(size);
+	return annibale_platform_is_annibale() ? adreno8_bo_reserve(size) : 0;
 }
 
 void
@@ -71,20 +74,13 @@ annibale_gpu_address_free(uint64_t address, uint64_t size)
 {
 	if (annibale_platform_is_annibale()) {
 		(void)adreno8_bo_release(address, size);
-		return;
 	}
-	legacy_gpu_address_free(address, size);
 }
 
 void
 annibale_gpu_space(uint64_t *used, uint32_t *live, uint64_t *largest, unsigned *holes,
     unsigned *most, uint64_t *lost, uint32_t *refused)
 {
-	if (!annibale_platform_is_annibale()) {
-		legacy_gpu_space(used, live, largest, holes, most, lost, refused);
-		return;
-	}
-	/* gpu_va stays disabled on A830: these legacy allocator statistics are unavailable. */
 	*used = *largest = *lost = 0;
 	*live = *holes = *most = *refused = 0;
 }
@@ -92,38 +88,35 @@ annibale_gpu_space(uint64_t *used, uint32_t *live, uint64_t *largest, unsigned *
 bool
 annibale_gpu_map(uint64_t address, uint64_t phys, bool read_only)
 {
-	return annibale_platform_is_annibale() ? adreno8_bo_map(address, phys, read_only) :
-	    legacy_gpu_map(address, phys, read_only);
+	return annibale_platform_is_annibale() && adreno8_bo_map(address, phys, read_only);
 }
 
 bool
 annibale_gpu_mapped(void)
 {
-	return annibale_platform_is_annibale() ? adreno8_bo_commit() : legacy_gpu_mapped();
+	return annibale_platform_is_annibale() && adreno8_bo_commit();
 }
 
 bool
 annibale_gpu_unmap(uint64_t address, uint64_t size)
 {
-	return annibale_platform_is_annibale() ? adreno8_bo_unmap(address, size) : legacy_gpu_unmap(address, size);
+	return annibale_platform_is_annibale() && adreno8_bo_unmap(address, size);
 }
 
 void
 annibale_gpu_to_memory(void *start, uint64_t size)
 {
 	if (annibale_platform_is_annibale()) {
-		/* Initial cached-BO publication runs outside gGPULock; keep this cache-only. */
 		adreno8_to_memory((vm_offset_t)start, size);
-		return;
 	}
-	legacy_gpu_to_memory(start, size);
 }
 
 uint32_t
 annibale_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
 {
-	if (!annibale_platform_is_annibale()) return legacy_gpu_submit(addresses, words, count);
-	if (!adreno8_bo_ready()) return 0;
+	if (!annibale_platform_is_annibale() || !adreno8_bo_ready()) {
+		return 0;
+	}
 	adreno8_speed_tick();
 	return adreno8_context_submit(addresses, words, count);
 }
@@ -131,8 +124,7 @@ annibale_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t c
 bool
 annibale_gpu_done(uint32_t fence)
 {
-	if (!annibale_platform_is_annibale()) return legacy_gpu_done(fence);
-	return adreno8_bo_ready() && adreno8_context_done(fence);
+	return annibale_platform_is_annibale() && adreno8_bo_ready() && adreno8_context_done(fence);
 }
 
 uint32_t
@@ -154,7 +146,7 @@ annibale_gpu_pause(uint32_t seen, uint32_t poll_us, uint32_t longest_us)
 uint32_t
 annibale_gpu_last(void)
 {
-	return annibale_platform_is_annibale() ? adreno8_context_last() : legacy_gpu_last();
+	return annibale_platform_is_annibale() ? adreno8_context_last() : 0;
 }
 
 void
@@ -170,7 +162,11 @@ void
 annibale_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
 {
 	if (!annibale_platform_is_annibale()) {
-		legacy_gpu_worked(microseconds, submissions, by);
+		*microseconds = 0;
+		*submissions = 0;
+		for (unsigned i = 0; i < 7; i++) {
+			by[i] = 0;
+		}
 		return;
 	}
 	adreno8_hfi_worked(microseconds, submissions, by);
@@ -180,18 +176,13 @@ void
 annibale_gpu_report(const char *why)
 {
 	if (!annibale_platform_is_annibale()) {
-		legacy_gpu_report(why);
 		return;
 	}
-	/* Both callers report failed execution: a completion timeout or a zero submit fence. */
 	adreno8_say("adreno8: AnnibaleGPU %s; last timestamp %u, retired %u; SMMU fault %u\n",
 	    why, adreno8_context_last(), adreno8_context_retired(), adreno8_gpu_faulted());
-	/* The GMU's own report of a hang (HFI 150, context bad) can come after the caller's two
-	 * seconds have run out, and once the buffers are stopped nobody reads the queue: up to
-	 * three more seconds of polling, so that its words reach the log. adreno8_hfi_poll returns
-	 * false once a fatal message has been printed or the queue is unusable. */
-	for (unsigned i = 0; i < 30 && adreno8_hfi_poll(); i++)
+	for (unsigned i = 0; i < 30 && adreno8_hfi_poll(); i++) {
 		adreno8_sleep_us(100000);
+	}
 	adreno8_gpu_hang_dump();
 	adreno8_bo_stop();
 }
@@ -199,16 +190,17 @@ annibale_gpu_report(const char *why)
 bool
 annibale_gpu_recover(void)
 {
-	return annibale_platform_is_annibale() ? false : legacy_gpu_recover();
+	return false;
 }
 
 void
 annibale_gpu_stop(void)
 {
 	if (!annibale_platform_is_annibale()) {
-		legacy_gpu_stop();
 		return;
 	}
-	if (adreno8_bo_ready()) (void)adreno8_context_close();
+	if (adreno8_bo_ready()) {
+		(void)adreno8_context_close();
+	}
 	adreno8_bo_stop();
 }

@@ -26,5 +26,5 @@ load_device() {
 }
 
 have_userland() {
-	[ -d .userland.git ] || [ -f userland/build.sh ] || die "the userland is not here: run common/setup.sh"
+	[ -f ../hackios-xnu-userland/userland/build.sh ] || [ -f userland/build.sh ] || die "the userland is not here"
 }

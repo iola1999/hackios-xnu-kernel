@@ -8,8 +8,8 @@ index ddfae66cd7f2..0bfcbd10e2cf 100644
  
 +#if XNU_KERNEL_PRIVATE
 +/*
-+ * annibale: the drivers shared with xnu-8796 (xnu/files) take kmem_alloc(), kmem_free() and the
-+ * KMA_ flags from this header, where 8796 has them; 12377 moved them to vm_kern_xnu.h.
++ * annibale: the drivers in xnu/files take kmem_alloc(), kmem_free() and the
++ * KMA_ flags from this header; xnu-12377 moved them to vm_kern_xnu.h.
 + */
 +#include <vm/vm_kern_xnu.h>
 +#endif /* XNU_KERNEL_PRIVATE */

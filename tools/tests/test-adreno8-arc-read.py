@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-DEV = ROOT / "xnu/files/bsd/dev/adreno8/adreno8"
+DEV = ROOT / "xnu/files/bsd/dev/adreno8"
 PRODUCTION = (DEV / "adreno8_rpmh.c").read_text()
 HEADER = r'''
 #ifndef _TEST_ADRENO8_PRIVATE_H

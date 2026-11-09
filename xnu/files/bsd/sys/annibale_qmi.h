@@ -1,7 +1,7 @@
 /*
  * QMI, the message protocol the firmware of Qualcomm's processors speaks (the Wi-Fi DSP's
  * "WLFW" service among them): the helpers a client needs, under the names and with the meaning
- * of Linux's <linux/soc/qcom/qmi.h>, so that a driver written for Linux -- ath11k's qmi.c --
+ * of Linux's <linux/soc/qcom/qmi.h>, so that a driver written for Linux -- ath12k's qmi.c --
  * compiles against this header unchanged. The implementation (bsd/dev/annibale_qmi.c) is ours,
  * written from what the interface and the wire format are publicly described to be; nothing of
  * Linux's implementation is in it.
@@ -198,7 +198,7 @@ int annibale_qmi_txn_wait_ms(struct qmi_txn *txn, uint64_t milliseconds);
 
 /*
  * The server that requests without an address go to. In Linux this is a connect() on the
- * handle's socket, which is how ath11k does it; here that call is this one.
+ * handle's socket, which is how ath12k does it; here that call is this one.
  */
 int annibale_qmi_connect(struct socket *sock, uint32_t node, uint32_t port);
 #ifndef ANNIBALE_QMI_NO_KERNEL_CONNECT

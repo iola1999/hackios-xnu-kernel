@@ -13,7 +13,7 @@
  *     ring groups once the driver has enabled them.
  *
  * The rest -- what to do with the radio once it is registered: scan, join, carry frames -- is the
- * station of src/lx_80211.c, as for ath11k (src/lx_bus.c, which this follows).
+ * station of src/lx_80211.c.
  */
 #define LX_QMI_AS_IT_IS				/* (this file is where the driver's requests go past) */
 #include <linux/kernel.h>

@@ -1,7 +1,6 @@
 #!/bin/bash
 # Give the xnu-12377 kernel's build ath12k's descriptions of the messages the WCN7850's firmware speaks,
-# for bsd/dev/mhi_pcie_wlfw.c (PCIe step 9, a stand-in for ath12k's own qmi.c). As tools/mk-wlfw.sh does for
-# ath11k: the structures of qmi.h, the tables of qmi.c and this chip's copy engine tables (wifi7/hw.c names them,
+# for bsd/dev/mhi_pcie_wlfw.c (PCIe step 9, a stand-in for ath12k's own qmi.c): the structures of qmi.h, the tables of qmi.c and this chip's copy engine tables (wifi7/hw.c names them,
 # wifi7/ce.c holds them) are
 # taken out as they are and written as one header into the kernel's build directory, where the compiler finds
 # it and git does not. ath12k's text is BSD-3-Clause-Clear and is not kept in the repository; the six files

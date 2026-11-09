@@ -1,7 +1,7 @@
 #!/bin/bash
 # While a run is in progress on the phone: follow what the kernel's log says about the buttons
 # (the driver's "buttons:" lines, backboardd's "[Button]" lines, button presses a script makes
-# with rwtouch), print each new line, and take pictures of the screen after every press -- one at
+# with anntouch), print each new line, and take pictures of the screen after every press -- one at
 # once and one two seconds later -- so that a session in which somebody presses the phone's keys
 # also shows what iOS made of them (a volume key: the volume indicator; the side button: the
 # screen off, or back on).
@@ -16,8 +16,8 @@ cd "$(dirname "$(readlink -f "$0")")/.." || exit 1
 PHONE=${XDG_RUNTIME_DIR:-/tmp}/hackios-phone
 out=${1:-logs/buttons-$(date +%H%M%S)}
 mkdir -p "$out"
-pattern='^buttons: |\[Button\] [A-Za-z]+ page|^\$ /annibale/bin/rwtouch .*button |Set Blanked'
-press='PRESSED|rwtouch .*button '
+pattern='^buttons: |\[Button\] [A-Za-z]+ page|^\$ /annibale/bin/anntouch .*button |Set Blanked'
+press='PRESSED|anntouch .*button '
 shots=0 started= again=0 last=
 running() { ! flock -n "$PHONE.run" true 2>/dev/null; }
 picture() { # picture <suffix>

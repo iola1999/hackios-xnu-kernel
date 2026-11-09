@@ -42,18 +42,18 @@ struct rwa_texture;
  * knows nothing of the kernel tree.
  *
  * The struct goes in and comes back out of the same call, so `handle` is both the question
- * (RWD_DESCRIBE: do not make a buffer) and the answer (which buffer was made).
+ * (ANN_DESCRIBE: do not make a buffer) and the answer (which buffer was made).
  */
-struct rwd_surface {
+struct ann_surface {
 	uint32_t surface;                 /* the IOSurface's ID, which is what the kernel looks up */
-	uint32_t handle;                  /* in: RWD_DESCRIBE or 0; out: the GPU buffer, 1-based */
+	uint32_t handle;                  /* in: ANN_DESCRIBE or 0; out: the GPU buffer, 1-based */
 	uint64_t size;                    /* out: how big that buffer is, in whole pages */
 	uint32_t offset, rowBytes;        /* out: where the pixels start in it, and a row's length */
 	uint32_t width, height;           /* out: and what they are -- read back, not assumed, */
 	uint32_t pixelFormat, planes;     /* because MiniIOSurface substitutes some formats */
 };
 
-#define RWD_DESCRIBE 0xffffffffu          /* kAnnibaleDescribe: answer, allocate nothing */
+#define ANN_DESCRIBE 0xffffffffu          /* kAnnibaleDescribe: answer, allocate nothing */
 
 /*
  * The shape, in the same fields and the same order as `struct rwa_texture_shape`
@@ -62,7 +62,7 @@ struct rwd_surface {
  * tree's headers on its include path, and a second declaration of the same layout is
  * cheaper than making it have them.
  */
-struct rwd_texture_shape {
+struct ann_texture_shape {
 	unsigned pixel_format, type, width, height, depth;
 	unsigned array_length, mip_levels, sample_count, usage;
 };
@@ -75,8 +75,8 @@ struct rwd_texture_shape {
  * 0, or -1 and a sentence in `why`. A kernel booted without gpu=1 has no such service, and
  * that is the ordinary case rather than a fault.
  */
-int rwd_gpu_open(io_connect_t *connection, char *why, size_t why_size);
-void rwd_gpu_close(io_connect_t connection);
+int ann_gpu_open(io_connect_t *connection, char *why, size_t why_size);
+void ann_gpu_close(io_connect_t connection);
 
 /*
  * What a surface is, and the same with its memory taken as a GPU buffer. `describe`
@@ -94,11 +94,11 @@ void rwd_gpu_close(io_connect_t connection);
  * has a parameter to pass memory in -- but a surface handed to us by an application might
  * be, so the sentence says which it was.
  */
-int rwd_surface_describe(io_connect_t connection, uint32_t surfaceID,
-			 struct rwd_surface *surface, char *why, size_t why_size);
-int rwd_surface_take(io_connect_t connection, uint32_t surfaceID,
-		     struct rwd_surface *surface, char *why, size_t why_size);
-int rwd_surface_give_back(io_connect_t connection, uint32_t handle, char *why, size_t why_size);
+int ann_surface_describe(io_connect_t connection, uint32_t surfaceID,
+			 struct ann_surface *surface, char *why, size_t why_size);
+int ann_surface_take(io_connect_t connection, uint32_t surfaceID,
+		     struct ann_surface *surface, char *why, size_t why_size);
+int ann_surface_give_back(io_connect_t connection, uint32_t handle, char *why, size_t why_size);
 
 /*
  * An IOSurface's ID without linking IOSurface.framework.
@@ -111,7 +111,7 @@ int rwd_surface_give_back(io_connect_t connection, uint32_t handle, char *why, s
  * 0 is "no ID", which is also what IOSurfaceGetID answers for a surface that was never
  * made shareable; either way there is nothing for the kernel to look up.
  */
-uint32_t rwd_surface_id(void *iosurface);
+uint32_t ann_surface_id(void *iosurface);
 
 /*
  * Whether Adreno can render into this surface as it stands, and if not, which number says
@@ -131,7 +131,7 @@ uint32_t rwd_surface_id(void *iosurface);
  *
  * 0, or -1 and a sentence naming the stride, the width and the two numbers it failed.
  */
-int rwd_surface_fits_adreno(const struct rwd_surface *surface, unsigned bytes_per_pixel,
+int ann_surface_fits_adreno(const struct ann_surface *surface, unsigned bytes_per_pixel,
 			    char *why, size_t why_size);
 
 /*
@@ -151,31 +151,31 @@ int rwd_surface_fits_adreno(const struct rwd_surface *surface, unsigned bytes_pe
  *
  * 0, or -1 and a sentence. `fourcc` and `bytes_per_pixel` may be NULL.
  */
-int rwd_format_of_metal(unsigned metal_pixel_format, uint32_t *fourcc,
+int ann_format_of_metal(unsigned metal_pixel_format, uint32_t *fourcc,
 			unsigned *bytes_per_pixel, char *why, size_t why_size);
 
 /* Select and validate one IOSurface plane. allocation_base is the start of its allocation. */
-int rwd_surface_plane(void *iosurface, unsigned long plane, const struct rwd_texture_shape *want,
-    struct rwd_surface *selected, void **allocation_base, char *why, size_t why_size);
+int ann_surface_plane(void *iosurface, unsigned long plane, const struct ann_texture_shape *want,
+    struct ann_surface *selected, void **allocation_base, char *why, size_t why_size);
 
-struct rwa_texture *rwd_texture_for_surface(struct rwa_device *mesa_device,
-    const struct rwd_surface *selected, unsigned long plane, const struct rwd_texture_shape *want,
+struct rwa_texture *ann_texture_for_surface(struct rwa_device *mesa_device,
+    const struct ann_surface *selected, unsigned long plane, const struct ann_texture_shape *want,
     char *why, size_t why_size);
 
 /*
  * There is deliberately NO release call here. The buffer a surface's memory becomes belongs
  * to freedreno's table of buffers from the moment the library imports it, and
  * rwa_texture_destroy gives it back -- so a second release on this side would be a second
- * owner of one surface. `rwd_surface_take` / `rwd_surface_give_back` are for a caller that wants a buffer of its
+ * owner of one surface. `ann_surface_take` / `ann_surface_give_back` are for a caller that wants a buffer of its
  * own, which the drawable path is not.
  */
 
 /* Whether the compiler library has the import call at all, which is the one thing that
  * decides whether a drawable can exist in this boot. Said once, by the first caller. */
-int rwd_import_available(void);
+int ann_import_available(void);
 
 static inline unsigned
-rwd_canonical_pixel_format(unsigned fmt)
+ann_canonical_pixel_format(unsigned fmt)
 {
 	if (fmt == 94 || (fmt >= 550 && fmt <= 555)) {
 		return (fmt == 551 || fmt == 553 || fmt == 555) ? 81u : 80u;

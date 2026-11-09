@@ -10,13 +10,10 @@
  * with that driver's ReadBlocks into a buffer both can see. The kernel's side is
  * bsd/dev/annibale_ufs.c; it gets the page's address as ufs_shared_pa= on its command line.
  *
- * Reads, and -- with ufs_write=1 on the command line -- writes into one place and nowhere else:
- * dsu_store, the last 4 GiB of the slot Android's DSU installer keeps the iOS system image in
- * (loader_dsu.inc, dsu_store_open). It is not a GPT partition: this loader lists it in the table as
- * one, of its own blocks, and maps them onto the extents of the DSU file in userdata. No answer to
- * the kernel can reach any other part of the storage. The refusals are here, in the kernel
- * (bsd/dev/annibale_ufs.c) and in UEFI's own driver, which bounds userdata: a request has to pass
- * all three.
+ * Reads, and writes into one place and nowhere else: darwin_var, the dedicated UFS partition
+ * where the iOS data volume lives. No answer to the kernel can reach any other part of the
+ * storage. The refusals are here, in the kernel (bsd/dev/annibale/annibale_ufs.c) and in UEFI's
+ * own driver: a request has to pass all three.
  *
  * Each side writes its own cache lines only: the kernel the request, core 0 the answer (and the
  * table, once, before the kernel starts). A line one side cleans out of its cache therefore never
@@ -115,14 +112,8 @@ static void block_io2_probe(efi_handle h, efi_block_io *bio);
 static int block_probe_requested;       /* ufs_probe=1: block_io2_probe() at block_start() */
 static efi_block_io *block_bios[BLOCK_MAX_PARTS];
 static int block_enabled;
-static int block_write_requested;       /* ufs_write=1 on the command line */
-static int block_write_part = -1;       /* the only partition a write may reach; -1: none, writes refused */
-static int block_dsu_part = -1;         /* dsu_store's index in the table; -1: not listed this run */
 static int block_darwin_var_part = -1;  /* darwin_var's index in the table; -1: not listed this run */
 static uint64_t block_writes, block_writes_refused, block_write_bytes;
-/* loader_dsu.inc, included after this file */
-static int dsu_store_open(struct loader_block_part *bp, int want_write, int *writable);
-static efi_status dsu_store_io(int write, uint64_t lba, uint64_t bytes, uint8_t *buf);
 
 /* the bytes of a device path before its end node */
 static uint64_t
@@ -450,19 +441,6 @@ block_start(void)
 			block_io2_probe(handles[i], bio);
 		}
 	}
-	/* the DSU store: listed among the partitions, before the units */
-	block_dsu_part = -1;
-	if (block_shared.parts + nunits < BLOCK_MAX_PARTS) {
-		int writable = 0;
-
-		if (dsu_store_open(&block_shared.part[block_shared.parts], block_write_requested, &writable)) {
-			block_dsu_part = (int)block_shared.parts;
-			if (writable) {
-				block_write_part = block_dsu_part;
-			}
-			block_bios[block_shared.parts++] = NULL;        /* dsu_store_io, not a BlockIo of its own */
-		}
-	}
 	for (uint64_t u = 0; u < nunits; u++) {
 		struct loader_block_part *bp = &block_shared.part[block_shared.parts];
 		char *n = bp->name;
@@ -501,10 +479,6 @@ block_start(void)
 	/* per run, like the two above: this loader stays resident across runs, and a tally carried
 	 * over from the run before is read as this one's */
 	block_writes = block_writes_refused = block_write_bytes = 0;
-	if (block_write_part >= 0) {
-		block_shared.write_part_plus_one = (uint32_t)block_write_part + 1;
-		block_shared.write_first = 0;   /* the whole store */
-	}
 	block_shared.magic = BLOCK_MAGIC;
 	block_shared.version = BLOCK_VERSION;
 	block_shared.size = sizeof(block_shared);
@@ -630,9 +604,7 @@ block_poll(void)
 			s = 0x800000000000000FULL;      /* EFI_ACCESS_DENIED */
 			bytes = 0;
 		} else if (op == BLOCK_OP_WRITE) {
-			if ((block_write_part < 0 || part != (uint32_t)block_write_part) &&
-			    (block_darwin_var_part < 0 || part != (uint32_t)block_darwin_var_part)) {
-				/* not the store: never */
+			if (block_darwin_var_part < 0 || part != (uint32_t)block_darwin_var_part || bio == NULL) {
 				if (block_writes_refused++ < 8) {
 					print("ufs: a write of %d blocks from %d of %s: REFUSED\n", count, lba,
 					    block_shared.part[part].name);
@@ -651,20 +623,10 @@ block_poll(void)
 				flush_dcache((uint64_t)(uintptr_t)block_buffer,
 				    (uint64_t)(uintptr_t)block_buffer + bytes);
 				want = ufs_crc32(block_buffer, bytes);
-				if ((int)part == block_dsu_part) {
-					s = dsu_store_io(1, lba, bytes, block_buffer);
-				} else if (bio != NULL) {
-					s = bio->write_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
-					if (!EFI_ERROR(s)) {
-						bio->flush_blocks(bio);
-					}
-				} else {
-					s = 0x800000000000000FULL;
-				}
+				s = bio->write_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
 				if (!EFI_ERROR(s)) {
-					s = (int)part == block_dsu_part ?
-					    dsu_store_io(0, lba, bytes, block_buffer) :
-					    bio->read_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
+					bio->flush_blocks(bio);
+					s = bio->read_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
 					flush_dcache((uint64_t)(uintptr_t)block_buffer,
 					    (uint64_t)(uintptr_t)block_buffer + bytes);
 					if (!EFI_ERROR(s) && ufs_crc32(block_buffer, bytes) != want) {
@@ -679,8 +641,7 @@ block_poll(void)
 				}
 			}
 		} else if (op == BLOCK_OP_READ) {
-			s = (int)part == block_dsu_part ? dsu_store_io(0, lba, bytes, block_buffer) :
-			    bio->read_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
+			s = bio->read_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
 			/* what the controller wrote is in memory; drop whatever this core held of the buffer */
 			flush_dcache((uint64_t)(uintptr_t)block_buffer, (uint64_t)(uintptr_t)block_buffer + bytes);
 		} else {
@@ -708,7 +669,7 @@ charger_start(void)
 	static const efi_guid qcom_charger_guid = QCOM_CHARGER_GUID;
 	efi_status ex_status, qcom_status, init_status = 0;
 
-	if (charger_enabled || PLAT != &platform_poco) {
+	if (charger_enabled || PLAT == &platform_annibale) {
 		return;
 	}
 	ex_status = BS->locate_protocol(&charger_ex_guid, NULL, (void **)&CHARGER_EX);

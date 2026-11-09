@@ -12,9 +12,9 @@
 #include "annibalemetal_work_private.h"
 
 /*
- * kern.annibale.env (bsd/dev/annibale_threads.c, written by rwsh "setenv"/"addenv"): the words
+ * kern.annibale.env (bsd/dev/annibale_threads.c, written by annsh "setenv"/"addenv"): the words
  * PROCESS:NAME=VALUE and PROCESS:-NAME for this process go into its environment before the first
- * device is made, so a process restarted with rwsh "restart" runs with the new settings without a
+ * device is made, so a process restarted with annsh "restart" runs with the new settings without a
  * new image. Its launchd plist's EnvironmentVariables are already set by then and are overridden by
  * these. The +load methods run before this; only the ANNIBALE_DIAG address line there reads one.
  */

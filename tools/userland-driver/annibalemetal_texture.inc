@@ -559,7 +559,7 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 
 /*
  * An IOSurface as a texture. A surface whose rows lie a whole number of 64 bytes apart is imported
- * where it lies (rwd_texture_for_surface). One whose rows do not cannot be sampled there: the A830
+ * where it lies (ann_texture_for_surface). One whose rows do not cannot be sampled there: the A830
  * reads a linear texture at a pitch of whole 64-byte units, and SpringBoard writes its glyph
  * surfaces at the 224 or 416 bytes a row it asked for, whatever pitch the surface reports (render84
  * sampled them sheared; render88, with the kernel padding the pitch, read the rows sheared on the
@@ -576,7 +576,7 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
  */
 static id
 rw_surface_through_copy(AnnibaleMetalDevice *device, MTLTextureDescriptor *d, void *surface,
-			NSUInteger plane, const struct rwd_surface *selected, void *allocation_base)
+			NSUInteger plane, const struct ann_surface *selected, void *allocation_base)
 {
 	static NSMutableDictionary *shared;   /* "surface plane format WxH" -> the retained texture */
 	static pthread_mutex_t shared_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -688,8 +688,8 @@ rw_surface_through_copy(AnnibaleMetalDevice *device, MTLTextureDescriptor *d, vo
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(void *)s plane:(NSUInteger)p
 {
 	char why[768] = { 0 };
-	struct rwd_surface took;
-	struct rwa_texture_shape shape;   /* this file's own declaration; rwd_texture_shape is the
+	struct ann_surface took;
+	struct rwa_texture_shape shape;   /* this file's own declaration; ann_texture_shape is the
 					   * same layout under the other file's name, and the cast
 					   * below is the one place the two meet */
 	struct rwa_texture *texture;
@@ -712,7 +712,7 @@ rw_surface_through_copy(AnnibaleMetalDevice *device, MTLTextureDescriptor *d, vo
 	shape.usage = (unsigned)[d usage];
 	if (shape.pixel_format == 500)
 		return rw_combined_yuv(self, d, s, p, &shape);
-	if (rwd_surface_plane(s, p, (const struct rwd_texture_shape *)&shape, &took,
+	if (ann_surface_plane(s, p, (const struct ann_texture_shape *)&shape, &took,
 	    &allocation_base, why, sizeof(why)) != 0) {
 		rw_print("surface plane %lu: %s\n", (unsigned long)p, why);
 		return nil;
@@ -723,7 +723,7 @@ rw_surface_through_copy(AnnibaleMetalDevice *device, MTLTextureDescriptor *d, vo
 			rw_print("surface plane %lu copy allocation failed\n", (unsigned long)p);
 		return copy;
 	}
-	texture = rwd_texture_for_surface(_mesa, &took, p, (const struct rwd_texture_shape *)&shape,
+	texture = ann_texture_for_surface(_mesa, &took, p, (const struct ann_texture_shape *)&shape,
 					 why, sizeof(why));
 	if (texture == NULL) {
 		static unsigned long refusals;

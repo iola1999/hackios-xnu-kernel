@@ -100,10 +100,6 @@ ufs_read(uint32_t part, uint64_t offset, uint8_t *dst, uint64_t len)
 		if (error == 0) {
 			return 0;
 		}
-		if (ufs_write_busy) {
-			/* the list is out for a write of ours, not broken: this read goes the other way */
-			return ufs_read_mailbox(part, offset, dst, len);
-		}
 		if (ufs_native_on) {
 			ufs_native_on = false;
 			ufs_native_fallbacks++;
@@ -116,10 +112,9 @@ ufs_read(uint32_t part, uint64_t offset, uint8_t *dst, uint64_t len)
 }
 
 /*
- * Whole blocks [offset, offset + len) of the partition that takes writes, from src.
- * For ufs_darwin_var, writes are routed directly through ufshc_write to native hardware
- * multi-slot queues without dropping ufs_native_on.
- * For legacy DSU store, its transfer list goes out to UEFI driver as before.
+ * Whole blocks [offset, offset + len) of ufs_darwin_var, from src.
+ * Writes are routed directly through ufshc_write to native hardware multi-slot queues
+ * when ufs_native_on is active, or through the loader's Block I/O mailbox otherwise.
  */
 static int
 ufs_write(uint32_t part, uint64_t offset, const uint8_t *src, uint64_t len)
@@ -127,112 +122,38 @@ ufs_write(uint32_t part, uint64_t offset, const uint8_t *src, uint64_t len)
 	uint64_t nbs, per;
 	int error = 0;
 
-	if (!ufs_ready || part >= ufs_parts) {
-		ufs_write_refused++;
-		return EROFS;
-	}
-
-	if (ufs_darwin_var_part >= 0 && part == (uint32_t)ufs_darwin_var_part) {
-		nbs = ufs_page->part[part].block_size;
-		if (len == 0 || offset % nbs != 0 || len % nbs != 0) {
-			return EINVAL;
-		}
-		if (offset > ufs_part_bytes(part) || len > ufs_part_bytes(part) - offset) {
-			ufs_write_refused++;
-			return EROFS;
-		}
-		if (ufs_native_on && ufs_lun[part] != 0xff) {
-			return ufshc_write(ufs_lun[part], ufs_lun_offset[part] + offset, src, len);
-		}
-		per = ufs_buffer_size / nbs;
-		lck_mtx_lock(&ufs_lock);
-		while (len > 0 && error == 0) {
-			uint64_t count = len / nbs;
-			if (count > per) {
-				count = per;
-			}
-			error = ufs_request(BLOCK_OP_WRITE, part, offset / nbs, count, NULL, src);
-			offset += count * nbs;
-			src += count * nbs;
-			len -= count * nbs;
-		}
-		lck_mtx_unlock(&ufs_lock);
-		if (error != 0) {
-			ufs_write_errors++;
-		}
-		return error;
-	}
-
-	if (ufs_write_part < 0 || part != (uint32_t)ufs_write_part) {
+	if (!ufs_ready || part >= ufs_parts || ufs_darwin_var_part < 0 || part != (uint32_t)ufs_darwin_var_part) {
 		ufs_write_refused++;
 		return EROFS;
 	}
 	nbs = ufs_page->part[part].block_size;
 	if (len == 0 || offset % nbs != 0 || len % nbs != 0) {
-		return EINVAL;          /* whole blocks only: nothing is read before a write */
+		return EINVAL;
 	}
 	if (offset > ufs_part_bytes(part) || len > ufs_part_bytes(part) - offset) {
-		/* past the store's end: never */
 		ufs_write_refused++;
 		return EROFS;
 	}
-	per = ufs_buffer_size / nbs;
-	lck_mtx_lock(&ufs_write_mtx);
-	/*
-	 * The list goes out once, at the first write, and comes back when the device is closed: a
-	 * whole data volume is written a bufferful at a time, and switching the controller's list
-	 * for each of those would say so a hundred times over and buy nothing. ufs_native_on is
-	 * cleared first, so that a reader about to start goes the other way of its own accord; one
-	 * already inside this kernel's driver gets an error and is sent the other way by
-	 * ufs_write_busy.
-	 */
-	if (!ufs_write_out) {
-		ufs_write_was_native = ufs_native_on;
-		ufs_write_busy = true;
-		ufs_write_out = true;
-		if (ufs_write_was_native) {
-			ufs_native_on = false;
-			ufs_native_out("writing the data volume into the DSU store");
-		}
+	if (ufs_native_on && ufs_lun[part] != 0xff) {
+		return ufshc_write(ufs_lun[part], ufs_lun_offset[part] + offset, src, len);
 	}
+	per = ufs_buffer_size / nbs;
+	lck_mtx_lock(&ufs_lock);
 	while (len > 0 && error == 0) {
 		uint64_t count = len / nbs;
-
 		if (count > per) {
 			count = per;
 		}
-		lck_mtx_lock(&ufs_lock);
-		if (ufshc_list_in()) {
-			/* it did not go out after all: UEFI's driver must not be asked to ring */
-			error = EIO;
-		} else {
-			error = ufs_request(BLOCK_OP_WRITE, part, offset / nbs, count, NULL, src);
-		}
-		lck_mtx_unlock(&ufs_lock);
+		error = ufs_request(BLOCK_OP_WRITE, part, offset / nbs, count, NULL, src);
 		offset += count * nbs;
 		src += count * nbs;
 		len -= count * nbs;
 	}
-	lck_mtx_unlock(&ufs_write_mtx);
+	lck_mtx_unlock(&ufs_lock);
 	if (error != 0) {
 		ufs_write_errors++;
 	}
 	return error;
-}
-
-/* The writing over: this kernel's own transfer list back in, and reads through it again. */
-static void
-ufs_write_restore(void)
-{
-	lck_mtx_lock(&ufs_write_mtx);
-	if (ufs_write_out) {
-		if (ufs_write_was_native && ufs_native_in(false) == 0) {
-			ufs_native_on = true;
-		}
-		ufs_write_busy = false;
-		ufs_write_out = false;
-	}
-	lck_mtx_unlock(&ufs_write_mtx);
 }
 
 /* ---- the devices ---- */
@@ -251,19 +172,10 @@ ufs_open(dev_t dev, int flags, __unused int devtype, __unused proc_t p)
 	return 0;
 }
 
-/* The same, for the character devices: the partitions that take writes may be opened for them. */
+/* The same, for the character devices: darwin_var may be opened for writes. */
 static int
 ufs_copen(dev_t dev, int flags, int devtype, proc_t p)
 {
-	uint32_t part = (uint32_t)minor(dev);
-
-	if (flags & FWRITE) {
-		if (ufs_write_part >= 0 && part == (uint32_t)ufs_write_part) {
-			flags &= ~FWRITE;
-		} else if (ufs_darwin_var_part >= 0 && part == (uint32_t)ufs_darwin_var_part) {
-			/* permit character write open for darwin_var */
-		}
-	}
 	return ufs_open(dev, flags, devtype, p);
 }
 
@@ -273,13 +185,9 @@ ufs_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused
 	return 0;
 }
 
-/* The last close of /dev/rufs_dsu_store ends the writing: this kernel's own transfer list goes back in. */
 static int
 ufs_cclose(dev_t dev, int flags, int devtype, proc_t p)
 {
-	if (ufs_write_part >= 0 && (uint32_t)minor(dev) == (uint32_t)ufs_write_part) {
-		ufs_write_restore();
-	}
 	return ufs_close(dev, flags, devtype, p);
 }
 
@@ -428,7 +336,7 @@ ufs_cread(dev_t dev, struct uio *uio, __unused int ioflag)
 }
 
 /*
- * A write to /dev/rufs_darwin_var or /dev/rufs_dsu_store: whole blocks, out of user memory
+ * A write to /dev/rufs_darwin_var: whole blocks, out of user memory
  * a bufferful at a time and into the partition.
  */
 static int
@@ -442,43 +350,8 @@ ufs_cwrite(dev_t dev, struct uio *uio, __unused int ioflag)
 	if (!ufs_ready || part >= ufs_parts) {
 		return ENXIO;
 	}
-
-	if (ufs_darwin_var_part >= 0 && part == (uint32_t)ufs_darwin_var_part) {
-		nbs = ufs_page->part[part].block_size;
-		if (uio_offset(uio) < 0 || (uint64_t)uio_offset(uio) % nbs != 0 || (uint64_t)uio_resid(uio) % nbs != 0) {
-			return EINVAL;
-		}
-		bounce = kalloc_data(ufs_buffer_size, Z_WAITOK);
-		if (bounce == NULL) {
-			return ENOMEM;
-		}
-		while (error == 0 && uio_resid(uio) > 0) {
-			user_ssize_t want = uio_resid(uio);
-			off_t at = uio_offset(uio);
-
-			if (want > (user_ssize_t)ufs_buffer_size) {
-				want = (user_ssize_t)ufs_buffer_size;
-			}
-			error = uiomove((caddr_t)bounce, (int)want, uio);
-			if (error == 0) {
-				error = ufs_write(part, (uint64_t)at, bounce, (uint64_t)want);
-				if (error != 0) {
-					uio_setoffset(uio, at);
-					uio_setresid(uio, uio_resid(uio) + want);
-				}
-			}
-		}
-		kfree_data(bounce, ufs_buffer_size);
-		return error;
-	}
-
-	if (ufs_write_part < 0 || part != (uint32_t)ufs_write_part) {
+	if (ufs_darwin_var_part < 0 || part != (uint32_t)ufs_darwin_var_part) {
 		return EROFS;
-	}
-	if (ufs_var_busy_pid != proc_selfpid()) {
-		/* one writer of the store at a time, and it says so first (kern.annibale.var_busy) */
-		ufs_write_refused++;
-		return EPERM;
 	}
 	nbs = ufs_page->part[part].block_size;
 	if (uio_offset(uio) < 0 || (uint64_t)uio_offset(uio) % nbs != 0 || (uint64_t)uio_resid(uio) % nbs != 0) {
@@ -499,7 +372,6 @@ ufs_cwrite(dev_t dev, struct uio *uio, __unused int ioflag)
 		if (error == 0) {
 			error = ufs_write(part, (uint64_t)at, bounce, (uint64_t)want);
 			if (error != 0) {
-				/* these bytes did not go in: the write is to say so, not to count them */
 				uio_setoffset(uio, at);
 				uio_setresid(uio, uio_resid(uio) + want);
 			}
@@ -512,7 +384,7 @@ ufs_cwrite(dev_t dev, struct uio *uio, __unused int ioflag)
 bool
 annibale_ufs_var_info(uint64_t *size_bytes_out)
 {
-	int part = ufs_darwin_var_part >= 0 ? ufs_darwin_var_part : ufs_write_part;
+	int part = ufs_darwin_var_part;
 
 	if (!ufs_ready || part < 0 || (uint32_t)part >= ufs_parts) {
 		return false;
@@ -528,7 +400,7 @@ extern boolean_t ml_get_interrupts_enabled(void);
 int
 annibale_ufs_var_io(bool write, uint64_t offset, void *buf, uint64_t len)
 {
-	int part = ufs_darwin_var_part >= 0 ? ufs_darwin_var_part : ufs_write_part;
+	int part = ufs_darwin_var_part;
 
 	if (!ml_get_interrupts_enabled()) {
 		return EBUSY;
@@ -537,11 +409,7 @@ annibale_ufs_var_io(bool write, uint64_t offset, void *buf, uint64_t len)
 		return ENXIO;
 	}
 	if (write) {
-		int error = ufs_write((uint32_t)part, offset, (const uint8_t *)buf, len);
-		if (part == ufs_write_part) {
-			ufs_write_restore();
-		}
-		return error;
+		return ufs_write((uint32_t)part, offset, (const uint8_t *)buf, len);
 	}
 	return ufs_read((uint32_t)part, offset, (uint8_t *)buf, len);
 }

@@ -36,7 +36,7 @@
 # file that holds the image at the right offset (reflinked, so it costs neither disk space nor
 # host RAM).
 cd "$(dirname "$(readlink -f "$0")")/.." || exit 1
-K=${KERNEL:-xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837}
+K=${KERNEL:-xnu-src/xnu-12377.121.6/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837}
 [ -f $K ] || { echo "run-ios.sh: no kernel built here ($K)" >&2; exit 1; }
 IMG=${IMG:-userland/system.apfs}
 ROOT=${ROOT:-userland/root.apfs}

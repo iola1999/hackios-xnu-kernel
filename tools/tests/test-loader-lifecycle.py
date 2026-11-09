@@ -375,7 +375,7 @@ def wiring_checks(src):
     ck(blk_f.count("n < sizeof(msg) - 1") == 2, "fb_hard_limits")
     ck("usb_tx((const uint8_t *)msg, n);" in blk_f, "fb_via_guarded_tx")
     i_g = i_of("lc_after_return(ran_other_core, cpu_mpidr, cpu_count);")
-    ck(0 < i_g < i_of("if (block_write_requested)", i_g), "gate_before_stats")
+    ck(0 < i_g < i_of("lc_after_return_collect(", i_g), "gate_before_stats")
     ck('set_result(kernel_resources_held ? "returned-held" : "returned", klog_len, 0);' in src, "held_result")
     for s in ('kernel_resources_held ? "hung-held"', 'kernel_resources_held ? "no-such-core-held"',
               'kernel_resources_held ? "selftest-ok-held"', 'kernel_resources_held ? "checkpoint-held"',

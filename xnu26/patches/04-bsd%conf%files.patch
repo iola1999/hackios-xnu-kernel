@@ -2,7 +2,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 index 60d8aa6148d8..6d157a86c272 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -108,6 +108,71 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -108,6 +108,68 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c         optional config_cpu_counters
@@ -17,7 +17,6 @@ index 60d8aa6148d8..6d157a86c272 100644
 +bsd/dev/annibale/annibale_net.c		standard
 +bsd/dev/annibale/annibale_virtio_net.c	standard
 +bsd/dev/annibale/annibale_apple80211.c	standard
-+bsd/dev/annibale/annibale_adreno.c	standard
 +bsd/dev/annibale/annibale_gpu_dispatch.c	standard
 +bsd/dev/adreno8/adreno8.c	standard
 +bsd/dev/adreno8/adreno8_cx.c	standard
@@ -38,7 +37,6 @@ index 60d8aa6148d8..6d157a86c272 100644
 +bsd/dev/annibale/annibale_virtio_sound.c	standard
 +bsd/dev/annibale/annibale_guard.c		standard
 +bsd/dev/annibale/annibale_haptic.c	standard
-+bsd/dev/annibale/annibale_wifi.c		standard
 +bsd/dev/annibale/annibale_image.c		standard
 +bsd/dev/annibale/annibale_virtio_blk.c	standard
 +bsd/dev/annibale/annibale_sparse.c	standard
@@ -47,7 +45,6 @@ index 60d8aa6148d8..6d157a86c272 100644
 +bsd/dev/annibale/annibale_apfs_check_write.c	optional apfs
 +bsd/dev/annibale/annibale_qmi.c		standard
 +bsd/dev/annibale/annibale_qrtr.c		standard
-+bsd/dev/annibale/annibale_wlfw.c		standard
 +bsd/dev/annibale/annibale_lx.c		standard
 +bsd/dev/annibale/annibale_sta.c		standard
 +bsd/dev/annibale/annibale_torch.c		standard

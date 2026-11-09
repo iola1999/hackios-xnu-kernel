@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-DEV = ROOT / "xnu/files/bsd/dev/adreno8/adreno8"
+DEV = ROOT / "xnu/files/bsd/dev/adreno8"
 
 FENCES = r'''
 /* adreno8_bo.c's clock: each reading BO_CHECK_NS or more after the last unless a case stops it */

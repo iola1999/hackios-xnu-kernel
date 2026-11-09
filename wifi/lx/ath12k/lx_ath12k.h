@@ -1,6 +1,6 @@
 /*
  * What ath12k (Linux 7.0) uses of Linux and the headers of LinuxKPI (FreeBSD 15.1) do not have,
- * beyond what ath11k needed (include/lx_more.h): included before every file of the ath12k build.
+ * beyond include/lx_more.h: included before every file of the ath12k build.
  * The values are those of IEEE Std 802.11be-2024 and of radiotap.org; the functions are written
  * here from what the standard says the fields mean.
  */

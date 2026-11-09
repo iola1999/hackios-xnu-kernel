@@ -86,7 +86,7 @@ def main():
     dl_body = dl[len('} else if (starts_with(cmd, "download:")) {'):-len('} else if (starts_with(cmd, "upload"))')]
 
     macros = "\n".join(line for line in src.splitlines() if re.match(
-        r"#define (PAYLOAD_MAGIC|PAYLOAD_CONTAINER_MAX|PAYLOAD_RESERVE_SIZE|RESIDENT_RD_OFFSET|RESIDENT_RD_RESERVE|USB_CHUNK"
+        r"#define (PAYLOAD_MAGIC|PAYLOAD_CONTAINER_MAX|PAYLOAD_RESERVE_SIZE|MAX_RESIDENT_BOOT_SIZE|RESIDENT_RD_OFFSET|RESIDENT_RD_RESERVE|USB_CHUNK"
         r"|BASE_ALIGN|MAX_MEM_SIZE_LIMIT)\b", line))
     prelude = """#include <stdint.h>
 #include <stdio.h>
@@ -97,6 +97,8 @@ static uint8_t ram[0x03800000];   /* the reserved region, addressed like the loa
 #define PAYLOAD_BASE ((uint64_t)(uintptr_t)ram)
 """ + macros + """
 static char last_reply[96];
+struct platform { int dummy; } platform_annibale, platform_qemu_virt;
+static const struct platform *PLAT = &platform_qemu_virt;
 static void fb_reply(const char *a, const char *b) { snprintf(last_reply, sizeof(last_reply), "%s %s", a, b); }
 static void fb_reply_data(uint64_t n) { snprintf(last_reply, sizeof(last_reply), "DATA %llx", (unsigned long long)n); }
 static uint64_t win_size, win_base, resident_rd_size;

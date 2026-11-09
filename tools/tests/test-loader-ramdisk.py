@@ -93,13 +93,12 @@ static inline void ui_progress(uint64_t done, uint64_t total) { (void)done; (voi
 /* "oem sh": tools/test-loader-shell.py */
 static const char *menu_enter_fastboot(void) { assert(0); return "unexpected recovery"; }
 static void oem_shell(const char *text) { (void)text; }
-/* the host-silence watchdog clock, "oem push" into a running kernel's inbox and "oem dsu": not what this test checks */
+/* the host-silence watchdog clock and "oem push" into a running kernel's inbox: not what this test checks */
 static uint64_t host_last_cmd;
 #define READ_SYSREG(name) 0ULL
 static int wdt_armed, download_to_inbox;
 static struct kernel_live *inbox_live(void) { return NULL; }
 static void inbox_download(const char *size) { (void)size; assert(0); }
-static int dsu_command(const char *cmd) { (void)cmd; return 0; }
 static int str_eq(const char *a, const char *b) { return !strcmp(a, b); }
 static uint64_t parse_number(const char *p, int base) { uint64_t n = 0; (void)base; sscanf(p, "%llx", (unsigned long long *)&n); return n; }
 static void fb_reply(const char *status, const char *message)

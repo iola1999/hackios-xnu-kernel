@@ -1,46 +1,8 @@
-# Third-party notices for the kernels
+# Third-party notices for the kernel
 
-The kernels built from `xnu/` (xnu-8796) and `xnu26/` (xnu-12377) are Apple's XNU (APSL 2.0) with the changes in
-this repository. They also contain code of the following projects, linked in at build time (see README.md,
-"Licenses"): the xnu-8796 kernel links ath11k, the xnu-12377 kernel links ath12k, and both link FreeBSD's
-LinuxKPI.
-
-## ath11k (Linux, drivers/net/wireless/ath/ath11k)
-
-Built by `tools/mk-ath11k.sh` from Linux 7.0.14, unmodified. License: BSD-3-Clause-Clear (one header of
-`drivers/net/wireless/ath`, `spectral_common.h`, is ISC). The copyright lines of the files it is built from:
-
-```
-Copyright (c) 2013 Qualcomm Atheros, Inc.
-Copyright (c) 2018-2019 The Linux Foundation. All rights reserved.
-Copyright (c) 2018-2020 The Linux Foundation. All rights reserved.
-Copyright (c) 2019 The Linux Foundation. All rights reserved.
-Copyright (c) 2019-2020 The Linux Foundation. All rights reserved.
-Copyright (c) 2019-2021 The Linux Foundation. All rights reserved.
-Copyright (c) 2020 The Linux Foundation. All rights reserved.
-Copyright (c) 2020-2021 The Linux Foundation. All rights reserved.
-Copyright (c) 2021 Qualcomm Innovation Center, Inc. All rights reserved.
-Copyright (c) 2021, 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
-Copyright (c) 2021-2022 Qualcomm Innovation Center, Inc. All rights reserved.
-Copyright (c) 2021-2022, 2025 Qualcomm Innovation Center, Inc. All rights reserved.
-Copyright (c) 2021-2022, Qualcomm Innovation Center, Inc. All rights reserved.
-Copyright (c) 2021-2023 Qualcomm Innovation Center, Inc. All rights reserved.
-Copyright (c) 2021-2023, 2025 Qualcomm Innovation Center, Inc. All rights reserved.
-Copyright (c) 2021-2024 Qualcomm Innovation Center, Inc. All rights reserved.
-Copyright (c) 2021-2025 Qualcomm Innovation Center, Inc. All rights reserved.
-Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
-Copyright (c) 2022, 2024 Qualcomm Innovation Center, Inc. All rights reserved.
-Copyright (c) 2022, 2024-2025 Qualcomm Innovation Center, Inc. All rights reserved.
-Copyright (c) 2022, Qualcomm Innovation Center, Inc. All rights reserved.
-Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
-Copyright (c) 2022-2023, Qualcomm Innovation Center, Inc. All rights reserved.
-Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
-Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
-Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
-Copyright (c) 2023-2025 Qualcomm Innovation Center, Inc. All rights reserved.
-Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
-Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
-```
+The kernel built from `xnu26/` (xnu-12377) is Apple's XNU (APSL 2.0) with the changes in
+this repository. It also contains code of the following projects, linked in at build time (see README.md,
+"Licenses"): ath12k and FreeBSD's LinuxKPI.
 
 ## ath12k (Linux, drivers/net/wireless/ath/ath12k)
 

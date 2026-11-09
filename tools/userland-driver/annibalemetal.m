@@ -1445,7 +1445,7 @@ struct gem_close { uint32_t handle, pad; };
 	for (unsigned i = 0; i < 8; i++) {
 		MTLRenderPipelineColorAttachmentDescriptor *attachment =
 		    [[descriptor colorAttachments] objectAtIndexedSubscript:i];
-		unsigned format = attachment != nil ? rwd_canonical_pixel_format((unsigned)[attachment pixelFormat]) : 0;
+		unsigned format = attachment != nil ? ann_canonical_pixel_format((unsigned)[attachment pixelFormat]) : 0;
 
 		shape.color_format[i] = format;
 		if (format != 0) {
@@ -1772,7 +1772,7 @@ struct gem_close { uint32_t handle, pad; };
 		return nil;
 	}
 	struct rwa_texture_shape shape = {
-		.pixel_format = rwd_canonical_pixel_format((unsigned)[descriptor pixelFormat]),
+		.pixel_format = ann_canonical_pixel_format((unsigned)[descriptor pixelFormat]),
 		.type = (unsigned)[descriptor textureType],
 		.width = (unsigned)[descriptor width],
 		.height = (unsigned)[descriptor height],

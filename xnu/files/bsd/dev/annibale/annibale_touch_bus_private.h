@@ -28,41 +28,29 @@ sleep_ms(uint32_t ms)
 /* ---- pins (TLMM) ------------------------------------------------------------------------------- */
 
 /*
- * Two phones speak through this driver, chosen by the boot-arg's value: touchscreen=1 is the
- * POCO X5 Pro (an SM7375), touchscreen=2 the REDMI K90 (annibale, an SM8750 "sun",
- * k90-port). Everything phone-shaped below is a variable set once from a table at startup:
- * pins, bases, the clock controller's model (a rate-selectable RCG there, a plain vote and a
- * fixed divider here), and the supply's name and reserved-memory address in the RPMh command database.
- * Values cross-checked against the
- * phone's own device tree and mainline gcc-sm8750.c / pinctrl-sm8750.c (docs/analysis/annibale-hw-map.md).
+ * REDMI K90 (annibale, SM8750 "sun", k90-port) Goodix touch bus parameters.
+ * Values cross-checked against the phone's device tree and mainline
+ * gcc-sm8750.c / pinctrl-sm8750.c (docs/analysis/annibale-hw-map.md).
  */
 
-static int board_annibale;
 static uint32_t touch_steps = 5;  /* touch_hv_steps=1..5: database, GPIO, supplies, clocks, panel. */
 
-#define NO_STRAP                1000u     /* a GPIO number no phone has, so that a read of a strap reads none */
-
-static uint64_t tlmm_phys, tlmm_size;        /* GPIO window starts at 0x0f100000 on both boards. */
-#define TLMM_PHYS               tlmm_phys
-#define TLMM_SIZE               tlmm_size
+#define TLMM_PHYS               0x0f100000UL
+#define TLMM_SIZE               0x102000UL      /* vendor TLMM base + 0x100000, as in sm8750.dtsi */
 #define GPIO_CFG(n)             (tlmm + 0x1000UL * (n))         /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
 #define GPIO_IO(n)              (tlmm + 0x1000UL * (n) + 4)     /* bit 0 in, bit 1 out */
 #define PULL_NONE               0
 #define PULL_UP                 3
 
-/* the pins of this phone, from its device tree; the strap pins of a phone that has none */
-static unsigned pin_miso, pin_mosi, pin_clk, pin_cs, pin_int, pin_reset, pin_avdd;
-static unsigned pin_ft_id = NO_STRAP, pin_gx_id = NO_STRAP;
-#define PIN_MISO                pin_miso
-#define PIN_MOSI                pin_mosi
-#define PIN_CLK                 pin_clk
-#define PIN_CS                  pin_cs
-#define PIN_INT                 pin_int   /* low = the chip has a report */
-#define PIN_RESET               pin_reset /* low = in reset */
-#define PIN_AVDD                pin_avdd  /* high = analog supply on */
-#define PIN_FOCALTECH_ID        pin_ft_id /* FocalTech if this reads 0 ... */
-#define PIN_GOODIX_ID           pin_gx_id /* ... and this reads 1 (sm8350-kernel-OKX convention) */
-#define PIN_FUNCTION_SPI        1         /* "qup15"/"qup1_se2": the first non-GPIO function of these pins */
+/* the pins of this phone, from its device tree (qup1_se2) */
+#define PIN_MISO                40u
+#define PIN_MOSI                41u
+#define PIN_CLK                 42u
+#define PIN_CS                  43u
+#define PIN_INT                 162u      /* low = the chip has a report */
+#define PIN_RESET               161u      /* low = in reset */
+#define PIN_AVDD                114u      /* high = analog supply on */
+#define PIN_FUNCTION_SPI        1         /* "qup1_se2": the first non-GPIO function of these pins */
 static void
 gpio_configure(unsigned pin, unsigned function, unsigned pull, unsigned ma, bool output)
 {
@@ -78,7 +66,7 @@ gpio_set(unsigned pin, bool high)
 static bool
 gpio_get(unsigned pin)
 {
-	return pin != NO_STRAP && (rd(GPIO_IO(pin)) & 1);
+	return (rd(GPIO_IO(pin)) & 1) != 0;
 }
 
 static void
@@ -90,12 +78,9 @@ gpio_output(unsigned pin, bool high, unsigned pull, unsigned ma)
 
 /* ---- the I/O supply (RPMh) ----------------------------------------------------------------------- */
 
-/* Each board's device tree reserves a separate qcom,cmd-db memory region. */
-static uint64_t cmd_db_phys, cmd_db_size;
-#define CMD_DB_PHYS             cmd_db_phys
-#define CMD_DB_SIZE             cmd_db_size
-#define RSC_PHYS                rsc_phys              /* the application processor's "DRV 2", whose slot layout is the same on both */
-static uint64_t rsc_phys;
+#define CMD_DB_PHYS             0x81c60000UL            /* aop_cmd_db_region, qcom,cmd-db */
+#define CMD_DB_SIZE             0x20000UL
+#define RSC_PHYS                0x16520000UL            /* apps_rsc "drv-2"; its slots start at 0xd00 */
 static unsigned rsc_version;
 #define RSC_SIZE                0x10000UL
 #define TCS(reg)                (rsc + 0xd00 + (reg))           /* command slot set 0, an "active" one */
@@ -217,9 +202,8 @@ rpmh_write(const uint32_t *address, const uint32_t *data, unsigned count)
 	return done;
 }
 
-/* The chip's I/O supply, by its name in this phone's command database: annibale takes 1.8 V from
- * LDO2 of the PM8350C ("ldoc2"), annibale from L12B of its PMIC ("ldob12", the goodix vdd-supply). */
-static const char *supply_name = "ldoc2";
+/* The chip's I/O supply, by its name in this phone's command database: L12B of its PMIC ("ldob12", the goodix vdd-supply). */
+static const char *supply_name = "ldob12";
 
 static bool
 io_supply_on(void)
@@ -250,17 +234,11 @@ io_supply_on(void)
 
 #define GCC_PHYS                0x00100000UL
 #define GCC_SIZE                0x60000UL
-#define GCC_VOTE                (gcc + 0x52008)         /* the application processor's votes: the same register on both */
-static uint32_t vote_qup_bus, vote_se;                  /* the bits of this phone: the four bus clocks, then the engine */
-#define GCC_QUP1_M_AHB_CBCR     (gcc + (board_annibale ? 0x23140 : 0x18004)) /* bit 31: the clock is off */
-#define GCC_QUP1_S_AHB_CBCR     (gcc + (board_annibale ? 0x23144 : 0x18008))
-#define GCC_QUP1_SE5_CBCR       (gcc + 0x185fc)
-#define GCC_QUP1_SE5_CMD        (gcc + 0x18600)         /* bit 0: take the new configuration */
-#define GCC_QUP1_SE5_CFG        (gcc + 0x18604)         /* [4:0] 2*divider-1, [10:8] source, [13:12] mode */
-#define GCC_QUP1_SE5_DFSR       (gcc + 0x18614)         /* bit 0: the engine chooses among preset rates itself */
-#define GCC_QUP1_SE5_PERF_CFG(l) (gcc + 0x1861c + 4 * (l))
-#define GCC_QUP1_SE5_PERF_M(l)  (gcc + 0x1865c + 4 * (l))
-#define GCC_QUP1_SE5_PERF_N(l)  (gcc + 0x1869c + 4 * (l))
+#define GCC_VOTE                (gcc + 0x52008)         /* the application processor's votes */
+#define VOTE_QUP_BUS            (1u << 18 | 1u << 19 | 1u << 20 | 1u << 21)
+#define VOTE_SE                 (1u << 24)              /* gcc_qupv3_wrap1_s2_clk: the engine's branch */
+#define GCC_QUP1_M_AHB_CBCR     (gcc + 0x23140)         /* bit 31: the clock is off */
+#define GCC_QUP1_S_AHB_CBCR     (gcc + 0x23144)
 #define CLOCK_OFF               (1u << 31)
 #define XO_HZ                   19200000
 
@@ -293,17 +271,16 @@ rcg_rate(const uint32_t *parent, uint32_t cfg, uint32_t m, uint32_t not_n_minus_
 	return (uint32_t)hz;
 }
 
-/* the POCO X5 Pro's own parent set, for the rate-selectable clock of its serial engine 5 */
-static const uint32_t poco_parent[8] = { XO_HZ, 600000000, 0, 0, 0, 0, 300000000, 0 };
-/* annibale's, for the source of the fixed divider above its engine (mainline gcc_qupv3_wrap1_qspi_ref_clk_src) */
+/* annibale's parent set for the source of the fixed divider above its engine (mainline gcc_qupv3_wrap1_qspi_ref_clk_src) */
 static const uint32_t annibale_parent[8] = { XO_HZ, 600000000, 500000000, 0, 0, 0, 300000000, 0 };
 
 /* annibale: no rate selection at all — vote the branch on and take the rate the divider says.
  * Reading rather than writing the divider is deliberate: the boot loader or a started touch
  * daemon already left a working one, and nothing here needs a particular rate but a working clock. */
 static bool
-clocks_on_annibale(void)
+clocks_on(void)
 {
+	wr(GCC_VOTE, rd(GCC_VOTE) | VOTE_QUP_BUS);
 	se_source_hz = rcg_rate(annibale_parent, rd(A_QSPI_REF_CFG), rd(A_QSPI_REF_M), rd(A_QSPI_REF_N));
 	se_source_hz /= (rd(A_S2_CLK_SRC_DIV) & 0xf) + 1;
 	if (se_source_hz == 0) {
@@ -311,7 +288,7 @@ clocks_on_annibale(void)
 		return false;
 	}
 	se_clock_select = 0;
-	wr(GCC_VOTE, rd(GCC_VOTE) | vote_se);
+	wr(GCC_VOTE, rd(GCC_VOTE) | VOTE_SE);
 	for (int i = 0; i < 1000; i++) {
 		if (!(rd(A_SE2_HALT) & CLOCK_OFF)) {
 			printf("goodix: engine clock %u Hz (source %#x, divider %#x)\n", se_source_hz, rd(A_QSPI_REF_CFG),
@@ -324,58 +301,9 @@ clocks_on_annibale(void)
 	return false;
 }
 
-static bool
-clocks_on(void)
-{
-	wr(GCC_VOTE, rd(GCC_VOTE) | vote_qup_bus);
-	if (board_annibale) {
-		return clocks_on_annibale();
-	}
-	if (rd(GCC_QUP1_SE5_DFSR) & 1) {
-		/* preset rates: the lowest that is at least 4 MHz */
-		for (uint32_t level = 0; level < 8; level++) {
-			uint32_t hz = rcg_rate(poco_parent, rd(GCC_QUP1_SE5_PERF_CFG(level)), rd(GCC_QUP1_SE5_PERF_M(level)),
-			    rd(GCC_QUP1_SE5_PERF_N(level)));
-
-			if (hz >= 4000000 && (se_source_hz == 0 || hz < se_source_hz)) {
-				se_source_hz = hz;
-				se_clock_select = level;
-			}
-		}
-		if (se_source_hz == 0) {
-			printf("goodix: no usable preset clock rate\n");
-			return false;
-		}
-	} else {
-		/* the crystal, undivided: nothing else has to be running */
-		wr(GCC_QUP1_SE5_CFG, (rd(GCC_QUP1_SE5_CFG) & ~0x371fu) | 1);
-		wr(GCC_QUP1_SE5_CMD, rd(GCC_QUP1_SE5_CMD) | 1);
-		for (int i = 0; i < 500 && (rd(GCC_QUP1_SE5_CMD) & 1); i++) {
-			sleep_us(10);
-		}
-		if (rd(GCC_QUP1_SE5_CMD) & 1) {
-			printf("goodix: the serial engine's clock does not take its configuration (%#x)\n", rd(GCC_QUP1_SE5_CMD));
-			return false;
-		}
-		se_source_hz = XO_HZ;
-		se_clock_select = 0;
-	}
-	wr(GCC_VOTE, rd(GCC_VOTE) | vote_se);
-	for (int i = 0; i < 1000; i++) {
-		if (!((rd(GCC_QUP1_M_AHB_CBCR) | rd(GCC_QUP1_S_AHB_CBCR) | rd(GCC_QUP1_SE5_CBCR)) & CLOCK_OFF)) {
-			return true;
-		}
-		sleep_us(10);
-	}
-	printf("goodix: clocks stay off: %#x %#x %#x\n", rd(GCC_QUP1_M_AHB_CBCR), rd(GCC_QUP1_S_AHB_CBCR),
-	    rd(GCC_QUP1_SE5_CBCR));
-	return false;
-}
-
 /* ---- SPI through the serial engine (GENI) ---------------------------------------------------------- */
 
-#define SE_PHYS                 se_phys               /* annibale 0x00a94000, annibale 0x00a88000 */
-static uint64_t se_phys;
+#define SE_PHYS                 0x00a88000UL            /* serial engine 6: "qup1_se2", the touch chip's SPI */
 #define SE_SIZE                 0x4000UL
 #define GENI_FORCE_DEFAULT      (se + 0x020)
 #define GENI_OUTPUT_CTRL        (se + 0x024)

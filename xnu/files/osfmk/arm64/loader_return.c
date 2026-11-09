@@ -52,10 +52,7 @@ extern void gic_v3_irq_cpu_shutdown(void);
 void loader_log_putc(char c);
 void loader_return(void);
 void hv_wdt_pet_NOW(void);
-extern void annibale_adreno_quiesce(void);
-extern void annibale_adreno_stop(void);
-extern void annibale_adreno_minute(void);
-extern void adreno8_quiesce(void);      /* bsd/dev/adreno8.c: the Adreno 830's stepper on the other phone */
+extern void adreno8_quiesce(void);
 extern void adreno8_return_quiesce(void);
 extern void annibale_wifi_stop(void);
 extern void annibale_wifi_quiesce(void);
@@ -370,7 +367,7 @@ extern uint64_t loader_stub_slot[4];
  * valid from the first instruction; the loader knows the distance to the physical ones.
  */
 
-/* The inbox: a file from the host while the kernel runs, for rwsh "pull" (kern.annibale.inbox), so a
+/* The inbox: a file from the host while the kernel runs, for annsh "pull" (kern.annibale.inbox), so a
  * library can be replaced without a new image. In the kernel image so its memory is contiguous and
  * the loader reaches it the way it reaches the log. 16 MB holds the AIR library (about 15 MB); the
  * kernel's static span and the root image after it have to end below the resident system image at
@@ -612,8 +609,7 @@ loader_return(void)
 	loader_panic_sync_ufs("loader_return", 1);
 
 	annibale_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
-	annibale_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
-	adreno8_return_quiesce();       /* the other phone's GMU back in reset and its translation off without parking */
+	adreno8_return_quiesce();       /* the GMU back in reset and its translation off without parking */
 	annibale_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
 	annibale_haptic_quiesce();      /* or the PMIC's haptics block of the other phone, if it was configured */
 	annibale_torch_quiesce();       /* or the other phone's, lit on its PMIC's flash module */
@@ -670,7 +666,6 @@ loader_return_timer(__unused thread_call_param_t p0, __unused thread_call_param_
 	}
 	if (!as_panic) {
 		annibale_var_save_on_return();   /* the data volume kept, while the system is still whole */
-		annibale_adreno_stop();          /* a GPU kept for the system is given back while there is a thread to wait in */
 		annibale_wifi_stop();            /* and the Wi-Fi DSP, if it runs, shut down */
 	}
 	if (PE_parse_boot_argn("return_cpu", &cpu, sizeof(cpu)) && cpu <= (uint32_t)ml_get_max_cpu_number() &&
@@ -715,7 +710,6 @@ loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p
 			loader_log_putc(*c);
 		}
 		annibale_var_save_on_return();
-		annibale_adreno_stop();
 		annibale_wifi_stop();
 		loader_return();
 	}
@@ -793,7 +787,6 @@ memory_report(void)
 
 	annibale_memory_line(line, sizeof(line));
 	printf("%s", line);
-	annibale_adreno_minute();                /* (and how warm the GPU is, if it is in use) */
 }
 
 void

@@ -2,7 +2,7 @@
  * QMI: the helpers of sys/annibale_qmi.h -- messages coded by tables, a handle on the IPC router,
  * requests as transactions, indications to handlers.
  *
- * The interface is that of Linux's QMI helpers, because the driver that uses it (ath11k's qmi.c)
+ * The interface is that of Linux's QMI helpers, because the driver that uses it (ath12k's qmi.c)
  * was written for them and is compiled as it is. The code is not Linux's: it is written from the
  * interface's meaning and from the public descriptions of the wire format (a 7-byte header, then
  * type-length-value triples; see below at "the coding").

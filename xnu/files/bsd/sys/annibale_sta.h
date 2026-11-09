@@ -2,9 +2,9 @@
  * Darwin-on-annibale: the station boundary.
  *
  * On one side whatever does the scanning and the joining with a radio: the station logic over
- * ath11k on the phone (wifi/lx in the repository). On the other whoever wants a network: the
- * Apple80211 requests of iOS's Wi-Fi side, answered in bsd/dev/annibale_apple80211.c, and the
- * kernel's own join of the network it was given in a file (bsd/dev/annibale_wifi.c). Frames do
+ * ath12k on the phone (wifi/lx in the repository). On the other whoever wants a network: the
+ * Apple80211 requests of iOS's Wi-Fi side, answered in bsd/dev/annibale/annibale_apple80211.c, and the
+ * kernel's own join of the network (bsd/dev/annibale/annibale_lx.c). Frames do
  * not pass here, and neither does "the link is up": those go through bsd/sys/annibale_net.h,
  * which the station side calls itself.
  *

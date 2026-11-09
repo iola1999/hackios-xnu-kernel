@@ -1,11 +1,7 @@
 /*
  * Writing into APFS: the contents of an existing file, in place.
  *
- * The driver beside this file reads APFS and does not write it, and that one fact shapes the
- * whole port: /private/var has to be a filesystem in memory, remade empty at every boot, and
- * what is to outlive a boot has to be packed into an archive and put somewhere that is not a
- * filesystem at all (userland/src/var_store.c).  This file is the first step out of that, and
- * it is a deliberately small one.
+ * The driver beside this file reads APFS and writes existing file blocks in place.
  *
  * What a write has to touch, and in what order
  * -------------------------------------------
@@ -74,9 +70,8 @@
  * every structure of the container is exactly as it was, so the volume mounts, every tree and
  * every checksum still checks, and every other file is byte for byte what it was.  The one
  * thing a failure can leave behind is a mixture of the old and the new contents of the file
- * being written -- which is a loss the caller is in a position to notice and handle, as
- * var_store.c already does for the raw blocks it writes today: two slots, and a checksum
- * written last.
+ * being written -- which is a loss the caller is in a position to notice and handle with
+ * two slots and a checksum written last.
  *
  * What it refuses, and why.  Every one of these is read off the volume before a byte goes out:
  *

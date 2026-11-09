@@ -6,7 +6,7 @@ index 3e2f8ad6c032..75f67791f5b2 100644
  #define _KERN_CPU_NUMBER_H_
  
  extern int boot_cpu_id;
-+/* annibale: the name xnu-8796 has for it, which the drivers shared with that kernel (xnu/files) use */
++/* annibale: alias used by the platform drivers in xnu/files */
 +#define master_cpu boot_cpu_id
  
  #include <machine/cpu_number.h>

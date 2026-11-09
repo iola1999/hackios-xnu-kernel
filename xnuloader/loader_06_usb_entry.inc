@@ -499,10 +499,9 @@ starts_with(const char *s, const char *prefix)
 }
 
 #include "loader_ramdisk.inc"
-#include "loader_dsu.inc"
 
 /*
- * "oem sh TEXT": hand TEXT to the running kernel's mailbox, where /annibale/bin/rwsh finds it
+ * "oem sh TEXT": hand TEXT to the running kernel's mailbox, where /annibale/bin/annsh finds it
  * through kern.annibale.cmd and runs it; its output arrives in the kernel's log. The text goes in
  * before the sequence number, which is what the kernel's reader checks, and the reply is the new
  * number so the host can find the output that belongs to it. It goes out twice: fastboot prints an
@@ -544,7 +543,7 @@ oem_shell(const char *text)
 }
 
 /*
- * "oem push" and the download after it: a file into the running kernel's inbox, where rwsh "pull"
+ * "oem push" and the download after it: a file into the running kernel's inbox, where annsh "pull"
  * finds it (kern.annibale.inbox), so a library can be replaced while iOS runs. The download goes
  * straight into the kernel's buffer, which is the kernel's memory and none of the loader's or the
  * payload's; the length and then the sequence number follow it, the order the kernel reads them in.
@@ -621,7 +620,6 @@ fb_command(char *cmd)
 			    : "a kernel may still hold memory or devices: reboot to start over");
 		} else if (ramdisk_command(cmd)) {
 			/* The RAM protocol uses the same command protection as legacy downloads. */
-		} else if (dsu_command(cmd)) {
 		} else if (starts_with(cmd, "oem stop")) {
 			/* the kernel looks at this once a second and comes back as it does when its time is up */
 			int act = lc_stop_action(kernel_resources_held, live);

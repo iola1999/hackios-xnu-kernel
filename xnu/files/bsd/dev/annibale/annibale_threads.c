@@ -19,7 +19,7 @@
  * name is available.
  *
  * kern.annibale.cmd is the other way in: the last command the host sent through the loader with
- * "oem sh TEXT" while this kernel runs, read by /annibale/bin/rwsh, which runs it as root and so may
+ * "oem sh TEXT" while this kernel runs, read by /annibale/bin/annsh, which runs it as root and so may
  * also write thread_dump for a process that cannot do it for itself.
  *
  * Nothing is enabled unless asked: no boot argument, no timer, no work while idle.
@@ -323,7 +323,7 @@ SYSCTL_PROC(_kern_annibale, OID_AUTO, cmd, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG
     "the last command the host sent through the loader (oem sh), as SEQ TEXT");
 
 /* kern.annibale.inbox: the last file the host pushed through the loader ("oem push"), preceded by
- * its sequence number (8 bytes, 0 before the first push); rwsh "pull" writes it to a file. */
+ * its sequence number (8 bytes, 0 before the first push); annsh "pull" writes it to a file. */
 static int
 annibale_inbox_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
     struct sysctl_req *req)
@@ -347,7 +347,7 @@ SYSCTL_PROC(_kern_annibale, OID_AUTO, inbox, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFL
  * reads it with "fastboot get_staged" (tools/k90auto/run-auto.py). This replaces a screen
  * recording of the same run. Reading answers { total bytes, bytes written so far }.
  *
- * The loaded file system has no other way off the phone faster than the log (rwsh "cat", 48 bytes a
+ * The loaded file system has no other way off the phone faster than the log (annsh "cat", 48 bytes a
  * line). The buffer is allocated on the first write, which finds no 328 MB in one piece once iOS
  * runs (kernel-12377-cmd29-seed2); boot-arg outbox_mb=N takes N MB at boot instead, while memory
  * is still in large pieces (annibale_outbox_init, called with the other drivers' inits).
@@ -446,7 +446,7 @@ SYSCTL_PROC(_kern_annibale, OID_AUTO, outbox, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLF
     "a file for the host, staged by the loader after the run: write { total, offset } and a piece");
 
 /*
- * kern.annibale.env: settings for the processes that load libannibalemetal, written by rwsh
+ * kern.annibale.env: settings for the processes that load libannibalemetal, written by annsh
  * ("setenv", "addenv") while iOS runs. The words are PROCESS:NAME=VALUE or PROCESS:-NAME; the
  * driver applies its process's words when the process loads it, so a probe can be changed and the
  * process restarted ("restart NAME") without a new image. Empty until written; writing needs root.

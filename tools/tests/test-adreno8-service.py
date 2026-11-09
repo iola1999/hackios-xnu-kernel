@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-DEV = ROOT / "xnu/files/bsd/dev/adreno8/adreno8"
+DEV = ROOT / "xnu/files/bsd/dev/adreno8"
 base = runpy.run_path(str(ROOT / "tools/tests/test-adreno8-handoff.py"))
 stub = base["stub"].replace(
     "static uint64_t mach_absolute_time(void) { return 0x1234abcdull; }",

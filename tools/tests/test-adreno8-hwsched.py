@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-DEV = ROOT / "xnu/files/bsd/dev/adreno8/adreno8"
+DEV = ROOT / "xnu/files/bsd/dev/adreno8"
 hfi = (DEV / "adreno8_hfi.c").read_text()
 transport = hfi[hfi.index("static unsigned adreno8_hfi_seq;"):hfi.index("/* ---- step 12:")]
 hwsched = (DEV / "adreno8_hwsched.c").read_text()

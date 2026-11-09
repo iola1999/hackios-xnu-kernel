@@ -20,7 +20,7 @@ STUB = r'''
 #include <string.h>
 typedef uintptr_t vm_offset_t;
 static bool annibale, adreno8_gpu8_keep, adreno8_gpu8_return, bo_open, self_test, publish_ok;
-static uint32_t adreno8_gx_hz[17] = {0, 160000000, 222000000, 342000000}, gpu_va, gpu_log;
+static uint32_t adreno8_gx_hz[17] = {0, 160000000, 222000000, 342000000};
 static unsigned adreno8_gx_count = 4;
 static unsigned legacy_calls, enable_calls, close_calls, stop_calls, cache_calls, submit_calls, publish_calls, ready_checks, speed_ticks;
 static bool annibale_platform_is_annibale(void) { return annibale; }
@@ -92,24 +92,40 @@ static void exercise(bool platform) {
     annibale = platform; bo_open = true; legacy_calls = close_calls = stop_calls = cache_calls = submit_calls = 0;
     uint64_t value, used=9, largest=9, lost=9, address=0x10001000;
     uint32_t live=9, refused=9, words=6, by[7], timed; unsigned holes=9, most=9;
-    assert(annibale_gpu_ready() && annibale_gpu_parameter(1, &value) && value == (platform ? 830u : 660u));
-    assert(annibale_gpu_address(4096) == (platform ? 0x10001000u : 0x20000000u));
+    assert(annibale_gpu_ready() == platform);
+    if (!platform) {
+        assert(!annibale_gpu_parameter(1, &value) && !annibale_gpu_address(4096));
+        annibale_gpu_address_free(address, 4096);
+        annibale_gpu_space(&used, &live, &largest, &holes, &most, &lost, &refused);
+        assert(!used && !live && !largest && !holes && !most && !lost && !refused);
+        assert(!annibale_gpu_map(address, 0x50000000, true) && !annibale_gpu_mapped() && !annibale_gpu_unmap(address, 4096));
+        annibale_gpu_to_memory((void *)0x1000, 4096);
+        assert(!annibale_gpu_submit(&address, &words, 1) && !annibale_gpu_done(17) && !annibale_gpu_last());
+        { uint32_t mhz = 9, changes = 9; annibale_gpu_speed(&mhz, &changes); assert(!mhz && !changes); }
+        annibale_gpu_worked(&value, &timed, by);
+        assert(!value && !timed && !by[6]);
+        assert(!annibale_gpu_recover());
+        annibale_gpu_report("failed execution"); annibale_gpu_stop();
+        assert(!legacy_calls && !stop_calls && !close_calls && !submit_calls && !cache_calls);
+        return;
+    }
+    assert(annibale_gpu_parameter(1, &value) && value == 830u);
+    assert(annibale_gpu_address(4096) == 0x10001000u);
     annibale_gpu_address_free(address, 4096);
     annibale_gpu_space(&used, &live, &largest, &holes, &most, &lost, &refused);
-    assert(used == (platform ? 0u : 7u) && live == used && largest == used && holes == used && most == used && lost == used && refused == used);
+    assert(!used && !live && !largest && !holes && !most && !lost && !refused);
     assert(annibale_gpu_map(address, 0x50000000, true) && annibale_gpu_mapped() && annibale_gpu_unmap(address, 4096));
     annibale_gpu_to_memory((void *)0x1000, 4096);
     speed_ticks = 0;
     assert(annibale_gpu_submit(&address, &words, 1) == 17 && annibale_gpu_done(17) && annibale_gpu_last() == 17);
-    assert(speed_ticks == (platform ? 1u : 0u));
+    assert(speed_ticks == 1u);
     { uint32_t mhz = 9, changes = 9; annibale_gpu_speed(&mhz, &changes);
-      assert(mhz == (platform ? 342u : 0u) && changes == (platform ? 2u : 0u)); }
+      assert(mhz == 342u && changes == 2u); }
     annibale_gpu_worked(&value, &timed, by);
-    assert(value == (platform ? 3u : 7u) && timed == value && by[6] == value);
-    assert(annibale_gpu_recover() == !platform);
+    assert(value == 3u && timed == value && by[6] == value);
+    assert(!annibale_gpu_recover());
     annibale_gpu_report("failed execution"); annibale_gpu_stop();
-    assert(legacy_calls == (platform ? 0u : 16u));
-    if (platform) assert(!bo_open && stop_calls == 2 && !close_calls && submit_calls == 1 && cache_calls == 1);
+    assert(!legacy_calls && !bo_open && stop_calls == 2 && !close_calls && submit_calls == 1 && cache_calls == 1);
 }
 int main(void) {
     exercise(false); exercise(true);
@@ -276,8 +292,6 @@ def main():
         (target/"sys/annibale_input.h").write_text("")
         for name in ("adreno8_bo_private.h","adreno8_memory_private.h","adreno8_context_private.h","adreno8_hwsched_private.h"):
             (target/name).write_text((DEV/"adreno8"/name).read_text())
-        for name in ("annibale_gpu_private.h",):
-            (target/name).write_text((DEV/"annibale"/name).read_text())
         unit='#include "adreno8_private.h"\n'+dispatch+BACKENDS+DISPATCH_CASES
         run(unit,target,"dispatch",False)
         changed=dispatch.replace('adreno8_to_memory((vm_offset_t)start, size);',
@@ -320,21 +334,6 @@ def main():
         for label,old,new in variants:
             assert old in source
             run(boundaries(source.replace(old,new,1),fixture),target,label,success=False)
-        legacy=(DEV/"annibale/annibale_gpu_service.inc").read_text()
-        old='static void annibale_gpu_stop() { assert(gGPULock && gGPULock->depth==1); stopped++; }'
-        chain_stubs='''static bool annibale=true, bo_open=true, gpu_kept;
-        static bool annibale_platform_is_annibale(){return annibale;}
-        static bool adreno8_bo_ready(){return bo_open;}
-        static bool adreno8_context_close(){assert(gGPULock->depth==1);return true;}
-        static void adreno8_bo_stop(){assert(gGPULock->depth==1);bo_open=false;stopped++;}
-        static void legacy_gpu_stop(){assert(gGPULock->depth==1);stopped++;}
-        void annibale_gpu_stop();'''
-        assert old in PUBLISHER
-        chain=(PUBLISHER.replace(old,chain_stubs)+publisher+function(dispatch,"annibale_gpu_stop")
-               +function(legacy,"annibale_adreno_stop")
-               +PUBLISH_CASES.replace('AnnibaleGPUStop(); assert(stopped==1',
-                                     'annibale_adreno_stop(); assert(stopped==1',1))
-        run(chain,target,"stop_chain")
         ready_block=source[source.index('\tif (selector != kAnnibaleShow) {'):source.index('\tbzero(&r, sizeof(r));')]
         param_block=source[source.index('\tcase kMsmGetParam:'):source.index('\tcase kMsmSetParam:')]
         locked=PUBLISHER+r'''
@@ -360,25 +359,8 @@ def main():
         IOLockFree(gGPULock);gGPULock=nullptr;}
         '''
         run(locked,target,"locked_entries")
-        legacy_start=(DEV/"annibale/annibale_adreno.c").read_text()
-        start_line=re.search(r"^\s*if \(!AnnibaleGPUStart\(\)\) legacy_gpu_stop\(\);$",legacy_start,re.M).group()
-        cleanup='''#include <cassert>\n#include <cstdint>\n#include <cstdio>
-        static bool gpu_kept, quiet, core_stuck, publish_ok;static uint32_t gpu_fence;
-        static unsigned stopped;static bool legacy_gpu_done(uint32_t){return true;}
-        static void sleep_us(unsigned){}static void gpu_block_stop(){stopped++;}
-        static bool AnnibaleGPUStart(){return publish_ok;}
-        '''+function(legacy,"legacy_gpu_stop")+'\nstatic void publish(){'+start_line+'''}
-        int main(){for(unsigned pass=0;pass<2;pass++){gpu_kept=true;publish_ok=pass;stopped=0;
-        publish();assert(gpu_kept==publish_ok && stopped==!publish_ok);}}
-        '''
-        run(cleanup,target,"legacy_publication_cleanup")
         print("IOKit queues/timing, complete stop chain and 7 admission/publication mutations: PASS")
-    # This source chain has one lock boundary and no recursive call back to its caller.
-    legacy=(DEV/"annibale/annibale_gpu_service.inc").read_text()
-    stopped=function(legacy,"annibale_adreno_stop")
-    assert "AnnibaleGPUStop();" in stopped and "annibale_adreno_stop" not in function(source,"AnnibaleGPUStop")
     assert "AnnibaleGPUStop" not in function(dispatch,"annibale_gpu_stop")
-    assert "annibale_adreno_stop" not in function(dispatch,"annibale_gpu_stop")
     header=(DEV/"adreno8/adreno8_context_private.h").read_text()
     assert re.search(r"GPU_A830_SUBMIT_CMDS\s+82",source) and re.search(r"ADRENO8_CONTEXT_MAX_IBS\s+82",header)
     stage=(DEV/"adreno8/adreno8.c").read_text()

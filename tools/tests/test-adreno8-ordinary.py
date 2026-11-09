@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-DEV = ROOT / "xnu/files/bsd/dev/adreno8/adreno8"
+DEV = ROOT / "xnu/files/bsd/dev/adreno8"
 PIN = "efbda69d92e6a4822c5f2d09910f547872a9498d"
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--mainline-dir", required=True, type=Path, help=f"Linux adreno sources at {PIN}")

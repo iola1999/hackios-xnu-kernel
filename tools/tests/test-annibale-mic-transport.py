@@ -41,6 +41,7 @@ HEADER = r'''
 #define IO_NDELAY 1
 #define BUFFER_BYTES 65536
 #define CMD_OFFSET 0xc000
+#define APM_CMD_GET_SPF_STATE 0x01001021
 struct proc { int unused; };
 #ifndef __APPLE__
 typedef intptr_t user_ssize_t;
