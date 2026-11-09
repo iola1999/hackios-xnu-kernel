@@ -127,6 +127,8 @@ static uint64_t screen_touched;                 /* mach_absolute_time() of the l
 #define EXIT_HOLD_MS    1500
 
 extern void loader_return(void);
+extern void annibale_var_save_on_return(void);
+extern void annibale_wifi_stop(void);
 
 static thread_call_t exit_call;
 static uint32_t fingers_down;           /* one bit for each finger a driver says is down */
@@ -135,6 +137,8 @@ static void
 exit_hold_elapsed(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
 	printf("\n--- %d fingers held on the screen for %d ms: back to the loader ---\n", EXIT_FINGERS, EXIT_HOLD_MS);
+	annibale_var_save_on_return();
+	annibale_wifi_stop();
 	loader_return();
 }
 
@@ -344,6 +348,9 @@ annibale_input_init(void)
 		printf("annibale-touch: cannot create the device\n");
 	}
 	exit_call = thread_call_allocate(exit_hold_elapsed, NULL);
+	if (annibale_platform_is_annibale()) {
+		annibale_cpufreq_init();
+	}
 	annibale_virtio_input_init();
 	annibale_goodix_init();
 	annibale_ufs_init();
