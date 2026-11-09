@@ -216,11 +216,19 @@ ui_fill(int x, int y, int w, int h, uint32_t color)
 	if (x1 > (int)SCREEN.width) x1 = (int)SCREEN.width;
 	if (y1 > (int)SCREEN.height) y1 = (int)SCREEN.height;
 	color &= 0x00ffffffu;
+	uint64_t pair = (uint64_t)color | ((uint64_t)color << 32);
 	fb = (volatile uint32_t *)(uintptr_t)SCREEN.base;
 	stride = SCREEN.stride / 4;
 	for (int row = y; row < y1; row++) {
 		volatile uint32_t *line = fb + (unsigned)row * stride;
-		for (int col = x; col < x1; col++) {
+		int col = x;
+		if ((((uintptr_t)(line + (unsigned)col)) & 7u) != 0 && col < x1) {
+			line[(unsigned)col++] = color;
+		}
+		for (; col + 1 < x1; col += 2) {
+			*(volatile uint64_t *)(line + (unsigned)col) = pair;
+		}
+		if (col < x1) {
 			line[(unsigned)col] = color;
 		}
 	}
@@ -271,11 +279,15 @@ ui_round_rect(int x, int y, int w, int h, int r, int border, uint32_t fill_col, 
 		volatile uint32_t *line = fb + (unsigned)row * stride;
 
 		if (!in_corner_y) {
-			for (int col = x0; col < x1; col++) {
-				int rx = col - x;
-				uint32_t c = (border > 0 && (rx < border || rx >= w - border)) ? border_col : fill_col;
-				line[(unsigned)col] = c & 0x00ffffffu;
+			int mid_h = (y + h - r < y1 ? y + h - r : y1) - row;
+			if (border > 0) {
+				ui_fill(x, row, border, mid_h, border_col);
+				ui_fill(x + border, row, w - 2 * border, mid_h, fill_col);
+				ui_fill(x + w - border, row, border, mid_h, border_col);
+			} else {
+				ui_fill(x, row, w, mid_h, fill_col);
 			}
+			row += mid_h - 1;
 			continue;
 		}
 
@@ -285,8 +297,10 @@ ui_round_rect(int x, int y, int w, int h, int r, int border, uint32_t fill_col, 
 		for (int col = x0; col < x1; col++) {
 			int rx = col - x;
 			if (rx >= r && rx < w - r) {
+				int span_end = (x + w - r < x1) ? (x + w - r) : x1;
 				uint32_t c = (border > 0 && (ry < border || ry >= h - border)) ? border_col : fill_col;
-				line[(unsigned)col] = c & 0x00ffffffu;
+				ui_fill(col, row, span_end - col, 1, c);
+				col = span_end - 1;
 				continue;
 			}
 			int dx = (rx < r) ? (2 * r - 1 - 2 * rx) : (2 * (rx - (w - r)) + 1);

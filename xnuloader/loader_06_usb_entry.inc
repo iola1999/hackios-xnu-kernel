@@ -1160,7 +1160,6 @@ efi_main(efi_handle image, efi_system_table *st)
 	install_exception_hook();
 	wdt_arm();
 	screen_quiet = 1;
-	ui_init();
 
 	int have_payload = parse_payload(&pi, 0);
 	block_start();

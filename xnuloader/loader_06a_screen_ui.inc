@@ -596,6 +596,9 @@ ui_draw_menu_footer(int countdown, int pct_remaining, int user_interacted, int r
 	}
 }
 
+static int usb_menu_interrupted;
+static void usb_poll_command(void);
+
 static void
 ui_draw_menu(int choice, int countdown, int user_interacted)
 {
@@ -613,9 +616,11 @@ ui_draw_menu(int choice, int countdown, int user_interacted)
 	const char *sub = "REDMI K90  -  Select Boot System";
 	int sw = ui_measure_text_ex(sub, 40, 2, 0);
 	ui_draw_text_ex(((int)SCREEN.width - sw) / 2, 442, sub, 2, 40, UI_TEXT_SEC, UI_BG, 0, 0);
+	usb_poll_command();
 
 	for (int i = 0; i < 3; i++) {
 		ui_draw_menu_card(i, i == choice);
+		usb_poll_command();
 	}
 	ui_draw_menu_footer(countdown, countdown * 20, user_interacted, 1);
 }
@@ -720,9 +725,6 @@ spmi_btn_edge(struct spmi_btn *b, int pressed)
 	return pressed ? 1 : 0;
 }
 
-static int usb_menu_interrupted;
-static void usb_poll_command(void);
-
 static void
 ui_menu_select(int *choice, int next_choice, int countdown, int *user_interacted)
 {
@@ -759,6 +761,9 @@ ui_boot_menu(void)
 	}
 	spmi_buttons_init(&spmi_btns);
 
+	UI.ready = 1;
+	UI.pct = -1;
+	UI.spin_at = ui_now();
 	UI.usb_chrome_drawn = 0;
 	ui_fill(0, 0, (int)SCREEN.width, (int)SCREEN.height, UI_BG);
 	ui_draw_menu(choice, countdown, user_interacted);
