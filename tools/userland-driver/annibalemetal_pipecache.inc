@@ -113,6 +113,13 @@ rw_pipe_keep(struct rwa_device *device, const unsigned char key[CC_SHA256_DIGEST
 	e->info = *info;
 	e->users = 1;
 	os_unfair_lock_lock(&rw_pipes_lock);
+	for (struct rw_pipe_entry *cur = rw_pipes; cur != NULL; cur = cur->next) {
+		if (cur->device == device && memcmp(cur->key, key, CC_SHA256_DIGEST_LENGTH) == 0) {
+			os_unfair_lock_unlock(&rw_pipes_lock);
+			free(e);
+			return;
+		}
+	}
 	e->next = rw_pipes;
 	rw_pipes = e;
 	os_unfair_lock_unlock(&rw_pipes_lock);

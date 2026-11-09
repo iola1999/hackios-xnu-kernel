@@ -236,6 +236,8 @@ rw_work_time(int kind, uint64_t began)
 	NSMutableArray *_work;
 	NSError *_error;
 	NSUInteger _status;
+	unsigned _phase;
+	BOOL _failed;
 	BOOL _owesSlot;                 /* this buffer holds one of the queue's slots */
 	NSMutableArray *_scheduled, *_completed;   /* handler blocks, copied to the heap */
 	NSUInteger _protectionOptions;  /* what the window server asked for; see -setProtectionOptions: */
@@ -437,6 +439,9 @@ rw_work_time(int kind, uint64_t began)
 
 - (void)recordWork:(AnnibaleMetalWork *)work
 {
+	if (_phase != RW_CB_PHASE_RECORDING) {
+		return;
+	}
 	[work retainResources];
 	[_work addObject:work];
 }
@@ -458,6 +463,10 @@ static pthread_mutex_t rw_commit_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 	uint64_t refresh_us = 0, encode_us = 0, flush_us = 0;
 
 	pthread_mutex_lock(&rw_commit_lock);
+	if (_phase != RW_CB_PHASE_RECORDING) {
+		pthread_mutex_unlock(&rw_commit_lock);
+		return;
+	}
 	__atomic_add_fetch(&hb_commit, 1, __ATOMIC_RELAXED);
 
 	if (commit_started != 0) {
@@ -471,6 +480,7 @@ static pthread_mutex_t rw_commit_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 	pthread_once(&rw_watch_once, rw_start_watch);
 	commit_progress_us = rw_now_us();
 	commit_in_flight = commit_count;
+	_phase = RW_CB_PHASE_COMMITTED;
 	_status = RW_CB_COMMITTED;
 	/* Textures laid over buffers get the callers' bytes copied into them again: the
 	 * processor may have written those buffers since the last -commit, and Metal's own
@@ -642,15 +652,10 @@ static pthread_mutex_t rw_commit_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 		rw_work_time(RW_WORK_DISPATCH, work_began);
 		if (rc != 0) {
 			rw_print("the dispatch failed: %s\n", why);
-			_error = [[NSError errorWithDomain:@"AnnibaleMetal" code:2
-						  userInfo:@{ NSLocalizedDescriptionKey:
-							      [NSString stringWithUTF8String:why] }]
-				     retain];
-			_status = RW_CB_ERROR;
+			[self failWith:why];
 			goto done;
 		}
 	}
-	_status = RW_CB_SCHEDULED;   /* submitted; the fence below is what makes it completed */
 	if (rw_thumbs_wanted(commit_count) && !rw_thumb_draws) {
 		NSMutableSet *seen = [NSMutableSet set];
 
@@ -1062,11 +1067,12 @@ done:
 
 - (void)failWith:(const char *)reason
 {
-    rw_print("command buffer failed: %s\n", reason);
+	rw_print("command buffer failed: %s\n", reason);
+	[_error release];
 	_error = [[NSError errorWithDomain:@"AnnibaleMetal" code:4
 				  userInfo:@{ NSLocalizedDescriptionKey:
 					      [NSString stringWithUTF8String:reason] }] retain];
-	_status = RW_CB_ERROR;
+	_failed = YES;
 }
 
 /* The fence is the whole point: a dispatch that the GPU does not finish must not read as a
@@ -1075,7 +1081,7 @@ done:
 {
 	char why[512] = { 0 };
 
-	if (_status == RW_CB_ERROR || [self annibaleAwaitCompletion]) {
+	if ([self annibaleAwaitCompletion] || _phase == RW_CB_PHASE_FINISHED) {
 		return;
 	}
 
@@ -1095,9 +1101,12 @@ done:
 	if (mesa.finish([[_queue device] mesaDevice], why, sizeof(why)) != 0) {
 		__atomic_store_n(&fence_wait, 0, __ATOMIC_RELEASE);
 		rw_print("THE GPU DID NOT FINISH: %s\n", why);
+		[_error release];
 		_error = [[NSError errorWithDomain:@"AnnibaleMetal" code:3
 					  userInfo:@{ NSLocalizedDescriptionKey:
 						      [NSString stringWithUTF8String:why] }] retain];
+		_failed = YES;
+		_phase = RW_CB_PHASE_FINISHED;
 		_status = RW_CB_ERROR;
 		return;
 	}
@@ -1107,7 +1116,8 @@ done:
 	if (mesa.buffer_textures_writeback != NULL) {
 		mesa.buffer_textures_writeback([[_queue device] mesaDevice]);
 	}
-	_status = RW_CB_COMPLETED;   /* the fence has been paid, and only now */
+	_phase = RW_CB_PHASE_FINISHED;
+	_status = _failed ? RW_CB_ERROR : RW_CB_COMPLETED;
 }
 
 - (void)waitUntilScheduled { }
@@ -1124,38 +1134,12 @@ done:
  *
  * So handlers are kept until the work they are about: scheduled ones go out at -commit, completed
  * ones from the completion thread once the GPU has done the buffer (annibalemetal_completion.inc).
- * A scheduled handler added after -commit is delivered here at once rather than dropped: Metal
- * calls that undefined, and losing it would be the kind of silence this driver is trying to stop
- * having.
  */
-- (void)annibaleDeliver:(void (^)(id))handler
-{
-	dispatch_queue_t queue = [_queue annibaleCompletionQueue];
-
-	if (queue != nil) {
-		/* dispatch_async copies the block, which retains both this buffer and the
-		 * handler it carries, so the buffer outlives its own completion. */
-		dispatch_async(queue, ^{ handler(self); });
-		return;
-	}
-	handler(self);
-}
-
 - (void)addScheduledHandler:(void (^)(id))handler
 {
-	if (handler == NULL) {
-		return;
+	if (handler != NULL) {
+		[self annibaleAddScheduled:handler];
 	}
-	/* scheduled or further, an error included (3, 4, 5): the work this handler is about has
-	 * already run, so it is delivered rather than kept */
-	if (_status >= RW_CB_SCHEDULED) {
-		[self annibaleDeliver:handler];
-		return;
-	}
-	if (_scheduled == nil) {
-		_scheduled = [[NSMutableArray alloc] init];
-	}
-	[_scheduled addObject:[[handler copy] autorelease]];
 }
 
 - (void)addCompletedHandler:(void (^)(id))handler

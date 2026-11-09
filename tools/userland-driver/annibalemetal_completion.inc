@@ -71,19 +71,34 @@ static void *rw_completion_main(void *unused);
 		}
 	});
 	pthread_mutex_lock(&rw_completion_lock);
+	_phase = RW_CB_PHASE_SCHEDULED;
+	if (_status < RW_CB_SCHEDULED) {
+		_status = RW_CB_SCHEDULED;
+	}
 	scheduled = _scheduled;
 	_scheduled = nil;
 	pthread_mutex_unlock(&rw_completion_lock);
 	[self annibaleDeliverLater:scheduled];
 	[scheduled release];
 	if (item == NULL) {
+		NSArray *completed;
+
 		rw_print("no memory to queue a command buffer for completion\n");
+		pthread_mutex_lock(&rw_completion_lock);
+		_phase = RW_CB_PHASE_FINISHED;
+		_status = _failed ? RW_CB_ERROR : RW_CB_COMPLETED;
+		completed = _completed;
+		_completed = nil;
+		pthread_cond_broadcast(&rw_completion_done);
+		pthread_mutex_unlock(&rw_completion_lock);
+		[self annibaleDeliverLater:completed];
+		[completed release];
 		return;
 	}
 	item->buffer = [self retain];
 	item->commit = commit;
 	item->queued_us = rw_now_us();
-	item->fence = _status == RW_CB_ERROR || mesa.fence_take == NULL ? NULL :
+	item->fence = _failed || mesa.fence_take == NULL ? NULL :
 	    mesa.fence_take([[_queue device] mesaDevice]);
 	pthread_mutex_lock(&rw_completion_lock);
 	*rw_completion_tail = item;
@@ -102,46 +117,63 @@ static void *rw_completion_main(void *unused);
 	char why[256] = { 0 };
 
 	/* A compiler library without the fence calls: wait for everything, as -commit used to. */
-	if (fence == NULL && mesa.fence_take == NULL && _status != RW_CB_ERROR && mesa.finish != NULL &&
+	if (fence == NULL && mesa.fence_take == NULL && !_failed && mesa.finish != NULL &&
 	    mesa.finish(device, why, sizeof(why)) != 0) {
 		rw_print("THE GPU DID NOT FINISH: %s\n", why);
-		_status = RW_CB_ERROR;
+		_failed = YES;
 	}
 	if (fence != NULL && mesa.fence_wait(device, fence) != 0) {
 		rw_print("THE GPU DID NOT FINISH: a command buffer's fence did not signal in time\n");
+		[_error release];
 		_error = [[NSError errorWithDomain:@"AnnibaleMetal" code:3
 					  userInfo:@{ NSLocalizedDescriptionKey:
 						      @"the GPU did not finish this command buffer in time" }] retain];
-		_status = RW_CB_ERROR;
+		_failed = YES;
 	}
 	fence_us = rw_now_us() - began_us;
 	if (fence != NULL) {
 		mesa.fence_release(device, fence);
 	}
-	if (_status != RW_CB_ERROR && mesa.buffer_textures_writeback != NULL) {
+	if (!_failed && mesa.buffer_textures_writeback != NULL) {
 		uint64_t writeback_began = rw_now_us();
 
 		mesa.buffer_textures_writeback(device);
 		writeback_us = rw_now_us() - writeback_began;
 	}
 	pthread_mutex_lock(&rw_completion_lock);
-	if (_status != RW_CB_ERROR) {
-		_status = RW_CB_COMPLETED;
-	}
+	_phase = RW_CB_PHASE_FINISHED;
+	_status = _failed ? RW_CB_ERROR : RW_CB_COMPLETED;
 	completed = _completed;
 	_completed = nil;
 	pthread_cond_broadcast(&rw_completion_done);
 	pthread_mutex_unlock(&rw_completion_lock);
-	rw_timing_completion(commit, began_us - queued_us, fence_us, writeback_us, _status == RW_CB_COMPLETED);
+	rw_timing_completion(commit, began_us - queued_us, fence_us, writeback_us, !_failed);
 	[self annibaleDeliverLater:completed];
 	[completed release];
+}
+
+/* -addScheduledHandler:. Kept until -commit finishes encoding; delivered at once afterwards. */
+- (void)annibaleAddScheduled:(void (^)(id))handler
+{
+	pthread_mutex_lock(&rw_completion_lock);
+	if (_phase < RW_CB_PHASE_SCHEDULED) {
+		if (_scheduled == nil) {
+			_scheduled = [[NSMutableArray alloc] init];
+		}
+		[_scheduled addObject:[[handler copy] autorelease]];
+		handler = nil;
+	}
+	pthread_mutex_unlock(&rw_completion_lock);
+	if (handler != nil) {
+		[self annibaleDeliverLater:@[ [[handler copy] autorelease] ]];
+	}
 }
 
 /* -addCompletedHandler:. Kept until completion; delivered at once to a buffer already complete. */
 - (void)annibaleAddCompleted:(void (^)(id))handler
 {
 	pthread_mutex_lock(&rw_completion_lock);
-	if (_status < RW_CB_COMPLETED) {
+	if (_phase < RW_CB_PHASE_FINISHED) {
 		if (_completed == nil) {
 			_completed = [[NSMutableArray alloc] init];
 		}
@@ -158,11 +190,12 @@ static void *rw_completion_main(void *unused);
  * never committed, which the caller waits for the old way. */
 - (BOOL)annibaleAwaitCompletion
 {
-	if (_status < RW_CB_COMMITTED) {
+	pthread_mutex_lock(&rw_completion_lock);
+	if (_phase < RW_CB_PHASE_COMMITTED) {
+		pthread_mutex_unlock(&rw_completion_lock);
 		return NO;
 	}
-	pthread_mutex_lock(&rw_completion_lock);
-	while (_status < RW_CB_COMPLETED) {
+	while (_phase < RW_CB_PHASE_FINISHED) {
 		pthread_cond_wait(&rw_completion_done, &rw_completion_lock);
 	}
 	pthread_mutex_unlock(&rw_completion_lock);

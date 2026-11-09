@@ -604,10 +604,9 @@ rw_surface_through_copy(AnnibaleMetalDevice *device, MTLTextureDescriptor *d, vo
 		pthread_mutex_unlock(&shared_lock);
 		return before;
 	}
-	if (before != nil) {
-		d = [[d copy] autorelease];
-		[d setUsage:usage | [before usage]];
-	}
+	d = [[d copy] autorelease];
+	[d setUsage:usage | (before != nil ? [before usage] :
+	    (MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView))];
 	/* the buffer reads and writes the surface's memory for as long as it lives */
 	CFRetain(surface);
 	buffer = [device newBufferWithBytesNoCopy:allocation_base length:selected->size

@@ -246,6 +246,10 @@ protocol_declares(const char *name, SEL selector, struct objc_method_description
 
 - (void)generateMipmapsForTexture:(id)texture
 {
+	if (_ended) {
+		[NSException raise:NSInternalInconsistencyException format:@"copy after endEncoding"];
+		return;
+	}
 	if (![texture isKindOfClass:[AnnibaleMetalTexture class]] || [texture device] != [self device]) {
 		[self rejectCopy:"mipmap generation requires a texture of this device"];
 		return;
@@ -257,6 +261,7 @@ protocol_declares(const char *name, SEL selector, struct objc_method_description
 	AnnibaleMetalWork *work = [[AnnibaleMetalWork alloc] init];
 	work->copyKind = RW_COPY_MIPMAP;
 	work->textures[0] = texture;
+	work->textureCount = 1;
 	[_commandBuffer recordWork:work];
 	[work release];
 }

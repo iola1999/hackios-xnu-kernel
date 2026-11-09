@@ -778,3 +778,108 @@ rw_audit_commit_end(unsigned commit)
 	atomic_store_explicit(&rw_audit_active, false, memory_order_release);
 }
 
+
+/*
+ * A BLEND LINE, deduplicated the way a repeated refusal is -- but on the CONTENT and not on
+ * the call site, which is the difference between this and RW_AGAIN above.
+ *
+ * These lines are the measurement this driver exists to make, and they repeat enormously:
+ * the window server built 127 pipelines in logs/080121-run.log and printed 240 attachment
+ * lines, and there were THIRTEEN DISTINCT ONES among them. One boot of Resident Evil 4
+ * would be a different order of magnitude -- 7 879 modules in its library -- and the
+ * loader keeps the first 256 KB of a log and the last megabyte and drops the middle, which
+ * is how 862 identical drawable refusals once pushed out the lines saying whether the game
+ * had launched at all.
+ *
+ * So a line is printed the first time its exact content is seen and then on powers of two
+ * of that content's own count, carrying the count. RW_AGAIN cannot do this: its counter is
+ * per call site, so it would have suppressed twelve of those thirteen as if they were
+ * repetitions of the first.
+ *
+ * Returns whether it printed, so the caller can attach the pipeline's LABEL to a line that
+ * is new -- the label is what names the blend mode, and one per distinct configuration is
+ * the whole of what it has to say.
+ *
+ * 32 entries is more than twice the thirteen a whole boot of the compositor produced, and
+ * past it every further distinct line shares one counter rather than being dropped: a table
+ * that silently stopped reporting would be the same instrument failure as the flood.
+ */
+static bool
+rw_blend_line(unsigned attachment, unsigned format, const struct rwa_color_blend *b)
+{
+	static struct {
+		unsigned attachment, format;
+		struct rwa_color_blend b;
+		unsigned long times;
+	} seen[32];
+	static unsigned nseen;
+	static unsigned long beyond;
+	unsigned long *times = NULL;
+
+	for (unsigned i = 0; i < nseen; i++) {
+		if (seen[i].attachment == attachment && seen[i].format == format &&
+		    memcmp(&seen[i].b, b, sizeof(*b)) == 0) {
+			times = &seen[i].times;
+			break;
+		}
+	}
+	if (times == NULL && nseen < sizeof(seen) / sizeof(seen[0])) {
+		seen[nseen].attachment = attachment;
+		seen[nseen].format = format;
+		seen[nseen].b = *b;
+		times = &seen[nseen].times;
+		nseen++;
+	}
+	if (times == NULL) {
+		times = &beyond;
+	}
+	if ((++*times & (*times - 1)) != 0) {
+		return false;
+	}
+	rw_print("blend: attachment %u format %u blend %u rgb %u/%u op %u alpha %u/%u op %u "
+	         "writeMask 0x%x\n", attachment, format, b->blending_enabled,
+	         b->source_rgb_blend_factor, b->destination_rgb_blend_factor,
+	         b->rgb_blend_operation, b->source_alpha_blend_factor,
+	         b->destination_alpha_blend_factor, b->alpha_blend_operation, b->write_mask);
+	if (*times > 1) {
+		rw_print("  ... and that is the %lu'th pipeline asking for exactly that%s\n",
+		         *times, times == &beyond ? ", counting every configuration past the "
+		                                    "thirty-two this keeps apart" : "");
+	}
+	return true;
+}
+
+/* The same, for what the LIBRARY made of it: four distinct lines in that whole boot. */
+static void
+rw_blend_result(unsigned enabled_mask, unsigned write_masks)
+{
+	static struct { unsigned enabled, masks; unsigned long times; } seen[16];
+	static unsigned nseen;
+	static unsigned long beyond;
+	unsigned long *times = NULL;
+
+	for (unsigned i = 0; i < nseen; i++) {
+		if (seen[i].enabled == enabled_mask && seen[i].masks == write_masks) {
+			times = &seen[i].times;
+			break;
+		}
+	}
+	if (times == NULL && nseen < sizeof(seen) / sizeof(seen[0])) {
+		seen[nseen].enabled = enabled_mask;
+		seen[nseen].masks = write_masks;
+		times = &seen[nseen].times;
+		nseen++;
+	}
+	if (times == NULL) {
+		times = &beyond;
+	}
+	if ((++*times & (*times - 1)) != 0) {
+		return;
+	}
+	rw_print("blend: the library blends attachments 0x%x and writes 0x%08x (four Gallium "
+	         "bits per attachment, R 0x1 .. A 0x8)\n", enabled_mask, write_masks);
+	if (*times > 1) {
+		rw_print("  ... and that is the %lu'th pipeline it made that of\n", *times);
+	}
+}
+

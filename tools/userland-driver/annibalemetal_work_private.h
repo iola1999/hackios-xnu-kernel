@@ -96,6 +96,13 @@ enum RWCopyKind { RW_COPY_NONE, RW_COPY_BUFFER, RW_COPY_TEXTURE, RW_COPY_MIPMAP,
  * MiniIOMobileFramebuffer, in the kernel, where this library has no view. `texwrite` counts
  * -replaceRegion:...bytesPerImage:, the one caller of rwa_texture_write.
  */
+enum {
+	RW_CB_PHASE_RECORDING = 0,
+	RW_CB_PHASE_COMMITTED = 1,
+	RW_CB_PHASE_SCHEDULED = 2,
+	RW_CB_PHASE_FINISHED  = 3,
+};
+
 #define RW_HEARTBEAT_US 1000000ULL
 static unsigned hb_commit;                      /* -commit entries this second */
 static unsigned hb_wait;                        /* -waitUntilCompleted entries this second */

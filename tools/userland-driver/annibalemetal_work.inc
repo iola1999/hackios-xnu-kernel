@@ -73,3 +73,23 @@
 }
 
 @end
+
+/* Apple's own "this buffer still owes a signal" flag, cleared when we pay, so that its
+ * bookkeeping and ours cannot disagree about a debt that has been settled. */
+static void
+annibale_clear_semaphore_debt(id commandBuffer)
+{
+	static Ivar ivar;
+	static BOOL looked;
+
+	if (!looked) {
+		Class base = objc_getClass("_MTLCommandBuffer");
+
+		looked = YES;
+		ivar = base != Nil ?
+		    class_getInstanceVariable(base, "_needsCommandBufferSemaphoreSignal") : NULL;
+	}
+	if (ivar != NULL) {
+		*(unsigned char *)((char *)commandBuffer + ivar_getOffset(ivar)) = 0;
+	}
+}
