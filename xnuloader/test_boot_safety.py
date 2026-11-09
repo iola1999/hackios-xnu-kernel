@@ -179,11 +179,112 @@ class TestSourceContracts(unittest.TestCase):
 
     def test_file_line_limits(self):
         for fname in ["loader_05_layout_run_kernel.inc", "loader_06_usb_entry.inc",
-                      "loader_06a_screen_ui.inc", "mkstandalone.py"]:
+                      "loader_06a_screen_ui.inc", "ui_font_private.h", "mkstandalone.py"]:
             f = HERE / fname
             self.assertTrue(f.is_file(), f"{f} missing")
             lines = len(f.read_text().splitlines())
             self.assertLessEqual(lines, 1200, f"{f} has {lines} lines (exceeds 1200 limit)")
+
+    def test_ui_rendering_and_fault_banner_preservation(self):
+        """Compile UI code on host and verify boot menu, USB progress, and fault banner layout."""
+        harness = r"""
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef uint16_t char16;
+typedef uint64_t efi_status;
+#define EFIAPI
+#define EFI_ERROR(x) ((x) != 0)
+static struct { uint64_t base; uint32_t width, height, stride; } SCREEN;
+static struct { void *con_in; } st_inst, *ST = &st_inst;
+static void *running_live = NULL;
+static int kernel_resources_held = 0, firmware_fault = 0, held_irq_masked = 0;
+static int usb_connected = 1, skip_ufs_arbitration = 0;
+static uint64_t host_last_cmd = 0, fake_cntvct = 1000;
+static char log_buf[4096];
+static uint32_t log_len = 0;
+static char last_result[64] = "early-exception 0 0xffffffff0071a42c0";
+#define CTX_LOG_PA  0
+#define CTX_LOG_LEN 1
+static uint64_t loader_ctx[2];
+#define READ_SYSREG(reg) (strcmp(#reg, "CNTFRQ_EL0") == 0 ? 19200000ULL : fake_cntvct)
+#define PAYLOAD_BASE 0ULL
+#define PAYLOAD_CONTAINER_MAX (55ULL << 20)
+static struct { uintptr_t fb_base; } platform_annibale = { 0xdeadbeefULL };
+static int str_eq(const char *a, const char *b) { return strcmp(a, b) == 0; }
+static int starts_with(const char *s, const char *p) { return strncmp(s, p, strlen(p)) == 0; }
+static void print(const char *fmt, ...) { (void)fmt; }
+static void wdt_pet(void) {}
+static void clean_dcache(uint64_t s, uint64_t e) { (void)s; (void)e; }
+typedef struct { uint32_t media_id; uint32_t block_size; uint64_t last_block; } efi_media;
+typedef struct efi_block_io {
+    efi_media *media;
+    efi_status (*read_blocks)(struct efi_block_io *, uint32_t, uint64_t, uint64_t, void *);
+    efi_status (*write_blocks)(struct efi_block_io *, uint32_t, uint64_t, uint64_t, void *);
+    efi_status (*flush_blocks)(struct efi_block_io *);
+} efi_block_io;
+#define BLOCK_PART_UNIT 1
+static struct {
+    uint32_t parts;
+    struct { uint32_t flags; uint16_t lun, unit; char name[36]; } part[4];
+} block_shared;
+static efi_block_io *block_bios[4];
+static uint8_t ufs_buffer[65536];
+static uint32_t ufs_crc32(const void *d, uint64_t n) { (void)d; (void)n; return 0; }
+static efi_block_io *find_partition_named(const char16 *n, uint64_t l) { (void)n; (void)l; return NULL; }
+
+#include "loader_06a_screen_ui.inc"
+static void usb_poll_command(void) {}
+
+static int count_nonzero_in_band(const uint32_t *fb, int y0, int y1) {
+    int nz = 0;
+    for (int y = y0; y < y1; y++) {
+        for (int x = 0; x < 1156; x++) {
+            if ((fb[y * 1156 + x] & 0x00ffffffu) != 0) nz++;
+        }
+    }
+    return nz;
+}
+
+int main(void) {
+    uint32_t *fb = calloc(1156 * 2510, sizeof(uint32_t));
+    SCREEN.base = (uint64_t)(uintptr_t)fb;
+    SCREEN.width = 1156;
+    SCREEN.height = 2510;
+    SCREEN.stride = 1156 * 4;
+
+    loader_slot = 'a';
+    android_slot = 'b';
+    slot_update_menu_text();
+    ui_draw_menu(MENU_CHOICE_IOS, 5, 0);
+    if (count_nonzero_in_band(fb, 200, 1520) < 50000) return 1;
+
+    ui_draw_ios_boot_splash();
+    if (count_nonzero_in_band(fb, 1000, 1450) < 2000) return 2;
+
+    const char *klog = "panic(cpu 0): kernel trap\nhalting cpu 0 and returning to xnuloader stub\n";
+    loader_ctx[CTX_LOG_PA] = (uint64_t)(uintptr_t)klog;
+    loader_ctx[CTX_LOG_LEN] = strlen(klog);
+    UI.ready = 1;
+    boot_fallback_enter();
+    /* Subsequent ui_init() from usb_command_loop() must preserve the fault banner below y=1250 */
+    ui_init();
+    if (count_nonzero_in_band(fb, 240, 670) < 10000) return 3;
+    if (count_nonzero_in_band(fb, 1250, 2450) < 20000) return 4;
+
+    free(fb);
+    return 0;
+}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "harness.c").write_text(harness)
+            binary = root / "harness"
+            subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Wno-unused-function", "-Werror",
+                            "-I", str(HERE), "-o", str(binary), str(root / "harness.c")], check=True)
+            subprocess.run([str(binary)], check=True)
 
 
 class TestStandalonePackager(unittest.TestCase):

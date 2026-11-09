@@ -1,105 +1,42 @@
 /* ------------------------------------------------------------------------ */
-/* Status on the panel.                                                     */
+/* Status and Boot Menu UI on the panel.                                    */
 /*                                                                          */
 /* The firmware console font is fixed at 8x16 and the command loop turns    */
 /* the console off (screen_quiet), so once the loader waits for USB nothing */
-/* on the panel moves. This paints the status where it can be read from a   */
-/* distance: the stage, a bar with the megabytes received, a block that     */
-/* moves while the loader polls USB, and the tail of the log. The pixels go */
-/* into the same framebuffer SCREEN names; the fourth byte stays zero,      */
-/* which is what the panel and the raw screenshots already carry.           */
+/* on the panel moves. This paints an iBoot-style interface on the panel:   */
+/* a rounded-card multi-boot selector with hardware-key navigation, a       */
+/* smooth rotating ring indicator while waiting on USB, a rounded transfer  */
+/* progress bar with megabytes and percentage, and a monospace console card */
+/* showing the tail of the loader log.                                      */
 /*                                                                          */
 /* The panel belongs to the kernel from "oem run" on: nothing is drawn      */
 /* while a kernel is live or may still hold the hardware, after a firmware  */
 /* fault, or after a started kernel came back (its last frame is what       */
 /* oem screenshot is for).                                                  */
 /*                                                                          */
-/* Included by loader_06 ahead of the LC-USB block: usb_wait() calls       */
+/* Included by loader_06 ahead of the LC-USB block: usb_wait() calls        */
 /* ui_tick from its poll loop, and the host tests stub that one call.       */
 
-#define UI_WHITE        0x00ffffffu
-#define UI_BLACK        0x00000000u
-#define UI_LEFT         78
-#define UI_TITLE_SCALE  10              /* a 3x5 glyph is 30x50 pixels */
-#define UI_AMOUNT_SCALE 8
-#define UI_LOG_SCALE    4
-#define UI_LOG_LINES    8
-#define UI_LOG_STEP     30
+#include "ui_font_private.h"
 
-/* 3x5 glyphs, rows top to bottom; '#' is a dot that lights up. */
-#define G(a, b, c, d, e) a b c d e
-static const char *const ui_fonts[128] = {
-	[' '] = G("...", "...", "...", "...", "..."),
-	['-'] = G("...", "...", "###", "...", "..."),
-	['_'] = G("...", "...", "...", "...", "###"),
-	['.'] = G("...", "...", "...", "...", ".#."),
-	[','] = G("...", "...", "...", ".#.", "#.."),
-	['/'] = G("..#", "..#", ".#.", "#..", "#.."),
-	[':'] = G("...", ".#.", "...", ".#.", "..."),
-	[';'] = G("...", ".#.", "...", ".#.", "#.."),
-	['='] = G("...", "###", "...", "###", "..."),
-	['+'] = G("...", ".#.", "###", ".#.", "..."),
-	['*'] = G("#.#", ".#.", "#.#", "...", "..."),
-	['('] = G("..#", ".#.", ".#.", ".#.", "..#"),
-	[')'] = G("#..", ".#.", ".#.", ".#.", "#.."),
-	['['] = G("##.", "#..", "#..", "#..", "##."),
-	[']'] = G(".##", "..#", "..#", "..#", ".##"),
-	['<'] = G("..#", ".#.", "#..", ".#.", "..#"),
-	['>'] = G("#..", ".#.", "..#", ".#.", "#.."),
-	['!'] = G(".#.", ".#.", ".#.", "...", ".#."),
-	['\''] = G(".#.", ".#.", "...", "...", "..."),
-	['"'] = G("#.#", "#.#", "...", "...", "..."),
-	['#'] = G("#.#", "###", "#.#", "###", "#.#"),
-	['|'] = G(".#.", ".#.", ".#.", ".#.", ".#."),
-	['%'] = G("#.#", "..#", ".#.", "#..", "#.#"),
-	['?'] = G("##.", "..#", ".#.", "...", ".#."),
-	['0'] = G("###", "#.#", "#.#", "#.#", "###"),
-	['1'] = G(".#.", "##.", ".#.", ".#.", "###"),
-	['2'] = G("##.", "..#", ".#.", "#..", "###"),
-	['3'] = G("##.", "..#", ".#.", "..#", "##."),
-	['4'] = G("#.#", "#.#", "###", "..#", "..#"),
-	['5'] = G("###", "#..", "##.", "..#", "##."),
-	['6'] = G(".##", "#..", "###", "#.#", "###"),
-	['7'] = G("###", "..#", ".#.", ".#.", ".#."),
-	['8'] = G("###", "#.#", "###", "#.#", "###"),
-	['9'] = G("###", "#.#", "###", "..#", "##."),
-	['A'] = G(".#.", "#.#", "###", "#.#", "#.#"),
-	['B'] = G("##.", "#.#", "##.", "#.#", "##."),
-	['C'] = G(".##", "#..", "#..", "#..", ".##"),
-	['D'] = G("##.", "#.#", "#.#", "#.#", "##."),
-	['E'] = G("###", "#..", "##.", "#..", "###"),
-	['F'] = G("###", "#..", "##.", "#..", "#.."),
-	['G'] = G(".##", "#..", "#.#", "#.#", ".##"),
-	['H'] = G("#.#", "#.#", "###", "#.#", "#.#"),
-	['I'] = G("###", ".#.", ".#.", ".#.", "###"),
-	['J'] = G("..#", "..#", "..#", "#.#", ".#."),
-	['K'] = G("#.#", "#.#", "##.", "#.#", "#.#"),
-	['L'] = G("#..", "#..", "#..", "#..", "###"),
-	['M'] = G("#.#", "###", "###", "#.#", "#.#"),
-	['N'] = G("##.", "#.#", "#.#", "#.#", "#.#"),
-	['O'] = G(".#.", "#.#", "#.#", "#.#", ".#."),
-	['P'] = G("##.", "#.#", "##.", "#..", "#.."),
-	['Q'] = G(".#.", "#.#", "#.#", "##.", ".##"),
-	['R'] = G("##.", "#.#", "##.", "#.#", "#.#"),
-	['S'] = G(".##", "#..", ".#.", "..#", "##."),
-	['T'] = G("###", ".#.", ".#.", ".#.", ".#."),
-	['U'] = G("#.#", "#.#", "#.#", "#.#", "###"),
-	['V'] = G("#.#", "#.#", "#.#", "#.#", ".#."),
-	['W'] = G("#.#", "#.#", "###", "###", "#.#"),
-	['X'] = G("#.#", "#.#", ".#.", "#.#", "#.#"),
-	['Y'] = G("#.#", "#.#", ".#.", ".#.", ".#."),
-	['Z'] = G("###", "..#", ".#.", "#..", "###"),
-};
-#undef G
+#define UI_MARGIN       70
+#define UI_TITLE_SCALE  3
+#define UI_AMOUNT_SCALE 2
+#define UI_LOG_SCALE    2
+#define UI_LOG_LINES    10
+#define UI_LOG_STEP     42
 
 static struct {
 	int ready;
+	int usb_chrome_drawn;
 	const char *stage;      /* what ui_stage last drew; compared by text */
 	int pct;                /* fill already on the bar, -1 before the first draw */
-	int spin;               /* block position, 0..3 */
+	int spin;               /* ring phase, 0..15 */
 	uint64_t spin_at, amount_at, log_seen;
 	uint64_t done, total;
 } UI;
+
+static int boot_fallback_active;
 
 static uint64_t
 ui_now(void)
@@ -112,7 +49,7 @@ ui_freq(void)
 {
 	uint64_t f = READ_SYSREG(CNTFRQ_EL0);
 
-	return f ? f : 1000000;   /* every board here sets CNTFRQ; the fallback only keeps the block moving */
+	return f ? f : 1000000;   /* every board here sets CNTFRQ; the fallback only keeps the ring moving */
 }
 
 static int
@@ -121,131 +58,51 @@ ui_on(void)
 	return UI.ready && running_live == NULL && !kernel_resources_held && !firmware_fault;
 }
 
-/* One solid rectangle, clipped to the panel. */
 static void
-ui_fill(int x, int y, int w, int h, uint32_t color)
+ui_spin_draw(void)
 {
-	volatile uint32_t *fb;
-	unsigned stride;
-	int x1 = x + w, y1 = y + h;
+	int cx = (int)SCREEN.width / 2;
+	int cy = 368;
 
-	if (SCREEN.base == 0) {
-		return;
-	}
-	if (x < 0) x = 0;
-	if (y < 0) y = 0;
-	if (x1 > (int)SCREEN.width) x1 = (int)SCREEN.width;
-	if (y1 > (int)SCREEN.height) y1 = (int)SCREEN.height;
-	fb = (volatile uint32_t *)(uintptr_t)SCREEN.base;
-	stride = SCREEN.stride / 4;
-	for (int row = y; row < y1; row++) {
-		for (int col = x; col < x1; col++) {
-			fb[(unsigned)row * stride + (unsigned)col] = color;
-		}
-	}
-}
-
-static const char *
-ui_glyph(char c)
-{
-	unsigned char u = (unsigned char)c;
-
-	if (u >= 'a' && u <= 'z') {
-		u = (unsigned char)(u - 'a' + 'A');
-	}
-	if (u >= 128 || ui_fonts[u] == 0) {
-		return ui_fonts['?'];
-	}
-	return ui_fonts[u];
-}
-
-/* Draw at most max_chars of s (which need not be terminated there). */
-static void
-ui_text(int x, int y, const char *s, int scale, int max_chars)
-{
-	int cx = x;
-
-	for (int n = 0; n < max_chars && s[n]; n++) {
-		const char *g = ui_glyph(s[n]);
-
-		for (int r = 0; r < 5; r++) {
-			for (int c = 0; c < 3; c++) {
-				if (g[r * 3 + c] == '#') {
-					ui_fill(cx + c * scale, y + r * scale, scale, scale, UI_WHITE);
-				}
-			}
-		}
-		cx += 4 * scale;
-	}
-}
-
-static int
-ui_text_width(const char *s, int len, int scale)
-{
-	int n = 0;
-
-	while (n < len && s[n]) {
-		n++;
-	}
-	return n ? n * 4 * scale - scale : 0;
-}
-
-static int
-ui_dec(char *out, uint64_t v)
-{
-	char tmp[20];
-	int n = 0, i;
-
-	do {
-		tmp[n++] = (char)('0' + v % 10);
-		v /= 10;
-	} while (v);
-	for (i = 0; i < n; i++) {
-		out[i] = tmp[n - 1 - i];
-	}
-	return n;
-}
-
-static void
-ui_stage(const char *word)
-{
-	int y = (int)SCREEN.height - 380;
-	int w;
-
-	if (!ui_on() || (UI.stage != 0 && str_eq(UI.stage, word))) {
-		return;
-	}
-	UI.stage = word;
-	w = ui_text_width(word, 64, UI_TITLE_SCALE);
-	ui_fill(0, y - 10, (int)SCREEN.width, 70, UI_BLACK);
-	ui_text(((int)SCREEN.width - w) / 2, y, word, UI_TITLE_SCALE, 64);
+	ui_draw_spinner_ring(cx, cy, 42, 8, UI.spin, UI_WHITE, UI_TRACK_BG, UI_CARD_BG);
 }
 
 static void
 ui_bar(int pct)
 {
-	int x = UI_LEFT, y = (int)SCREEN.height - 270;
-	int w = (int)SCREEN.width - 2 * UI_LEFT, h = 48, t = 4;
-	int fill = (w - 2 * t) * pct / 100;
+	int card_w = (int)SCREEN.width - 2 * UI_MARGIN;
+	int bx = UI_MARGIN + 64;
+	int bw = card_w - 128;
+	int by = 548;
+	int bh = 22;
 
-	ui_fill(x, y, w, h, UI_BLACK);
-	ui_fill(x, y, w, t, UI_WHITE);
-	ui_fill(x, y + h - t, w, t, UI_WHITE);
-	ui_fill(x, y, t, h, UI_WHITE);
-	ui_fill(x + w - t, y, t, h, UI_WHITE);
-	if (fill > 0) {
-		ui_fill(x + t, y + t, fill, h - 2 * t, UI_WHITE);
+	if (pct < 0) pct = 0;
+	if (pct > 100) pct = 100;
+	ui_round_rect(bx, by, bw, bh, 11, 0, UI_TRACK_BG, UI_TRACK_BG, UI_CARD_BG);
+	if (pct > 0) {
+		int fill = bw * pct / 100;
+		if (fill < 22) fill = 22;
+		ui_round_rect(bx, by, fill, bh, 11, 0, UI_WHITE, UI_WHITE, UI_TRACK_BG);
 	}
 }
 
 static void
 ui_amount(void)
 {
-	char buf[48];
-	int n = ui_dec(buf, UI.done >> 20);
-	int y = (int)SCREEN.height - 180;
-	int w;
+	char buf[64];
+	int card_w = (int)SCREEN.width - 2 * UI_MARGIN;
+	int y = 594;
+	int n = 0, w;
 
+	if (UI.total == 0) {
+		const char *idle_msg = "Ready for Fastboot commands over USB";
+		w = ui_measure_text_ex(idle_msg, 48, UI_AMOUNT_SCALE, 0);
+		ui_fill(UI_MARGIN + 20, y - 4, card_w - 40, 40, UI_CARD_BG);
+		ui_draw_text_ex(((int)SCREEN.width - w) / 2, y, idle_msg, UI_AMOUNT_SCALE, 48, UI_TEXT_SEC, UI_CARD_BG, 0, 0);
+		return;
+	}
+
+	n += ui_dec(buf + n, UI.done >> 20);
 	buf[n++] = ' ';
 	buf[n++] = '/';
 	buf[n++] = ' ';
@@ -253,9 +110,122 @@ ui_amount(void)
 	buf[n++] = ' ';
 	buf[n++] = 'M';
 	buf[n++] = 'B';
-	w = ui_text_width(buf, n, UI_AMOUNT_SCALE);
-	ui_fill(0, y - 6, (int)SCREEN.width, 5 * UI_AMOUNT_SCALE + 12, UI_BLACK);
-	ui_text(((int)SCREEN.width - w) / 2, y, buf, UI_AMOUNT_SCALE, n);
+	buf[n++] = ' ';
+	buf[n++] = ' ';
+	buf[n++] = '(';
+	n += ui_dec(buf + n, UI.pct >= 0 ? (uint64_t)UI.pct : 0);
+	buf[n++] = '%';
+	buf[n++] = ')';
+	buf[n] = 0;
+
+	w = ui_measure_text_ex(buf, n, UI_AMOUNT_SCALE, 0);
+	ui_fill(UI_MARGIN + 20, y - 4, card_w - 40, 40, UI_CARD_BG);
+	ui_draw_text_ex(((int)SCREEN.width - w) / 2, y, buf, UI_AMOUNT_SCALE, n, UI_TEXT_SEC, UI_CARD_BG, 0, 0);
+}
+
+static void
+ui_log(void)
+{
+	int card_x = UI_MARGIN;
+	int card_w = (int)SCREEN.width - 2 * UI_MARGIN;
+	int body_y = 838;
+	int max_h = boot_fallback_active ? 460 : 620;
+	int max_lines = (max_h - 90) / UI_LOG_STEP;
+	int maxc = 96;
+	uint32_t end = log_len, p, start = 0, line;
+	int seen = 0;
+
+	if (max_lines > UI_LOG_LINES) max_lines = UI_LOG_LINES;
+	ui_fill(card_x + 12, body_y, card_w - 24, max_lines * UI_LOG_STEP + 16, UI_TERM_BG);
+	UI.log_seen = log_len;
+
+	while (end > 0 && (log_buf[end - 1] == '\n' || log_buf[end - 1] == '\r')) {
+		end--;
+	}
+	for (p = end; p > 0; ) {
+		if (log_buf[--p] == '\n' && ++seen == max_lines) {
+			start = p + 1;
+			break;
+		}
+	}
+	int y = body_y + 6;
+	for (line = start; line < end && y + 32 <= body_y + max_lines * UI_LOG_STEP + 12; line = p + 1) {
+		int n, last;
+
+		for (p = line; p < end && log_buf[p] != '\n'; p++) {
+		}
+		n = (int)(p - line);
+		if (n > maxc) {
+			n = maxc;
+		}
+		for (last = n - 1; last >= 0 && log_buf[line + last] == '\r'; last--) {
+			n = last;
+		}
+		ui_draw_text_ex(card_x + 32, y, log_buf + line, UI_LOG_SCALE, n, UI_TEXT_SEC, UI_TERM_BG, 1, 0);
+		y += UI_LOG_STEP;
+	}
+}
+
+static void
+ui_ensure_usb_chrome(void)
+{
+	int card_w = (int)SCREEN.width - 2 * UI_MARGIN;
+	int term_h = boot_fallback_active ? 460 : 620;
+
+	if (UI.usb_chrome_drawn) {
+		return;
+	}
+	UI.usb_chrome_drawn = 1;
+	if (!boot_fallback_active) {
+		ui_fill(0, 0, (int)SCREEN.width, (int)SCREEN.height, UI_BG);
+	} else {
+		ui_fill(0, 0, (int)SCREEN.width, 1220, UI_BG);
+	}
+
+	ui_draw_top_pill("USB Fastboot  -  annibale", UI_AMBER);
+	/* Main status and progress card */
+	ui_round_rect(UI_MARGIN, 240, card_w, 430, 36, 2, UI_CARD_BG, UI_CARD_BORDER, UI_BG);
+	ui_spin_draw();
+	ui_bar(UI.pct >= 0 ? UI.pct : 0);
+	ui_amount();
+
+	/* Console log card */
+	ui_round_rect(UI_MARGIN, 730, card_w, term_h, 32, 2, UI_TERM_BG, UI_TERM_BORDER, UI_BG);
+	ui_round_rect(UI_MARGIN + 28, 762, 16, 16, 8, 0, UI_RED, UI_RED, UI_TERM_BG);
+	ui_round_rect(UI_MARGIN + 54, 762, 16, 16, 8, 0, UI_AMBER, UI_AMBER, UI_TERM_BG);
+	ui_round_rect(UI_MARGIN + 80, 762, 16, 16, 8, 0, UI_GREEN, UI_GREEN, UI_TERM_BG);
+	ui_draw_text_ex(UI_MARGIN + 116, 754, "LOADER CONSOLE", 2, 32, UI_TEXT_DIM, UI_TERM_BG, 0, 1);
+	ui_fill(UI_MARGIN + 4, 810, card_w - 8, 2, UI_TERM_BORDER);
+	ui_log();
+}
+
+static void
+ui_stage(const char *word)
+{
+	int card_w = (int)SCREEN.width - 2 * UI_MARGIN;
+	int y = 456;
+	int w;
+	uint32_t dot_col = UI_AMBER;
+
+	if (!ui_on() || (UI.stage != 0 && str_eq(UI.stage, word) && UI.usb_chrome_drawn)) {
+		return;
+	}
+	UI.stage = word;
+	ui_ensure_usb_chrome();
+
+	if (starts_with(word, "PAYLOAD READY") || starts_with(word, "RAMDISK READY") || starts_with(word, "SYSTEM READY")) {
+		dot_col = UI_GREEN;
+	} else if (starts_with(word, "TRANSFER FAILED") || starts_with(word, "BOOT FAILED") ||
+	           starts_with(word, "BOOT FALLBACK") || starts_with(word, "NO KERNEL")) {
+		dot_col = UI_RED;
+	} else if (usb_connected) {
+		dot_col = UI_GREEN;
+	}
+	ui_draw_top_pill(usb_connected ? "USB Fastboot Connected" : "USB Fastboot  -  annibale", dot_col);
+
+	w = ui_measure_text_ex(word, 64, UI_TITLE_SCALE, 0);
+	ui_fill(UI_MARGIN + 16, y - 6, card_w - 32, 64, UI_CARD_BG);
+	ui_draw_text_ex(((int)SCREEN.width - w) / 2, y, word, UI_TITLE_SCALE, 64, UI_WHITE, UI_CARD_BG, 0, 1);
 }
 
 static void
@@ -266,6 +236,7 @@ ui_progress(uint64_t done, uint64_t total)
 	if (!ui_on() || total == 0) {
 		return;
 	}
+	ui_ensure_usb_chrome();
 	if (done > total) {
 		done = total;
 	}
@@ -284,59 +255,13 @@ ui_progress(uint64_t done, uint64_t total)
 	}
 }
 
-/* The moving block: four positions in a row, one step every 250 ms. */
-static void
-ui_spin_draw(void)
-{
-	int x = UI_LEFT, y = (int)SCREEN.height - 480;
-	int prev = (UI.spin + 3) & 3;
-
-	ui_fill(x + prev * 60, y, 40, 40, UI_BLACK);
-	ui_fill(x + UI.spin * 60, y, 40, 40, UI_WHITE);
-}
-
-static void
-ui_log(void)
-{
-	int y = (int)SCREEN.height - 760;
-	int maxc = ((int)SCREEN.width - 2 * UI_LEFT) / (4 * UI_LOG_SCALE);
-	uint32_t end = log_len, p, start = 0, line;
-	int seen = 0;
-
-	ui_fill(0, y - 10, (int)SCREEN.width, UI_LOG_LINES * UI_LOG_STEP + 20, UI_BLACK);
-	UI.log_seen = log_len;
-	while (end > 0 && (log_buf[end - 1] == '\n' || log_buf[end - 1] == '\r')) {
-		end--;
-	}
-	for (p = end; p > 0; ) {
-		if (log_buf[--p] == '\n' && ++seen == UI_LOG_LINES) {
-			start = p + 1;
-			break;
-		}
-	}
-	for (line = start; line < end && y < (int)SCREEN.height - 500; line = p + 1) {
-		int n, last;
-
-		for (p = line; p < end && log_buf[p] != '\n'; p++) {
-		}
-		n = (int)(p - line);
-		if (n > maxc) {
-			n = maxc;
-		}
-		for (last = n - 1; last >= 0 && log_buf[line + last] == '\r'; last--) {
-			n = last;
-		}
-		ui_text(UI_LEFT, y, log_buf + line, UI_LOG_SCALE, n);
-		y += UI_LOG_STEP;
-	}
-}
-
 static void
 ui_init(void)
 {
 	if (SCREEN.base == 0) {
 		return;
 	}
+	const char *prev_stage = UI.stage;
 	memset(&UI, 0, sizeof(UI));
 	UI.pct = -1;
 	UI.ready = 1;
@@ -344,10 +269,13 @@ ui_init(void)
 	if (!ui_on()) {
 		return;
 	}
-	ui_fill(0, (int)SCREEN.height - 820, (int)SCREEN.width, 820, UI_BLACK);
+	if (boot_fallback_active) {
+		ui_ensure_usb_chrome();
+		ui_stage(prev_stage ? prev_stage : "BOOT FALLBACK - FASTBOOT MODE");
+		return;
+	}
+	ui_ensure_usb_chrome();
 	ui_stage("WAITING FOR HOST");
-	ui_spin_draw();
-	ui_log();
 }
 
 /* Called from usb_wait's poll loop: two counter reads when nothing is due. */
@@ -357,12 +285,15 @@ ui_tick(void)
 	if (!ui_on()) {
 		return;
 	}
+	if (!UI.usb_chrome_drawn) {
+		ui_ensure_usb_chrome();
+	}
 	if (log_len != UI.log_seen) {
 		ui_log();
 	}
-	if (ui_now() - UI.spin_at >= ui_freq() / 4) {
+	if (ui_now() - UI.spin_at >= ui_freq() / 16) {
 		UI.spin_at = ui_now();
-		UI.spin = (UI.spin + 1) & 3;
+		UI.spin = (UI.spin + 1) & 15;
 		ui_spin_draw();
 	}
 }
@@ -391,9 +322,11 @@ typedef struct efi_simple_text_input {
 /* 'a' or 'b' once slot_detect has found the slots, 0 while unknown (slot_choice.h) */
 static char loader_slot;
 static char android_slot;
-static char menu_item_ios[40] = "[1] BOOT IOS 26";
-static char menu_item_android[40] = "[2] BOOT ANDROID";
-static const char *const menu_item_fastboot = "[3] FASTBOOT USB DIAGNOSTICS";
+static char menu_item_ios[40] = "iOS 26";
+static char menu_item_android[40] = "Android";
+static const char *const menu_item_fastboot = "Fastboot Diagnostics";
+static char menu_badge_ios[16] = "RAM";
+static char menu_badge_android[16] = "ACTIVE";
 
 static const char *
 menu_item_str(int i)
@@ -403,7 +336,30 @@ menu_item_str(int i)
 	return menu_item_fastboot;
 }
 
-/* "LABEL (SLOT X)", or the label alone while the slot is unknown; fits the 40-byte menu items */
+static const char *
+menu_item_sub(int i)
+{
+	if (i == 0) return "Darwin XNU Kernel  -  APFS System";
+	if (i == 1) return "Qualcomm ABL  -  UFS LUN 4";
+	return "USB Command & Log Channel";
+}
+
+static const char *
+menu_item_badge(int i)
+{
+	if (i == 0) return menu_badge_ios;
+	if (i == 1) return menu_badge_android;
+	return "USB";
+}
+
+static const uint64_t *
+menu_item_icon(int i)
+{
+	if (i == 0) return ui_icon_apple;
+	if (i == 1) return ui_icon_android;
+	return ui_icon_usb;
+}
+
 static void
 menu_compose(char *dst, const char *label, char slot)
 {
@@ -424,10 +380,29 @@ menu_compose(char *dst, const char *label, char slot)
 }
 
 static void
+menu_compose_badge(char *dst, char slot, const char *fallback)
+{
+	if (slot == 'a' || slot == 'b') {
+		dst[0] = 'S'; dst[1] = 'L'; dst[2] = 'O'; dst[3] = 'T'; dst[4] = ' ';
+		dst[5] = (char)(slot - 'a' + 'A');
+		dst[6] = 0;
+	} else {
+		int i = 0;
+		while (fallback[i] && i < 15) {
+			dst[i] = fallback[i];
+			i++;
+		}
+		dst[i] = 0;
+	}
+}
+
+static void
 slot_update_menu_text(void)
 {
-	menu_compose(menu_item_ios, "[1] BOOT IOS 26", loader_slot);
-	menu_compose(menu_item_android, "[2] BOOT ANDROID", android_slot);
+	menu_compose(menu_item_ios, "iOS 26", loader_slot);
+	menu_compose(menu_item_android, "Android", android_slot);
+	menu_compose_badge(menu_badge_ios, loader_slot, "RAM");
+	menu_compose_badge(menu_badge_android, android_slot, "ACTIVE");
 }
 
 static efi_block_io *
@@ -548,54 +523,99 @@ slot_detect(void)
 }
 
 static void
+ui_draw_menu_card(int i, int selected)
+{
+	int card_x = UI_MARGIN;
+	int card_w = (int)SCREEN.width - 2 * UI_MARGIN;
+	int card_h = 204;
+	int card_y = 620 + i * 236;
+
+	uint32_t bg = selected ? UI_CARD_SEL_BG : UI_CARD_BG;
+	uint32_t brd = selected ? UI_CARD_SEL_BORDER : UI_CARD_BORDER;
+	uint32_t icon_box_bg = selected ? UI_ICON_SEL_BG : UI_ICON_BG;
+	uint32_t icon_fg = selected ? UI_TEXT_SEL_PRI : UI_WHITE;
+	uint32_t title_col = selected ? UI_TEXT_SEL_PRI : UI_TEXT_PRI;
+	uint32_t sub_col = selected ? UI_TEXT_SEL_SEC : UI_TEXT_SEC;
+	uint32_t badge_bg = selected ? UI_BADGE_SEL_BG : UI_BADGE_BG;
+	uint32_t badge_fg = selected ? UI_TEXT_SEL_PRI : UI_TEXT_SEC;
+
+	ui_round_rect(card_x, card_y, card_w, card_h, 36, selected ? 0 : 2, bg, brd, UI_BG);
+
+	/* Left icon badge */
+	int ib_x = card_x + 36;
+	int ib_y = card_y + (card_h - 96) / 2;
+	ui_round_rect(ib_x, ib_y, 96, 96, 24, 0, icon_box_bg, icon_box_bg, bg);
+	ui_draw_icon24(ib_x + 24, ib_y + 24, menu_item_icon(i), 2, icon_fg, icon_box_bg);
+
+	/* Title and subtitle */
+	const char *title = (i == 0) ? "iOS 26" : (i == 1) ? "Android" : menu_item_str(i);
+	const char *sub = menu_item_sub(i);
+	ui_draw_text_ex(ib_x + 128, card_y + 52, title, 3, 28, title_col, bg, 0, 1);
+	ui_draw_text_ex(ib_x + 128, card_y + 116, sub, 2, 40, sub_col, bg, 0, 0);
+
+	/* Right slot pill badge */
+	const char *badge = menu_item_badge(i);
+	int bw = ui_measure_text_ex(badge, 12, 2, 0) + 48;
+	int bh = 56;
+	int bx = card_x + card_w - bw - 36;
+	int by = card_y + (card_h - bh) / 2;
+	ui_round_rect(bx, by, bw, bh, 18, 0, badge_bg, badge_bg, bg);
+	ui_draw_text_ex(bx + 24, by + 12, badge, 2, 12, badge_fg, badge_bg, 0, 1);
+}
+
+static void
+ui_draw_menu_footer(int countdown, int pct_remaining, int user_interacted)
+{
+	int card_x = UI_MARGIN;
+	int card_w = (int)SCREEN.width - 2 * UI_MARGIN;
+	int bar_y = 1420;
+	int text_y = 1464;
+
+	if (!user_interacted && countdown > 0) {
+		if (pct_remaining < 0) pct_remaining = 0;
+		if (pct_remaining > 100) pct_remaining = 100;
+		ui_round_rect(card_x, bar_y, card_w, 14, 7, 0, UI_TRACK_BG, UI_TRACK_BG, UI_BG);
+		int fill = card_w * pct_remaining / 100;
+		if (fill > 0) {
+			if (fill < 14) fill = 14;
+			ui_round_rect(card_x, bar_y, fill, 14, 7, 0, UI_WHITE, UI_WHITE, UI_TRACK_BG);
+		}
+		char cmsg[64] = "Auto-boot in 5s   -   Vol: Select   Pwr: Confirm";
+		cmsg[13] = (char)('0' + countdown);
+		int cw = ui_measure_text_ex(cmsg, 56, 2, 0);
+		ui_fill(0, text_y - 4, (int)SCREEN.width, 44, UI_BG);
+		ui_draw_text_ex(((int)SCREEN.width - cw) / 2, text_y, cmsg, 2, 56, UI_TEXT_SEC, UI_BG, 0, 0);
+	} else {
+		ui_fill(card_x, bar_y - 2, card_w, 20, UI_BG);
+		const char *hint = "Volume Keys: Select Target   -   Power Key: Confirm";
+		int hw = ui_measure_text_ex(hint, 56, 2, 0);
+		ui_fill(0, text_y - 4, (int)SCREEN.width, 44, UI_BG);
+		ui_draw_text_ex(((int)SCREEN.width - hw) / 2, text_y, hint, 2, 56, UI_TEXT_SEC, UI_BG, 0, 0);
+	}
+}
+
+static void
 ui_draw_menu(int choice, int countdown, int user_interacted)
 {
-	int mid_y = (int)SCREEN.height / 3;
+	/* Top Apple/HackiOS emblem and header */
+	int emb_sz = 104;
+	int emb_x = ((int)SCREEN.width - emb_sz) / 2;
+	int emb_y = 240;
+	ui_round_rect(emb_x, emb_y, emb_sz, emb_sz, 52, 2, UI_CARD_BG, UI_CARD_BORDER, UI_BG);
+	ui_draw_icon24(emb_x + 28, emb_y + 26, ui_icon_apple, 2, UI_WHITE, UI_CARD_BG);
 
-	const char *title = "HACKIOS K90 BOOT MENU";
-	int tw = ui_text_width(title, 32, UI_TITLE_SCALE);
-	ui_text(((int)SCREEN.width - tw) / 2, mid_y - 60, title, UI_TITLE_SCALE, 32);
+	const char *title = "HackiOS Startup";
+	int tw = ui_measure_text_ex(title, 32, 3, 0);
+	ui_draw_text_ex(((int)SCREEN.width - tw) / 2, 376, title, 3, 32, UI_WHITE, UI_BG, 0, 1);
+
+	const char *sub = "REDMI K90  -  Select Boot System";
+	int sw = ui_measure_text_ex(sub, 40, 2, 0);
+	ui_draw_text_ex(((int)SCREEN.width - sw) / 2, 442, sub, 2, 40, UI_TEXT_SEC, UI_BG, 0, 0);
 
 	for (int i = 0; i < 3; i++) {
-		const char *item = menu_item_str(i);
-		int y = mid_y + 100 + i * 80;
-		int w = ui_text_width(item, 32, UI_AMOUNT_SCALE);
-		int x = ((int)SCREEN.width - w) / 2;
-		ui_fill(x - 20, y - 6, w + 40, 5 * UI_AMOUNT_SCALE + 12, UI_BLACK);
-		if (i == choice) {
-			ui_fill(x - 16, y - 4, w + 32, 5 * UI_AMOUNT_SCALE + 8, UI_WHITE);
-			for (int n = 0; n < 32 && item[n]; n++) {
-				const char *g = ui_glyph(item[n]);
-				for (int r = 0; r < 5; r++) {
-					for (int c = 0; c < 3; c++) {
-						if (g[r * 3 + c] == '#') {
-							ui_fill(x + n * 4 * UI_AMOUNT_SCALE + c * UI_AMOUNT_SCALE,
-							    y + r * UI_AMOUNT_SCALE, UI_AMOUNT_SCALE, UI_AMOUNT_SCALE, UI_BLACK);
-						}
-					}
-				}
-			}
-		} else {
-			ui_text(x, y, item, UI_AMOUNT_SCALE, 32);
-		}
+		ui_draw_menu_card(i, i == choice);
 	}
-
-	int cy = mid_y + 360;
-	ui_fill(0, cy - 6, (int)SCREEN.width, 5 * UI_LOG_SCALE + 12, UI_BLACK);
-	if (!user_interacted && countdown > 0) {
-		char cmsg[48];
-		cmsg[0] = 'A'; cmsg[1] = 'U'; cmsg[2] = 'T'; cmsg[3] = 'O'; cmsg[4] = ' ';
-		cmsg[5] = 'B'; cmsg[6] = 'O'; cmsg[7] = 'O'; cmsg[8] = 'T'; cmsg[9] = ' ';
-		cmsg[10] = 'I'; cmsg[11] = 'N'; cmsg[12] = ' ';
-		cmsg[13] = (char)('0' + countdown);
-		cmsg[14] = ' '; cmsg[15] = 'S'; cmsg[16] = 0;
-		int cw = ui_text_width(cmsg, 16, UI_LOG_SCALE);
-		ui_text(((int)SCREEN.width - cw) / 2, cy, cmsg, UI_LOG_SCALE, 16);
-	} else {
-		const char *hint = "VOL KEYS: SELECT   PWR: CONFIRM";
-		int hw = ui_text_width(hint, 32, UI_LOG_SCALE);
-		ui_text(((int)SCREEN.width - hw) / 2, cy, hint, UI_LOG_SCALE, 32);
-	}
+	ui_draw_menu_footer(countdown, countdown * 20, user_interacted);
 }
 
 #define SPMI_ARB_CORE   ((uintptr_t)0x0c400000ULL)
@@ -699,8 +719,23 @@ spmi_btn_edge(struct spmi_btn *b, int pressed)
 }
 
 static int usb_menu_interrupted;
-static int boot_fallback_active;
 static void usb_poll_command(void);
+
+static void
+ui_menu_select(int *choice, int next_choice, int countdown, int *user_interacted)
+{
+	int prev = *choice;
+	int first_interact = (*user_interacted == 0);
+	*user_interacted = 1;
+	*choice = next_choice;
+	if (prev != next_choice) {
+		ui_draw_menu_card(prev, 0);
+		ui_draw_menu_card(next_choice, 1);
+	}
+	if (first_interact) {
+		ui_draw_menu_footer(countdown, 0, 1);
+	}
+}
 
 static int
 ui_boot_menu(void)
@@ -709,6 +744,7 @@ ui_boot_menu(void)
 	int choice = MENU_CHOICE_IOS;
 	uint64_t start_time, last_spmi_poll, freq, poll_ticks;
 	int countdown = 5;
+	int last_pct = 100;
 	int user_interacted = 0;
 	struct spmi_btn_ctx spmi_btns;
 
@@ -725,8 +761,8 @@ ui_boot_menu(void)
 	start_time = ui_now();
 	last_spmi_poll = start_time;
 
-	int mid_y = (int)SCREEN.height / 3;
-	ui_fill(0, mid_y - 80, (int)SCREEN.width, 600, UI_BLACK);
+	UI.usb_chrome_drawn = 0;
+	ui_fill(0, 0, (int)SCREEN.width, (int)SCREEN.height, UI_BG);
 	ui_draw_menu(choice, countdown, user_interacted);
 	usb_menu_interrupted = 0;
 
@@ -740,16 +776,12 @@ ui_boot_menu(void)
 			efi_input_key key;
 			efi_status status = cin->read_key_stroke(cin, &key);
 			if (!EFI_ERROR(status)) {
-				user_interacted = 1;
 				if (key.scan_code == 0x0001 || key.unicode_char == '+' || key.unicode_char == 'k' || key.unicode_char == '1') {
-					choice = (choice + 2) % 3;
-					ui_draw_menu(choice, countdown, user_interacted);
+					ui_menu_select(&choice, (choice + 2) % 3, countdown, &user_interacted);
 				} else if (key.scan_code == 0x0002 || key.unicode_char == '-' || key.unicode_char == 'j' || key.unicode_char == '2') {
-					choice = (choice + 1) % 3;
-					ui_draw_menu(choice, countdown, user_interacted);
+					ui_menu_select(&choice, (choice + 1) % 3, countdown, &user_interacted);
 				} else if (key.unicode_char == '3') {
-					choice = MENU_CHOICE_FASTBOOT;
-					ui_draw_menu(choice, countdown, user_interacted);
+					ui_menu_select(&choice, MENU_CHOICE_FASTBOOT, countdown, &user_interacted);
 				} else if (key.scan_code == 0x0017 || key.scan_code == 0x0003 || key.unicode_char == '\r' || key.unicode_char == '\n' || key.unicode_char == ' ') {
 					break;
 				}
@@ -771,13 +803,9 @@ ui_boot_menu(void)
 				up_edge = spmi_btn_edge(&spmi_btns.vol_up, (rt & 0x01u) == 0);
 			}
 			if (up_edge) {
-				user_interacted = 1;
-				choice = (choice + 2) % 3;
-				ui_draw_menu(choice, countdown, user_interacted);
+				ui_menu_select(&choice, (choice + 2) % 3, countdown, &user_interacted);
 			} else if (down_edge) {
-				user_interacted = 1;
-				choice = (choice + 1) % 3;
-				ui_draw_menu(choice, countdown, user_interacted);
+				ui_menu_select(&choice, (choice + 1) % 3, countdown, &user_interacted);
 			} else if (pwr_edge) {
 				break;
 			}
@@ -785,14 +813,17 @@ ui_boot_menu(void)
 
 		if (!user_interacted) {
 			uint64_t elapsed = now - start_time;
+			uint64_t total_ticks = 5 * freq;
+			if (elapsed >= total_ticks) {
+				choice = MENU_CHOICE_IOS;
+				break;
+			}
 			int sec_left = 5 - (int)(elapsed / freq);
-			if (sec_left != countdown) {
+			int pct_left = (int)((total_ticks - elapsed) * 100 / (total_ticks ? total_ticks : 1));
+			if (sec_left != countdown || pct_left / 2 != last_pct / 2) {
 				countdown = sec_left;
-				if (countdown <= 0) {
-					choice = MENU_CHOICE_IOS;
-					break;
-				}
-				ui_draw_menu(choice, countdown, user_interacted);
+				last_pct = pct_left;
+				ui_draw_menu_footer(countdown, pct_left, 0);
 			}
 		}
 
@@ -800,7 +831,12 @@ ui_boot_menu(void)
 		}
 	}
 
-	ui_fill(0, mid_y - 80, (int)SCREEN.width, 600, UI_BLACK);
+	if (choice == MENU_CHOICE_IOS) {
+		UI.usb_chrome_drawn = 0;
+		ui_draw_ios_boot_splash();
+	} else {
+		ui_fill(0, 0, (int)SCREEN.width, (int)SCREEN.height, UI_BG);
+	}
 	return choice;
 }
 
@@ -1027,28 +1063,36 @@ ui_draw_fault_banner(const char *status_line, const char *klog, uint64_t klog_le
 	if (!ui_on()) {
 		return;
 	}
-	int top_y = (int)SCREEN.height - 920;
-	if (top_y < 0) {
-		top_y = 0;
+	int card_x = UI_MARGIN;
+	int card_w = (int)SCREEN.width - 2 * UI_MARGIN;
+	int top_y = 1250;
+	int card_h = (int)SCREEN.height - top_y - 60;
+	if (card_h < 400) {
+		top_y = (int)SCREEN.height - 920;
+		if (top_y < 0) top_y = 0;
+		card_h = (int)SCREEN.height - top_y - 40;
 	}
-	ui_fill(0, top_y, (int)SCREEN.width, (int)SCREEN.height - top_y, 0xff180000u);
-	ui_fill(0, top_y, (int)SCREEN.width, 64, 0xffcc1010u);
-	const char *hdr = "KERNEL FAULT / HUNG - FASTBOOT RECOVERY";
-	int hw = ui_text_width(hdr, 40, UI_AMOUNT_SCALE);
-	ui_text(((int)SCREEN.width - hw) / 2, top_y + 18, hdr, UI_AMOUNT_SCALE, 40);
 
-	int maxc = ((int)SCREEN.width - 2 * UI_LEFT) / (4 * UI_LOG_SCALE);
-	int y = top_y + 82;
-	ui_text(UI_LEFT, y, status_line, UI_LOG_SCALE, maxc);
-	y += UI_LOG_STEP + 6;
+	ui_round_rect(card_x, top_y, card_w, card_h, 36, 3, UI_FAULT_BG, UI_FAULT_BORDER, UI_BG);
+	ui_round_rect(card_x + 20, top_y + 20, card_w - 40, 68, 22, 0, UI_FAULT_HDR_BG, UI_FAULT_HDR_BG, UI_FAULT_BG);
+
+	const char *hdr = "KERNEL FAULT / HUNG - FASTBOOT RECOVERY";
+	int hw = ui_measure_text_ex(hdr, 44, UI_AMOUNT_SCALE, 0);
+	ui_draw_text_ex(((int)SCREEN.width - hw) / 2, top_y + 38, hdr, UI_AMOUNT_SCALE, 44, UI_RED, UI_FAULT_HDR_BG, 0, 1);
+
+	int maxc = 96;
+	int y = top_y + 112;
+	ui_draw_text_ex(card_x + 32, y, status_line, UI_LOG_SCALE, maxc, UI_AMBER, UI_FAULT_BG, 1, 1);
+	y += UI_LOG_STEP + 8;
 
 	const char *src = (klog != NULL && klog_len > 0 && klog_len <= (16u << 20)) ? klog : log_buf;
 	uint64_t slen = (src == klog) ? klog_len : log_len;
 	while (slen > 0 && (src[slen - 1] == 0 || src[slen - 1] == '\n' || src[slen - 1] == '\r')) {
 		slen--;
 	}
+	int max_y = top_y + card_h - 36;
 	/* First show any line containing "panic" */
-	for (uint64_t i = 0; i + 5 < slen && y < (int)SCREEN.height - 460; i++) {
+	for (uint64_t i = 0; i + 5 < slen && y + 32 < max_y - 120; i++) {
 		if ((src[i] == 'p' || src[i] == 'P') &&
 		    (src[i + 1] == 'a' || src[i + 1] == 'A') &&
 		    (src[i + 2] == 'n' || src[i + 2] == 'N') &&
@@ -1059,30 +1103,30 @@ ui_draw_fault_banner(const char *status_line, const char *klog, uint64_t klog_le
 			while (le < slen && src[le] != '\n' && src[le] != '\r') le++;
 			int n = (int)(le - ls);
 			if (n > maxc) n = maxc;
-			ui_text(UI_LEFT, y, src + ls, UI_LOG_SCALE, n);
+			ui_draw_text_ex(card_x + 32, y, src + ls, UI_LOG_SCALE, n, 0x00ff8a80u, UI_FAULT_BG, 1, 1);
 			y += UI_LOG_STEP;
 			i = le;
 		}
 	}
 	/* Then show the last lines of the log */
-	int rem_rows = ((int)SCREEN.height - 420 - y) / UI_LOG_STEP;
+	int rem_rows = (max_y - y) / UI_LOG_STEP;
 	if (rem_rows > 0 && slen > 0) {
 		uint64_t start = slen;
 		for (int lines = 0; start > 0 && lines < rem_rows; start--) {
 			if (src[start - 1] == '\n') lines++;
 		}
-		for (uint64_t line = start, p; line < slen && y < (int)SCREEN.height - 420; line = p + 1) {
+		for (uint64_t line = start, p; line < slen && y + 32 <= max_y; line = p + 1) {
 			for (p = line; p < slen && src[p] != '\n'; p++) {}
 			int n = (int)(p - line);
 			while (n > 0 && src[line + n - 1] == '\r') n--;
 			if (n > maxc) n = maxc;
-			ui_text(UI_LEFT, y, src + line, UI_LOG_SCALE, n);
+			ui_draw_text_ex(card_x + 32, y, src + line, UI_LOG_SCALE, n, 0x00e5c5c8u, UI_FAULT_BG, 1, 0);
 			y += UI_LOG_STEP;
 		}
 	}
 	if (skip_ufs_arbitration && SCREEN.base == 0xfc800000ULL) {
-		uint64_t off = (uint64_t)top_y * SCREEN.stride;
-		uint64_t bytes = (uint64_t)((int)SCREEN.height - top_y) * SCREEN.stride;
+		uint64_t off = 0;
+		uint64_t bytes = (uint64_t)SCREEN.height * SCREEN.stride;
 		memcpy((void *)(uintptr_t)(0xfd400000ULL + off), (const void *)(uintptr_t)(SCREEN.base + off), bytes);
 		clean_dcache(0xfd400000ULL + off, 0xfd400000ULL + off + bytes);
 	}
@@ -1126,5 +1170,3 @@ boot_fallback_check(void)
 		host_last_cmd = READ_SYSREG(CNTVCT_EL0);
 	}
 }
-
-
