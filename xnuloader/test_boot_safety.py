@@ -164,10 +164,13 @@ class TestSourceContracts(unittest.TestCase):
         self.assertTrue(0 < idx_block < idx_inspect < idx_slot_detect < idx_menu,
                         "Must call block_start, inspect_storage, and slot_detect before ui_boot_menu")
 
-        # Fallback to fastboot debug loop
+        # Fallback to fastboot debug loop and unattended recovery safeguards
         self.assertIn("boot_fallback_enter();", text)
         self.assertIn("BOOT FALLBACK - FASTBOOT MODE", (HERE / "loader_06a_screen_ui.inc").read_text())
         self.assertIn("usb_command_loop()", text)
+        self.assertIn("(void)menu_enter_fastboot();", text)
+        self.assertIn("spmi_reboot_lk_prepare();", text)
+        self.assertIn("spmi_reboot_lk_prepare(void)", (HERE / "loader_06a_screen_ui.inc").read_text())
 
     def test_run_kernel_null_fallback(self):
         run_inc = HERE / "loader_05_layout_run_kernel.inc"
@@ -379,6 +382,22 @@ class TestStandalonePackager(unittest.TestCase):
                     with self.subTest(argument=argument), self.assertRaises(ValueError):
                         module.build_standalone_payload(fixture, fixture, output, boot_image=fixture,
                                                        cmdline=module.DEFAULT_CMDLINE + ' ' + argument)
+                run.assert_not_called()
+                compress.assert_not_called()
+            self.assertFalse(output.parent.exists())
+
+    def test_stale_macho_kernel_without_return_quiesce_rejected(self):
+        module = self.packager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kernel, helper, boot = (root / name for name in ('kernel', 'helper', 'boot'))
+            kernel.write_bytes(b'\xcf\xfa\xed\xfe' + b'\x00' * (1048576 + 64))
+            helper.write_bytes(b'NXSB' + b'\x00' * 1024)
+            boot.write_bytes(b'NXSB' + b'\x00' * 1024)
+            output = root / 'new-directory' / 'payload.bin'
+            with patch.object(module.subprocess, 'run') as run, patch.object(module, 'compress_lz4') as compress:
+                with self.assertRaisesRegex(ValueError, '_adreno8_return_quiesce'):
+                    module.build_standalone_payload(kernel, helper, output, boot_image=boot)
                 run.assert_not_called()
                 compress.assert_not_called()
             self.assertFalse(output.parent.exists())

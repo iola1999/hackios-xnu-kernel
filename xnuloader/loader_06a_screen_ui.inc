@@ -628,41 +628,46 @@ ui_draw_menu(int choice, int countdown, int user_interacted)
 #define SPMI_ARB_CORE   ((uintptr_t)0x0c400000ULL)
 #define SPMI_ARB_OBSRV  ((uintptr_t)0x0c440000ULL)
 
-struct spmi_btn {
-	int usable;
-	int live;
-	int last;
-	int down;
-};
-
-struct spmi_btn_ctx {
-	int pon_ch;
-	int pin_ch;
-	struct spmi_btn pwr;
-	struct spmi_btn vol_up;
-	struct spmi_btn vol_down;
-};
+struct spmi_btn { int usable, live, last, down; };
+struct spmi_btn_ctx { int pon_ch, pin_ch; struct spmi_btn pwr, vol_up, vol_down; };
 
 static int
 spmi_obsrv_read(int ch, uint8_t reg, uint8_t *buf, uint32_t count)
 {
 	if (ch < 0 || count == 0 || count > 8) return 0;
 	uintptr_t base = SPMI_ARB_OBSRV + (uintptr_t)0x20ULL * (uintptr_t)ch;
-	uint32_t opc = (count > 4) ? 1u : 13u;
+	uint32_t opc = (count > 4) ? 1u : 13u, status = 0;
 	*(volatile uint32_t *)(base + 0x00) = (opc << 27) | (((uint32_t)reg & 0xffu) << 4) | (count - 1);
-	uint32_t status = 0;
 	for (int i = 0; i < 4000; i++) {
 		status = *(volatile uint32_t *)(base + 0x08);
 		if (status & 0x1u) break;
 	}
 	if (!(status & 0x1u) || (status & 0xeu)) return 0;
-	uint32_t d[2];
-	d[0] = *(volatile uint32_t *)(base + 0x18);
-	d[1] = (count > 4) ? *(volatile uint32_t *)(base + 0x1c) : 0;
-	for (uint32_t i = 0; i < count; i++) {
-		buf[i] = (uint8_t)(d[i / 4] >> (8 * (i % 4)));
-	}
+	uint32_t d[2] = { *(volatile uint32_t *)(base + 0x18), (count > 4) ? *(volatile uint32_t *)(base + 0x1c) : 0 };
+	for (uint32_t i = 0; i < count; i++) buf[i] = (uint8_t)(d[i / 4] >> (8 * (i % 4)));
 	return 1;
+}
+
+/* Write PMK8550 SID 0 SDAM 0x7148 = (orig & 1) | (2 << 1) so PSCI reset enters LK Fastboot. */
+static void
+spmi_reboot_lk_prepare(void)
+{
+	if (SCREEN.base != platform_annibale.fb_base) return;
+	if (*(volatile uint32_t *)(SPMI_ARB_CORE + 0x000) < 0x70000000u) return;
+	uint32_t channels = *(volatile uint32_t *)(SPMI_ARB_CORE + 0x004) & 0x7ffu;
+	if (channels == 0 || channels > 1024) channels = 1024;
+	for (uint32_t n = 0; n < channels; n++) {
+		uint32_t map = *(volatile uint32_t *)(SPMI_ARB_CORE + (uintptr_t)0x2000ULL + (uintptr_t)(4 * n));
+		if (((map >> 8) & 0xfffu) != 0x071u) continue;
+		if ((*(volatile uint32_t *)(SPMI_ARB_CORE + (uintptr_t)0x2d000ULL + (uintptr_t)(4 * n)) & 0xfu) != 0) break;
+		uint8_t orig = 0;
+		if (!spmi_obsrv_read((int)n, 0x48, &orig, 1)) break;
+		uintptr_t wbase = (uintptr_t)0x0c500000ULL + (uintptr_t)0x1000ULL * n;
+		*(volatile uint32_t *)(wbase + 0x10) = (uint32_t)((orig & 1u) | 4u);
+		*(volatile uint32_t *)(wbase + 0x00) = 0x48u << 4;
+		for (int i = 0; i < 4000 && !(*(volatile uint32_t *)(wbase + 0x08) & 0x1u); i++) {}
+		break;
+	}
 }
 
 static void
@@ -745,20 +750,12 @@ static int
 ui_boot_menu(void)
 {
 	efi_simple_text_input *cin = (efi_simple_text_input *)ST->con_in;
-	int choice = MENU_CHOICE_IOS;
+	int choice = MENU_CHOICE_IOS, countdown = 5, last_pct = 100, user_interacted = 0;
 	uint64_t start_time, last_spmi_poll, freq, poll_ticks;
-	int countdown = 5;
-	int last_pct = 100;
-	int user_interacted = 0;
 	struct spmi_btn_ctx spmi_btns;
 
-	if (SCREEN.base == 0) {
-		return MENU_CHOICE_IOS;
-	}
-
-	if (loader_slot == 0 && android_slot == 0) {
-		slot_detect();
-	}
+	if (SCREEN.base == 0) return MENU_CHOICE_IOS;
+	if (loader_slot == 0 && android_slot == 0) slot_detect();
 	spmi_buttons_init(&spmi_btns);
 
 	UI.ready = 1;
@@ -851,8 +848,12 @@ ui_boot_menu(void)
 		UI.usb_chrome_drawn = 0;
 		ui_draw_ios_boot_splash();
 		uint64_t splash_t0 = ui_now();
-		while (usb_connected && ui_now() - splash_t0 < freq / 2) {
+		while (usb_connected && !usb_menu_interrupted && ui_now() - splash_t0 < freq / 2) {
 			usb_poll_command();
+		}
+		if (usb_menu_interrupted) {
+			choice = MENU_CHOICE_FASTBOOT;
+			ui_fill(0, 0, (int)SCREEN.width, (int)SCREEN.height, UI_BG);
 		}
 	} else {
 		ui_fill(0, 0, (int)SCREEN.width, (int)SCREEN.height, UI_BG);

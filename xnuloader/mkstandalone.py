@@ -97,6 +97,10 @@ def build_standalone_payload(
 
     if not kernel.is_file():
         raise FileNotFoundError(f"kernel not found at {kernel}")
+    if kernel.stat().st_size > 1048576:
+        kbytes = kernel.read_bytes()
+        if kbytes[:4] == b"\xcf\xfa\xed\xfe" and b"_adreno8_return_quiesce" not in kbytes:
+            raise ValueError(f"kernel {kernel} lacks _adreno8_return_quiesce and would hang in wfe on loader_return")
     if not ramdisk.is_file():
         raise FileNotFoundError(f"ramdisk not found at {ramdisk}")
     if boot_image is None:

@@ -713,7 +713,7 @@ loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p
 		annibale_wifi_stop();
 		loader_return();
 	}
-	clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
+	clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
 	thread_call_enter_delayed(loader_stop_call, deadline);
 }
 

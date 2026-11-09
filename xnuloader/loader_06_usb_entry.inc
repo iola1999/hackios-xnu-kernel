@@ -606,6 +606,9 @@ fb_command(char *cmd)
 	int live = running_live != NULL;
 
 	host_last_cmd = READ_SYSREG(CNTVCT_EL0);
+	if (!live && !kernel_resources_held && !firmware_fault && !held_irq_masked) {
+		(void)menu_enter_fastboot();
+	}
 	{
 		if (live && download_to_inbox && starts_with(cmd, "download:")) {
 			inbox_download(cmd + 9);
@@ -883,6 +886,9 @@ fb_command(char *cmd)
 			}
 			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "reboot") || starts_with(cmd, "oem reboot")) {
+			if (str_eq(cmd, "reboot-bootloader") || str_eq(cmd, "oem reboot-lk")) {
+				spmi_reboot_lk_prepare();
+			}
 			fb_reply("OKAY", "");
 			if (PLAT == &platform_annibale || kernel_resources_held || firmware_fault) {
 				/* annibale matches ArmPsciResetSystemLib; on any platform a held or faulted
@@ -1112,7 +1118,6 @@ efi_main(efi_handle image, efi_system_table *st)
 	ST = st;
 	BS = st->bs;
 	IMAGE = image;
-
 	BS->set_watchdog_timer(0, 0, 0, NULL);
 	print("== XNULOADER v3 ==\n");
 	print("CurrentEL=%x MIDR=%x MMFR0=%x CNTFRQ=%d image=%x\n", READ_SYSREG(CurrentEL) >> 2, READ_SYSREG(MIDR_EL1),
@@ -1123,15 +1128,10 @@ efi_main(efi_handle image, efi_system_table *st)
 	    GOP->mode->info == NULL || GOP->mode->fb_base == 0) {
 		GOP = NULL;                     /* no display (QEMU without -device ramfb) */
 #ifdef DIRECT_PHONE_PLAT
-		/*
-		 * A phone build must select annibale even without GOP. The device tree reserves
-		 * splash_region at 0xfc800000+0x2b00000, matching MemoryMapLib's Display_Reserved.
-		 * The P11 mode is 1156x2510. BootArgs.video uses that buffer for kernel output;
-		 * visible scanout still depends on the panel state left by LK.
-		 */
+		/* A phone build selects annibale even without GOP (splash_region 0xfc800000+0x2b00000, P11 1156x2510). */
 		PLAT = &platform_annibale;
 		SCREEN.base = platform_annibale.fb_base;
-		SCREEN.width = 1156;              /* P11 mode from the device tree and Android DRM */
+		SCREEN.width = 1156;
 		SCREEN.height = 2510;
 		SCREEN.stride = 1156 * 4;
 		print("display assumed at %x: LK splash region\n", SCREEN.base);
@@ -1156,7 +1156,6 @@ efi_main(efi_handle image, efi_system_table *st)
 	}
 	print("platform %s\n", PLAT->name);
 	skip_ufs_arbitration = (PLAT == &platform_annibale); /* Native UFS driver owns controller setup on K90. */
-
 	install_exception_hook();
 	wdt_arm();
 	screen_quiet = 1;
@@ -1181,10 +1180,10 @@ efi_main(efi_handle image, efi_system_table *st)
 	}
 
 	/* One-shot mode: run the kernel that came with the image, then fall back to Fastboot if it returns. */
-	if (have_payload) {
+	if (have_payload && !pi.usb_mode) {
 		run_kernel(0, 0);
+		boot_fallback_enter();
 	}
-	boot_fallback_enter();
 	if (USB != NULL || usb_start()) {
 		usb_command_loop();
 	}
