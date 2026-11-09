@@ -206,7 +206,7 @@ rw_stitch_dump_linked(id descriptor)
 
 - (NSString *)name { return _name; }
 - (id)annibaleConstantValues { return _constantValues; }
-- (id)annibaleUnspecializedFunction { return _cachedBitcode != nil ? self : _function; }
+- (id)annibaleUnspecializedFunction { return _cachedBitcode != nil ? nil : _function; }
 - (NSData *)bitcodeData
 {
 	if (_cachedBitcode != nil)
@@ -218,22 +218,15 @@ rw_stitch_dump_linked(id descriptor)
 }
 - (id)forwardingTargetForSelector:(SEL)sel
 {
-	if (sel == sel_getUid("bitcodeData") && _cachedBitcode != nil)
-		return nil;
+	(void)sel;
 	return _function;
 }
 - (NSMethodSignature *)methodSignatureForSelector:(SEL)sel
 {
-	if (sel == sel_getUid("bitcodeData"))
-		return [NSMethodSignature signatureWithObjCTypes:"@@:"];
 	return [_function methodSignatureForSelector:sel];
 }
 - (void)forwardInvocation:(NSInvocation *)invocation
 {
-	if ([invocation selector] == sel_getUid("bitcodeData") && _cachedBitcode != nil) {
-		[invocation setReturnValue:&_cachedBitcode];
-		return;
-	}
 	[invocation invokeWithTarget:_function];
 }
 - (BOOL)respondsToSelector:(SEL)sel

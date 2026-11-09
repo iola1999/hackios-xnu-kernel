@@ -115,7 +115,18 @@ static void *rw_completion_main(void *unused);
 	uint64_t began_us = rw_now_us(), fence_us, writeback_us = 0;
 
 	char why[256] = { 0 };
+	bool waiting_gpu = (fence == NULL && mesa.fence_take == NULL && !_failed && mesa.finish != NULL) ||
+	    fence != NULL;
 
+	if (waiting_gpu) {
+		unsigned slot = __atomic_add_fetch(&fence_waits, 1, __ATOMIC_ACQ_REL);
+		__atomic_add_fetch(&hb_wait, 1, __ATOMIC_RELAXED);
+		fence_frame = commit;
+		fence_owner = (const void *)self;
+		fence_tid = (unsigned)pthread_mach_thread_np(pthread_self());
+		fence_began_us = began_us;
+		__atomic_store_n(&fence_wait, slot, __ATOMIC_RELEASE);
+	}
 	/* A compiler library without the fence calls: wait for everything, as -commit used to. */
 	if (fence == NULL && mesa.fence_take == NULL && !_failed && mesa.finish != NULL &&
 	    mesa.finish(device, why, sizeof(why)) != 0) {
@@ -129,6 +140,9 @@ static void *rw_completion_main(void *unused);
 					  userInfo:@{ NSLocalizedDescriptionKey:
 						      @"the GPU did not finish this command buffer in time" }] retain];
 		_failed = YES;
+	}
+	if (waiting_gpu) {
+		__atomic_store_n(&fence_wait, 0, __ATOMIC_RELEASE);
 	}
 	fence_us = rw_now_us() - began_us;
 	if (fence != NULL) {

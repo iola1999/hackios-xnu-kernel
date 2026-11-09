@@ -475,6 +475,8 @@ static pthread_mutex_t rw_commit_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 		rw_print("commit %u started while commit %u was still running\n", commit_count + 1,
 			 commit_count);
 	}
+	uint64_t prev_started = commit_started;
+	unsigned prev_in_flight = commit_in_flight;
 	commit_started = started;
 	unsigned this_commit = ++commit_count;
 	pthread_once(&rw_watch_once, rw_start_watch);
@@ -763,8 +765,8 @@ done:
 	 * included: a buffer that errored is as finished as one that drew, and a slot kept
 	 * because of an error would turn one bad draw into a queue that blocks for ever. */
 	[self annibaleReturnSlot];
-	commit_started = 0;
-	commit_in_flight = 0;
+	commit_started = prev_started;
+	commit_in_flight = prev_in_flight;
 	/* The handlers run outside the lock: one that waits for another thread's commit would
 	 * otherwise wait for ever. */
 	pthread_mutex_unlock(&rw_commit_lock);
