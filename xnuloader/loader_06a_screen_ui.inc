@@ -55,7 +55,7 @@ ui_freq(void)
 static int
 ui_on(void)
 {
-	return UI.ready && running_live == NULL && !kernel_resources_held && !firmware_fault;
+	return UI.ready && running_live == NULL && (!kernel_resources_held || boot_fallback_active) && !firmware_fault;
 }
 
 static void
@@ -564,7 +564,7 @@ ui_draw_menu_card(int i, int selected)
 }
 
 static void
-ui_draw_menu_footer(int countdown, int pct_remaining, int user_interacted)
+ui_draw_menu_footer(int countdown, int pct_remaining, int user_interacted, int redraw_text)
 {
 	int card_x = UI_MARGIN;
 	int card_w = (int)SCREEN.width - 2 * UI_MARGIN;
@@ -580,12 +580,14 @@ ui_draw_menu_footer(int countdown, int pct_remaining, int user_interacted)
 			if (fill < 14) fill = 14;
 			ui_round_rect(card_x, bar_y, fill, 14, 7, 0, UI_WHITE, UI_WHITE, UI_TRACK_BG);
 		}
-		char cmsg[64] = "Auto-boot in 5s   -   Vol: Select   Pwr: Confirm";
-		cmsg[13] = (char)('0' + countdown);
-		int cw = ui_measure_text_ex(cmsg, 56, 2, 0);
-		ui_fill(0, text_y - 4, (int)SCREEN.width, 44, UI_BG);
-		ui_draw_text_ex(((int)SCREEN.width - cw) / 2, text_y, cmsg, 2, 56, UI_TEXT_SEC, UI_BG, 0, 0);
-	} else {
+		if (redraw_text) {
+			char cmsg[64] = "Auto-boot in 5s   -   Vol: Select   Pwr: Confirm";
+			cmsg[13] = (char)('0' + countdown);
+			int cw = ui_measure_text_ex(cmsg, 56, 2, 0);
+			ui_fill(0, text_y - 4, (int)SCREEN.width, 44, UI_BG);
+			ui_draw_text_ex(((int)SCREEN.width - cw) / 2, text_y, cmsg, 2, 56, UI_TEXT_SEC, UI_BG, 0, 0);
+		}
+	} else if (redraw_text) {
 		ui_fill(card_x, bar_y - 2, card_w, 20, UI_BG);
 		const char *hint = "Volume Keys: Select Target   -   Power Key: Confirm";
 		int hw = ui_measure_text_ex(hint, 56, 2, 0);
@@ -615,7 +617,7 @@ ui_draw_menu(int choice, int countdown, int user_interacted)
 	for (int i = 0; i < 3; i++) {
 		ui_draw_menu_card(i, i == choice);
 	}
-	ui_draw_menu_footer(countdown, countdown * 20, user_interacted);
+	ui_draw_menu_footer(countdown, countdown * 20, user_interacted, 1);
 }
 
 #define SPMI_ARB_CORE   ((uintptr_t)0x0c400000ULL)
@@ -733,7 +735,7 @@ ui_menu_select(int *choice, int next_choice, int countdown, int *user_interacted
 		ui_draw_menu_card(next_choice, 1);
 	}
 	if (first_interact) {
-		ui_draw_menu_footer(countdown, 0, 1);
+		ui_draw_menu_footer(countdown, 0, 1, 1);
 	}
 }
 
@@ -752,22 +754,30 @@ ui_boot_menu(void)
 		return MENU_CHOICE_IOS;
 	}
 
-	slot_detect();
+	if (loader_slot == 0 && android_slot == 0) {
+		slot_detect();
+	}
 	spmi_buttons_init(&spmi_btns);
-
-	freq = ui_freq();
-	poll_ticks = freq / 100;
-	if (poll_ticks == 0) poll_ticks = 1;
-	start_time = ui_now();
-	last_spmi_poll = start_time;
 
 	UI.usb_chrome_drawn = 0;
 	ui_fill(0, 0, (int)SCREEN.width, (int)SCREEN.height, UI_BG);
 	ui_draw_menu(choice, countdown, user_interacted);
 	usb_menu_interrupted = 0;
 
-	while (1) {
+	freq = ui_freq();
+	poll_ticks = freq / 100;
+	if (poll_ticks == 0) poll_ticks = 1;
+	start_time = ui_now();
+	while (!usb_connected && !usb_menu_interrupted && ui_now() - start_time < (freq * 3) / 2) {
 		usb_poll_command();
+	}
+	start_time = ui_now();
+	last_spmi_poll = start_time;
+
+	while (1) {
+		for (int u = 0; u < 32 && !usb_menu_interrupted; u++) {
+			usb_poll_command();
+		}
 		if (usb_menu_interrupted) {
 			choice = MENU_CHOICE_FASTBOOT;
 			break;
@@ -820,20 +830,25 @@ ui_boot_menu(void)
 			}
 			int sec_left = 5 - (int)(elapsed / freq);
 			int pct_left = (int)((total_ticks - elapsed) * 100 / (total_ticks ? total_ticks : 1));
-			if (sec_left != countdown || pct_left / 2 != last_pct / 2) {
+			if (sec_left != countdown || pct_left / 5 != last_pct / 5) {
+				int redraw_text = (sec_left != countdown);
 				countdown = sec_left;
 				last_pct = pct_left;
-				ui_draw_menu_footer(countdown, pct_left, 0);
+				ui_draw_menu_footer(countdown, pct_left, 0, redraw_text);
 			}
 		}
 
-		for (volatile int d = 0; d < 10000; d++) {
+		for (volatile int d = 0; d < 200; d++) {
 		}
 	}
 
 	if (choice == MENU_CHOICE_IOS) {
 		UI.usb_chrome_drawn = 0;
 		ui_draw_ios_boot_splash();
+		uint64_t splash_t0 = ui_now();
+		while (usb_connected && ui_now() - splash_t0 < freq / 2) {
+			usb_poll_command();
+		}
 	} else {
 		ui_fill(0, 0, (int)SCREEN.width, (int)SCREEN.height, UI_BG);
 	}

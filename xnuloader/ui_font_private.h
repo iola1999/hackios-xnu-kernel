@@ -191,16 +191,6 @@ ui_blend(uint32_t bg, uint32_t fg, uint32_t a)
 	return rb | g;
 }
 
-static inline uint32_t
-ui_get_px(int x, int y)
-{
-	if (SCREEN.base == 0 || x < 0 || y < 0 || x >= (int)SCREEN.width || y >= (int)SCREEN.height) {
-		return 0;
-	}
-	volatile uint32_t *fb = (volatile uint32_t *)(uintptr_t)SCREEN.base;
-	return fb[(unsigned)y * (SCREEN.stride / 4) + (unsigned)x] & 0x00ffffffu;
-}
-
 static inline void
 ui_put_px(int x, int y, uint32_t color)
 {
@@ -399,8 +389,7 @@ ui_draw_text_ex(int x, int y, const char *s, int scale, int max_chars, uint32_t 
 					if (a > 0) {
 						int dst_x = cx + px;
 						int dst_y = y + py;
-						uint32_t cur_bg = ui_get_px(dst_x, dst_y);
-						ui_put_px(dst_x, dst_y, ui_blend(cur_bg, fg, a));
+						ui_put_px(dst_x, dst_y, ui_blend(bg, fg, a));
 					}
 				}
 			}
@@ -447,8 +436,7 @@ ui_draw_icon24(int x, int y, const uint64_t *icon, int scale, uint32_t fg, uint3
 			uint32_t bot = (v01 * (16 - fx) + v11 * fx) >> 4;
 			uint32_t a = (top * (16 - fy) + bot * fy) >> 4;
 			if (a > 0) {
-				uint32_t cur_bg = ui_get_px(x + px, y + py);
-				ui_put_px(x + px, y + py, ui_blend(cur_bg, fg, a));
+				ui_put_px(x + px, y + py, ui_blend(bg, fg, a));
 			}
 		}
 	}
