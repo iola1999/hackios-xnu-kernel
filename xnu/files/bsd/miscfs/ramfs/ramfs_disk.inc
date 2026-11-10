@@ -28,7 +28,7 @@ extern int annibale_ufs_var_io(bool write, uint64_t offset, void *buf, uint64_t 
 #define KLOG_MAGIC               0x474f4c4bU     /* 'KLOG' */
 #define KLOG_MAGIC_ARCHIVED      0x474f4c44U     /* 'DLOG' */
 #define KLOG_VERSION             1U
-#define ANNFS_BL_MAGIC           0x424c5356U     /* 'BLSV' */
+#define ANNFS_BL_MAGIC           0x424c5332U     /* 'BLS2' */
 
 struct klog_head {
 	uint32_t magic;

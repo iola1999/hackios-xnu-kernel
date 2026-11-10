@@ -1,3 +1,32 @@
+#include <mach-o/loader.h>
+
+static void
+rw_image_uuid(const void *addr, char *out, size_t out_size)
+{
+	Dl_info info;
+
+	snprintf(out, out_size, "none");
+	if (addr == NULL || dladdr(addr, &info) == 0 || info.dli_fbase == NULL) {
+		return;
+	}
+	const struct mach_header_64 *mh = (const struct mach_header_64 *)info.dli_fbase;
+	if (mh->magic != MH_MAGIC_64) {
+		return;
+	}
+	const struct load_command *lc = (const struct load_command *)(mh + 1);
+	for (uint32_t i = 0; i < mh->ncmds; i++) {
+		if (lc->cmd == LC_UUID && lc->cmdsize >= sizeof(struct uuid_command)) {
+			const uint8_t *u = ((const struct uuid_command *)lc)->uuid;
+			snprintf(out, out_size,
+			         "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+			         u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7],
+			         u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
+			return;
+		}
+		lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+	}
+}
+
 @implementation AnnibaleMetalDevice
 
 + (void)load
@@ -57,6 +86,16 @@
 		_mesa = mesa.device_open(why, sizeof(why));
 		rw_print("the compiler library %s\n",
 		         _mesa != NULL ? mesa.device_name(_mesa) : why);
+		{
+			char drv_uuid[40], air_uuid[40], say_line[200];
+
+			rw_image_uuid((const void *)&rw_print, drv_uuid, sizeof(drv_uuid));
+			rw_image_uuid((const void *)mesa.device_open, air_uuid, sizeof(air_uuid));
+			snprintf(say_line, sizeof(say_line),
+			         "annibalemetal: uuid=%s air_uuid=%s backend=%s\n",
+			         drv_uuid, air_uuid, _mesa != NULL ? mesa.device_name(_mesa) : "none");
+			sysctlbyname("kern.annibale.say", NULL, NULL, say_line, strlen(say_line) + 1);
+		}
 		/* freedreno reads its debug switches without saying so; these lines are the only
 		 * record that a job's FD_MESA_DEBUG or IR3_SHADER_DEBUG (package.py JOB_ENV) reached
 		 * the process. */

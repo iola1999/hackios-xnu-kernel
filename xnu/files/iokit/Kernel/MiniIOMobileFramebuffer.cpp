@@ -934,6 +934,15 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	IOLockUnlock(fSwapLock);
 	fSwapsShown++;
 	annibale_frames_shown = fSwapsShown;      /* (kern.annibale.frames: what a control run watches) */
+	if (fSwapsShown == 1) {
+		uint64_t first_ns = 0;
+
+		absolutetime_to_nanoseconds(drawn, &first_ns);
+		annibale_tl("milestone: first_frame at %llu.%03llu s (swap %u)\n",
+		    (unsigned long long)(first_ns / NSEC_PER_SEC),
+		    (unsigned long long)((first_ns / NSEC_PER_MSEC) % 1000),
+		    swapWord(swap, SWAP_ID));
+	}
 	if (gTouchLat) {
 		annibale_tl("tl: v %u ready %llu shown %llu done %llu\n", swapWord(swap, SWAP_ID), micros(ready), micros(copy_began),
 		    micros(drawn));

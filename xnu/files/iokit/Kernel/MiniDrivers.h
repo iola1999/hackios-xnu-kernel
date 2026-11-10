@@ -21,6 +21,7 @@ void MiniIOMobileFramebufferStart(IOService * provider);
 void MiniAppleARMBacklightStart(IOService * provider);
 void MiniAppleKeyStoreStart(void);
 void MiniIONetworkStackStart(void);
+extern "C" void MiniAHSFirmwareReadyNotifierStart(void);
 extern "C" void AnnibaleBTStart(const char * bsdname, const uint8_t * address);
 extern "C" void AnnibaleBTSetAddress(const uint8_t * address);
 

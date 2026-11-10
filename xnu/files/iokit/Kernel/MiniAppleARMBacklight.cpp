@@ -188,10 +188,18 @@ list_keys(char * line, size_t size, size_t used, OSDictionary * dict)
 	OSSymbol * key;
 
 	while (each != NULL && used < size && (key = OSDynamicCast(OSSymbol, each->getNextObject())) != NULL) {
-		OSNumber * n = OSDynamicCast(OSNumber, dict->getObject(key));
+		OSObject * obj = dict->getObject(key);
+		OSNumber * n = OSDynamicCast(OSNumber, obj);
+		OSDictionary * sub = OSDynamicCast(OSDictionary, obj);
 
 		if (n != NULL) {
 			used += (size_t) snprintf(line + used, size - used, " %s=%llu", key->getCStringNoCopy(), n->unsigned64BitValue());
+		} else if (sub != NULL) {
+			used += (size_t) snprintf(line + used, size - used, " %s={", key->getCStringNoCopy());
+			used = list_keys(line, size, used < size ? used : size, sub);
+			if (used < size) {
+				used += (size_t) snprintf(line + used, size - used, " }");
+			}
 		} else {
 			used += (size_t) snprintf(line + used, size - used, " %s=?", key->getCStringNoCopy());
 		}
@@ -247,6 +255,7 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 {
 	OSNumber * nits = OSDynamicCast(OSNumber, dict->getObject(nits_key));
 	OSNumber * value = value_key != NULL ? OSDynamicCast(OSNumber, dict->getObject(value_key)) : NULL;
+	OSDictionary * db_dict = OSDynamicCast(OSDictionary, dict->getObject("DisplayBrightness"));
 	uint64_t now = mach_absolute_time(), active_win;
 	uint64_t v, millinits;
 	uint32_t level, mixed;
@@ -255,21 +264,34 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 	size_t used;
 
 	bool slider_moved = false;
+	bool touch_recent = false;
 	uint64_t slider_pos = 0;
 	if (value_key != NULL && nits == NULL && value == NULL) {
-		nits = OSDynamicCast(OSNumber, dict->getObject("DisplayBrightnessNitsNVRAM"));
+		if (db_dict != NULL) {
+			nits = OSDynamicCast(OSNumber, db_dict->getObject("NitsPhysical"));
+			if (nits == NULL) {
+				nits = OSDynamicCast(OSNumber, db_dict->getObject("Nits"));
+			}
+		}
+		if (nits == NULL) {
+			nits = OSDynamicCast(OSNumber, dict->getObject("DisplayBrightnessNitsNVRAM"));
+		}
 	}
-	if (value_key != NULL) {
+	{
 		uint64_t touch_win, touched = annibale_cpufreq_touched();
-		bool touch_recent = false;
 		nanoseconds_to_absolutetime(400 * NSEC_PER_MSEC, &active_win);
-		nanoseconds_to_absolutetime(2000 * NSEC_PER_MSEC, &touch_win);
+		nanoseconds_to_absolutetime(3000 * NSEC_PER_MSEC, &touch_win);
 		if (touched != 0 && now >= touched && now - touched <= touch_win) {
 			touch_recent = true;
 		} else if (bl.user_until != 0 && now <= bl.user_until) {
 			touch_recent = true;
 		}
+	}
+	if (value_key != NULL) {
 		OSNumber * slider = OSDynamicCast(OSNumber, dict->getObject("DisplayBrightnessSliderPosition"));
+		if (slider == NULL && db_dict != NULL) {
+			slider = OSDynamicCast(OSNumber, db_dict->getObject("DisplayBrightnessSliderPosition"));
+		}
 		if (slider != NULL) {
 			uint64_t pos = slider->unsigned64BitValue();
 			slider_pos = pos > 65536 ? 65536 : pos;
@@ -294,17 +316,7 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 	used = (size_t) snprintf(bl.line, sizeof(bl.line), "%s[%d] to the %s:", who, proc_selfpid(),
 	    value_key != NULL ? "backlight" : "framebuffer");
 	used = list_keys(bl.line, sizeof(bl.line), used < sizeof(bl.line) ? used : sizeof(bl.line), dict);
-	if (value_key == NULL && (bl.user_until == 0 || now > bl.user_until)) {
-		snprintf(bl.line + used, sizeof(bl.line) - used,
-		    "; framebuffer update outside slider window ignored, keeping %llu.%03llu nits",
-		    bl.last_millinits / 1000, bl.last_millinits % 1000);
-		bl_log();
-		return;
-	}
-	if (slider_moved) {
-		millinits = kBLMilliNitsMin + slider_pos * (kBLMilliNitsMax - kBLMilliNitsMin) / 65536;
-		v = kBLValueMin + (millinits - kBLMilliNitsMin) * (kBLValueMax - kBLValueMin) / (kBLMilliNitsMax - kBLMilliNitsMin);
-	} else if (nits != NULL) {
+	if (nits != NULL) {
 		uint64_t n16 = nits->unsigned64BitValue();
 		int64_t s16 = (int64_t) n16;
 
@@ -319,6 +331,9 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 		if (n16 >= 65536) {
 			/* Standard 16.16 fixed-point nits (>= 1.0 nit) */
 			OSNumber * db_num = OSDynamicCast(OSNumber, dict->getObject("DisplayBrightness"));
+			if (db_num == NULL && db_dict != NULL) {
+				db_num = OSDynamicCast(OSNumber, db_dict->getObject("Brightness"));
+			}
 			uint64_t db = db_num != NULL ? db_num->unsigned64BitValue() : 65536;
 			if (n16 == fixed_nits(kBLMilliNitsMid) && db < 49398) {
 				millinits = kBLMilliNitsMin + db * (kBLMilliNitsMid - kBLMilliNitsMin) / 49398;
@@ -343,23 +358,21 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 		v = value->unsigned64BitValue();
 		v = v < kBLValueMin ? kBLValueMin : v > kBLValueMax ? kBLValueMax : v;
 		millinits = kBLMilliNitsMin + (v - kBLValueMin) * (kBLMilliNitsMax - kBLMilliNitsMin) / (kBLValueMax - kBLValueMin);
+	} else if (slider_moved) {
+		millinits = kBLMilliNitsMin + slider_pos * (kBLMilliNitsMax - kBLMilliNitsMin) / 65536;
+		v = kBLValueMin + (millinits - kBLMilliNitsMin) * (kBLValueMax - kBLValueMin) / (kBLMilliNitsMax - kBLMilliNitsMin);
 	} else {
 		snprintf(bl.line + used, sizeof(bl.line) - used, "; nothing taken");
-		bl_log();
-		return;
-	}
-	/* CoreBrightness sends nits separately after the slider-position request. */
-	if (bl.initialized && !slider_moved && (bl.user_until == 0 || now > bl.user_until)) {
-		snprintf(bl.line + used, sizeof(bl.line) - used,
-		    "; update outside slider window ignored, keeping %llu nits",
-		    bl.last_millinits / 1000);
 		bl_log();
 		return;
 	}
 	bl.last_v = v;
 	bl.last_millinits = millinits;
 	bl.initialized = true;
-	ramfs_backlight_save((uint32_t) v, (uint32_t) millinits);
+	if (touch_recent || slider_moved) {
+		ramfs_backlight_save((uint32_t) v, (uint32_t) millinits);
+		bl.service->setProperty("annibale-bl-restored", kOSBooleanTrue);
+	}
 	level = (uint32_t) (millinits * kBLLevelFull / kBLMilliNitsMax);
 	/* with fb_dcs=4 the panel takes v itself, and the mixers are given the full level */
 	mixed = MiniIOMobileFramebufferDCS((uint32_t) v) ? kBLLevelFull : level;
@@ -434,9 +447,10 @@ MiniAppleARMBacklightStart(IOService * provider)
 		IOLog("MiniAppleARMBacklight: cannot create the service\n");
 		return;
 	}
-	if (!ramfs_backlight_load(&saved_v, &saved_mn) ||
-	    saved_v < kBLValueMin || saved_v > kBLValueMax ||
-	    saved_mn < kBLMilliNitsMin || saved_mn > kBLMilliNitsMax) {
+	bool restored = ramfs_backlight_load(&saved_v, &saved_mn) &&
+	    saved_v >= kBLValueMin && saved_v <= kBLValueMax &&
+	    saved_mn >= kBLMilliNitsMin && saved_mn <= kBLMilliNitsMax;
+	if (!restored) {
 		saved_v = kBLValueMax;
 		saved_mn = kBLMilliNitsMax;
 	}
@@ -449,6 +463,7 @@ MiniAppleARMBacklightStart(IOService * provider)
 		MiniIOMobileFramebufferDim(boot_mixed);
 	}
 	backlight->setProperty("backlight-control", kOSBooleanTrue);
+	backlight->setProperty("annibale-bl-restored", restored ? kOSBooleanTrue : kOSBooleanFalse);
 	backlight->publish(bl.last_v, bl.last_millinits);
 	publish_calibration(backlight);
 	if (!backlight->attach(provider)) {

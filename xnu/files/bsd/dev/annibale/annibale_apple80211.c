@@ -31,6 +31,7 @@
  * outcome as one of Apple80211's result numbers, which the framework turns into its errors:
  * 1 success, 21 "invalid PMK" (a wrong passphrase), 9 a timeout, 2 anything else.
  */
+#include <kern/clock.h>
 #include <kern/kalloc.h>
 #include <kern/locks.h>
 #include <libkern/libkern.h>
@@ -74,6 +75,7 @@ type_name(int32_t type)
 		{ 79, "STA_STATS" }, { 80, "ROAM_THRESH" }, { 85, "IE" }, { 86, "SCAN_REQ_MULTIPLE" }, { 87, "BTCOEX_MODE" },
 		{ 90, "SCANCACHE_CLEAR" }, { 94, "VIRTUAL_IF_CREATE" }, { 95, "VIRTUAL_IF_DELETE" }, { 103, "CURRENT_NETWORK" },
 		{ 106, "RSSI_BOUNDS" }, { 107, "ROAM" }, { 207, "CHANNELS_INFO" }, { 254, "HW_SUPPORTED_CHANNELS" },
+		{ 564, "EVENT_FILTER" },
 	};
 
 	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
@@ -302,7 +304,10 @@ give_network(const struct apple80211req *request, const struct annibale_sta_bss 
 	bzero(result, sizeof(*result));
 	result->version = 1;
 	channel_fill(&result->channel, bss->frequency, 0);
-	result->rssi = bss->rssi;
+	result->noise_known = 1;
+	result->noise = -95;
+	result->rssi = bss->rssi != 0 ? bss->rssi : -55;
+	result->snr = (int16_t)(result->rssi - result->noise);
 	result->beacon_interval = bss->beacon_interval;
 	result->capability = bss->capability;
 	memcpy(result->bssid, bss->bssid, sizeof(result->bssid));
@@ -329,6 +334,9 @@ give_network(const struct apple80211req *request, const struct annibale_sta_bss 
 
 /* ---- get ---------------------------------------------------------------------------------------------- */
 
+static void post(uint32_t code, const void *data, uint32_t length);
+static void post_lqm(int16_t rssi);
+
 static int
 get(struct apple80211req *request)
 {
@@ -336,6 +344,17 @@ get(struct apple80211req *request)
 	int error = 0;
 
 	switch (request->req_type) {
+	case 5:                                 /* POWERSAVE */
+		request->req_val = 0;
+		return 0;
+	case 106: {                             /* RSSI_BOUNDS */
+		struct {
+			uint32_t version;
+			int32_t rssi_min, rssi_max, rssi_threshold;
+		} answer = { .version = 1, .rssi_min = -100, .rssi_max = 0, .rssi_threshold = -80 };
+
+		return give(request, &answer, sizeof(answer));
+	}
 	case 43:
 	case 44: {                              /* the driver's and the hardware's name: the text alone, in 256 bytes */
 		static const char name[256] = "annibale: ath12k for the WCN7850";
@@ -470,6 +489,16 @@ get(struct apple80211req *request)
 	case 13:                                /* the state: APPLE80211_S_INIT 0, _SCAN 1, _AUTH 2, _ASSOC 3, _RUN 4 */
 		request->req_val = state->phase == ANNIBALE_STA_JOINED ? 4 : state->phase == ANNIBALE_STA_JOINING ? 2 :
 		    state->phase == ANNIBALE_STA_SCANNING ? 1 : 0;
+		if (state->phase == ANNIBALE_STA_JOINED) {
+			post_lqm(state->bss.rssi);
+		}
+		break;
+	case 8:                                 /* RATE (Mbit/s) */
+		if (state->phase != ANNIBALE_STA_JOINED) {
+			error = ENXIO;
+		} else {
+			request->req_val = 54;
+		}
 		break;
 	case 1:                                 /* its name; the length goes back in the request */
 		if (state->phase != ANNIBALE_STA_JOINED) {
@@ -496,17 +525,38 @@ get(struct apple80211req *request)
 		break;
 	}
 	case 16: {                              /* how strongly it is heard: dBm, per radio and all together, twice over */
+		int32_t rssi = state->bss.rssi != 0 ? state->bss.rssi : -55;
 		struct {
 			uint32_t version, radios, unit;
 			int32_t each[4], all, each_ext[4], all_ext;
-		} answer = { .version = 1, .radios = 1, .each = { state->bss.rssi }, .all = state->bss.rssi,
-			     .each_ext = { state->bss.rssi }, .all_ext = state->bss.rssi };
+		} answer = { .version = 1, .radios = 1, .each = { rssi }, .all = rssi,
+			     .each_ext = { rssi }, .all_ext = rssi };
+
+		if (state->phase != ANNIBALE_STA_JOINED) {
+			error = ENXIO;
+		} else {
+			error = give(request, &answer, sizeof(answer));
+			post_lqm(state->bss.rssi);
+		}
+		break;
+	}
+	case 17: {                              /* NOISE (dBm, same layout as RSSI) */
+		struct {
+			uint32_t version, radios, unit;
+			int32_t each[4], all, each_ext[4], all_ext;
+		} answer = { .version = 1, .radios = 1, .each = { -95 }, .all = -95,
+			     .each_ext = { -95 }, .all_ext = -95 };
 
 		error = state->phase != ANNIBALE_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
 		break;
 	}
 	case 103:                               /* all of it, as a scan's result */
-		error = state->phase != ANNIBALE_STA_JOINED ? ENXIO : give_network(request, &state->bss);
+		if (state->phase != ANNIBALE_STA_JOINED) {
+			error = ENXIO;
+		} else {
+			error = give_network(request, &state->bss);
+			post_lqm(state->bss.rssi);
+		}
 		break;
 	case 2: {                               /* how it was joined: open system, then WPA2 with a passphrase */
 		struct {
@@ -697,8 +747,50 @@ set(const struct apple80211req *request, char *said, size_t said_size)
 	}
 	case 10:
 		return set_scan(request, said, said_size);
+	case 564: {                             /* Apple80211FilterMonitoringEvent (32-byte event mask) */
+		struct annibale_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
+
+		if (state != NULL) {
+			annibale_sta_state(state);
+			if (state->phase == ANNIBALE_STA_JOINED) {
+				int32_t rssi = state->bss.rssi != 0 ? state->bss.rssi : -55;
+				struct apple80211_link_changed link = {
+					.down = 0,
+					.rssi = rssi,
+					.snr = 40,
+					.noise = (uint16_t)-95,
+				};
+				struct apple80211_lqm_changed lqm = { .rssi_known = 1, .rssi = rssi };
+
+				post(EVENT_SSID_CHANGED, NULL, 0);
+				post(EVENT_BSSID_CHANGED, NULL, 0);
+				post(EVENT_LINK_CHANGED, &link, sizeof(link));
+				post(EVENT_LQM_CHANGED, &lqm, sizeof(lqm));
+			}
+			kfree_data(state, sizeof(*state));
+		}
+		return 0;
+	}
+	case 5:
+	case 25:
 	case 51:
 	case 87:
+	case 383:
+	case 471:
+	case 473:
+	case 481:
+	case 483:
+	case 485:
+	case 512:
+	case 539:
+	case 542:
+	case 543:
+	case 544:
+	case 545:
+	case 547:
+	case 548:
+	case 572:
+	case 582:
 		return 0;
 	default:
 		return EOPNOTSUPP;
@@ -722,6 +814,25 @@ post(uint32_t code, const void *data, uint32_t length)
 		message.dv[1].data_ptr = __DECONST(void *, data);
 	}
 	kev_post_msg(&message);
+}
+
+static void
+post_lqm(int16_t rssi)
+{
+	static clock_sec_t last_sec;
+	clock_sec_t sec = 0;
+	clock_usec_t usec = 0;
+	struct apple80211_lqm_changed lqm = { .rssi_known = 1, .rssi = rssi != 0 ? rssi : -55 };
+
+	clock_get_system_microtime(&sec, &usec);
+	lck_mtx_lock(&apple80211_lock);
+	if (last_sec != 0 && sec == last_sec) {
+		lck_mtx_unlock(&apple80211_lock);
+		return;
+	}
+	last_sec = sec;
+	lck_mtx_unlock(&apple80211_lock);
+	post(EVENT_LQM_CHANGED, &lqm, sizeof(lqm));
 }
 
 /* What the station side says has happened (bsd/dev/annibale_sta.c calls this, on its thread or the station's). */
@@ -759,13 +870,17 @@ annibale_apple80211_event(enum annibale_sta_event event, int status)
 	}
 	case ANNIBALE_STA_LINK: {
 		struct apple80211_link_changed link = { .down = status != 1, .involuntary = status != 1 && status != 0,
-			                                .reason = status != 1 && status != 0 ? 4 : 0 };      /* (4: gone, not asked) */
+			                                .reason = status != 1 && status != 0 ? 4 : 0,      /* (4: gone, not asked) */
+			                                .snr = status == 1 ? 40 : 0,
+			                                .noise = status == 1 ? (uint16_t)-95 : 0 };
 		struct annibale_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
 
 		if (state != NULL) {
 			annibale_sta_state(state);
-			link.rssi = status == 1 ? state->bss.rssi : 0;
+			link.rssi = status == 1 ? (state->bss.rssi != 0 ? state->bss.rssi : -55) : 0;
 			kfree_data(state, sizeof(*state));
+		} else if (status == 1) {
+			link.rssi = -55;
 		}
 		post(EVENT_SSID_CHANGED, NULL, 0);
 		post(EVENT_BSSID_CHANGED, NULL, 0);

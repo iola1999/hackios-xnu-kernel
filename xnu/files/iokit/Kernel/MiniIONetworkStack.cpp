@@ -112,3 +112,54 @@ MiniIONetworkStackStart(void)
 	}
 	stack->release();
 }
+
+/*
+ * AHSFirmwareReadyNotifier: AudioToolbox's HapticServerManager (in audiomxd) waits for an IOService
+ * of class AHSFirmwareReadyNotifier on non-VM hardware (when kern.hv_vmm_present == 0) before
+ * calling DeferFuncUntilFWReadyAndActuatorVADRouted's completion and resuming the NSXPCListener for
+ * com.apple.audio.hapticd. Published once /dev/annibale-haptic is ready (bsd/dev/annibale/annibale_haptic.c).
+ */
+class AHSFirmwareReadyNotifier : public IOService
+{
+	OSDeclareDefaultStructors(AHSFirmwareReadyNotifier);
+
+public:
+	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
+};
+
+OSDefineMetaClassAndStructors(AHSFirmwareReadyNotifier, IOService);
+
+bool
+AHSFirmwareReadyNotifier::start(IOService * provider)
+{
+	if (!IOService::start(provider)) {
+		return false;
+	}
+	setName("AHSFirmwareReadyNotifier");
+	registerService();
+	return true;
+}
+
+extern "C" void
+MiniAHSFirmwareReadyNotifierStart(void)
+{
+	static bool started;
+	if (started) {
+		return;
+	}
+	IOService * resources = IOService::getResourceService();
+	AHSFirmwareReadyNotifier * notifier = OSTypeAlloc(AHSFirmwareReadyNotifier);
+
+	if (resources == NULL || notifier == NULL || !notifier->init() || !notifier->attach(resources)) {
+		OSSafeReleaseNULL(notifier);
+		IOLog("AHSFirmwareReadyNotifier: cannot create the service\n");
+		return;
+	}
+	if (!notifier->start(resources)) {
+		notifier->detach(resources);
+	} else {
+		started = true;
+		IOLog("AHSFirmwareReadyNotifier: registered on IOResources\n");
+	}
+	notifier->release();
+}

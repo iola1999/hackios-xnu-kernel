@@ -708,6 +708,10 @@ serve(void)
 		say("haptic: /dev/annibale-haptic cannot be made\n");
 		return;
 	}
+	{
+		extern void MiniAHSFirmwareReadyNotifierStart(void);
+		MiniAHSFirmwareReadyNotifierStart();
+	}
 	say("haptic: THE MOTOR PLAYS WHAT IOS PLAYS ON ITS ACTUATOR (/dev/annibale-haptic) from here on, until the run ends\n");
 	while (!broken) {
 		uint64_t now = now_us();

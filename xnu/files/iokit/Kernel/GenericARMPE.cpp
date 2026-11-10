@@ -235,6 +235,24 @@ publishWifiAddress(void)
 	OSSafeReleaseNULL(chosen);
 }
 
+static void
+publishHapticsNode(IORegistryEntry * dtRoot)
+{
+	IORegistryEntry * existing = IORegistryEntry::fromPath("/haptics", gIODTPlane);
+
+	if (existing == NULL && dtRoot != NULL) {
+		IORegistryEntry * hap = new IORegistryEntry;
+
+		if (hap != NULL && hap->init()) {
+			hap->setName("haptics", gIODTPlane);
+			hap->setName("haptics");
+			hap->attachToParent(dtRoot, gIODTPlane);
+		}
+		OSSafeReleaseNULL(hap);
+	}
+	OSSafeReleaseNULL(existing);
+}
+
 bool
 GenericARMPE::start(IOService * provider)
 {
@@ -321,6 +339,7 @@ GenericARMPE::start(IOService * provider)
 	}
 
 	publishWifiAddress();
+	publishHapticsNode(provider);
 	/* BSD looks the platform expert up by class (IOSecureBSDRoot). */
 	registerService();
 

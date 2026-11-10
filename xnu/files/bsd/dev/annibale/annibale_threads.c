@@ -52,6 +52,7 @@ SYSCTL_DECL(_kern_annibale);
 #define ANNIBALE_EXEC_IMAGE_PROBES 64
 
 void annibale_thread_dump(task_t task, int pid, uint64_t exec_base, const char *exec_image);
+extern void annibale_tl(const char *format, ...) __printflike(1, 2);
 int annibale_task_region_image(task_t task, uint64_t addr, char *name, uint32_t namelen,
     uint64_t *start, uint64_t *end);
 uint64_t annibale_task_exec_image(task_t task, char *name, uint32_t namelen);
@@ -244,11 +245,30 @@ void
 annibale_freeze_check(uint64_t touched)
 {
 	static int enabled = -1;
-	static uint32_t frames, dumps, began_frames, quiet_dumps;
-	static uint64_t moved, moved_before, touch_seen, began;
-	static bool dumped, began_dumped;
+	static uint32_t frames, dumps, began_frames, quiet_dumps, first_touch_frames;
+	static uint64_t moved, moved_before, touch_seen, began, first_touch;
+	static bool dumped, began_dumped, first_touch_logged;
 	uint64_t now = mach_absolute_time(), touch_ns, still_ns, flowing_ns;
 
+	if (touched != 0 && first_touch == 0) {
+		first_touch = touched;
+		first_touch_frames = annibale_frames_shown;
+	}
+	if (first_touch != 0 && !first_touch_logged && annibale_frames_shown > first_touch_frames && now >= first_touch) {
+		uint64_t resp_ns = 0, t_ns = 0, lat_ns = 0;
+
+		first_touch_logged = true;
+		absolutetime_to_nanoseconds(now, &resp_ns);
+		absolutetime_to_nanoseconds(first_touch, &t_ns);
+		absolutetime_to_nanoseconds(now - first_touch, &lat_ns);
+		annibale_tl("milestone: first_touch_response at %llu.%03llu s (touch at %llu.%03llu s, latency %llu ms, frame %u)\n",
+		    (unsigned long long)(resp_ns / NSEC_PER_SEC),
+		    (unsigned long long)((resp_ns / NSEC_PER_MSEC) % 1000),
+		    (unsigned long long)(t_ns / NSEC_PER_SEC),
+		    (unsigned long long)((t_ns / NSEC_PER_MSEC) % 1000),
+		    (unsigned long long)(lat_ns / NSEC_PER_MSEC),
+		    annibale_frames_shown);
+	}
 	if (enabled < 0) {
 		uint32_t value = 0;
 
@@ -525,8 +545,6 @@ SYSCTL_PROC(_kern_annibale, OID_AUTO, prof, CTLTYPE_STRING | CTLFLAG_RD | CTLFLA
  * rest counted, so a library that says too much costs the log one line a second.
  */
 #define ANNIBALE_SAY_PER_SECOND  200
-
-extern void annibale_tl(const char *format, ...) __printflike(1, 2);
 
 static int
 annibale_say_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,

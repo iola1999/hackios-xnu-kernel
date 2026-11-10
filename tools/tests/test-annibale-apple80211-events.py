@@ -16,8 +16,8 @@ def declaration(name):
     return production[start : production.index("};", start) + 2]
 
 
-def function(name):
-    start = production.index("void\n" + name + "(")
+def function(name, prefix="void\n"):
+    start = production.index(prefix + name + "(")
     begin = production.index("{", start)
     depth = 1
     end = begin + 1
@@ -36,6 +36,13 @@ source = r'''
 #define Z_WAITOK 1
 #define Z_ZERO 2
 #define printf(...) ((void)0)
+
+typedef uint64_t clock_sec_t;
+typedef uint32_t clock_usec_t;
+static clock_sec_t fake_sec = 10;
+static void clock_get_system_microtime(clock_sec_t *sec, clock_usec_t *usec) {
+    *sec = fake_sec; *usec = 0;
+}
 
 enum annibale_sta_event { ANNIBALE_STA_POWER, ANNIBALE_STA_SCAN_DONE, ANNIBALE_STA_JOIN_DONE, ANNIBALE_STA_LINK };
 struct annibale_sta_state { struct { int16_t rssi; } bss; };
@@ -67,7 +74,7 @@ static void post(uint32_t code, const void *data, uint32_t length) {
     "struct apple80211_lqm_changed {",
     "struct apple80211_assoc_done {",
     "enum { EVENT_POWER_CHANGED",
-)) + "\n" + function("annibale_apple80211_event") + r'''
+)) + "\n" + function("post_lqm", "static void\n") + "\n" + function("annibale_apple80211_event") + r'''
 
 static void reset(void) { event_count = 0; memset(events, 0, sizeof(events)); }
 static void check_codes(const uint32_t *codes, unsigned count) {
@@ -83,6 +90,7 @@ static void check_down(int status) {
 }
 int main(void) {
     const uint32_t codes[] = { EVENT_SSID_CHANGED, EVENT_BSSID_CHANGED, EVENT_LINK_CHANGED, EVENT_LQM_CHANGED };
+    const uint32_t lqm_code[] = { EVENT_LQM_CHANGED };
     struct apple80211_link_changed link;
     struct apple80211_lqm_changed lqm;
     _Static_assert(sizeof(lqm) == 0x1d8 && offsetof(struct apple80211_lqm_changed, rssi) == 4, "LQM layout");
@@ -95,6 +103,13 @@ int main(void) {
     for (unsigned i = 1; i < 4; i++) assert(events[3].data[i] == 0);
     for (unsigned i = 8; i < sizeof(lqm); i++) assert(events[3].data[i] == 0);
     check_down(0); check_down(-1);
+
+    reset(); fake_sec = 20; post_lqm(-49); post_lqm(-49); check_codes(lqm_code, 1);
+    memcpy(&lqm, events[0].data, sizeof(lqm));
+    assert(lqm.rssi_known == 1 && lqm.rssi == -49);
+    reset(); fake_sec = 21; post_lqm(0); check_codes(lqm_code, 1);
+    memcpy(&lqm, events[0].data, sizeof(lqm));
+    assert(lqm.rssi_known == 1 && lqm.rssi == -55);
 }
 '''
 
