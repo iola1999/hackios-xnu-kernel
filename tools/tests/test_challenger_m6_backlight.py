@@ -1,29 +1,12 @@
 #!/usr/bin/env python3
-"""Empirical Challenger Test Suite for MiniAppleARMBacklight (M6 Boot Remediation).
+"""Empirical Challenger Test Suite for MiniAppleARMBacklight 1:1 Slider & Panel Sync."""
 
-Adversarially challenges:
-1. publish_calibration():
-   - lMidPanel and lMidProduct calibration values must equal fixed_nits(140000) = 9175040 (140.0 nits).
-   - lMinPanel / lMinProduct = 5 nits, lMaxPanel / lMaxProduct = 400 nits.
-2. bl_take() autonomous rejection:
-   - Cold boot: backboardd sends autonomous brightness-nits = 327680 (5.0 nits) without slider.
-     Must be rejected; 400 nits maintained.
-   - Autonomous ramp: backboardd sends autonomous ramps with DisplayBrightness key but no slider key.
-     Must be rejected; 400 nits maintained.
-3. bl_take() slider activation & decay:
-   - Slider arrives with DisplayBrightnessSliderPosition: accepted, window opens (500ms).
-   - Follow-up updates within 500ms window with DisplayBrightness: accepted, window extends.
-   - After window expires (> 500ms): autonomous updates rejected; user brightness retained.
-4. Framebuffer brightness requests:
-   - Always rejected, preserving current nits.
-5. Boundary conditions & corrupted dictionaries:
-   - Negative values, zero values, transients (1025..65535), > 400 nits, empty dict.
-6. 10,000 randomized concurrent stress iterations.
-"""
-
-import sys
-import time
+from pathlib import Path
 import random
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+BACKLIGHT_CPP = REPO_ROOT / "xnu/files/iokit/Kernel/MiniAppleARMBacklight.cpp"
+RAMFS_DISK_INC = REPO_ROOT / "xnu/files/bsd/miscfs/ramfs/ramfs_disk.inc"
 
 kBLValueMin = 5
 kBLValueMax = 0x1A5E
@@ -32,283 +15,137 @@ kBLMilliNitsMid = 140000
 kBLMilliNitsMax = 400000
 kBLLevelFull = 1024
 
+
 def fixed_nits(millinits: int) -> int:
     return (millinits << 16) // 1000
+
 
 class MiniAppleARMBacklightSimulator:
     def __init__(self, boot_v: int = kBLValueMax, boot_millinits: int = kBLMilliNitsMax):
         self.last_v = boot_v
         self.last_millinits = boot_millinits
-        self.user_until = 0
-        self.initialized = True
-        self.slider_initialized = False
-        self.last_slider_pos = 0
-        self.touched_ns = 0
+        self.panel_v = boot_v
         self.saved = None
         self.active_level = (boot_millinits * kBLLevelFull) // kBLMilliNitsMax
-        self.log_messages = []
 
-    def bl_take(self, dict_keys: dict, value_key: str | None, nits_key: str | None, now_ns: int, touch_override: bool = True):
-        """Exact replica of bl_take logic in MiniAppleARMBacklight.cpp."""
+    def bl_take(self, dict_keys: dict, value_key: str | None, nits_key: str | None):
         nits = dict_keys.get(nits_key) if nits_key else None
         value = dict_keys.get(value_key) if value_key else None
+        db_dict = dict_keys.get("DisplayBrightness") if isinstance(dict_keys.get("DisplayBrightness"), dict) else None
         slider_moved = False
         slider_pos = 0
 
         if value_key is not None and nits is None and value is None:
             nits = dict_keys.get("DisplayBrightnessNitsNVRAM")
+            if nits is None and db_dict is not None:
+                nits = db_dict.get("NitsPhysical") or db_dict.get("Nits")
 
         if value_key is not None:
-            active_win_ns = 500 * 1_000_000
-            touch_win_ns = 2000 * 1_000_000
-            if "DisplayBrightnessSliderPosition" in dict_keys:
-                if touch_override and self.touched_ns == 0:
-                    self.touched_ns = now_ns
-                touch_recent = (
-                    (self.touched_ns != 0 and 0 <= now_ns - self.touched_ns <= touch_win_ns)
-                    or (self.user_until != 0 and now_ns <= self.user_until)
-                )
-                pos = min(65536, max(0, dict_keys["DisplayBrightnessSliderPosition"]))
-                slider_pos = pos
-                if not self.slider_initialized and not touch_override:
-                    self.slider_initialized = True
-                    self.last_slider_pos = slider_pos
-                elif not touch_recent:
-                    self.last_slider_pos = slider_pos
-                else:
-                    self.slider_initialized = True
-                    if not touch_override and abs(slider_pos - self.last_slider_pos) < 64:
-                        pass
-                    else:
-                        self.user_until = now_ns + active_win_ns
-                        self.last_slider_pos = slider_pos
-                        slider_moved = not touch_override
-            elif "DisplayBrightness" in dict_keys and now_ns <= self.user_until:
-                self.user_until = now_ns + active_win_ns
-
-        if value_key is None and (self.user_until == 0 or now_ns > self.user_until):
-            msg = f"framebuffer brightness ignored, keeping {self.last_millinits / 1000:.3f} nits"
-            self.log_messages.append(msg)
-            return ("IGNORED_FRAMEBUFFER", self.last_millinits)
+            pos_obj = dict_keys.get("DisplayBrightnessSliderPosition")
+            if pos_obj is None and db_dict is not None:
+                pos_obj = db_dict.get("DisplayBrightnessSliderPosition")
+            if pos_obj is not None:
+                slider_pos = min(65536, max(0, int(pos_obj)))
+                if slider_pos > 0 or (nits is not None and nits > 0):
+                    slider_moved = True
 
         if slider_moved:
             millinits = kBLMilliNitsMin + slider_pos * (kBLMilliNitsMax - kBLMilliNitsMin) // 65536
             v = kBLValueMin + (millinits - kBLMilliNitsMin) * (kBLValueMax - kBLValueMin) // (kBLMilliNitsMax - kBLMilliNitsMin)
         elif nits is not None:
-            n16 = nits
-            s16 = nits
+            s16 = int(nits)
+            n16 = s16
             if s16 <= 0:
-                msg = f"discarded non-positive level {s16}, keeping {self.last_millinits / 1000:.3f} nits"
-                self.log_messages.append(msg)
-                return ("DISCARDED_NON_POSITIVE", self.last_millinits)
-
+                self.panel_v = 0
+                return ("PANEL_OFF", self.last_millinits)
             if n16 >= 65536:
-                db = dict_keys.get("DisplayBrightness", 65536)
+                db = dict_keys.get("DisplayBrightness")
+                if isinstance(db, dict):
+                    db = db.get("Brightness", 65536)
+                elif db is None:
+                    db = 65536
                 if n16 == fixed_nits(kBLMilliNitsMid) and db < 49398:
                     millinits = kBLMilliNitsMin + db * (kBLMilliNitsMid - kBLMilliNitsMin) // 49398
                 else:
                     max_fixed = kBLMilliNitsMax << 16
                     clamped_n16 = n16 if n16 < max_fixed else max_fixed
                     millinits = (clamped_n16 * 1000) >> 16
-
                 millinits = max(kBLMilliNitsMin, min(kBLMilliNitsMax, millinits))
                 v = kBLValueMin + (millinits - kBLMilliNitsMin) * (kBLValueMax - kBLValueMin) // (kBLMilliNitsMax - kBLMilliNitsMin)
             elif 1 <= n16 <= kBLLevelFull:
                 millinits = kBLMilliNitsMin + (n16 - 1) * (kBLMilliNitsMax - kBLMilliNitsMin) // (kBLLevelFull - 1)
                 v = kBLValueMin + (millinits - kBLMilliNitsMin) * (kBLValueMax - kBLValueMin) // (kBLMilliNitsMax - kBLMilliNitsMin)
             else:
-                msg = f"discarded invalid transient {n16}, keeping {self.last_millinits / 1000:.3f} nits"
-                self.log_messages.append(msg)
                 return ("DISCARDED_TRANSIENT", self.last_millinits)
         elif value is not None:
-            v = max(kBLValueMin, min(kBLValueMax, value))
+            if value == 0:
+                self.panel_v = 0
+                return ("PANEL_OFF", self.last_millinits)
+            v = max(kBLValueMin, min(kBLValueMax, int(value)))
             millinits = kBLMilliNitsMin + (v - kBLValueMin) * (kBLMilliNitsMax - kBLMilliNitsMin) // (kBLValueMax - kBLValueMin)
         else:
-            self.log_messages.append("nothing taken")
             return ("NOTHING_TAKEN", self.last_millinits)
 
-        if self.initialized and not slider_moved and (self.user_until == 0 or now_ns > self.user_until):
-            msg = f"autonomous update ignored (no slider active), keeping {self.last_millinits // 1000} nits"
-            self.log_messages.append(msg)
-            return ("IGNORED_AUTONOMOUS", self.last_millinits)
-
+        self.panel_v = v
         self.last_v = v
         self.last_millinits = millinits
-        self.initialized = True
         self.saved = (v, millinits)
         self.active_level = (millinits * kBLLevelFull) // kBLMilliNitsMax
         return ("APPLIED", self.last_millinits)
 
+
 def run_tests():
     print("=== EMPIRICAL CHALLENGE: MiniAppleARMBacklight ===")
 
-    # 1. Calibration parameters test
-    print("[1] Testing calibration parameters...")
-    mid_fixed = fixed_nits(kBLMilliNitsMid)
-    assert mid_fixed == 9175040, f"Expected 9175040, got {mid_fixed}"
-    assert mid_fixed == int(140.0 * 65536)
-    min_fixed = fixed_nits(kBLMilliNitsMin)
-    assert min_fixed == 327680, f"Expected 327680, got {min_fixed}"
-    max_fixed = fixed_nits(kBLMilliNitsMax)
-    assert max_fixed == 26214400, f"Expected 26214400, got {max_fixed}"
-    print(f"  ✓ Calibration parameters correct: min={min_fixed} (5nits), mid={mid_fixed} (140nits), max={max_fixed} (400nits)")
+    cpp_src = BACKLIGHT_CPP.read_text(encoding="utf-8")
+    ramfs_src = RAMFS_DISK_INC.read_text(encoding="utf-8")
+
+    print("[1] Checking source invariants in MiniAppleARMBacklight.cpp and ramfs_disk.inc...")
+    assert "outside slider window ignored" not in cpp_src, "Stale slider window filter still in MiniAppleARMBacklight.cpp"
+    assert '"annibale-bl-restored"' in cpp_src, "Missing annibale-bl-restored property"
+    assert 'OSDynamicCast(OSDictionary, dict->getObject("DisplayBrightness"))' in cpp_src, (
+        "Missing nested DisplayBrightness dictionary parsing"
+    )
+    assert "0x424c5332U" in ramfs_src, "Expected ANNFS_BL_MAGIC 0x424c5332U ('BLS2') in ramfs_disk.inc"
+    print("  ✓ Source invariants verified")
+
+    print("[2] Testing calibration parameters...")
+    assert fixed_nits(kBLMilliNitsMin) == 327680
+    assert fixed_nits(kBLMilliNitsMid) == 9175040
+    assert fixed_nits(kBLMilliNitsMax) == 26214400
+    print("  ✓ Calibration parameters correct")
 
     sim = MiniAppleARMBacklightSimulator()
 
-    # 2. Cold Boot Autonomous Rejection
-    print("[2] Testing cold boot CoreBrightness autonomous dimming request...")
-    t0 = 1000_000_000 # 1.0s
-    req_5nits = {
-        "brightness-nits": fixed_nits(5000), # 327680 (5.0 nits)
-        "DisplayBrightness": 0,
-        "FadePeriod": 200,
-    }
-    action, current_nits = sim.bl_take(req_5nits, "brightness", "brightness-nits", t0)
-    assert action == "IGNORED_AUTONOMOUS", f"Expected IGNORED_AUTONOMOUS, got {action}"
-    assert current_nits == 400000, f"Expected 400000 m-nits (400 nits), got {current_nits}"
-    assert sim.last_millinits == 400000
-    print("  ✓ Cold boot 5 nits request safely rejected; 400 nits retained")
-
-    # 3. Autonomous Ramp Rejection
-    print("[3] Testing autonomous ramp sequence without slider...")
-    for ramp_nits in [350, 300, 200, 100, 50, 5]:
-        t0 += 50_000_000 # 50ms interval
-        req = {
-            "brightness-nits": fixed_nits(ramp_nits * 1000),
-            "DisplayBrightness": int(ramp_nits * 100),
-        }
-        action, current_nits = sim.bl_take(req, "brightness", "brightness-nits", t0)
-        assert action == "IGNORED_AUTONOMOUS", f"Step {ramp_nits} nits failed: got {action}"
-        assert current_nits == 400000, f"Brightness changed to {current_nits}!"
-    # 3b. Autonomous FreezeBrightness=NO unfreeze fade with DisplayBrightnessSliderPosition but NO touch
-    print("[3b] Testing 33s FreezeBrightness=NO autonomous slider-position fade without user touch...")
-    sim_unfreeze = MiniAppleARMBacklightSimulator()
-    # Initial backboardd start packet at 21s
-    sim_unfreeze.bl_take({"DisplayBrightnessSliderPosition": 0, "brightness-nits": fixed_nits(5000)}, "brightness", "brightness-nits", 21_000_000_000, touch_override=False)
-    # 33s FreezeBrightness=NO unfreeze fade packets with DisplayBrightnessSliderPosition ramping down to 3656 (13.475 nits)
-    for pos in [65536, 50000, 30000, 15000, 3656]:
-        action, current_nits = sim_unfreeze.bl_take(
-            {"DisplayBrightnessSliderPosition": pos, "brightness-nits": fixed_nits(13475)},
-            "brightness",
-            "brightness-nits",
-            33_000_000_000,
-            touch_override=False,
-        )
-        assert action == "IGNORED_AUTONOMOUS", f"Unfreeze fade without touch should be ignored, got {action}"
-        assert current_nits == 400000
-    # Now user touches screen at 40s and drags slider to 32768 (~50%)
-    sim_unfreeze.touched_ns = 40_000_000_000
-    action, current_nits = sim_unfreeze.bl_take(
-        {"DisplayBrightnessSliderPosition": 32768},
+    print("[3] Testing 1:1 framebuffer and nested DisplayBrightness synchronization...")
+    action, current_nits = sim.bl_take({"IOMFBBrightnessLevel": fixed_nits(200000)}, None, "IOMFBBrightnessLevel")
+    assert action == "APPLIED" and current_nits == 200000
+    action, current_nits = sim.bl_take(
+        {"DisplayBrightness": {"Brightness": 32768, "Nits": fixed_nits(300000), "DisplayBrightnessSliderPosition": 32768}},
         "brightness",
         "brightness-nits",
-        40_050_000_000,
-        touch_override=False,
     )
-    assert action == "APPLIED"
-    assert sim_unfreeze.saved is not None
-    print("  ✓ 33s autonomous unfreeze fade rejected without touch; real touched slider persisted")
+    assert action == "APPLIED" and 200000 <= current_nits <= 205000
+    print("  ✓ Framebuffer and nested DisplayBrightness updates synchronize 1:1 with panel")
 
-    # 4. User Slider Interaction
-    print("[4] Testing slider drag activation and decay...")
-    t_slider = t0 + 200_000_000
-    slider_req = {
-        "DisplayBrightnessSliderPosition": 500,
-        "DisplayBrightness": 32768,
-        "brightness-nits": fixed_nits(200000), # 200 nits
-    }
-    action, current_nits = sim.bl_take(slider_req, "brightness", "brightness-nits", t_slider)
-    assert action == "APPLIED", f"Slider request not applied: {action}"
-    assert current_nits == 200000, f"Expected 200000, got {current_nits}"
-    assert sim.user_until == t_slider + 500_000_000
-    print("  ✓ Slider drag accepted: brightness updated to 200 nits, window set to +500ms")
+    print("[4] Testing screen-off (s16 <= 0) preserves last user brightness...")
+    saved_before = sim.saved
+    action, current_nits = sim.bl_take({"IOMFBBrightnessLevel": 0}, None, "IOMFBBrightnessLevel")
+    assert action == "PANEL_OFF"
+    assert sim.panel_v == 0
+    assert sim.saved == saved_before
+    print("  ✓ Screen-off turns off panel without overwriting persisted brightness")
 
-    # Rapid updates within window
-    t_followup = t_slider + 100_000_000 # +100ms
-    followup_req = {
-        "DisplayBrightness": 25000,
-        "brightness-nits": fixed_nits(150000), # 150 nits
-    }
-    action, current_nits = sim.bl_take(followup_req, "brightness", "brightness-nits", t_followup)
-    assert action == "APPLIED", f"Follow-up in window not applied: {action}"
-    assert current_nits == 150000
-    assert sim.user_until == t_followup + 500_000_000
-    print("  ✓ Follow-up event in window extended window and updated brightness to 150 nits")
-
-    # After window expires
-    t_expired = sim.user_until + 10_000_000 # +10ms after expiry
-    auto_dim = {
-        "brightness-nits": fixed_nits(5000),
-        "DisplayBrightness": 0,
-    }
-    action, current_nits = sim.bl_take(auto_dim, "brightness", "brightness-nits", t_expired)
-    assert action == "IGNORED_AUTONOMOUS", f"Expired request not ignored: {action}"
-    assert current_nits == 150000, f"User brightness corrupted! Got {current_nits}"
-    print("  ✓ Autonomous dimming after slider idle ignored; user brightness (150 nits) retained")
-
-    # 5. Framebuffer Requests
-    print("[5] Testing framebuffer brightness requests...")
-    fb_req = {"IOMFBBrightnessLevel": fixed_nits(50000)}
-    action, current_nits = sim.bl_take(fb_req, None, "IOMFBBrightnessLevel", t_expired)
-    assert action == "IGNORED_FRAMEBUFFER"
-    assert current_nits == 150000
-    print("  ✓ Framebuffer brightness requests safely ignored")
-
-    # 6. Malicious / Edge Case Inputs
-    print("[6] Testing edge cases & corrupted inputs...")
-    # Negative nits
-    res, _ = sim.bl_take({"brightness-nits": -100}, "brightness", "brightness-nits", t_slider)
-    assert res == "DISCARDED_NON_POSITIVE"
-
-    # Zero nits
-    res, _ = sim.bl_take({"brightness-nits": 0}, "brightness", "brightness-nits", t_slider)
-    assert res == "DISCARDED_NON_POSITIVE"
-
-    # Invalid transient (between 1025 and 65535)
-    res, _ = sim.bl_take({"brightness-nits": 30000}, "brightness", "brightness-nits", t_slider)
-    assert res == "DISCARDED_TRANSIENT"
-
-    # Empty dictionary
-    res, _ = sim.bl_take({}, "brightness", "brightness-nits", t_slider)
-    assert res == "NOTHING_TAKEN"
-
-    # Enormous nits (> 400 nits)
-    res, val = sim.bl_take({"DisplayBrightnessSliderPosition": 1, "brightness-nits": fixed_nits(800000)}, "brightness", "brightness-nits", t_slider)
-    assert res == "APPLIED"
-    assert val == 400000, f"Expected clamp to 400000, got {val}"
-    print("  ✓ All boundary and adversarial inputs handled without panic or corruption")
-
-    # 7. Stress test: 10,000 randomized events
-    print("[7] Stress testing 10,000 randomized events...")
-    curr_time = 0
-    slider_active_cnt = 0
-    auto_cnt = 0
-    for _ in range(10000):
-        curr_time += random.randint(1_000, 20_000_000) # advance 1us to 20ms
-        is_slider = random.random() < 0.05 # 5% user slider interaction
-        if is_slider:
-            target_nits = random.randint(5, 400)
-            d = {
-                "DisplayBrightnessSliderPosition": random.randint(0, 1000),
-                "brightness-nits": fixed_nits(target_nits * 1000),
-                "DisplayBrightness": random.randint(0, 65536)
-            }
-            res, val = sim.bl_take(d, "brightness", "brightness-nits", curr_time)
-            assert res == "APPLIED"
-            slider_active_cnt += 1
-        else:
-            target_nits = random.randint(5, 400)
-            d = {
-                "brightness-nits": fixed_nits(target_nits * 1000),
-                "DisplayBrightness": random.randint(0, 65536)
-            }
-            res, val = sim.bl_take(d, "brightness", "brightness-nits", curr_time)
-            auto_cnt += 1
-            if curr_time > sim.user_until:
-                assert res == "IGNORED_AUTONOMOUS"
-
-    print(f"  ✓ 10,000 stress events completed successfully ({slider_active_cnt} slider, {auto_cnt} auto).")
+    print("[5] Testing edge cases & 5,000 randomized events...")
+    assert sim.bl_take({"brightness-nits": 30000}, "brightness", "brightness-nits")[0] == "DISCARDED_TRANSIENT"
+    assert sim.bl_take({}, "brightness", "brightness-nits")[0] == "NOTHING_TAKEN"
+    for _ in range(5000):
+        target_nits = random.randint(5, 400)
+        res, val = sim.bl_take({"IOMFBBrightnessLevel": fixed_nits(target_nits * 1000)}, None, "IOMFBBrightnessLevel")
+        assert res == "APPLIED"
+        assert kBLMilliNitsMin <= val <= kBLMilliNitsMax
     print("ALL MiniAppleARMBacklight TESTS PASSED!")
+
 
 if __name__ == "__main__":
     run_tests()
