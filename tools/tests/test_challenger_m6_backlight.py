@@ -1,151 +1,185 @@
 #!/usr/bin/env python3
-"""Empirical Challenger Test Suite for MiniAppleARMBacklight 1:1 Slider & Panel Sync."""
+"""Compile MiniAppleARMBacklight request handlers with host IOKit and hardware stubs."""
 
+import argparse
+import hashlib
+import json
 from pathlib import Path
-import random
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-BACKLIGHT_CPP = REPO_ROOT / "xnu/files/iokit/Kernel/MiniAppleARMBacklight.cpp"
-RAMFS_DISK_INC = REPO_ROOT / "xnu/files/bsd/miscfs/ramfs/ramfs_disk.inc"
-
-kBLValueMin = 5
-kBLValueMax = 0x1A5E
-kBLMilliNitsMin = 5000
-kBLMilliNitsMid = 140000
-kBLMilliNitsMax = 400000
-kBLLevelFull = 1024
+import re
+import shutil
+import subprocess
+import tempfile
 
 
-def fixed_nits(millinits: int) -> int:
-    return (millinits << 16) // 1000
+SOURCE = Path("xnu/files/iokit/Kernel/MiniAppleARMBacklight.cpp")
+FIXTURE = Path(__file__).with_name("backlight_fixture.cpp")
 
 
-class MiniAppleARMBacklightSimulator:
-    def __init__(self, boot_v: int = kBLValueMax, boot_millinits: int = kBLMilliNitsMax):
-        self.last_v = boot_v
-        self.last_millinits = boot_millinits
-        self.panel_v = boot_v
-        self.saved = None
-        self.active_level = (boot_millinits * kBLLevelFull) // kBLMilliNitsMax
-
-    def bl_take(self, dict_keys: dict, value_key: str | None, nits_key: str | None):
-        nits = dict_keys.get(nits_key) if nits_key else None
-        value = dict_keys.get(value_key) if value_key else None
-        db_dict = dict_keys.get("DisplayBrightness") if isinstance(dict_keys.get("DisplayBrightness"), dict) else None
-        slider_moved = False
-        slider_pos = 0
-
-        if value_key is not None and nits is None and value is None:
-            nits = dict_keys.get("DisplayBrightnessNitsNVRAM")
-            if nits is None and db_dict is not None:
-                nits = db_dict.get("NitsPhysical") or db_dict.get("Nits")
-
-        if value_key is not None:
-            pos_obj = dict_keys.get("DisplayBrightnessSliderPosition")
-            if pos_obj is None and db_dict is not None:
-                pos_obj = db_dict.get("DisplayBrightnessSliderPosition")
-            if pos_obj is not None:
-                slider_pos = min(65536, max(0, int(pos_obj)))
-                if slider_pos > 0 or (nits is not None and nits > 0):
-                    slider_moved = True
-
-        if slider_moved:
-            millinits = kBLMilliNitsMin + slider_pos * (kBLMilliNitsMax - kBLMilliNitsMin) // 65536
-            v = kBLValueMin + (millinits - kBLMilliNitsMin) * (kBLValueMax - kBLValueMin) // (kBLMilliNitsMax - kBLMilliNitsMin)
-        elif nits is not None:
-            s16 = int(nits)
-            n16 = s16
-            if s16 <= 0:
-                self.panel_v = 0
-                return ("PANEL_OFF", self.last_millinits)
-            if n16 >= 65536:
-                db = dict_keys.get("DisplayBrightness")
-                if isinstance(db, dict):
-                    db = db.get("Brightness", 65536)
-                elif db is None:
-                    db = 65536
-                if n16 == fixed_nits(kBLMilliNitsMid) and db < 49398:
-                    millinits = kBLMilliNitsMin + db * (kBLMilliNitsMid - kBLMilliNitsMin) // 49398
-                else:
-                    max_fixed = kBLMilliNitsMax << 16
-                    clamped_n16 = n16 if n16 < max_fixed else max_fixed
-                    millinits = (clamped_n16 * 1000) >> 16
-                millinits = max(kBLMilliNitsMin, min(kBLMilliNitsMax, millinits))
-                v = kBLValueMin + (millinits - kBLMilliNitsMin) * (kBLValueMax - kBLValueMin) // (kBLMilliNitsMax - kBLMilliNitsMin)
-            elif 1 <= n16 <= kBLLevelFull:
-                millinits = kBLMilliNitsMin + (n16 - 1) * (kBLMilliNitsMax - kBLMilliNitsMin) // (kBLLevelFull - 1)
-                v = kBLValueMin + (millinits - kBLMilliNitsMin) * (kBLValueMax - kBLValueMin) // (kBLMilliNitsMax - kBLMilliNitsMin)
-            else:
-                return ("DISCARDED_TRANSIENT", self.last_millinits)
-        elif value is not None:
-            if value == 0:
-                self.panel_v = 0
-                return ("PANEL_OFF", self.last_millinits)
-            v = max(kBLValueMin, min(kBLValueMax, int(value)))
-            millinits = kBLMilliNitsMin + (v - kBLValueMin) * (kBLMilliNitsMax - kBLMilliNitsMin) // (kBLValueMax - kBLValueMin)
-        else:
-            return ("NOTHING_TAKEN", self.last_millinits)
-
-        self.panel_v = v
-        self.last_v = v
-        self.last_millinits = millinits
-        self.saved = (v, millinits)
-        self.active_level = (millinits * kBLLevelFull) // kBLMilliNitsMax
-        return ("APPLIED", self.last_millinits)
+def block_end(source, start):
+    depth, state, pos = 0, "code", start
+    while pos < len(source):
+        char, pair = source[pos], source[pos:pos + 2]
+        if state == "line":
+            if char == "\n":
+                state = "code"
+        elif state == "comment":
+            if pair == "*/":
+                state = "code"
+                pos += 1
+        elif state in ("string", "char"):
+            if char == "\\":
+                pos += 1
+            elif char == ('"' if state == "string" else "'"):
+                state = "code"
+        elif pair in ("//", "/*"):
+            state = "line" if pair == "//" else "comment"
+            pos += 1
+        elif char in ('"', "'"):
+            state = "string" if char == '"' else "char"
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return pos + 1
+        pos += 1
+    raise ValueError("incomplete function body")
 
 
-def run_tests():
-    print("=== EMPIRICAL CHALLENGE: MiniAppleARMBacklight ===")
+def function(source, name):
+    match = re.search(r"(?m)^" + re.escape(name) + r"\(", source)
+    if match is None:
+        raise ValueError(f"missing function {name}")
+    start = source.rfind("\n", 0, match.start() - 1) + 1
+    body = source.index("{", match.end())
+    return source[start:block_end(source, body)] + "\n"
 
-    cpp_src = BACKLIGHT_CPP.read_text(encoding="utf-8")
-    ramfs_src = RAMFS_DISK_INC.read_text(encoding="utf-8")
 
-    print("[1] Checking source invariants in MiniAppleARMBacklight.cpp and ramfs_disk.inc...")
-    assert "outside slider window ignored" not in cpp_src, "Stale slider window filter still in MiniAppleARMBacklight.cpp"
-    assert '"annibale-bl-restored"' in cpp_src, "Missing annibale-bl-restored property"
-    assert 'OSDynamicCast(OSDictionary, dict->getObject("DisplayBrightness"))' in cpp_src, (
-        "Missing nested DisplayBrightness dictionary parsing"
+def extract(source):
+    definitions = "\n".join(re.findall(r"(?m)^#define kBL[^\n]+", source)) + "\n"
+    table_start = source.index("static const uint32_t kBLMarketingMilliNits[]")
+    definitions += source[table_start:source.index(";", table_start) + 1] + "\n"
+    state_start = source.index("static struct {")
+    state_end = block_end(source, source.index("{", state_start))
+    state_end = source.index(";", state_end) + 1
+    names = (
+        "range", "AppleARMBacklight::publish", "list_keys", "bl_print",
+        "bl_log", "bl_take", "AppleARMBacklight::setProperties",
+        "MiniAppleARMBacklightFramebufferProperties",
     )
-    assert "0x424c5332U" in ramfs_src, "Expected ANNFS_BL_MAGIC 0x424c5332U ('BLS2') in ramfs_disk.inc"
-    print("  ✓ Source invariants verified")
-
-    print("[2] Testing calibration parameters...")
-    assert fixed_nits(kBLMilliNitsMin) == 327680
-    assert fixed_nits(kBLMilliNitsMid) == 9175040
-    assert fixed_nits(kBLMilliNitsMax) == 26214400
-    print("  ✓ Calibration parameters correct")
-
-    sim = MiniAppleARMBacklightSimulator()
-
-    print("[3] Testing 1:1 framebuffer and nested DisplayBrightness synchronization...")
-    action, current_nits = sim.bl_take({"IOMFBBrightnessLevel": fixed_nits(200000)}, None, "IOMFBBrightnessLevel")
-    assert action == "APPLIED" and current_nits == 200000
-    action, current_nits = sim.bl_take(
-        {"DisplayBrightness": {"Brightness": 32768, "Nits": fixed_nits(300000), "DisplayBrightnessSliderPosition": 32768}},
-        "brightness",
-        "brightness-nits",
+    return definitions + function(source, "fixed_nits") + source[state_start:state_end] + "\n" + "\n".join(
+        function(source, name) for name in names
     )
-    assert action == "APPLIED" and 200000 <= current_nits <= 205000
-    print("  ✓ Framebuffer and nested DisplayBrightness updates synchronize 1:1 with panel")
 
-    print("[4] Testing screen-off (s16 <= 0) preserves last user brightness...")
-    saved_before = sim.saved
-    action, current_nits = sim.bl_take({"IOMFBBrightnessLevel": 0}, None, "IOMFBBrightnessLevel")
-    assert action == "PANEL_OFF"
-    assert sim.panel_v == 0
-    assert sim.saved == saved_before
-    print("  ✓ Screen-off turns off panel without overwriting persisted brightness")
 
-    print("[5] Testing edge cases & 5,000 randomized events...")
-    assert sim.bl_take({"brightness-nits": 30000}, "brightness", "brightness-nits")[0] == "DISCARDED_TRANSIENT"
-    assert sim.bl_take({}, "brightness", "brightness-nits")[0] == "NOTHING_TAKEN"
-    for _ in range(5000):
-        target_nits = random.randint(5, 400)
-        res, val = sim.bl_take({"IOMFBBrightnessLevel": fixed_nits(target_nits * 1000)}, None, "IOMFBBrightnessLevel")
-        assert res == "APPLIED"
-        assert kBLMilliNitsMin <= val <= kBLMilliNitsMax
-    print("ALL MiniAppleARMBacklight TESTS PASSED!")
+def replace(source, before, after):
+    if source.count(before) != 1:
+        raise ValueError(f"mutation not unique: {before!r}")
+    return source.replace(before, after, 1)
+
+
+def mutations(source):
+    plain = "millinits = (n16 < kBLMilliNitsMax / 1000 ? n16 : kBLMilliNitsMax / 1000) * 1000;"
+    fixed = "millinits = (n16 < fixed_nits(kBLMilliNitsMax) ? n16 : fixed_nits(kBLMilliNitsMax)) * 1000 >> 16;"
+    linear = (
+        "\tif (slider_moved) {\n"
+        "\t\tmillinits = kBLMilliNitsMin + slider_pos * (kBLMilliNitsMax - kBLMilliNitsMin) / 65536;\n"
+        "\t\tv = kBLValueMin + (millinits - kBLMilliNitsMin) * (kBLValueMax - kBLValueMin) / (kBLMilliNitsMax - kBLMilliNitsMin);\n"
+        "\t} else if (nits != NULL) {\n\t\tuint64_t n16 ="
+    )
+    return {
+        "dictionary_uses_fixed": replace(source, "plain_nits = nits != NULL;", "plain_nits = false;"),
+        "nvram_uses_plain": replace(source,
+            'nits = OSDynamicCast(OSNumber, dict->getObject("DisplayBrightnessNitsNVRAM"));',
+            'nits = OSDynamicCast(OSNumber, dict->getObject("DisplayBrightnessNitsNVRAM"));\n\t\t\tplain_nits = nits != NULL;'),
+        "physical_priority_removed": source.replace('db_dict->getObject("NitsPhysical")', 'db_dict->getObject("TEMP")').replace(
+            'db_dict->getObject("Nits")', 'db_dict->getObject("NitsPhysical")').replace(
+            'db_dict->getObject("TEMP")', 'db_dict->getObject("Nits")'),
+        "plain_wrong_scale": replace(source, plain, plain[:-5] + "100;"),
+        "fixed_uses_plain": replace(source, fixed, plain),
+        "plain_clamp_removed": replace(source, plain, "millinits = n16 * 1000;"),
+        "fixed_clamp_removed": replace(source, fixed, "millinits = n16 * 1000 >> 16;"),
+        "low_fixed_discarded": replace(source, "if (s16 <= 0)", "if (s16 < 65536)"),
+        "dictionary_overrides_top": replace(source,
+            "if (value_key != NULL && nits == NULL && value == NULL)", "if (value_key != NULL)"),
+        "off_treated_as_min": replace(source, "if (s16 <= 0)", "if (false)"),
+        "persist_idle": replace(source, "if (touch_recent || slider_moved)", "if (true)"),
+        "persist_removed": replace(source,
+            "ramfs_backlight_save((uint32_t) v, (uint32_t) millinits);", "(void) v;"),
+        "mid_brightness_guess_restored": replace(source, fixed,
+            fixed + "\n\t\t\tif (n16 == fixed_nits(kBLMilliNitsMid)) millinits = kBLMilliNitsMin;"),
+        "slider_linear_override_restored": replace(source,
+            "\tif (nits != NULL) {\n\t\tuint64_t n16 =", linear),
+        "slider_tracking_removed": replace(source, "if (diff >= 64)", "if (false)"),
+        "slider_clamp_removed": replace(source, "slider_pos = pos > 65536 ? 65536 : pos;", "slider_pos = pos;"),
+    }
+
+
+def run(name, source, output, compiler):
+    directory = output / name
+    directory.mkdir(parents=True, exist_ok=True)
+    included = extract(source)
+    (directory / "compiled-backlight.inc").write_text(included)
+    executable = directory / "fixture"
+    command = [
+        compiler, "-std=c++17", "-O1", "-g", "-fsanitize=address,undefined",
+        "-fno-omit-frame-pointer", "-Wno-format", str(FIXTURE),
+        "-I", str(directory), "-o", str(executable),
+    ]
+    compiled = subprocess.run(command, text=True, capture_output=True, timeout=60)
+    (directory / "compile.log").write_text(compiled.stdout + compiled.stderr)
+    if compiled.returncode:
+        raise RuntimeError(f"{name} failed to compile; see {directory / 'compile.log'}")
+    result = subprocess.run([str(executable)], text=True, capture_output=True, timeout=10)
+    (directory / "result.log").write_text(result.stdout + result.stderr)
+    failures = [line for line in result.stdout.splitlines() if line.startswith("FAIL ")]
+    passes = [line for line in result.stdout.splitlines() if line.startswith("PASS ")]
+    summary = {
+        "exit_code": result.returncode,
+        "passed": len(passes),
+        "failed": len(failures),
+        "failures": failures,
+        "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+        "included_sha256": hashlib.sha256(included.encode()).hexdigest(),
+    }
+    print(f"{name}: {len(passes)} passed, {len(failures)} failed", flush=True)
+    return summary
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source-root", type=Path, default=Path(__file__).resolve().parents[2],
+                        help="kernel repository or a directory with the same source layout")
+    parser.add_argument("--baseline-ref", help="Git revision whose backlight source must expose a regression")
+    parser.add_argument("--mutations", action="store_true", help="compile and reject protection-removal variants")
+    parser.add_argument("--output-dir", type=Path, help="store compiler and fixture outputs here; default is a temporary directory")
+    args = parser.parse_args()
+    compiler = shutil.which("clang++")
+    if compiler is None:
+        parser.error("clang++ is required")
+    root = args.source_root.resolve()
+    output = args.output_dir.resolve() if args.output_dir else Path(tempfile.mkdtemp(prefix="backlight-host-"))
+    output.mkdir(parents=True, exist_ok=True)
+    source = (root / SOURCE).read_text()
+    results = {"source": run("source", source, output, compiler)}
+    if args.baseline_ref:
+        baseline = subprocess.run(
+            ["git", "-C", str(root), "cat-file", "blob", f"{args.baseline_ref}:{SOURCE.as_posix()}"],
+            text=True, capture_output=True, check=True, timeout=10,
+        ).stdout
+        results["baseline"] = run("baseline", baseline, output, compiler)
+    if args.mutations and results["source"]["exit_code"] == 0:
+        for name, variant in mutations(source).items():
+            results[name] = run(name, variant, output, compiler)
+    (output / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+    print(f"outputs: {output}")
+    if results["source"]["exit_code"] != 0:
+        raise SystemExit("backlight source failed")
+    if args.baseline_ref and results["baseline"]["failed"] == 0:
+        raise SystemExit("baseline did not expose a regression")
+    if any(item["failed"] == 0 for name, item in results.items() if name not in ("source", "baseline")):
+        raise SystemExit("a protection variant unexpectedly passed")
 
 
 if __name__ == "__main__":
-    run_tests()
+    main()

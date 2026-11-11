@@ -280,16 +280,6 @@ ramfs_disk_evict_page_locked(struct ramfs_mount *rm, struct ramfs_node *node, ui
 }
 
 static void
-ramfs_disk_evict_page(struct ramfs_mount *rm, struct ramfs_node *node, uint64_t index, void *page)
-{
-	if (os_atomic_load(&ramfs_pages_in_use, relaxed) >= rm->rm_max_pages / 2) {
-		lck_mtx_lock(&rm->rm_lock);
-		ramfs_disk_evict_page_locked(rm, node, index, page);
-		lck_mtx_unlock(&rm->rm_lock);
-	}
-}
-
-static void
 ramfs_disk_dirty_locked(struct ramfs_mount *rm)
 {
 	if (rm == NULL || !rm->rm_disk_backed || rm->rm_disk_loading) {

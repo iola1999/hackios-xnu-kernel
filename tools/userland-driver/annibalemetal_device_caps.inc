@@ -91,26 +91,19 @@
 							      fromModule:NO];
 }
 
-/* The iOS 16 form, which takes a reflection object (MTLBufferBinding) instead of
- * descriptors. Declined by name: every reflection object in this process comes from
- * Metal's own compiler, which is nil here (docs/metal.md 10.7), so an application that
- * has one did not get it from us and this driver has nothing to read out of it. */
+/* Direct buffer reflection supplies a declared type and byte layout. An argument
+ * encoder also needs argument-buffer member IDs, read through the function path.
+ */
 - (id)newArgumentEncoderWithBufferBinding:(id)binding
 {
 	(void)binding;
-	rw_print("-newArgumentEncoderWithBufferBinding: takes a reflection "
-	         "object, and reflection on this port needs Metal's own compiler, which is "
-	         "nil; ask a function for an encoder (-newArgumentEncoderWithBufferIndex:) or "
+	rw_print("-newArgumentEncoderWithBufferBinding: requires argument-buffer member IDs; "
+	         "ask a function for an encoder (-newArgumentEncoderWithBufferIndex:) or "
 	         "describe the set with MTLArgumentDescriptors\n");
 	return nil;
 }
 
-/*
- * And the function path, which the method installed into Metal's own _MTLFunction
- * forwards here.
- * The layout is read out of the function's bitcode -- the one thing this port has that
- * Metal's reflection has not -- so the numbers are the module's own.
- */
+/* The function path reads the argument-buffer layout from the function's bitcode. */
 - (id)annibaleArgumentEncoderForFunction:(id)function bufferIndex:(NSUInteger)index
 {
 	static SEL bitcode;
@@ -182,30 +175,39 @@
 	return [[AnnibaleMetalCommandQueue alloc] initWithAnnibaleDevice:self descriptor:use];
 }
 
-/*
- * Where subsystem (1) is finally asked to do its work.
- *
- * Both pipeline entry points of _MTLDevice route through -[_MTLDevice compiler], which is
- * `mov x0, #0; ret`, so a driver that leaves them alone gets nil and no error -- which is
- * exactly what this device did before this method existed. Overriding them, as AGX does, is
- * what keeps us out of Apple's compiler: the AIR comes from the function object and goes to
- * our own front end.
- *
- * The cost of that road, named in docs/metal.md 10.7: with -compiler still nil,
- * -newFunctionWithName:constantValues: and -[MTLFunction reflectionWithOptions:] return nil,
- * because those go through the compiler inside Metal's own classes where we cannot reach.
+/* Compute pipelines compile the function's AIR with libannibaleair. Requested
+ * reflection uses the same entry point's argument declarations and byte layouts.
  */
 - (id)newComputePipelineStateWithDescriptor:(id)descriptor
 				    options:(NSUInteger)options
 				 reflection:(id *)reflection
 				      error:(NSError **)error
 {
-	(void)options;
-	if (reflection != NULL) {
-		*reflection = nil;   /* reflection needs Metal's compiler; saying nil is honest */
+	if (reflection != NULL)
+		*reflection = nil;
+	id state = [self pipelineForFunction:[descriptor computeFunction] descriptor:descriptor
+				      error:error];
+	if (state == nil || reflection == NULL ||
+	    !(options & (MTLPipelineOptionBindingInfo | MTLPipelineOptionBufferTypeInfo)))
+		return state;
+	if (mesa.compute_get_reflection == NULL) {
+		[state release];
+		return [self fail:error with:@"the compiler library has no compute reflection query"];
 	}
-	return [self pipelineForFunction:[descriptor computeFunction] descriptor:descriptor
-				  error:error];
+	const struct rwa_compute_reflection *metadata = NULL;
+	char why[512] = { 0 };
+	if (mesa.compute_get_reflection([state compute], &metadata, why, sizeof(why)) != 0) {
+		[state release];
+		return [self fail:error with:[NSString stringWithUTF8String:why]];
+	}
+	NSString *reason = nil;
+	id result = rw_compute_reflection(metadata, &reason);
+	if (result == nil) {
+		[state release];
+		return [self fail:error with:reason ?: @"Metal could not construct compute reflection"];
+	}
+	*reflection = [result autorelease];
+	return state;
 }
 
 - (id)newComputePipelineStateWithDescriptor:(id)descriptor error:(NSError **)error

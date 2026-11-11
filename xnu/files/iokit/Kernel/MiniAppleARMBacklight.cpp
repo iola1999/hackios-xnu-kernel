@@ -247,8 +247,10 @@ bl_log_later(thread_call_param_t, thread_call_param_t)
 
 /*
  * A request to either service, with bl.lock held. NITS_KEY (16.16) is taken if it is there, else
- * VALUE_KEY (a value of the brightness range, none for the framebuffer); either way the result is a
- * value, nits, and the level, which the mixers are given when it changes.
+ * VALUE_KEY (a value of the brightness range, none for the framebuffer). DisplayBrightness's
+ * NitsPhysical/Nits are nits (CoreBrightness 23G90, 0x1e273eb08); DisplayBrightnessNitsNVRAM is 16.16.
+ * Slider position records interaction; CoreBrightness supplies the mapped nits.
+ * The result is a panel value, nits, and the level given to the mixers when it changes.
  */
 static void
 bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
@@ -256,6 +258,7 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 	OSNumber * nits = OSDynamicCast(OSNumber, dict->getObject(nits_key));
 	OSNumber * value = value_key != NULL ? OSDynamicCast(OSNumber, dict->getObject(value_key)) : NULL;
 	OSDictionary * db_dict = OSDynamicCast(OSDictionary, dict->getObject("DisplayBrightness"));
+	bool plain_nits = false;
 	uint64_t now = mach_absolute_time(), active_win;
 	uint64_t v, millinits;
 	uint32_t level, mixed;
@@ -272,6 +275,7 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 			if (nits == NULL) {
 				nits = OSDynamicCast(OSNumber, db_dict->getObject("Nits"));
 			}
+			plain_nits = nits != NULL;
 		}
 		if (nits == NULL) {
 			nits = OSDynamicCast(OSNumber, dict->getObject("DisplayBrightnessNitsNVRAM"));
@@ -316,10 +320,7 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 	used = (size_t) snprintf(bl.line, sizeof(bl.line), "%s[%d] to the %s:", who, proc_selfpid(),
 	    value_key != NULL ? "backlight" : "framebuffer");
 	used = list_keys(bl.line, sizeof(bl.line), used < sizeof(bl.line) ? used : sizeof(bl.line), dict);
-	if (slider_moved) {
-		millinits = kBLMilliNitsMin + slider_pos * (kBLMilliNitsMax - kBLMilliNitsMin) / 65536;
-		v = kBLValueMin + (millinits - kBLMilliNitsMin) * (kBLValueMax - kBLValueMin) / (kBLMilliNitsMax - kBLMilliNitsMin);
-	} else if (nits != NULL) {
+	if (nits != NULL) {
 		uint64_t n16 = nits->unsigned64BitValue();
 		int64_t s16 = (int64_t) n16;
 
@@ -335,32 +336,14 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 			return;
 		}
 
-		if (n16 >= 65536) {
-			/* Standard 16.16 fixed-point nits (>= 1.0 nit) */
-			OSNumber * db_num = OSDynamicCast(OSNumber, dict->getObject("DisplayBrightness"));
-			if (db_num == NULL && db_dict != NULL) {
-				db_num = OSDynamicCast(OSNumber, db_dict->getObject("Brightness"));
-			}
-			uint64_t db = db_num != NULL ? db_num->unsigned64BitValue() : 65536;
-			if (n16 == fixed_nits(kBLMilliNitsMid) && db < 49398) {
-				millinits = kBLMilliNitsMin + db * (kBLMilliNitsMid - kBLMilliNitsMin) / 49398;
-			} else {
-				millinits = (n16 < (uint64_t) kBLMilliNitsMax << 16 ? n16 : (uint64_t) kBLMilliNitsMax << 16) * 1000 >> 16;
-			}
-			millinits = millinits < kBLMilliNitsMin ? kBLMilliNitsMin : millinits > kBLMilliNitsMax ? kBLMilliNitsMax : millinits;
-			v = kBLValueMin + (millinits - kBLMilliNitsMin) * (kBLValueMax - kBLValueMin) / (kBLMilliNitsMax - kBLMilliNitsMin);
-		} else if (n16 >= 1 && n16 <= kBLLevelFull) {
-			/* Integer step in 1..1024, map linearly to [kBLMilliNitsMin, kBLMilliNitsMax] */
-			millinits = kBLMilliNitsMin + (n16 - 1) * (kBLMilliNitsMax - kBLMilliNitsMin) / (kBLLevelFull - 1);
-			v = kBLValueMin + (millinits - kBLMilliNitsMin) * (kBLValueMax - kBLValueMin) / (kBLMilliNitsMax - kBLMilliNitsMin);
+		/* CoreBrightness's DisplayBrightness dictionary uses nits; the other keys use 16.16. */
+		if (plain_nits) {
+			millinits = (n16 < kBLMilliNitsMax / 1000 ? n16 : kBLMilliNitsMax / 1000) * 1000;
 		} else {
-			/* Invalid transient (> 1024 and < 65536): discard and keep previous stable brightness */
-			snprintf(bl.line + used, sizeof(bl.line) - used,
-			    "; discarded invalid transient %llu, keeping %llu.%03llu nits",
-			    n16, bl.last_millinits / 1000, bl.last_millinits % 1000);
-			bl_log();
-			return;
+			millinits = (n16 < fixed_nits(kBLMilliNitsMax) ? n16 : fixed_nits(kBLMilliNitsMax)) * 1000 >> 16;
 		}
+		millinits = millinits < kBLMilliNitsMin ? kBLMilliNitsMin : millinits > kBLMilliNitsMax ? kBLMilliNitsMax : millinits;
+		v = kBLValueMin + (millinits - kBLMilliNitsMin) * (kBLValueMax - kBLValueMin) / (kBLMilliNitsMax - kBLMilliNitsMin);
 	} else if (value != NULL) {
 		v = value->unsigned64BitValue();
 		if (v == 0) {

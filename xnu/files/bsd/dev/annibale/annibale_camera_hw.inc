@@ -283,7 +283,12 @@ cbcr_enable(vm_offset_t base, uint32_t offset, bool check_off)
 	reg_wr(base, offset, reg_rd(base, offset) | 1u);
 	if (!check_off) {
 		delay_for_interval(10, NSEC_PER_USEC);
-		return true;
+		uint32_t v = reg_rd(base, offset);
+		if (v != UINT32_MAX && (v & 1u) != 0) {
+			return true;
+		}
+		say("CBCR +%#x enable readback failed (%#x)\n", offset, v);
+		return false;
 	}
 	for (uint32_t i = 0; i < 500; i++) {
 		uint32_t v = reg_rd(base, offset);
@@ -390,14 +395,17 @@ static void
 cam_vote_rpmh_supplies(bool enable)
 {
 	if (enable) {
-		(void)annibale_rpmh_arc_vote("mmcx.lvl", ANNIBALE_RPMPD_LEVEL_NOM);
-		(void)annibale_rpmh_arc_vote("mxc.lvl", ANNIBALE_RPMPD_LEVEL_NOM);
+		bool mmcx_ok = annibale_rpmh_arc_vote("mmcx.lvl", ANNIBALE_RPMPD_LEVEL_NOM);
+		bool mxc_ok = annibale_rpmh_arc_vote("mxc.lvl", ANNIBALE_RPMPD_LEVEL_NOM);
+		say("rpmh arc mmcx_return=%u mxc_return=%u\n", mmcx_ok ? 1u : 0u, mxc_ok ? 1u : 0u);
 	}
 	for (size_t i = 0; i < sizeof(cam_vrm_rails) / sizeof(cam_vrm_rails[0]); i++) {
 		size_t idx = enable ? i : (sizeof(cam_vrm_rails) / sizeof(cam_vrm_rails[0]) - 1u - i);
-		(void)annibale_rpmh_regulator(cam_vrm_rails[idx].name,
+		bool regulator_ok = annibale_rpmh_regulator(cam_vrm_rails[idx].name,
 		    cam_vrm_rails[idx].mv, enable,
 		    enable ? cam_vrm_rails[idx].mode : ANNIBALE_RPMH_MODE_NONE);
+		say("rpmh regulator=%s enable=%u returned=%u\n", cam_vrm_rails[idx].name,
+		    enable ? 1u : 0u, regulator_ok ? 1u : 0u);
 	}
 }
 

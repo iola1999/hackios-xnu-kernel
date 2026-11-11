@@ -1,4 +1,5 @@
 #include "air_metal_copy.h"
+#include "air_metal_reflection.h"
 
 struct rwa_fence;
 
@@ -31,6 +32,7 @@ static struct {
 					      const char *, struct rwa_compute_info *, char *,
 					      size_t);
 	void (*compute_destroy)(struct rwa_compute *);
+	__typeof__(&rwa_compute_get_reflection) compute_get_reflection;
 	struct rwa_texture *(*texture_create)(struct rwa_device *,
 					      const struct rwa_texture_shape *, char *, size_t);
 	int (*texture_write)(struct rwa_texture *, unsigned, unsigned, const unsigned[3],
@@ -132,6 +134,7 @@ mesa_available(void)
 	*(void **)&mesa.buffer_destroy = dlsym(mesa.handle, "rwa_buffer_destroy");
 	*(void **)&mesa.compute_create = dlsym(mesa.handle, "rwa_compute_create");
 	*(void **)&mesa.compute_destroy = dlsym(mesa.handle, "rwa_compute_destroy");
+	*(void **)&mesa.compute_get_reflection = dlsym(mesa.handle, "rwa_compute_get_reflection");
 	*(void **)&mesa.texture_create = dlsym(mesa.handle, "rwa_texture_create");
 	*(void **)&mesa.texture_write = dlsym(mesa.handle, "rwa_texture_write");
 	*(void **)&mesa.texture_read = dlsym(mesa.handle, "rwa_texture_read");

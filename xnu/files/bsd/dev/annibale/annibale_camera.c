@@ -207,13 +207,24 @@ cam_hardware_power_up(void)
 
 	/* 2. Enable HLOS-owned GCC camera vote + AHB / XO / MCLK AHB clock branches */
 	bool gcc_cam_ahb_ok = false;
+	bool gcc_cam_xo_ok = false;
 	bool gcc_mclk_ahb_ok = false;
 	if (gcc_base != 0) {
 		reg_wr(gcc_base, GCC_APSS_VOTE_1,
 		    reg_rd(gcc_base, GCC_APSS_VOTE_1) | GCC_VOTE1_CAMERA_BITS);
-		gcc_cam_ahb_ok = cbcr_enable(gcc_base, GCC_CAMERA_AHB_CBCR, true);
-		(void)cbcr_enable(gcc_base, GCC_CAMERA_XO_CBCR, true);
-		gcc_mclk_ahb_ok = cbcr_enable(gcc_base, GCC_CAM_BIST_MCLK_AHB_CBCR, true);
+		/*
+		 * gcc_sun_probe sets camera/MCLK AHB bit 0 without waiting for HALT.
+		 * CAMCC/MCLKCC access and subsequent capture check the consumers.
+		 */
+		gcc_cam_ahb_ok = cbcr_enable(gcc_base, GCC_CAMERA_AHB_CBCR, false);
+		gcc_cam_xo_ok = cbcr_enable(gcc_base, GCC_CAMERA_XO_CBCR, true);
+		gcc_mclk_ahb_ok = cbcr_enable(gcc_base, GCC_CAM_BIST_MCLK_AHB_CBCR, false);
+		say("gcc ahb=0x%08x xo=0x%08x mclk_ahb=0x%08x vote1=0x%08x cam_ahb_ok=%u xo_ok=%u mclk_ahb_ok=%u\n",
+		    reg_rd(gcc_base, GCC_CAMERA_AHB_CBCR), reg_rd(gcc_base, GCC_CAMERA_XO_CBCR),
+		    reg_rd(gcc_base, GCC_CAM_BIST_MCLK_AHB_CBCR), reg_rd(gcc_base, GCC_APSS_VOTE_1),
+		    gcc_cam_ahb_ok ? 1u : 0u, gcc_cam_xo_ok ? 1u : 0u, gcc_mclk_ahb_ok ? 1u : 0u);
+	} else {
+		say("gcc mapping failed\n");
 	}
 
 	/* 3. Idempotent apps_smmu SID 0x1c00 Stage-1 bypass */
@@ -278,6 +289,10 @@ cam_hardware_power_up(void)
 		rcgr_enable_xo(camcc_base, CAMCC_CCI0_CMD_RCGR, CAMCC_CCI0_CFG_RCGR);
 		cci0_clk_ok = cbcr_enable(camcc_base, CAMCC_CCI0_CBCR, true);
 	}
+	say("camcc mapped=%u entered=%u titan=%u cpas_ahb=%u core_ahb=%u cci0=%u ife_lite=%u\n",
+	    camcc_base != 0 ? 1u : 0u, camcc_base != 0 && gcc_cam_ahb_ok ? 1u : 0u,
+	    titan_top_on ? 1u : 0u, cpas_ahb_ok ? 1u : 0u, core_ahb_ok ? 1u : 0u,
+	    cci0_clk_ok ? 1u : 0u, cam_ife_lite_clks_on ? 1u : 0u);
 
 	/* 5. Read CAM-CPAS (0x0ac04000, read-only HW_VERSION / HW_CAPABILITY) once clocked */
 	if (cpas_base != 0 && titan_top_on && cpas_ahb_ok && core_ahb_ok) {

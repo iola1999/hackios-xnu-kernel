@@ -29,6 +29,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
+extern void annibale_tl(const char *format, ...) __printflike(1, 2);
 extern uint64_t kvtophys(vm_offset_t va);
 extern const uint8_t *annibale_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 extern bool annibale_ufs_fat16_fw_read(const char *name, uint64_t *size_out, volatile void *dst_buf, uint64_t dst_cap);
@@ -39,7 +40,7 @@ extern int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t ar
 #ifdef ANNIBALE_IRIS_HOST_TEST
 #define iris_say(...) printf("iris: " __VA_ARGS__)
 #else
-#define iris_say(...) kprintf("iris: " __VA_ARGS__)
+#define iris_say(...) annibale_tl("iris: " __VA_ARGS__)
 #endif
 
 /* Hardware physical apertures on SM8750 ("sun") */
@@ -176,12 +177,23 @@ extern int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t ar
 #define HFI_CMD_START                   0x01000005u
 #define HFI_CMD_STOP                    0x01000006u
 #define HFI_CMD_DRAIN                   0x01000007u
+#define HFI_CMD_RESUME                  0x01000008u
 #define HFI_CMD_BUFFER                  0x01000009u
 #define HFI_CMD_SUBSCRIBE_MODE          0x0100000bu
 #define HFI_CMD_SETTINGS_CHANGE         0x0100000cu
 
-#define HFI_SYS_ERROR                   0x05000008u
-#define HFI_INFORMATION_END_OF_DRAIN    (1u << 28)
+#define HFI_SESSION_ERROR_BEGIN         0x04000000u
+#define HFI_SESSION_ERROR_END           0x04ffffffu
+#define HFI_SYSTEM_ERROR_BEGIN          0x05000000u
+#define HFI_SYSTEM_ERROR_END            0x05ffffffu
+#define HFI_FW_FLAGS_SUCCESS            0x00000001u
+#define HFI_FW_FLAGS_INFORMATION        0x00000002u
+#define HFI_FW_FLAGS_SESSION_ERROR      0x00000004u
+#define HFI_FW_FLAGS_SYSTEM_ERROR       0x00000008u
+#define HFI_INFO_DATA_CORRUPT           0x06000002u
+#define HFI_INFO_BUFFER_OVERFLOW        0x06000004u
+#define HFI_INFO_HFI_FLAG_DRAIN_LAST    0x06000006u
+#define HFI_INFO_HFI_FLAG_PSC_LAST      0x06000007u
 
 #define HFI_PROP_UBWC_MAX_CHANNELS      0x03000003u
 #define HFI_PROP_UBWC_MAL_LENGTH        0x03000004u
@@ -193,10 +205,22 @@ extern int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t ar
 
 #define HFI_PROP_CODEC                  0x03000100u
 #define HFI_PROP_COLOR_FORMAT           0x03000101u
-#define HFI_PROP_SECURE                 0x03000102u
 #define HFI_PROP_BITSTREAM_RESOLUTION   0x03000103u
 #define HFI_PROP_LINEAR_STRIDE_SCANLINE 0x03000104u
 #define HFI_PROP_CROP_OFFSETS           0x03000105u
+#define HFI_PROP_PROFILE                0x03000107u
+#define HFI_PROP_LEVEL                  0x03000108u
+#define HFI_PROP_TIER                   0x03000109u
+#define HFI_PROP_LUMA_CHROMA_BIT_DEPTH   0x0300010fu
+#define HFI_PROP_CODED_FRAMES            0x03000120u
+#define HFI_PROP_CABAC_SESSION           0x03000121u
+#define HFI_PROP_BUFFER_FW_MIN_OUTPUT_COUNT 0x03000124u
+#define HFI_PROP_PIC_ORDER_CNT_TYPE      0x03000128u
+#define HFI_PROP_SIGNAL_COLOR_INFO       0x03000155u
+#define HFI_PROP_PICTURE_TYPE            0x03000162u
+#define HFI_PROP_DEC_DEFAULT_HEADER      0x03000168u
+#define HFI_PROP_NO_OUTPUT               0x0300016au
+#define HFI_PROP_OPB_ENABLE              0x03000184u
 #define HFI_PROP_COMV_BUFFER_COUNT      0x03000193u
 
 #define HFI_PAYLOAD_NONE                0u
@@ -204,10 +228,19 @@ extern int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t ar
 #define HFI_PAYLOAD_U64                 3u
 #define HFI_PAYLOAD_STRUCTURE           5u
 #define HFI_PAYLOAD_U32_ENUM            9u
+#define HFI_PAYLOAD_32_PACKED           10u
+#define HFI_PAYLOAD_U32_ARRAY           11u
+#define HFI_PAYLOAD_64_PACKED           13u
 
-#define HFI_PACKET_SELF_DEFINED         1u
-#define HFI_PACKET_RESPONSE_REQUIRED    2u
-#define HFI_PACKET_ORDERED              4u
+#define HFI_HOST_FLAGS_NONE             0u
+#define HFI_HOST_FLAGS_INTR_REQUIRED    1u
+#define HFI_HOST_FLAGS_RESPONSE_REQUIRED 2u
+#define HFI_HOST_FLAGS_NON_DISCARDABLE   4u
+#define HFI_MODE_PORT_SETTINGS_CHANGE   1u
+#define HFI_MODE_PROPERTY               2u
+#define HFI_CODEC_DECODE_AVC             1u
+#define HFI_CODEC_DECODE_HEVC            3u
+#define HFI_COLOR_FMT_NV12               1u
 
 #define HFI_PORT_NONE                   0u
 #define HFI_PORT_BITSTREAM              1u
@@ -215,17 +248,24 @@ extern int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t ar
 
 #define HFI_BUFFER_BITSTREAM            1u
 #define HFI_BUFFER_RAW                  2u
-#define HFI_BUFFER_PERSIST              5u
+#define HFI_BUFFER_DPB                  6u
 #define HFI_BUFFER_BIN                  7u
-#define HFI_BUFFER_COMV                 9u
-#define HFI_BUFFER_NON_COMV             10u
-#define HFI_BUFFER_LINE                 11u
-#define HFI_BUFFER_DPB                  12u
+#define HFI_BUFFER_LINE                 8u
+#define HFI_BUFFER_COMV                 10u
+#define HFI_BUFFER_NON_COMV             11u
+#define HFI_BUFFER_PERSIST              12u
 
-#define HFI_BUFFER_HOST_OWNS            0x00000002u
+#define HFI_BUF_HOST_FLAGS_CB_NON_SECURE 0x00000200u
+#define HFI_BUF_FW_FLAG_READONLY         0x00000010u
+#define HFI_BUF_FW_FLAG_LAST             0x10000000u
+#define HFI_BUF_FW_FLAG_PSC_LAST          0x20000000u
+#define IRIS_RAW_HOST                    0u
+#define IRIS_RAW_QUEUED                  1u
+#define IRIS_RAW_RETURNED                2u
 
 #define IRIS_MAX_SESSIONS               4u
 #define IRIS_RAW_POOL_COUNT             4u
+#define IRIS_DPB_POOL_COUNT             6u
 #define IRIS_MAX_BITSTREAM_BYTES        (4u * 1024u * 1024u)
 #define IRIS_MAX_WIDTH                  4096u
 #define IRIS_MAX_HEIGHT                 4096u
@@ -309,8 +349,17 @@ struct iris_smmu_table {
 
 struct iris_session {
 	bool                active;
-	bool                streaming;
+	bool                opened;
+	bool                closing;
+	bool                input_queued;
 	bool                draining;
+	bool                drain_ack;
+	bool                drain_last;
+	uint32_t            started_ports;
+	uint32_t            drain_packet_id;
+	uint32_t            wire_session_id;
+	int                 error;
+	uint32_t            response_logs;
 	int                 owner_pid;
 	uint32_t            session_id;
 	uint32_t            codec_type;
@@ -322,6 +371,10 @@ struct iris_session {
 	uint32_t            uv_scanlines;
 	uint32_t            raw_frame_size;
 	uint32_t            next_input_idx;
+	uint32_t            dpb_frame_size;
+	uint32_t            dpb_count;
+	uint32_t            psc_seen;
+	uint32_t            psc_values[11];
 	struct iris_dma_buf bitstream;
 	struct iris_dma_buf intern_bin;
 	struct iris_dma_buf intern_comv;
@@ -330,7 +383,8 @@ struct iris_session {
 	struct iris_dma_buf intern_persist;
 	struct iris_dma_buf intern_dpb;
 	struct iris_dma_buf raw[IRIS_RAW_POOL_COUNT];
-	bool                raw_queued[IRIS_RAW_POOL_COUNT];
+	uint8_t             raw_state[IRIS_RAW_POOL_COUNT];
+	struct hfi_buffer   raw_done[IRIS_RAW_POOL_COUNT];
 };
 
 struct iris_controller {
@@ -343,7 +397,10 @@ struct iris_controller {
 	bool                    hw_attempted;
 	bool                    hw_ready;
 	bool                    pas_authed;
+	volatile bool           pas_shutdown_required;
+	volatile bool           dma_shutdown_unconfirmed;
 	bool                    smmu_ready;
+	volatile bool           smmu_owned;
 
 	vm_offset_t             gcc;
 	vm_offset_t             vidcc;
@@ -363,6 +420,7 @@ struct iris_controller {
 	struct iris_dma_buf     sfr_region;
 	uint32_t                next_header_id;
 	uint32_t                next_packet_id;
+	uint32_t                next_wire_session_id;
 
 	struct iris_session     sessions[IRIS_MAX_SESSIONS];
 };
@@ -371,8 +429,10 @@ extern struct iris_controller g_iris;
 
 void iris_sleep_us(uint32_t us);
 void iris_cache_clean_inval(const void *addr, size_t len);
+/* A failed allocation may retain pages (kva != 0); cleanup must succeed before reuse. */
 bool iris_dma_alloc_map(struct iris_dma_buf *buf, uint32_t iova, uint32_t size, bool cached);
-void iris_dma_free_unmap(struct iris_dma_buf *buf);
+/* False retains the pages and descriptor until TLB invalidation completes. */
+bool iris_dma_free_unmap(struct iris_dma_buf *buf);
 bool iris_hw_probe_firmware(void);
 bool iris_hw_ensure_ready(void);
 
@@ -380,6 +440,6 @@ bool iris_hfi_sys_init(void);
 int  iris_hfi_session_open(struct iris_session *s);
 int  iris_hfi_decode_frame(struct iris_session *s, struct iris_decode_frame *req);
 int  iris_hfi_session_flush(struct iris_session *s);
-void iris_hfi_session_close(struct iris_session *s);
+int  iris_hfi_session_close(struct iris_session *s);
 
 #endif /* _BSD_DEV_ANNIBALE_IRIS_PRIVATE_H_ */

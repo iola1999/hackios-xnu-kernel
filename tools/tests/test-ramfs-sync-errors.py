@@ -124,15 +124,14 @@ static void ramfs_fetch(struct ramfs_node *n, uint64_t off, void *to, size_t len
     assert(off + len <= sizeof(n->data)); memcpy(to, n->data + off, len);
 }
 static int ramfs_store(struct ramfs_node *n, uint64_t off, const void *data, size_t len,
-                       void **spare, uint32_t *block, void **page) {
-    (void)spare; *block = 0; *page = NULL;
+                       void **spare) {
+    (void)spare;
     assert(off + len <= sizeof(n->data)); memcpy(n->data + off, data, len);
     if (off + len > n->rn_size) n->rn_size = off + len;
     changes++; return 0;
 }
-static int ramfs_store_write(struct ramfs_mount *rm, struct ramfs_node *n,
-                             uint64_t index, uint32_t block, void *page) {
-    (void)rm; (void)n; assert(index == 0 && block == 0 && page == NULL); return 0;
+static int ramfs_store_write_locked(struct ramfs_node *n, uint64_t index) {
+    (void)n; assert(index == 0); return 0;
 }
 '''
 source += function((SRC / 'ramfs.c').read_text(), 'ramfs_sync_mapping')

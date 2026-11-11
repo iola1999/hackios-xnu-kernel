@@ -469,20 +469,18 @@ ramfs_write(struct vnop_write_args *ap)
 		if (spare == NULL) {
 			spare = ramfs_page_alloc(true);
 		}
-		uint32_t write_dblk = 0;
-		void *write_page = NULL;
-
 		ramfs_reserve_slots(rm, node, off / PAGE_SIZE);
 		lck_mtx_lock(&rm->rm_lock);
-		error = ramfs_store(node, off, bounce, len, &spare, &write_dblk, &write_page);
-		lck_mtx_unlock(&rm->rm_lock);
+		error = ramfs_store(node, off, bounce, len, &spare);
 		if (error) {
+			lck_mtx_unlock(&rm->rm_lock);
 			/* nothing of this piece was stored: hand it back to the caller's count */
 			uio_setoffset(uio, (off_t)off);
 			uio_setresid(uio, uio_resid(uio) + (user_ssize_t)len);
 			break;
 		}
-		error = ramfs_store_write(rm, node, off / PAGE_SIZE, write_dblk, write_page);
+		error = ramfs_store_write_locked(node, off / PAGE_SIZE);
+		lck_mtx_unlock(&rm->rm_lock);
 		if (error) {
 			break;
 		}
@@ -761,22 +759,36 @@ ramfs_pageout(struct vnop_pageout_args *ap)
 	}
 	addr += ap->a_pl_offset;
 
-	for (upl_size_t done = 0; done < size && off + done < node->rn_size && !error; done += PAGE_SIZE) {
-		size_t len = (size_t)MIN((uint64_t)PAGE_SIZE, node->rn_size - (off + done));
+	for (upl_size_t done = 0; done < size && !error; done += PAGE_SIZE) {
 		uint64_t index = (off + done) / PAGE_SIZE;
-		uint32_t write_dblk = 0;
-		void *write_page = NULL;
-		/* this may be the pageout daemon looking for memory: never wait for more of it here */
-		void *spare = index < node->rn_nslots && node->rn_pages[index] != NULL ? NULL : ramfs_page_alloc(false);
+		void *spare = NULL;
+		size_t len;
 
 		lck_mtx_lock(&rm->rm_lock);
-		error = ramfs_store(node, off + done, (const void *)(addr + done), len, &spare, &write_dblk, &write_page);
+		if (off + done >= node->rn_size) {
+			lck_mtx_unlock(&rm->rm_lock);
+			break;
+		}
+		if (index >= node->rn_nslots || node->rn_pages[index] == NULL) {
+			lck_mtx_unlock(&rm->rm_lock);
+			/* The pageout daemon must not wait for memory. Recheck EOF after allocation. */
+			spare = ramfs_page_alloc(false);
+			lck_mtx_lock(&rm->rm_lock);
+		}
+		len = off + done < node->rn_size ?
+		    (size_t)MIN((uint64_t)PAGE_SIZE, node->rn_size - (off + done)) : 0;
+		if (len != 0) {
+			error = ramfs_store(node, off + done, (const void *)(addr + done), len, &spare);
+			if (!error) {
+				error = ramfs_store_write_locked(node, index);
+			}
+		}
 		lck_mtx_unlock(&rm->rm_lock);
 		if (spare != NULL) {
 			ramfs_page_free(spare);
 		}
-		if (!error) {
-			error = ramfs_store_write(rm, node, index, write_dblk, write_page);
+		if (len == 0) {
+			break;
 		}
 	}
 	if (!error) {

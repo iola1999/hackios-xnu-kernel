@@ -1,11 +1,9 @@
 /*
  * ramfs_store.inc: File page allocation, storage, and persistence write helpers.
  *
- * ramfs_store() allocates and writes data to a node's in-memory page slots
- * and prepares disk block writes for disk-backed mounts (ANNFS001).
- * ramfs_store_write() performs synchronous UFS block writes and memory-pressure
- * page evictions outside rm->rm_lock to prevent lock contention during bulk writes
- * and seed unpack.
+ * The caller holds rm_lock from ramfs_store() through the synchronous disk
+ * write and eviction. This protects the page mapping, block ownership and
+ * ordering against other writes and truncation.
  */
 
 /*
@@ -14,19 +12,12 @@
  * the lock; it is consumed if the slot was empty. The mount lock is held.
  */
 static int
-ramfs_store(struct ramfs_node *node, uint64_t off, const void *src, size_t len, void **spare,
-    uint32_t *dblk_out, void **page_out)
+ramfs_store(struct ramfs_node *node, uint64_t off, const void *src, size_t len, void **spare)
 {
 	struct ramfs_mount *rm = node->rn_mount;
 	uint64_t index = off / PAGE_SIZE;
 	int error = ramfs_grow_slots(node, index);
 
-	if (dblk_out != NULL) {
-		*dblk_out = 0;
-	}
-	if (page_out != NULL) {
-		*page_out = NULL;
-	}
 	if (error) {
 		return error;
 	}
@@ -38,9 +29,7 @@ ramfs_store(struct ramfs_node *node, uint64_t off, const void *src, size_t len, 
 		}
 		if (existing_blk != 0) {
 			if (len < PAGE_SIZE) {
-				lck_mtx_unlock(&rm->rm_lock);
 				error = ramfs_disk_read_block(rm, existing_blk, *spare);
-				lck_mtx_lock(&rm->rm_lock);
 				if (error) {
 					return error;
 				}
@@ -78,30 +67,23 @@ ramfs_store(struct ramfs_node *node, uint64_t off, const void *src, size_t len, 
 		node->rn_size = off + len;
 	}
 	if (rm->rm_disk_backed && node->rn_blocks[index] != 0) {
-		if (dblk_out != NULL && page_out != NULL) {
-			*dblk_out = node->rn_blocks[index];
-			*page_out = node->rn_pages[index];
-		} else {
-			error = ramfs_disk_write_block(rm, node->rn_blocks[index], node->rn_pages[index]);
-			if (error) {
-				return error;
-			}
-			ramfs_disk_evict_page_locked(rm, node, index, node->rn_pages[index]);
-		}
 		ramfs_disk_dirty_locked(rm);
 	}
 	return 0;
 }
 
 static int
-ramfs_store_write(struct ramfs_mount *rm, struct ramfs_node *node, uint64_t index, uint32_t dblk, void *page)
+ramfs_store_write_locked(struct ramfs_node *node, uint64_t index)
 {
-	if (dblk != 0 && page != NULL) {
-		int error = ramfs_disk_write_block(rm, dblk, page);
+	struct ramfs_mount *rm = node->rn_mount;
+
+	if (rm->rm_disk_backed && node->rn_blocks[index] != 0) {
+		void *page = node->rn_pages[index];
+		int error = ramfs_disk_write_block(rm, node->rn_blocks[index], page);
 		if (error) {
 			return error;
 		}
-		ramfs_disk_evict_page(rm, node, index, page);
+		ramfs_disk_evict_page_locked(rm, node, index, page);
 	}
 	return 0;
 }

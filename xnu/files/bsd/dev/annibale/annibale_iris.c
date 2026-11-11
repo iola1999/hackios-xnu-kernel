@@ -50,17 +50,22 @@ static int
 iris_dev_close(dev_t dev __unused, int flags __unused, int devtype __unused, struct proc *p)
 {
 	int pid = iris_caller_pid(p);
+	int error = 0;
 
 	iris_lock_acquire();
 	for (uint32_t i = 0; i < IRIS_MAX_SESSIONS; i++) {
 		struct iris_session *s = &g_iris.sessions[i];
 		if (s->active && (pid == 0 || s->owner_pid == pid)) {
-			iris_hfi_session_close(s);
-			memset(s, 0, sizeof(*s));
+			int result = iris_hfi_session_close(s);
+			if (result == 0) memset(s, 0, sizeof(*s));
+			else {
+				if (error == 0) error = result;
+				iris_say("device close retained slot=%u error=%d\n", s->session_id, result);
+			}
 		}
 	}
 	iris_lock_release();
-	return 0;
+	return error;
 }
 
 static int
@@ -117,13 +122,16 @@ iris_ioctl_open_session(struct iris_session_params *params, int pid)
 	slot->width = params->width;
 	slot->height = params->height;
 	slot->owner_pid = pid;
+	/* Reserve the slot before OPEN publishes any session or DMA addresses. */
+	slot->active = true;
 
 	int err = iris_hfi_session_open(slot);
 	if (err != 0) {
-		memset(slot, 0, sizeof(*slot));
-		return err;
+		int cleanup = iris_hfi_session_close(slot);
+		if (cleanup == 0) memset(slot, 0, sizeof(*slot));
+		else iris_say("open cleanup retained slot=%u open_error=%d close_error=%d\n", sid, err, cleanup);
+		return cleanup != 0 ? cleanup : err;
 	}
-	slot->active = true;
 	params->session_id = sid;
 	return 0;
 }
@@ -181,8 +189,9 @@ iris_dev_ioctl(dev_t dev __unused, u_long cmd, caddr_t data, int flags __unused,
 		if (s == NULL) {
 			err = EINVAL;
 		} else {
-			iris_hfi_session_close(s);
-			memset(s, 0, sizeof(*s));
+			err = iris_hfi_session_close(s);
+			if (err == 0) memset(s, 0, sizeof(*s));
+			else iris_say("ioctl close retained slot=%u error=%d\n", sid, err);
 		}
 		break;
 	}

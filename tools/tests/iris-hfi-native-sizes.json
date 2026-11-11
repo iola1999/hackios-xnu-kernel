@@ -1,0 +1,330 @@
+{
+  "commit": "a41e364995bbcfa627418a70fe913c35b7510728",
+  "sources": {
+    "iris_vpu_buffer.c": "63abc0601d1572889160f596485d0687a37b4d7b1565edeea6acbfa6c74aa6d4",
+    "iris_buffer.c": "800862e3d6ef4ec444df0f0393a45c74eacf5e15a14661de5e3521a31acf3815",
+    "iris_vpu_buffer.h": "30d677ad72e514738cf17e65f280875507652cdb51dd95f186744c954fc3d6c0"
+  },
+  "cases": [
+    {
+      "codec": 1,
+      "width": 64,
+      "height": 64,
+      "internal": [
+        5701632,
+        65536,
+        196608,
+        196608,
+        524288,
+        131072
+      ],
+      "dpb_frame": 20480,
+      "raw": 16384,
+      "supported": true
+    },
+    {
+      "codec": 1,
+      "width": 320,
+      "height": 192,
+      "internal": [
+        5701632,
+        262144,
+        458752,
+        720896,
+        524288,
+        720896
+      ],
+      "dpb_frame": 118784,
+      "raw": 114688,
+      "supported": true
+    },
+    {
+      "codec": 1,
+      "width": 640,
+      "height": 480,
+      "internal": [
+        5701632,
+        1310720,
+        1048576,
+        1376256,
+        524288,
+        2883584
+      ],
+      "dpb_frame": 479232,
+      "raw": 475136,
+      "supported": true
+    },
+    {
+      "codec": 1,
+      "width": 1280,
+      "height": 720,
+      "internal": [
+        5701632,
+        3932160,
+        1245184,
+        2752512,
+        524288,
+        8716288
+      ],
+      "dpb_frame": 1445888,
+      "raw": 1425408,
+      "supported": true
+    },
+    {
+      "codec": 1,
+      "width": 1920,
+      "height": 1080,
+      "internal": [
+        12582912,
+        8650752,
+        1245184,
+        4063232,
+        524288,
+        18939904
+      ],
+      "dpb_frame": 3153920,
+      "raw": 3145728,
+      "supported": true
+    },
+    {
+      "codec": 1,
+      "width": 1922,
+      "height": 1082,
+      "internal": [
+        12648448,
+        8716288,
+        1245184,
+        4128768,
+        524288,
+        20185088
+      ],
+      "dpb_frame": 3362816,
+      "raw": 3342336,
+      "supported": true
+    },
+    {
+      "codec": 1,
+      "width": 64,
+      "height": 1920,
+      "internal": [
+        5701632,
+        524288,
+        1245184,
+        589824,
+        524288,
+        2359296
+      ],
+      "dpb_frame": 393216,
+      "raw": 376832,
+      "supported": true
+    },
+    {
+      "codec": 1,
+      "width": 1920,
+      "height": 64,
+      "internal": [
+        5701632,
+        524288,
+        196608,
+        3866624,
+        524288,
+        1179648
+      ],
+      "dpb_frame": 192512,
+      "raw": 196608,
+      "supported": true
+    },
+    {
+      "codec": 1,
+      "width": 3840,
+      "height": 2160,
+      "internal": [
+        49807360,
+        34537472,
+        1245184,
+        8257536,
+        524288,
+        75563008
+      ],
+      "dpb_frame": 12591104,
+      "raw": 12533760,
+      "supported": false
+    },
+    {
+      "codec": 1,
+      "width": 4096,
+      "height": 4096,
+      "internal": [
+        100663296,
+        69271552,
+        1245184,
+        9437184,
+        524288,
+        151584768
+      ],
+      "dpb_frame": 25264128,
+      "raw": 25165824,
+      "supported": false
+    },
+    {
+      "codec": 2,
+      "width": 64,
+      "height": 64,
+      "internal": [
+        5701632,
+        65536,
+        458752,
+        131072,
+        458752,
+        131072
+      ],
+      "dpb_frame": 20480,
+      "raw": 16384,
+      "supported": true
+    },
+    {
+      "codec": 2,
+      "width": 320,
+      "height": 192,
+      "internal": [
+        5701632,
+        524288,
+        1638400,
+        524288,
+        458752,
+        720896
+      ],
+      "dpb_frame": 118784,
+      "raw": 114688,
+      "supported": true
+    },
+    {
+      "codec": 2,
+      "width": 640,
+      "height": 480,
+      "internal": [
+        5701632,
+        2490368,
+        1703936,
+        1048576,
+        458752,
+        2883584
+      ],
+      "dpb_frame": 479232,
+      "raw": 475136,
+      "supported": true
+    },
+    {
+      "codec": 2,
+      "width": 1280,
+      "height": 720,
+      "internal": [
+        5701632,
+        7405568,
+        1703936,
+        1966080,
+        458752,
+        8716288
+      ],
+      "dpb_frame": 1445888,
+      "raw": 1425408,
+      "supported": true
+    },
+    {
+      "codec": 2,
+      "width": 1920,
+      "height": 1080,
+      "internal": [
+        12582912,
+        16777216,
+        1703936,
+        2949120,
+        458752,
+        18939904
+      ],
+      "dpb_frame": 3153920,
+      "raw": 3145728,
+      "supported": true
+    },
+    {
+      "codec": 2,
+      "width": 1922,
+      "height": 1082,
+      "internal": [
+        12648448,
+        16908288,
+        1703936,
+        3014656,
+        458752,
+        20185088
+      ],
+      "dpb_frame": 3362816,
+      "raw": 3342336,
+      "supported": true
+    },
+    {
+      "codec": 2,
+      "width": 64,
+      "height": 1920,
+      "internal": [
+        5701632,
+        1048576,
+        1638400,
+        655360,
+        458752,
+        2359296
+      ],
+      "dpb_frame": 393216,
+      "raw": 376832,
+      "supported": true
+    },
+    {
+      "codec": 2,
+      "width": 1920,
+      "height": 64,
+      "internal": [
+        5701632,
+        1048576,
+        1638400,
+        2621440,
+        458752,
+        1179648
+      ],
+      "dpb_frame": 192512,
+      "raw": 196608,
+      "supported": true
+    },
+    {
+      "codec": 2,
+      "width": 3840,
+      "height": 2160,
+      "internal": [
+        49807360,
+        66387968,
+        1769472,
+        5963776,
+        458752,
+        75563008
+      ],
+      "dpb_frame": 12591104,
+      "raw": 12533760,
+      "supported": false
+    },
+    {
+      "codec": 2,
+      "width": 4096,
+      "height": 4096,
+      "internal": [
+        100663296,
+        134283264,
+        1900544,
+        7143424,
+        458752,
+        151584768
+      ],
+      "dpb_frame": 25264128,
+      "raw": 25165824,
+      "supported": false
+    }
+  ]
+}

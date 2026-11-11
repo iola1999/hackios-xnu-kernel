@@ -70,10 +70,17 @@ annibale_cmd_db_lookup(const char *name, const uint8_t **data_out, uint32_t *len
 {
 	char id[8] = { 0 };
 	uint32_t found_addr = 0;
+	size_t name_len;
 
 	if (name == NULL) {
 		return 0;
 	}
+	name_len = strnlen(name, sizeof(id) + 1u);
+	if (name_len > sizeof(id)) {
+		return 0;
+	}
+	/* CMD_DB IDs occupy eight bytes; a full-width ID has no terminator. */
+	memcpy(id, name, name_len);
 	lck_mtx_lock(&annibale_rpmh_lock);
 	if (cmd_db_va == NULL) {
 		cmd_db_va = (const struct cmd_db_header *)ml_io_map_wcomb(CMD_DB_PHYS, CMD_DB_SIZE);
@@ -87,7 +94,6 @@ annibale_cmd_db_lookup(const char *name, const uint8_t **data_out, uint32_t *len
 		lck_mtx_unlock(&annibale_rpmh_lock);
 		return 0;
 	}
-	strlcpy(id, name, sizeof(id));
 	for (unsigned s = 0; s < 8; s++) {
 		const struct cmd_db_slave *slv = &cmd_db_va->slave[s];
 		const struct cmd_db_entry *ent;

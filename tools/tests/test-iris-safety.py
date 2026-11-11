@@ -47,6 +47,7 @@ static void no_operation(void) {}
 static int registry_calls, node_calls, hardware_accesses, lock_depth;
 static int open_sessions_hw, decode_calls_hw, flush_calls_hw, close_calls_hw;
 static bool sim_fw_present, sim_hw_ready;
+static int sim_open_error, sim_close_error;
 
 static void iris_lock_acquire(void) { assert(lock_depth == 0); lock_depth++; }
 static void iris_lock_release(void) { assert(lock_depth == 1); lock_depth--; }
@@ -80,10 +81,13 @@ bool iris_hw_ensure_ready(void) {
 	return sim_hw_ready;
 }
 int iris_hfi_session_open(struct iris_session *s) {
+	assert(s->active && s->owner_pid && s->session_id);
 	hardware_accesses++;
 	open_sessions_hw++;
-	s->streaming = true;
-	return 0;
+	s->opened = true;
+	s->started_ports = 1u << HFI_PORT_BITSTREAM;
+	s->bitstream.kva = 0x1000u + s->session_id;
+	return sim_open_error;
 }
 int iris_hfi_decode_frame(struct iris_session *s, struct iris_decode_frame *req) {
 	(void)s;
@@ -99,10 +103,14 @@ int iris_hfi_session_flush(struct iris_session *s) {
 	flush_calls_hw++;
 	return 0;
 }
-void iris_hfi_session_close(struct iris_session *s) {
-	(void)s;
+int iris_hfi_session_close(struct iris_session *s) {
 	hardware_accesses++;
 	close_calls_hw++;
+	if (sim_close_error) return sim_close_error;
+	s->opened = false;
+	s->started_ports = 0;
+	memset(&s->bitstream, 0, sizeof(s->bitstream));
+	return 0;
 }
 
 __IRIS_KERNEL_BODY__
@@ -185,6 +193,26 @@ int main(void) {
 	assert(iris_cdevsw.d_close(0, 0, 0, &p2) == 0);
 	assert(close_calls_hw == (int)IRIS_MAX_SESSIONS);
 	assert(lock_depth == 0);
+
+	sim_open_error = EIO;
+	sp.session_id = 0;
+	assert(iris_cdevsw.d_ioctl(0, IRIS_IOC_OPEN_SESSION, (caddr_t)&sp, 0, &p1) == EIO);
+	assert(!g_iris.sessions[0].active && sp.session_id == 0);
+	sim_close_error = ETIMEDOUT;
+	assert(iris_cdevsw.d_ioctl(0, IRIS_IOC_OPEN_SESSION, (caddr_t)&sp, 0, &p1) == ETIMEDOUT);
+	assert(g_iris.sessions[0].active && g_iris.sessions[0].opened && g_iris.sessions[0].bitstream.kva);
+	assert(g_iris.sessions[0].owner_pid == p1.pid && sp.session_id == 0);
+	sim_open_error = 0;
+	assert(iris_cdevsw.d_ioctl(0, IRIS_IOC_OPEN_SESSION, (caddr_t)&sp, 0, &p1) == 0 && sp.session_id == 2);
+	uint32_t retained_sid = 1;
+	assert(iris_cdevsw.d_ioctl(0, IRIS_IOC_CLOSE_SESSION, (caddr_t)&retained_sid, 0, &p1) == ETIMEDOUT);
+	assert(g_iris.sessions[0].active && g_iris.sessions[0].bitstream.kva);
+	assert(iris_cdevsw.d_close(0, 0, 0, &p1) == ETIMEDOUT);
+	assert(g_iris.sessions[0].active && g_iris.sessions[1].active);
+	assert(g_iris.sessions[0].owner_pid == p1.pid && g_iris.sessions[1].owner_pid == p1.pid);
+	sim_close_error = 0;
+	assert(iris_cdevsw.d_close(0, 0, 0, &p1) == 0);
+	assert(!g_iris.sessions[0].active && !g_iris.sessions[1].active && lock_depth == 0);
 	puts("PASS: Iris kernel cdevsw safety, lazy init, and session lifecycle verified");
 	return 0;
 }
@@ -265,16 +293,26 @@ struct fake_cf_obj {
 	uint8_t storage[512];
 };
 
+static VTDecoderSessionRef borrowed_session;
+static int cf_live_objects, pixbuf_allocations;
+
+static void require_cf_object(CFTypeRef p) {
+	assert(p != borrowed_session);
+	assert((uintptr_t)p >= 4096);
+}
+
 static CFTypeRef CFRetain(CFTypeRef p) {
 	if (p == NULL || p == kCFBooleanTrue || p == (CFTypeRef)&k_false_obj) return p;
+	require_cf_object(p);
 	((struct fake_cf_obj *)p)->refcnt++;
 	return p;
 }
 static void CFRelease(CFTypeRef p) {
 	if (p == NULL || p == kCFBooleanTrue || p == (CFTypeRef)&k_false_obj) return;
+	require_cf_object(p);
 	struct fake_cf_obj *o = (struct fake_cf_obj *)p;
 	assert(o->refcnt > 0);
-	if (--o->refcnt == 0) free(o);
+	if (--o->refcnt == 0) { cf_live_objects--; free(o); }
 }
 static Boolean CFEqual(CFTypeRef a, CFTypeRef b) {
 	return a && b && strcmp((const char *)a, (const char *)b) == 0;
@@ -282,15 +320,15 @@ static Boolean CFEqual(CFTypeRef a, CFTypeRef b) {
 static Boolean CFBooleanGetValue(CFBooleanRef b) { return b == kCFBooleanTrue; }
 static CFNumberRef CFNumberCreate(CFAllocatorRef a, int t, const void *v) {
 	(void)a; (void)t; (void)v;
-	struct fake_cf_obj *o = calloc(1, sizeof(*o)); o->refcnt = 1; return o;
+	struct fake_cf_obj *o = calloc(1, sizeof(*o)); o->refcnt = 1; cf_live_objects++; return o;
 }
 static CFDictionaryRef CFDictionaryCreate(CFAllocatorRef a, const void **k, const void **v, CFIndex n, const int *kc, const int *vc) {
 	(void)a; (void)k; (void)v; (void)n; (void)kc; (void)vc;
-	struct fake_cf_obj *o = calloc(1, sizeof(*o)); o->refcnt = 1; return o;
+	struct fake_cf_obj *o = calloc(1, sizeof(*o)); o->refcnt = 1; cf_live_objects++; return o;
 }
 static CFStringRef CFStringCreateWithFormat(CFAllocatorRef a, CFDictionaryRef o, CFStringRef f, ...) {
 	(void)a; (void)o; (void)f;
-	struct fake_cf_obj *s = calloc(1, sizeof(*s)); s->refcnt = 1; return (CFStringRef)s;
+	struct fake_cf_obj *s = calloc(1, sizeof(*s)); s->refcnt = 1; cf_live_objects++; return (CFStringRef)s;
 }
 
 struct fake_data { const uint8_t *bytes; size_t len; };
@@ -351,6 +389,7 @@ static OSStatus CMDerivedObjectCreate(CFAllocatorRef a, const void *vtable, CFTy
 	last_created_vtable = vtable;
 	struct fake_cf_obj *o = calloc(1, sizeof(*o) + 2048);
 	o->refcnt = 1;
+	cf_live_objects++;
 	*out = o;
 	return noErr;
 }
@@ -370,12 +409,14 @@ static OSStatus VTRegisterVideoDecoderWithInfo(CMVideoCodecType codec, CFDiction
 }
 static int pb_attr_calls;
 static OSStatus VTDecoderSessionSetPixelBufferAttributes(VTDecoderSessionRef s, CFDictionaryRef a) {
-	(void)s; assert(a != NULL); pb_attr_calls++; return noErr;
+	assert(s == borrowed_session && a != NULL); pb_attr_calls++; return noErr;
 }
 static OSStatus VTDecoderSessionCreatePixelBuffer(VTDecoderSessionRef s, VTDecodeFrameRef fr, CVPixelBufferRef *out) {
-	(void)s; (void)fr;
+	assert(s == borrowed_session); (void)fr;
 	struct fake_pixbuf *pb = calloc(1, sizeof(*pb));
 	pb->base.refcnt = 1;
+	cf_live_objects++;
+	pixbuf_allocations++;
 	*out = pb;
 	return noErr;
 }
@@ -388,13 +429,21 @@ static void *CVPixelBufferGetBaseAddressOfPlane(CVPixelBufferRef pb, size_t idx)
 static size_t CVPixelBufferGetBytesPerRowOfPlane(CVPixelBufferRef pb, size_t idx) { (void)pb; (void)idx; return 256; }
 
 static int emit_calls;
-static VTDecodeFrameRef emitted_frames[16];
-static OSStatus emitted_statuses[16];
+static VTDecodeFrameRef emitted_frames[64];
+static OSStatus emitted_statuses[64];
+static VTDecodeInfoFlags emitted_flags[64];
 static OSStatus VTDecoderSessionEmitDecodedFrame(VTDecoderSessionRef s, VTDecodeFrameRef fr,
     OSStatus st, VTDecodeInfoFlags fl, CVImageBufferRef img) {
-	(void)s; (void)fl; (void)img;
+	assert(s == borrowed_session && fr != NULL);
+	assert(emit_calls < 64);
+	if (img != NULL) {
+		assert(((struct fake_pixbuf *)img)->base.refcnt == 1);
+		CFRetain(img);
+		CFRelease(img);
+	}
 	emitted_frames[emit_calls] = fr;
 	emitted_statuses[emit_calls] = st;
+	emitted_flags[emit_calls] = fl;
 	emit_calls++;
 	return noErr;
 }
@@ -402,6 +451,7 @@ static OSStatus VTDecoderSessionEmitDecodedFrame(VTDecoderSessionRef s, VTDecode
 static bool sim_dev_exists;
 static uint32_t sim_info_flags;
 static int sim_delay_mode;
+static bool sim_fail_decode;
 static uint64_t delayed_tag;
 static uint8_t last_submitted_bs[256];
 static uint32_t last_submitted_len;
@@ -432,6 +482,7 @@ static int iris_sys_ioctl(int fd, unsigned long cmd, void *arg) {
 	}
 	if (cmd == IRIS_IOC_DECODE_FRAME) {
 		struct iris_decode_frame *req = arg;
+		if (sim_fail_decode) return -1;
 		if ((req->flags & IRIS_FRAME_POLL) != 0) {
 			req->flags = 0;
 			return 0;
@@ -466,7 +517,41 @@ static int iris_sys_ioctl(int fd, unsigned long cmd, void *arg) {
 	return -1;
 }
 
-int main(void) {
+static void test_pending_tokens(void) {
+	struct iris_vt_decoder dec = { .session = borrowed_session, .fd = -1 };
+	const int live_before = cf_live_objects;
+	emit_calls = 0;
+	for (uint32_t i = 0; i < IRIS_VT_PENDING_MAX; i++) {
+		dec.next_tag = i + 1;
+		assert(iris_pending_push(&dec, 100 + i, (VTDecodeFrameRef)(uintptr_t)(i + 1)));
+	}
+	assert(!iris_pending_push(&dec, 999, (VTDecodeFrameRef)(uintptr_t)999));
+	assert(iris_pending_pop(&dec, 103) == (VTDecodeFrameRef)(uintptr_t)4);
+	assert(iris_pending_pop(&dec, 0) == (VTDecodeFrameRef)(uintptr_t)1);
+	iris_pending_abort_all(&dec, kVTVideoDecoderMalfunctionErr);
+	assert(emit_calls == (int)IRIS_VT_PENDING_MAX - 2);
+	int emitted = 0;
+	for (uint32_t token = 2; token <= IRIS_VT_PENDING_MAX; token++) {
+		if (token == 4) continue;
+		assert(emitted_frames[emitted] == (VTDecodeFrameRef)(uintptr_t)token);
+		assert(emitted_statuses[emitted] == kVTVideoDecoderMalfunctionErr);
+		assert(emitted_flags[emitted++] == kVTDecodeInfo_FrameDropped);
+	}
+	for (uint32_t i = 0; i < IRIS_VT_PENDING_MAX; i++) assert(!dec.pending[i].in_use);
+	iris_pending_abort_all(&dec, kVTVideoDecoderMalfunctionErr);
+	assert(emit_calls == emitted && cf_live_objects == live_before);
+}
+
+int main(int argc, char **argv) {
+	uintptr_t session_words[4] = { 0x101, 0x202, 0x303, 0 };
+	const uintptr_t original_words[4] = { 0x101, 0x202, 0x303, 0 };
+	VTDecoderSessionRef sess = session_words;
+	borrowed_session = sess;
+	if (argc == 2 && strcmp(argv[1], "tokens") == 0) {
+		test_pending_tokens();
+		puts("PASS: integer frame tokens survive queue completion and cancellation");
+		return 0;
+	}
 	/* 1. Missing device & unready VPU must NOT register hardware decoders */
 	sim_dev_exists = false;
 	register_iris_videotoolbox_decoders();
@@ -499,40 +584,54 @@ int main(void) {
 		0x01, 0x00, 0x04, 0x68, 0xce, 0x3c, 0x80
 	};
 	struct fake_fmt fmt = { .sub = kCMVideoCodecType_H264, .w = 160, .h = 96, .cfg = { avcc, sizeof(avcc) } };
-	struct fake_cf_obj sess = { .refcnt = 1 };
-	assert(vt->derived_class->start_session(dec_obj, &sess, &fmt) == noErr);
+	assert(vt->derived_class->start_session(dec_obj, sess, &fmt) == noErr);
 	assert(pb_attr_calls == 1);
+	assert(cf_live_objects == 1 && memcmp(session_words, original_words, sizeof(session_words)) == 0);
 	assert(vt->derived_class->can_accept_format(dec_obj, &fmt));
 
 	/* 5. Corrupt zero-length NALU is rejected with BadDataErr (-12909) */
 	static const uint8_t bad_nal[] = { 0x00, 0x00, 0x00, 0x00 };
 	struct fake_sample bad_sample = { bad_nal, sizeof(bad_nal), false };
-	struct fake_cf_obj fref_bad = { .refcnt = 1 };
-	assert(vt->derived_class->decode_frame(dec_obj, &fref_bad, &bad_sample, 0, NULL) == kVTVideoDecoderBadDataErr);
+	VTDecodeFrameRef fref_bad = (VTDecodeFrameRef)(uintptr_t)1;
+	assert(vt->derived_class->decode_frame(dec_obj, fref_bad, &bad_sample, 0, NULL) == kVTVideoDecoderBadDataErr);
 
 	/* 6. Valid AVCC IDR + B-frame reorder + drain */
 	static const uint8_t idr_nal[] = { 0x00, 0x00, 0x00, 0x03, 0x65, 0x88, 0x84 };
 	static const uint8_t b_nal[]   = { 0x00, 0x00, 0x00, 0x02, 0x01, 0x9a };
 	struct fake_sample s1 = { idr_nal, sizeof(idr_nal), false };
 	struct fake_sample s2 = { b_nal, sizeof(b_nal), true };
-	struct fake_cf_obj fref1 = { .refcnt = 1 }, fref2 = { .refcnt = 1 };
+	VTDecodeFrameRef fref1 = (VTDecodeFrameRef)(uintptr_t)1;
+	VTDecodeFrameRef fref2 = (VTDecodeFrameRef)(uintptr_t)2;
 
 	sim_delay_mode = 1;
-	assert(vt->derived_class->decode_frame(dec_obj, &fref1, &s1, 0, NULL) == noErr);
+	assert(vt->derived_class->decode_frame(dec_obj, fref1, &s1, 0, NULL) == noErr);
 	/* First sync sample prepended Annex-B SPS (8 B) + PPS (8 B) + IDR (7 B) = 23 B */
 	assert(last_submitted_len == 23);
 	assert(memcmp(last_submitted_bs, "\x00\x00\x00\x01\x67\x42\x00\x1e\x00\x00\x00\x01\x68\xce\x3c\x80\x00\x00\x00\x01\x65\x88\x84", 23) == 0);
 	assert(emit_calls == 0);
 
-	assert(vt->derived_class->decode_frame(dec_obj, &fref2, &s2, 0, NULL) == noErr);
+	assert(vt->derived_class->decode_frame(dec_obj, fref2, &s2, 0, NULL) == noErr);
 	/* Non-sync sample omits SPS/PPS: 4 + 2 = 6 B, emits fref2 while fref1 stays in DPB */
 	assert(last_submitted_len == 6);
-	assert(emit_calls == 1 && emitted_frames[0] == &fref2 && emitted_statuses[0] == noErr);
+	assert(emit_calls == 1 && emitted_frames[0] == fref2 && emitted_statuses[0] == noErr);
 
 	/* Drain flushes delayed fref1 */
 	assert(vt->derived_class->finish_delayed_frames(dec_obj) == noErr);
-	assert(emit_calls == 2 && emitted_frames[1] == &fref1 && emitted_statuses[1] == noErr);
-	assert(fref1.refcnt == 1 && fref2.refcnt == 1);
+	assert(emit_calls == 2 && emitted_frames[1] == fref1 && emitted_statuses[1] == noErr);
+	assert(cf_live_objects == 1 && pixbuf_allocations > 0);
+
+	/* Failed submission removes its token without a callback or CF access. */
+	sim_fail_decode = true;
+	assert(vt->derived_class->decode_frame(dec_obj, (VTDecodeFrameRef)(uintptr_t)3, &s2, 0, NULL) == kVTVideoDecoderBadDataErr);
+	sim_fail_decode = false;
+	struct iris_vt_decoder *storage = CMBaseObjectGetDerivedStorage(dec_obj);
+	for (uint32_t i = 0; i < IRIS_VT_PENDING_MAX; i++) assert(!storage->pending[i].in_use);
+	assert(emit_calls == 2 && cf_live_objects == 1);
+
+	/* Invalidation completes a delayed token once before clearing its handle. */
+	sim_delay_mode = 1;
+	assert(vt->derived_class->decode_frame(dec_obj, (VTDecodeFrameRef)(uintptr_t)4, &s2, 0, NULL) == noErr);
+	assert(emit_calls == 2);
 
 	/* HVCC parser sanity */
 	uint8_t hvcc[32] = { 0 };
@@ -542,9 +641,16 @@ int main(void) {
 	assert(iris_parse_hvcc(hvcc, 31, &nls, ab, sizeof(ab), &ab_len) && nls == 4 && ab_len == 7);
 
 	assert(vt->base_class->invalidate(dec_obj) == noErr);
+	assert(emit_calls == 3 && emitted_frames[2] == (VTDecodeFrameRef)(uintptr_t)4);
+	assert(emitted_statuses[2] == kVTVideoDecoderMalfunctionErr);
+	assert(emitted_flags[2] == kVTDecodeInfo_FrameDropped);
+	assert(storage->session == NULL && storage->fd == -1 && storage->session_id == 0);
+	assert(vt->base_class->invalidate(dec_obj) == noErr && emit_calls == 3);
 	vt->base_class->finalize(dec_obj);
 	CFRelease(dec_obj);
-	puts("PASS: Iris VideoToolbox gating, PAC vtable, Annex-B conversion, and B-frame drain verified");
+	assert(cf_live_objects == 0 && memcmp(session_words, original_words, sizeof(session_words)) == 0);
+	test_pending_tokens();
+	puts("PASS: Iris VideoToolbox gating, vtable layout, borrowed handles, frame tokens, Annex-B conversion, and B-frame drain verified");
 	return 0;
 }
 '''
@@ -567,20 +673,21 @@ def run_kernel(kernel_body: str, directory: Path, label: str) -> subprocess.Comp
     return subprocess.run([str(binary)], capture_output=True, text=True)
 
 
-def run_vt(directory: Path) -> subprocess.CompletedProcess:
-    src = directory / 'vt_test.c'
+def run_vt(directory: Path, vt_code=None, args=(), label='vt_test') -> subprocess.CompletedProcess:
+    src = directory / f'{label}.c'
     # Include videotoolbox_iris.c without iris_sys_ioctl forward issue by splitting before iris_sys_ioctl's callers
-    vt_code = VT_SRC.read_text()
+    if vt_code is None:
+        vt_code = VT_SRC.read_text()
     vt_header = 'static int iris_sys_ioctl(int fd, unsigned long cmd, void *arg);\n'
-    patched_vt = directory / 'videotoolbox_iris_under_test.h'
+    patched_vt = directory / f'{label}_source.h'
     patched_vt.write_text(vt_header + vt_code)
     src.write_text(VT_HARNESS.replace('__VT_SOURCE__', str(patched_vt)))
-    binary = directory / 'vt_test'
+    binary = directory / label
     subprocess.run([
         'cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-Wno-four-char-constants',
         str(src), '-lpthread', '-o', str(binary),
     ], check=True)
-    return subprocess.run([str(binary)], capture_output=True, text=True)
+    return subprocess.run([str(binary), *args], capture_output=True, text=True)
 
 
 with tempfile.TemporaryDirectory(prefix='iris-safety-') as tmp:
@@ -595,6 +702,13 @@ with tempfile.TemporaryDirectory(prefix='iris-safety-') as tmp:
         'open_hardware': ('return 0;\n}', 'hardware_accesses++; return 0;\n}'),
         'null_ioctl_pass': ('return EINVAL;', 'return 0;'),
         'unknown_ioctl_pass': ('return ENOTTY;', 'return 0;'),
+        'reserve_before_open': ('slot->active = true;', 'slot->active = false;'),
+        'open_retained': ('if (cleanup == 0) memset(slot, 0, sizeof(*slot));',
+                          'if (true) memset(slot, 0, sizeof(*slot));'),
+        'close_retained': ('if (err == 0) memset(s, 0, sizeof(*s));',
+                           'if (true) memset(s, 0, sizeof(*s));'),
+        'device_retained': ('if (result == 0) memset(s, 0, sizeof(*s));',
+                            'if (true) memset(s, 0, sizeof(*s));'),
     }
     for label, (old, new) in mutations.items():
         assert old in kernel_text, label
@@ -604,6 +718,9 @@ with tempfile.TemporaryDirectory(prefix='iris-safety-') as tmp:
 
     vt_res = run_vt(directory)
     assert vt_res.returncode == 0, vt_res.stderr
+    for stage in ('create codec=', 'create class=', 'create result=', 'start decoder=', 'start result=', 'decode session_id='):
+        assert any(line.startswith('iris_vt[') and line.split(']', 1)[0][8:].isdigit() and stage in line
+                   for line in vt_res.stderr.splitlines()), stage
     print(vt_res.stdout.strip())
 
 assert 'videotoolbox_iris.c' in PACKAGE

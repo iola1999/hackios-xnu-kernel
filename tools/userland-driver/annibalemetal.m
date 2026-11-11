@@ -1078,6 +1078,7 @@ struct gem_close { uint32_t handle, pad; };
 
 #include "annibalemetal_stitch.inc"
 #include "annibalemetal_pipecache.inc"
+#include "annibalemetal_reflection.inc"
 
 
 #include "annibalemetal_device.inc"
