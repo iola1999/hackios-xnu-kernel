@@ -37,29 +37,87 @@ iris_qring(uint32_t off)
 	return (uint32_t *)(g_iris.uc_region.kva + off);
 }
 
+/* annibale_tl has a 320-byte line buffer; split firmware text without truncating it. */
+static void
+iris_diag_text(const char *kind, const char *text, uint32_t capacity)
+{
+	uint32_t length = (uint32_t)strnlen(text, capacity);
+	for (uint32_t off = 0; off < length; ) {
+		uint32_t count = length - off;
+		if (count > 240u) count = 240u;
+		iris_say("VPU %s +%u: %.*s\n", kind, off, (int)count, text + off);
+		off += count;
+	}
+	if (length == capacity) iris_say("VPU %s: no terminator in %u bytes\n", kind, capacity);
+}
+
+static void
+iris_dump_sfr(void)
+{
+	if (g_iris.sfr_region.kva == 0 || g_iris.sfr_region.size < 4u) return;
+	uint32_t capacity = g_iris.sfr_region.size;
+	if (capacity > IRIS_IOVA_SFR_SIZE) capacity = IRIS_IOVA_SFR_SIZE;
+	iris_cache_clean_inval((const void *)g_iris.sfr_region.kva, capacity);
+	const uint32_t *sfr = (const uint32_t *)g_iris.sfr_region.kva;
+	uint32_t size = sfr[0];
+	if (size <= 4u || size > capacity) {
+		iris_say("VPU SFR: invalid size=%u capacity=%u\n", size, capacity);
+		return;
+	}
+	iris_diag_text("SFR", (const char *)(sfr + 1), size - 4u);
+}
+
 static void
 iris_drain_dbgq(void)
 {
+	/* iris_lock serializes the scratch buffer; keep 4 KiB off nested HFI receive stacks. */
+	static uint32_t packet[1024];
+	iris_dump_sfr();
+	if (g_iris.uc_region.kva == 0 ||
+	    g_iris.uc_region.size < IRIS_HFI_DBGQ_OFF + IRIS_HFI_Q_BYTES) return;
 	struct hfi_queue_header *qh = iris_qhdr(2u);
 	uint32_t *ring = iris_qring(IRIS_HFI_DBGQ_OFF);
-
 	iris_cache_clean_inval(qh, sizeof(*qh));
-	uint32_t rd = qh->read_idx;
-	uint32_t wr = qh->write_idx;
-	if (rd == wr || rd >= IRIS_HFI_Q_DWORDS || wr >= IRIS_HFI_Q_DWORDS) {
+	uint32_t rd = qh->read_idx, wr = qh->write_idx;
+	if (rd >= IRIS_HFI_Q_DWORDS || wr >= IRIS_HFI_Q_DWORDS) {
+		iris_say("VPU debug: invalid indices rd=%u wr=%u\n", rd, wr);
 		return;
 	}
-	qh->read_idx = wr;
-	iris_cache_clean_inval(qh, sizeof(*qh));
-	(void)ring;
-
-	iris_cache_clean_inval((const void *)g_iris.sfr_region.kva, 256u);
-	const char *sfr = (const char *)(g_iris.sfr_region.kva + 4u);
-	if (sfr[0] >= 0x20 && sfr[0] < 0x7f) {
-		char msg[128];
-		strlcpy(msg, sfr, sizeof(msg));
-		iris_say("VPU SFR: %s\n", msg);
+	/* Freeze the producer limit; at most 16 complete records (under 64 KiB) per call. */
+	uint32_t avail = wr >= rd ? wr - rd : IRIS_HFI_Q_DWORDS - rd + wr;
+	for (uint32_t records = 0; avail != 0 && records < 16u; records++) {
+		iris_cache_clean_inval(&ring[rd], sizeof(uint32_t));
+		uint32_t bytes = ring[rd];
+		/* Native __flush_debug_queue accepts 16..4095 bytes; __read_queue uses words. */
+		if (bytes < 16u || bytes >= sizeof(packet) || (bytes & 3u) != 0) {
+			iris_say("VPU debug: invalid length=%u rd=%u wr=%u\n", bytes, rd, wr);
+			return;
+		}
+		uint32_t words = bytes / 4u;
+		if (words > avail) {
+			iris_say("VPU debug: incomplete length=%u available=%u rd=%u wr=%u\n",
+			    bytes, avail * 4u, rd, wr);
+			return;
+		}
+		uint32_t first = IRIS_HFI_Q_DWORDS - rd;
+		if (first > words) first = words;
+		iris_cache_clean_inval(&ring[rd], first * 4u);
+		memcpy(packet, &ring[rd], first * 4u);
+		if (words > first) {
+			iris_cache_clean_inval(ring, (words - first) * 4u);
+			memcpy((uint8_t *)packet + first * 4u, ring, (words - first) * 4u);
+		}
+		/* Firmware may reuse consumed words as soon as read_idx is published. */
+		uint32_t start = rd;
+		rd = (rd + words) % IRIS_HFI_Q_DWORDS;
+		avail -= words;
+		qh->read_idx = rd;
+		iris_cache_clean_inval(qh, sizeof(*qh));
+		iris_say("VPU debug: rd=%u bytes=%u type=0x%x\n", start, bytes, packet[1]);
+		/* Native text starts at byte 0x11, after the 16-byte header and marker. */
+		if (bytes > 17u) iris_diag_text("debug", (const char *)packet + 17u, bytes - 17u);
 	}
+	if (avail != 0) iris_say("VPU debug: deferred words=%u rd=%u wr=%u\n", avail, rd, wr);
 }
 
 /* ---- Packet Builder & Queue Ring I/O --------------------------------------------------------- */
@@ -291,6 +349,7 @@ iris_hfi_sys_init(void)
 				if ((pkt->flags & HFI_FW_FLAGS_SESSION_ERROR) != 0 ||
 				    (pkt->type > HFI_SESSION_ERROR_BEGIN && pkt->type < HFI_SESSION_ERROR_END)) {
 					iris_say("HFI INIT session error type=0x%08x flags=0x%08x\n", pkt->type, pkt->flags);
+					iris_drain_dbgq();
 					return false;
 				}
 				if (pkt->type == HFI_CMD_INIT) {
@@ -723,6 +782,7 @@ iris_dispatch_message(const uint8_t *msg, uint32_t len, struct iris_session *tar
 		if ((pkt->flags & HFI_FW_FLAGS_SESSION_ERROR) != 0 ||
 		    (pkt->type > HFI_SESSION_ERROR_BEGIN && pkt->type < HFI_SESSION_ERROR_END)) {
 			iris_say("session error sid=%u type=0x%x flags=0x%x\n", hdr->session_id, pkt->type, pkt->flags);
+			iris_drain_dbgq();
 			if (s != NULL) s->error = EIO;
 		}
 		off += pkt->size;
