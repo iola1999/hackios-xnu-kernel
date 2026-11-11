@@ -1,6 +1,6 @@
 /*
- * Diagnostics of the command buffer path that only print: where the threads of a stalled process
- * are, the switch that waits after every draw, and the shaders of the draw that did not finish.
+ * Command buffer diagnostics: stalled threads, global or selected draw waits, thumbnails,
+ * and retained shader modules for failures in global sync mode.
  * Included by annibalemetal.m after air_dump and before the pipelines and command buffers that
  * call these.
  */
@@ -67,6 +67,35 @@ rw_sync_draws(void)
 	return on != 0;
 }
 
+/* ANNIBALE_SYNC_MATCHED_DRAWS=1..16 selects THUMB_MATCH names; the old global switch wins.
+ * The process-wide attempt budget is consumed under rw_commit_lock and never replenished.
+ * A selected finish also waits for preceding work; it does not isolate that draw's failure. */
+static unsigned rw_matched_left;
+static const char *rw_matched_text;
+static bool
+rw_matched_sync(void)
+{
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		const char *value = getenv("ANNIBALE_SYNC_MATCHED_DRAWS");
+		const char *match = getenv("ANNIBALE_THUMB_MATCH");
+		char *end = NULL;
+		unsigned long count = value ? strtoul(value, &end, 10) : 0;
+		if (value == NULL)
+			return;
+		if (rw_sync_draws()) {
+			rw_print("sync matched: ANNIBALE_SYNC_DRAWS takes precedence\n");
+		} else if (value[0] < '1' || value[0] > '9' || *end || count > 16 ||
+		    match == NULL || match[0] == '\0') {
+			rw_print("sync matched: require count 1..16 and nonempty ANNIBALE_THUMB_MATCH\n");
+		} else {
+			rw_matched_text = strdup(match);
+			rw_matched_left = rw_matched_text ? (unsigned)count : 0;
+		}
+	});
+	return rw_matched_text != NULL;
+}
+
 /*
  * Without ANNIBALE_MSAA, -supportsSampleCount:4 answers NO, and an application that asks for four
  * samples anyway gets one: the library makes the multisample texture and the render pipeline with
@@ -87,17 +116,17 @@ rw_one_sample(void)
 	return on != 0;
 }
 
-/* With rw_sync_draws, each render pipeline's modules are kept, so that the draw that does not
- * finish can have its shaders printed (air_dump, uncounted; airfail-extract.py reads them back,
- * stage names "hung-vertex" and "hung-fragment"). The modules are what the stitching made at run
- * time, so the log is the only place they can be read from. */
+/* Global sync retains the vertex/fragment modules passed to the compiler for failure dumps.
+ * Linked graph nodes are separate inputs and are not retained here. Matched sync retains only
+ * matching handles and names; it neither copies modules nor enables failure AIR dumps. */
 #define RW_KEPT_PIPELINES 256
-static struct {
+static struct rw_kept_pipeline {
 	const void *render;
 	NSData *vertex, *fragment;
 	char vertex_name[96], fragment_name[96];
 } rw_kept[RW_KEPT_PIPELINES];
 static unsigned rw_kept_count;
+static pthread_mutex_t rw_kept_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void
 rw_keep_air(const void *render, NSData *vertex, const char *vertex_name, NSData *fragment,
@@ -105,25 +134,37 @@ rw_keep_air(const void *render, NSData *vertex, const char *vertex_name, NSData 
 {
 	unsigned i = 0;
 
-	if (!rw_sync_draws() || render == NULL)
+	bool matched = rw_matched_sync();
+	if ((!rw_sync_draws() && !matched) || render == NULL)
 		return;
+	pthread_mutex_lock(&rw_kept_lock);
 	/* A later pipeline can get the address of one that was freed; its entry replaces the old
 	 * one, which otherwise answered for it (render81 sampled the wrong draws that way). */
 	while (i < rw_kept_count && rw_kept[i].render != render)
 		i++;
-	if (i >= RW_KEPT_PIPELINES)
-		return;
+	if (matched && !(vertex_name && strstr(vertex_name, rw_matched_text)) &&
+	    !(fragment_name && strstr(fragment_name, rw_matched_text))) {
+		if (i < rw_kept_count)
+			rw_kept[i] = rw_kept[--rw_kept_count];
+		goto done;
+	}
+	if (i >= RW_KEPT_PIPELINES) {
+		RW_ONCE("sync: pipeline name table full; further handles are not tracked\n");
+		goto done;
+	}
 	[rw_kept[i].vertex release];
 	[rw_kept[i].fragment release];
 	rw_kept[i].render = render;
-	rw_kept[i].vertex = [vertex copy];
-	rw_kept[i].fragment = [fragment copy];
+	rw_kept[i].vertex = matched ? nil : [vertex copy];
+	rw_kept[i].fragment = matched ? nil : [fragment copy];
 	snprintf(rw_kept[i].vertex_name, sizeof(rw_kept[0].vertex_name), "%s",
 		 vertex_name ? vertex_name : "(none)");
 	snprintf(rw_kept[i].fragment_name, sizeof(rw_kept[0].fragment_name), "%s",
 		 fragment_name ? fragment_name : "(none)");
 	if (i == rw_kept_count)
 		rw_kept_count++;
+done:
+	pthread_mutex_unlock(&rw_kept_lock);
 }
 
 /*
@@ -165,7 +206,7 @@ rw_thumbs_wanted(unsigned commit)
 			rw_thumb_size = size < 8 ? 8 : size > RW_THUMB_MAX ? RW_THUMB_MAX : (unsigned)size;
 		}
 	}
-	return rw_sync_draws() && rw_thumbs_left > 0 && commit >= rw_thumb_from;
+	return (rw_sync_draws() || rw_matched_sync()) && rw_thumbs_left > 0 && commit >= rw_thumb_from;
 }
 
 /* The first words of a buffer a sampled draw binds, in hex, 24 a line: RenderBox's uniforms hold
@@ -208,13 +249,16 @@ rw_thumb_words(const char *stage, unsigned slot, id buffer, size_t offset, unsig
 static bool
 rw_thumb_match(const void *render)
 {
-	if (rw_thumb_text == NULL)
+	bool matched = rw_matched_sync(), found = false;
+	if (!matched && rw_thumb_text == NULL)
 		return true;
+	pthread_mutex_lock(&rw_kept_lock);
 	for (unsigned i = 0; i < rw_kept_count; i++)
 		if (rw_kept[i].render == render)
-			return strstr(rw_kept[i].vertex_name, rw_thumb_text) != NULL ||
+			found = matched || strstr(rw_kept[i].vertex_name, rw_thumb_text) != NULL ||
 			    strstr(rw_kept[i].fragment_name, rw_thumb_text) != NULL;
-	return false;
+	pthread_mutex_unlock(&rw_kept_lock);
+	return found;
 }
 
 /* ANNIBALE_THUMB_WHOLE=1 widens ANNIBALE_THUMB_MATCH from a draw to its commit: every draw of a
@@ -229,7 +273,7 @@ rw_thumb_commit(NSArray *works, unsigned commit)
 
 	if (whole < 0)
 		whole = getenv("ANNIBALE_THUMB_WHOLE") != NULL;
-	if (!whole || !rw_thumbs_wanted(commit))
+	if (rw_matched_sync() || !whole || !rw_thumbs_wanted(commit))
 		return;
 	for (AnnibaleMetalWork *work in works)
 		if (work->render != nil && rw_thumb_match(((void *(*)(id, SEL))objc_msgSend)(
@@ -311,6 +355,60 @@ rw_thumb_work_wanted(AnnibaleMetalWork *work, unsigned commit)
 	    sel_registerName("render")));
 }
 
+static bool
+rw_thumb_role(const char *role, unsigned slot)
+{
+	if (rw_thumb_only != NULL) {
+		char name[16];
+		size_t length = (size_t)snprintf(name, sizeof(name), "%s%u", role, slot);
+		const char *at = rw_thumb_only;
+
+		while ((at = strstr(at, name)) != NULL && at[length] != '\0' && at[length] != ',')
+			at += length;
+		if (at == NULL)
+			return false;
+	}
+	return true;
+}
+
+static bool
+rw_take_matched_draw(AnnibaleMetalWork *work, unsigned commit, unsigned index)
+{
+	(void)rw_thumbs_wanted(commit); /* Initialize the shared filters even without thumbnails. */
+	if (!rw_matched_sync() || !rw_matched_left || commit < rw_thumb_from ||
+	    !rw_thumb_work_wanted(work, commit))
+		return false;
+	if (mesa.flush == NULL || mesa.finish == NULL) {
+		RW_ONCE("sync matched: unavailable flush/finish; no draw selected\n");
+		return false;
+	}
+	rw_matched_left--;
+	rw_print("sync matched: commit %u work %u pipeline %p, %u attempts left; waits for preceding work\n",
+	    commit, index, ((void *(*)(id, SEL))objc_msgSend)(work->render, sel_registerName("render")), rw_matched_left);
+	return true;
+}
+
+/* No other draw can spend the thumbnail budget while rw_commit_lock is held. */
+static bool
+rw_thumb_group_fits(AnnibaleMetalWork *work, unsigned commit, unsigned index)
+{
+	unsigned need = 0;
+	if (!rw_thumbs_wanted(commit) || !rw_thumb_draws)
+		return false;
+	for (unsigned i = 0; i < work->colorCount; i++)
+		if (work->color[i])
+			need += rw_thumb_role("pre", i) + rw_thumb_role("out", i);
+	if (work->depth)
+		need += rw_thumb_role("pre", 8) + rw_thumb_role("out", 8);
+	for (unsigned i = 0; i < work->textureCount; i++)
+		if (work->textures[i])
+			need += rw_thumb_role("in", i);
+	if (need > (unsigned)rw_thumbs_left)
+		rw_print("thumb group: commit %u work %u skipped, need %u samples have %d\n",
+		    commit, index, need, rw_thumbs_left);
+	return need > 0 && need <= (unsigned)rw_thumbs_left;
+}
+
 static void
 rw_thumb(struct rwa_texture *texture, id object, unsigned commit, unsigned work, const char *role,
 	 unsigned slot)
@@ -320,19 +418,15 @@ rw_thumb(struct rwa_texture *texture, id object, unsigned commit, unsigned work,
 	char row[RW_THUMB_MAX * 4 + 1];
 	const unsigned n = rw_thumb_size;
 
-	if (rw_thumb_only != NULL) {
-		char name[16];
-		size_t length = (size_t)snprintf(name, sizeof(name), "%s%u", role, slot);
-		const char *at = rw_thumb_only;
-
-		while ((at = strstr(at, name)) != NULL && at[length] != '\0' && at[length] != ',')
-			at += length;
-		if (at == NULL)
-			return;
-	}
-	if (texture == NULL || rw_thumbs_left <= 0 || mesa.texture_thumbnail == NULL ||
-	    mesa.texture_thumbnail(texture, n, n, rgba) != 0)
+	if (!rw_thumb_role(role, slot) || (rw_matched_sync() && object == nil))
 		return;
+	if (texture == NULL || rw_thumbs_left <= 0 || mesa.texture_thumbnail == NULL ||
+	    mesa.texture_thumbnail(texture, n, n, rgba) != 0) {
+		if (rw_matched_sync())
+			rw_print("thumb group: commit %u work %u incomplete, %s%u read failed\n",
+			    commit, work, role, slot);
+		return;
+	}
 	rw_thumbs_left--;
 	rw_print("thumb %u: commit %u work %u %s %u: format %lu %lux%lu %p%s\n", seq, commit, work,
 	    role, slot, (unsigned long)[(id<MTLTexture>)object pixelFormat],
@@ -455,20 +549,28 @@ rw_describe_draw(AnnibaleMetalWork *work, const void *render, unsigned commit, u
 static void
 rw_dump_kept_air(const void *render, const char *why)
 {
+	if (!rw_sync_draws())
+		return;
+	pthread_mutex_lock(&rw_kept_lock);
 	for (unsigned i = 0; i < rw_kept_count; i++) {
 		if (rw_kept[i].render != render)
 			continue;
 		char fragment[32], vertex[32];
+		struct rw_kept_pipeline kept = rw_kept[i];
+		[kept.vertex retain];
+		[kept.fragment retain];
+		pthread_mutex_unlock(&rw_kept_lock);
 		snprintf(fragment, sizeof(fragment), "%s-fragment", why);
 		snprintf(vertex, sizeof(vertex), "%s-vertex", why);
 		/* Fragment first: the process can be killed before the dump ends, and the hangs
 		 * so far came down to the fragment shader. */
-		air_dump([rw_kept[i].fragment bytes], [rw_kept[i].fragment length], fragment,
-			 rw_kept[i].fragment_name, false);
-		air_dump([rw_kept[i].vertex bytes], [rw_kept[i].vertex length], vertex,
-			 rw_kept[i].vertex_name, false);
+		air_dump([kept.fragment bytes], [kept.fragment length], fragment, kept.fragment_name, false);
+		air_dump([kept.vertex bytes], [kept.vertex length], vertex, kept.vertex_name, false);
+		[kept.vertex release];
+		[kept.fragment release];
 		return;
 	}
+	pthread_mutex_unlock(&rw_kept_lock);
 	rw_print("sync: pipeline %p was not kept, so its shaders cannot be printed\n", render);
 }
 

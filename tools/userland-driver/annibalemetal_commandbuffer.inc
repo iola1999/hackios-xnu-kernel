@@ -563,14 +563,20 @@ static pthread_mutex_t rw_commit_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 			continue;
 		}
 		if (work->render != nil) {
-			[self thumbWork:work index:work_index after:NO];
+			bool sync = rw_sync_draws() || rw_take_matched_draw(work, commit_count, work_index);
+			bool sample = !rw_matched_sync() ||
+			    (sync && rw_thumb_group_fits(work, commit_count, work_index));
+			if (sample)
+				[self thumbWork:work index:work_index after:NO];
 			if (![self runDraw:work why:why size:sizeof(why)]) {
+				if (sync && rw_matched_sync())
+					rw_print("sync matched: commit %u work %u incomplete, draw failed\n",
+					    commit_count, work_index);
 				goto done;
 			}
 			rw_audit_render_work(work, commit_count, work_index);
 			rw_work_time(RW_WORK_DRAW, work_began);
-			if (rw_sync_draws() && ![self syncDraw:work index:work_index why:why
-							  size:sizeof(why)]) {
+			if (sync && ![self syncDraw:work index:work_index sample:sample why:why size:sizeof(why)]) {
 				goto done;
 			}
 			/* The window line reports draws by the microsecond on average, which is
@@ -658,7 +664,7 @@ static pthread_mutex_t rw_commit_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 			goto done;
 		}
 	}
-	if (rw_thumbs_wanted(commit_count) && !rw_thumb_draws) {
+	if (rw_sync_draws() && rw_thumbs_wanted(commit_count) && !rw_thumb_draws) {
 		NSMutableSet *seen = [NSMutableSet set];
 
 		/* "res" is a colour attachment's resolve target: a CAMetalLayer drawn with
@@ -793,7 +799,8 @@ done:
 #define RW_COMMIT_SLOW_FOR_IN 500000ULL  /* a commit this old says its draws on entry */
 
 /* rw_sync_draws: hand this draw to the GPU and wait for it, naming it when it does not finish. */
-- (BOOL)syncDraw:(AnnibaleMetalWork *)work index:(unsigned)index why:(char *)why size:(size_t)size
+- (BOOL)syncDraw:(AnnibaleMetalWork *)work index:(unsigned)index sample:(BOOL)sample
+	    why:(char *)why size:(size_t)size
 {
 	struct rwa_device *device = [[_queue device] mesaDevice];
 
@@ -814,7 +821,8 @@ done:
 		[self failWith:why];
 		return NO;
 	}
-	[self thumbWork:work index:index after:YES];
+	if (sample)
+		[self thumbWork:work index:index after:YES];
 	return YES;
 }
 
