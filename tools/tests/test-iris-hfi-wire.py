@@ -61,14 +61,17 @@ def expected_open(row):
         change += [0x03000120, 0x03000124, 0x03000128, 0x03000107, 0x03000108, 0x03000155]
     else:
         change += [0x03000124, 0x03000107, 0x03000108, 0x03000109, 0x03000155]
+    # Native msm_vdec_set_min_output_count (0x2a168) sends U32 4 on input port 1
+    # after PSC subscription and before ordinary properties and START.
     message(101, [(0x0100000b, 3, 11, 1, struct.pack('<' + 'I' * (len(change) + 1), 1, *change)),
+                  (0x03000124, 0, 1, 1, u32(4)),
                   (0x0100000b, 3, 11, 1, struct.pack('<II', 2, 0x0300016a))])
     message(101, [(0x01000005, 3, 0, 1, b'')])
     return result
 
 
 def expected_output(row):
-    hid, pid = 1009, 2013
+    hid, pid = 1009, 2014
     result = bytearray()
 
     def message(fields):
@@ -239,7 +242,34 @@ def scoped(text, start, end, old, new):
 
 
 def mutations():
+    initial_min = (
+        '\t/* Native AVC/HEVC input subscription publishes the initial output minimum. */\n'
+        '\tif (port == HFI_PORT_BITSTREAM &&\n'
+        '\t    !pkt_add_u32(b, HFI_PROP_BUFFER_FW_MIN_OUTPUT_COUNT, HFI_HOST_FLAGS_NONE,\n'
+        '\t    HFI_PAYLOAD_U32, port, 4u)) return false;\n')
+    psc_subscription = (
+        '\tif (!pkt_add(b, HFI_CMD_SUBSCRIBE_MODE, flags, HFI_PAYLOAD_U32_ARRAY,\n'
+        '\t    port, payload, (count + 1u) * sizeof(uint32_t))) return false;\n')
     return {
+        'initial_min_missing': (HFI, 'static bool\niris_subscribe_port', 'static bool\niris_send_command',
+                                initial_min, '', ['wire-h264', 'wire-hevc']),
+        'initial_min_property': (HFI, 'static bool\niris_subscribe_port', 'static bool\niris_send_command',
+                                 initial_min, initial_min.replace('HFI_PROP_BUFFER_FW_MIN_OUTPUT_COUNT',
+                                                                  'HFI_PROP_COMV_BUFFER_COUNT'),
+                                 ['wire-h264', 'wire-hevc']),
+        'initial_min_port': (HFI, 'static bool\niris_subscribe_port', 'static bool\niris_send_command',
+                             initial_min, initial_min.replace('HFI_PAYLOAD_U32, port,',
+                                                              'HFI_PAYLOAD_U32, HFI_PORT_RAW,'),
+                             ['wire-h264', 'wire-hevc']),
+        'initial_min_payload': (HFI, 'static bool\niris_subscribe_port', 'static bool\niris_send_command',
+                                initial_min, initial_min.replace('HFI_PAYLOAD_U32,', 'HFI_PAYLOAD_U32_ENUM,'),
+                                ['wire-h264', 'wire-hevc']),
+        'initial_min_count': (HFI, 'static bool\niris_subscribe_port', 'static bool\niris_send_command',
+                              initial_min, initial_min.replace('port, 4u', 'port, 8u'),
+                              ['wire-h264', 'wire-hevc']),
+        'initial_min_order': (HFI, 'static bool\niris_subscribe_port', 'static bool\niris_send_command',
+                              psc_subscription + initial_min, initial_min + psc_subscription,
+                              ['wire-h264', 'wire-hevc']),
         'open_core_address': (HFI, 'int\niris_hfi_session_open', 'static int\niris_copy_decoded',
                               'pkt_begin(&b, 0u);', 'pkt_begin(&b, s->wire_session_id);', ['wire-h264']),
         'hevc_codec': (PRIVATE, '#define HFI_CODEC_DECODE_HEVC', '#define HFI_COLOR_FMT_NV12',

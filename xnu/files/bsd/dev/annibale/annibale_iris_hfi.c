@@ -555,6 +555,10 @@ iris_subscribe_port(struct iris_pkt_buf *b, const struct iris_session *s, uint32
 	uint32_t flags = HFI_HOST_FLAGS_INTR_REQUIRED | HFI_HOST_FLAGS_RESPONSE_REQUIRED;
 	if (!pkt_add(b, HFI_CMD_SUBSCRIBE_MODE, flags, HFI_PAYLOAD_U32_ARRAY,
 	    port, payload, (count + 1u) * sizeof(uint32_t))) return false;
+	/* Native AVC/HEVC input subscription publishes the initial output minimum. */
+	if (port == HFI_PORT_BITSTREAM &&
+	    !pkt_add_u32(b, HFI_PROP_BUFFER_FW_MIN_OUTPUT_COUNT, HFI_HOST_FLAGS_NONE,
+	    HFI_PAYLOAD_U32, port, 4u)) return false;
 	if (port == HFI_PORT_RAW) {
 		for (uint32_t i = 0; i < count; i++) {
 			int index = iris_psc_index(props[i]);
