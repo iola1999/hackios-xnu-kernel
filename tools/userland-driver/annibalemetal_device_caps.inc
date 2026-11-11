@@ -283,21 +283,30 @@
 					     @"was not started (gpu=1) or libannibaleair.dylib "
 					     @"is missing"];
 	}
-	if (![function respondsToSelector:bitcode]) {
-		return [self fail:error with:@"this function does not answer bitcodeData, so its "
-					     @"AIR cannot be read"];
-	}
-	NSData *air = ((NSData *(*)(id, SEL))objc_msgSend)(function, bitcode);
-
-	if (air == nil || [air length] == 0) {
-		return [self fail:error with:@"the function has no bitcode"];
-	}
-
 	char why[512] = { 0 };
 	struct rwa_compute_info info = { 0 };
-	struct rwa_compute *compute = mesa.compute_create(_mesa, [air bytes], [air length],
-							  [[function name] UTF8String], &info,
-							  why, sizeof(why));
+	struct rwa_compute *compute = NULL;
+	if ([function respondsToSelector:@selector(annibaleGraph)]) {
+		struct rwa_stitched_kernel kernel = { 0 };
+		struct rwa_linked_function graph = { 0 };
+		NSMutableData *scratch = [NSMutableData data];
+		BOOL valid = rw_stitched_nodes(function, &graph, scratch, &kernel);
+		if (valid && mesa.compute_create_stitched != NULL)
+			compute = mesa.compute_create_stitched(_mesa, &kernel, &info, why, sizeof(why));
+		else
+			snprintf(why, sizeof(why), "%s", valid ?
+				 "the AIR library has no stitched compute entry point" :
+				 "invalid stitched compute graph, input type, or dependency order");
+		rw_linked_free(scratch);
+	} else {
+		if (![function respondsToSelector:bitcode])
+			return [self fail:error with:@"the compute function has no bitcodeData"];
+		NSData *air = ((NSData *(*)(id, SEL))objc_msgSend)(function, bitcode);
+		if ([air length] == 0)
+			return [self fail:error with:@"the compute function has no bitcode"];
+		compute = mesa.compute_create(_mesa, [air bytes], [air length],
+			[[function name] UTF8String], &info, why, sizeof(why));
+	}
 	if (compute == NULL) {
 		/* The front end's own sentence, passed through rather than replaced: it says
 		 * which construct it refused, and an application can act on that. */
