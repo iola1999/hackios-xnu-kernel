@@ -429,6 +429,7 @@ static void *CVPixelBufferGetBaseAddressOfPlane(CVPixelBufferRef pb, size_t idx)
 static size_t CVPixelBufferGetBytesPerRowOfPlane(CVPixelBufferRef pb, size_t idx) { (void)pb; (void)idx; return 256; }
 
 static int emit_calls;
+static OSStatus sim_emit_status;
 static VTDecodeFrameRef emitted_frames[64];
 static OSStatus emitted_statuses[64];
 static VTDecodeInfoFlags emitted_flags[64];
@@ -445,13 +446,13 @@ static OSStatus VTDecoderSessionEmitDecodedFrame(VTDecoderSessionRef s, VTDecode
 	emitted_statuses[emit_calls] = st;
 	emitted_flags[emit_calls] = fl;
 	emit_calls++;
-	return noErr;
+	return sim_emit_status;
 }
 
 static bool sim_dev_exists;
 static uint32_t sim_info_flags;
 static int sim_delay_mode;
-static bool sim_fail_decode;
+static bool sim_fail_decode, sim_fail_poll;
 static uint64_t delayed_tag;
 static uint8_t last_submitted_bs[256];
 static uint32_t last_submitted_len;
@@ -484,6 +485,7 @@ static int iris_sys_ioctl(int fd, unsigned long cmd, void *arg) {
 		struct iris_decode_frame *req = arg;
 		if (sim_fail_decode) return -1;
 		if ((req->flags & IRIS_FRAME_POLL) != 0) {
+			if (sim_fail_poll) return -1;
 			req->flags = 0;
 			return 0;
 		}
@@ -526,6 +528,7 @@ static void test_pending_tokens(void) {
 		assert(iris_pending_push(&dec, 100 + i, (VTDecodeFrameRef)(uintptr_t)(i + 1)));
 	}
 	assert(!iris_pending_push(&dec, 999, (VTDecodeFrameRef)(uintptr_t)999));
+	assert(iris_pending_pop(&dec, 999) == NULL);
 	assert(iris_pending_pop(&dec, 103) == (VTDecodeFrameRef)(uintptr_t)4);
 	assert(iris_pending_pop(&dec, 0) == (VTDecodeFrameRef)(uintptr_t)1);
 	iris_pending_abort_all(&dec, kVTVideoDecoderMalfunctionErr);
@@ -593,7 +596,12 @@ int main(int argc, char **argv) {
 	static const uint8_t bad_nal[] = { 0x00, 0x00, 0x00, 0x00 };
 	struct fake_sample bad_sample = { bad_nal, sizeof(bad_nal), false };
 	VTDecodeFrameRef fref_bad = (VTDecodeFrameRef)(uintptr_t)1;
-	assert(vt->derived_class->decode_frame(dec_obj, fref_bad, &bad_sample, 0, NULL) == kVTVideoDecoderBadDataErr);
+	VTDecodeInfoFlags failure_flags = 0;
+	assert(vt->derived_class->decode_frame(dec_obj, fref_bad, &bad_sample, 0, &failure_flags) == kVTVideoDecoderBadDataErr);
+	assert(emit_calls == 1 && emitted_frames[0] == fref_bad);
+	assert(emitted_statuses[0] == kVTVideoDecoderBadDataErr && emitted_flags[0] == kVTDecodeInfo_FrameDropped);
+	assert(failure_flags == kVTDecodeInfo_FrameDropped);
+	emit_calls = 0;
 
 	/* 6. Valid AVCC IDR + B-frame reorder + drain */
 	static const uint8_t idr_nal[] = { 0x00, 0x00, 0x00, 0x03, 0x65, 0x88, 0x84 };
@@ -620,18 +628,36 @@ int main(int argc, char **argv) {
 	assert(emit_calls == 2 && emitted_frames[1] == fref1 && emitted_statuses[1] == noErr);
 	assert(cf_live_objects == 1 && pixbuf_allocations > 0);
 
-	/* Failed submission removes its token without a callback or CF access. */
+	/* The native wrapper consumes the return code; the frame still needs completion. */
 	sim_fail_decode = true;
 	assert(vt->derived_class->decode_frame(dec_obj, (VTDecodeFrameRef)(uintptr_t)3, &s2, 0, NULL) == kVTVideoDecoderBadDataErr);
 	sim_fail_decode = false;
 	struct iris_vt_decoder *storage = CMBaseObjectGetDerivedStorage(dec_obj);
 	for (uint32_t i = 0; i < IRIS_VT_PENDING_MAX; i++) assert(!storage->pending[i].in_use);
-	assert(emit_calls == 2 && cf_live_objects == 1);
+	assert(emit_calls == 3 && cf_live_objects == 1);
+	assert(emitted_frames[2] == (VTDecodeFrameRef)(uintptr_t)3);
+	assert(emitted_statuses[2] == kVTVideoDecoderBadDataErr && emitted_flags[2] == kVTDecodeInfo_FrameDropped);
 
 	/* Invalidation completes a delayed token once before clearing its handle. */
 	sim_delay_mode = 1;
 	assert(vt->derived_class->decode_frame(dec_obj, (VTDecodeFrameRef)(uintptr_t)4, &s2, 0, NULL) == noErr);
-	assert(emit_calls == 2);
+	assert(emit_calls == 3);
+	/* A rejected completion must not consume the older delayed token or emit twice. */
+	sim_emit_status = kVTVideoDecoderMalfunctionErr;
+	assert(vt->derived_class->decode_frame(dec_obj, (VTDecodeFrameRef)(uintptr_t)5, &s2, 0, NULL) == sim_emit_status);
+	sim_emit_status = noErr;
+	assert(emit_calls == 4 && emitted_frames[3] == (VTDecodeFrameRef)(uintptr_t)5);
+
+	/* Poll failure completes the older delayed frame, preserving the current completion. */
+	sim_fail_poll = true;
+	assert(vt->derived_class->decode_frame(dec_obj, (VTDecodeFrameRef)(uintptr_t)6, &s2, 0, NULL) == kVTVideoDecoderBadDataErr);
+	sim_fail_poll = false;
+	assert(emit_calls == 6 && emitted_frames[4] == (VTDecodeFrameRef)(uintptr_t)6);
+	assert(emitted_statuses[4] == noErr && emitted_frames[5] == (VTDecodeFrameRef)(uintptr_t)4);
+	assert(emitted_statuses[5] == kVTVideoDecoderBadDataErr && emitted_flags[5] == kVTDecodeInfo_FrameDropped);
+	for (uint32_t i = 0; i < IRIS_VT_PENDING_MAX; i++) assert(!storage->pending[i].in_use);
+	sim_delay_mode = 1;
+	assert(vt->derived_class->decode_frame(dec_obj, (VTDecodeFrameRef)(uintptr_t)7, &s2, 0, NULL) == noErr);
 
 	/* HVCC parser sanity */
 	uint8_t hvcc[32] = { 0 };
@@ -641,11 +667,11 @@ int main(int argc, char **argv) {
 	assert(iris_parse_hvcc(hvcc, 31, &nls, ab, sizeof(ab), &ab_len) && nls == 4 && ab_len == 7);
 
 	assert(vt->base_class->invalidate(dec_obj) == noErr);
-	assert(emit_calls == 3 && emitted_frames[2] == (VTDecodeFrameRef)(uintptr_t)4);
-	assert(emitted_statuses[2] == kVTVideoDecoderMalfunctionErr);
-	assert(emitted_flags[2] == kVTDecodeInfo_FrameDropped);
+	assert(emit_calls == 7 && emitted_frames[6] == (VTDecodeFrameRef)(uintptr_t)7);
+	assert(emitted_statuses[6] == kVTVideoDecoderMalfunctionErr);
+	assert(emitted_flags[6] == kVTDecodeInfo_FrameDropped);
 	assert(storage->session == NULL && storage->fd == -1 && storage->session_id == 0);
-	assert(vt->base_class->invalidate(dec_obj) == noErr && emit_calls == 3);
+	assert(vt->base_class->invalidate(dec_obj) == noErr && emit_calls == 7);
 	vt->base_class->finalize(dec_obj);
 	CFRelease(dec_obj);
 	assert(cf_live_objects == 0 && memcmp(session_words, original_words, sizeof(session_words)) == 0);

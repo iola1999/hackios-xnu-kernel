@@ -832,10 +832,11 @@ iris_hfi_session_open(struct iris_session *s)
 	}
 	s->opened = true;
 	pkt_begin(&b, s->wire_session_id);
+	/* Decoder resolution uses U32; the encoder uses the 32_PACKED payload type. */
 	if (!pkt_add_u32(&b, HFI_PROP_CODEC, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32_ENUM, HFI_PORT_NONE, codec) ||
 	    !pkt_add_u32(&b, HFI_PROP_DEC_DEFAULT_HEADER, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32,
 	    HFI_PORT_BITSTREAM, 0u) ||
-	    !pkt_add_u32(&b, HFI_PROP_BITSTREAM_RESOLUTION, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_32_PACKED,
+	    !pkt_add_u32(&b, HFI_PROP_BITSTREAM_RESOLUTION, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32,
 	    HFI_PORT_BITSTREAM, (s->width << 16) | s->height) ||
 	    !pkt_add_u32(&b, HFI_PROP_COMV_BUFFER_COUNT, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32,
 	    HFI_PORT_BITSTREAM, 8u) || !iris_cmdq_write(&b)) goto failed;

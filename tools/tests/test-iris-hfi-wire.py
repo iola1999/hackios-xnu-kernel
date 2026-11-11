@@ -45,7 +45,7 @@ def expected_open(row):
     message(0, [(0x01000003, 3, 1, 0, u32(101))])
     message(101, [(0x03000100, 0, 9, 0, u32(1 if row['codec'] == 1 else 3)),
                   (0x03000168, 0, 1, 1, u32(0)),
-                  (0x03000103, 0, 10, 1, u32(640 << 16 | 480)),
+                  (0x03000103, 0, 1, 1, u32(640 << 16 | 480)),
                   (0x03000193, 0, 1, 1, u32(8))])
     addresses = []
     cursor = 0x30000000
@@ -244,6 +244,10 @@ def mutations():
                               'pkt_begin(&b, 0u);', 'pkt_begin(&b, s->wire_session_id);', ['wire-h264']),
         'hevc_codec': (PRIVATE, '#define HFI_CODEC_DECODE_HEVC', '#define HFI_COLOR_FMT_NV12',
                        '3u', '2u', ['wire-hevc']),
+        'decoder_resolution_payload': (HFI, 'int\niris_hfi_session_open', 'static int\niris_copy_decoded',
+                                       'HFI_PROP_BITSTREAM_RESOLUTION, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32,',
+                                       'HFI_PROP_BITSTREAM_RESOLUTION, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_32_PACKED,',
+                                       ['wire-h264', 'wire-hevc']),
         'nonsecure_buffer': (HFI, 'static bool\niris_queue_buffer_ts', 'static bool\niris_queue_buffer(',
                             'buf_flags | HFI_BUF_HOST_FLAGS_CB_NON_SECURE', 'buf_flags', ['wire-h264']),
         'old_bin_size': (HFI, 'static void\niris_internal_sizes', 'static int\niris_alloc_session_buffers',
