@@ -379,6 +379,7 @@ static const struct ann_format ann_formats[] = {
 	{  10, 'A008', 1, 0, "MTLPixelFormatR8Unorm" },
 	{  11, 'A008', 1, 0, "MTLPixelFormatR8Unorm_sRGB" },
 	{  30, 'LA08', 2, 0, "MTLPixelFormatRG8Unorm" },
+	{  65, '2C0h', 4, 0, "MTLPixelFormatRG16Float" },
 	{  70, 'RGBA', 4, 0, "MTLPixelFormatRGBA8Unorm" },
 	{  71, 'RGBA', 4, 0, "MTLPixelFormatRGBA8Unorm_sRGB" },
 	{  80, 'BGRA', 4, 0, "MTLPixelFormatBGRA8Unorm" },
@@ -526,8 +527,11 @@ ann_surface_plane(void *iosurface, unsigned long plane, const struct ann_texture
 	} else if (ann_format_of_metal(want->pixel_format, &expected, &bpp, why, why_size) != 0) {
 		return -1;
 	} else if (fourcc != expected) {
-		ann_say(why, why_size, "surface FourCC %#x does not match Metal format %u",
-		    fourcc, want->pixel_format);
+		ann_say(why, why_size, "surface FourCC %#x does not match Metal format %u "
+		    "(expected %#x; plane %lu, %zux%zu, element %zu, row %zu, offset %zu, alloc %zu)",
+		    fourcc, want->pixel_format, expected, plane, width(iosurface, plane),
+		    height(iosurface, plane), element(iosurface, plane), row(iosurface, plane),
+		    offset(iosurface, plane), size(iosurface));
 		return -1;
 	}
 	size_t w = width(iosurface, plane), h = height(iosurface, plane);
@@ -538,7 +542,12 @@ ann_surface_plane(void *iosurface, unsigned long plane, const struct ann_texture
 	    want->width == 0 || want->height == 0 || want->width > w || want->height > h ||
 	    want->type != 2 || want->depth != 1 || want->array_length != 1 ||
 	    want->mip_levels != 1 || want->sample_count != 1) {
-		ann_say(why, why_size, "invalid surface plane %lu geometry or texture shape", plane);
+		ann_say(why, why_size, "invalid surface plane %lu geometry or texture shape: "
+		    "FourCC %#x, %zux%zu, element %zu (expected %u), row %zu, offset %zu, alloc %zu; "
+		    "texture format %u type %u %ux%ux%u, layers %u, mips %u, samples %u",
+		    plane, fourcc, w, h, element(iosurface, plane), bpp, stride, begin, size(iosurface),
+		    want->pixel_format, want->type, want->width, want->height, want->depth,
+		    want->array_length, want->mip_levels, want->sample_count);
 		return -1;
 	}
 	*selected = (struct ann_surface){ .surface = ann_surface_id(iosurface), .size = size(iosurface),
