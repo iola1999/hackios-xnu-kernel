@@ -504,6 +504,7 @@ ann_surface_plane(void *iosurface, unsigned long plane, const struct ann_texture
 		ann_say(why, why_size, "plane %lu is outside surface plane count %zu", plane, planes);
 		return -1;
 	}
+	/* CoreImage Rh uses '1C0h'; CoreVideo OneComponent16Half uses 'L00h'. */
 	uint32_t fourcc = format(iosurface), expected;
 	unsigned bpp;
 	if ((fourcc == '420v' || fourcc == '420f') && planes == 2) {
@@ -527,7 +528,7 @@ ann_surface_plane(void *iosurface, unsigned long plane, const struct ann_texture
 		return -1;
 	} else if (ann_format_of_metal(want->pixel_format, &expected, &bpp, why, why_size) != 0) {
 		return -1;
-	} else if (fourcc != expected) {
+	} else if (fourcc != expected && !(want->pixel_format == 25 && fourcc == '1C0h')) {
 		ann_say(why, why_size, "surface FourCC %#x does not match Metal format %u "
 		    "(expected %#x; plane %lu, %zux%zu, element %zu, row %zu, offset %zu, alloc %zu)",
 		    fourcc, want->pixel_format, expected, plane, width(iosurface, plane),
