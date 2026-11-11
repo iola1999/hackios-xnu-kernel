@@ -414,7 +414,7 @@ iris_free_session_buffers(struct iris_session *s)
 	for (uint32_t i = 0; i < sizeof(bufs) / sizeof(bufs[0]); i++) {
 		if (!iris_dma_free_unmap(bufs[i])) freed = false;
 	}
-	for (uint32_t i = 0; i < IRIS_RAW_POOL_COUNT; i++) {
+	for (uint32_t i = 0; i < IRIS_RAW_POOL_MAX; i++) {
 		if (iris_dma_free_unmap(&s->raw[i])) s->raw_state[i] = IRIS_RAW_HOST;
 		else freed = false;
 	}
@@ -524,6 +524,7 @@ iris_alloc_session_buffers(struct iris_session *s)
 	for (uint32_t i = 0; i < IRIS_RAW_POOL_COUNT; i++) {
 		if (!iris_dma_alloc_map(&s->raw[i], cur, s->raw_frame_size, true)) return ENOMEM;
 		cur += s->raw[i].size;
+		s->raw_count = i + 1u;
 	}
 	return 0;
 }
@@ -658,10 +659,19 @@ iris_start_output(struct iris_session *s)
 	    s->psc_values[PSC_RES] != ((s->width << 16) | s->height) ||
 	    s->psc_values[PSC_CROP_LT] != 0 || s->psc_values[PSC_CROP_RB] != 0 ||
 	    s->psc_values[PSC_DEPTH] != 0x00080008u || count == 0 ||
-	    count > IRIS_RAW_POOL_COUNT || count > IRIS_DPB_POOL_COUNT ||
+	    count > IRIS_RAW_POOL_MAX || s->raw_frame_size == 0 ||
+	    (uint64_t)s->raw_frame_size * count > IRIS_IOVA_RAW_SESSION_STRIDE ||
 	    s->dpb_frame_size == 0 || count > s->intern_dpb.size / s->dpb_frame_size ||
 	    (s->codec_type == IRIS_CODEC_H264 && (s->psc_values[PSC_CODED] & 1u) == 0)) {
 		return EOPNOTSUPP;
+	}
+	/* Keep the initial RAW allocations and add the buffers required by input PSC. */
+	while (s->raw_count < count) {
+		uint32_t i = s->raw_count;
+		uint32_t address = IRIS_IOVA_RAW_BASE + (s->session_id - 1u) *
+		    IRIS_IOVA_RAW_SESSION_STRIDE + i * s->raw_frame_size;
+		if (!iris_dma_alloc_map(&s->raw[i], address, s->raw_frame_size, true)) return ENOMEM;
+		s->raw_count++;
 	}
 	struct iris_pkt_buf b;
 	pkt_begin(&b, s->wire_session_id);
@@ -681,13 +691,13 @@ iris_start_output(struct iris_session *s)
 		if (!iris_queue_buffer(s->wire_session_id, HFI_PORT_RAW, HFI_BUFFER_DPB, i,
 		    s->intern_dpb.iova + i * s->dpb_frame_size, s->dpb_frame_size, 0, 0)) return EIO;
 	}
-	for (uint32_t i = 0; i < IRIS_RAW_POOL_COUNT; i++) {
+	for (uint32_t i = 0; i < s->raw_count; i++) {
 		if (!iris_queue_buffer(s->wire_session_id, HFI_PORT_RAW, HFI_BUFFER_RAW, i,
 		    s->raw[i].iova, s->raw[i].size, 0, 0)) return EIO;
 		s->raw_state[i] = IRIS_RAW_QUEUED;
 	}
 	iris_say("RAW published sid=%u ports=0x%x dpb=%u frame=%u raw=%u\n",
-	    s->wire_session_id, s->started_ports, count, s->dpb_frame_size, IRIS_RAW_POOL_COUNT);
+	    s->wire_session_id, s->started_ports, count, s->dpb_frame_size, s->raw_count);
 	return 0;
 }
 
@@ -734,7 +744,7 @@ iris_return_buffer(struct iris_session *s, const struct hfi_packet *pkt)
 		return 0;
 	}
 	if (hb->type == HFI_BUFFER_RAW) {
-		if (pkt->port != HFI_PORT_RAW || hb->index >= IRIS_RAW_POOL_COUNT ||
+		if (pkt->port != HFI_PORT_RAW || hb->index >= s->raw_count ||
 		    s->raw_state[hb->index] != IRIS_RAW_QUEUED || hb->data_offset != 0 ||
 		    hb->base_address != s->raw[hb->index].iova || hb->buffer_size != s->raw[hb->index].size ||
 		    (hb->flags & HFI_BUF_FW_FLAG_READONLY) != 0) return EIO;
@@ -971,7 +981,7 @@ iris_copy_decoded_nv12(struct iris_session *s, uint32_t raw_idx, struct iris_dec
 static int
 iris_take_output(struct iris_session *s, struct iris_decode_frame *req)
 {
-	for (uint32_t i = 0; i < IRIS_RAW_POOL_COUNT; i++) {
+	for (uint32_t i = 0; i < s->raw_count; i++) {
 		if (s->raw_state[i] != IRIS_RAW_RETURNED) continue;
 		struct hfi_buffer *hb = &s->raw_done[i];
 		bool decoded = hb->data_size != 0;
@@ -1013,7 +1023,7 @@ iris_finish_drain(struct iris_session *s)
 	if (!iris_send_command(s, HFI_CMD_RESUME, HFI_PORT_BITSTREAM, flags, HFI_CMD_DRAIN, NULL)) return EIO;
 	if ((s->started_ports & (1u << HFI_PORT_RAW)) != 0 &&
 	    !iris_send_command(s, HFI_CMD_RESUME, HFI_PORT_RAW, flags, HFI_CMD_DRAIN, NULL)) return EIO;
-	for (uint32_t i = 0; i < IRIS_RAW_POOL_COUNT; i++) {
+	for (uint32_t i = 0; i < s->raw_count; i++) {
 		if (s->raw_state[i] != IRIS_RAW_HOST || (s->started_ports & (1u << HFI_PORT_RAW)) == 0) continue;
 		if (!iris_queue_buffer(s->wire_session_id, HFI_PORT_RAW, HFI_BUFFER_RAW, i,
 		    s->raw[i].iova, s->raw[i].size, 0, 0)) return EIO;

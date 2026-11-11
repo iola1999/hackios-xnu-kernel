@@ -151,6 +151,7 @@ bool iris_dma_alloc_map(struct iris_dma_buf *buf, uint32_t iova, uint32_t size, 
 {
 	(void)cached; alloc_calls++; size = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 	if (alloc_calls == alloc_fail_at && !alloc_retained) return false;
+	assert(size > 0 && size <= IRIS_IOVA_RAW_SESSION_STRIDE);
 	buf->kva = (uintptr_t)calloc(1, size); assert(buf->kva); buf->iova = iova; buf->size = size;
 	return alloc_calls != alloc_fail_at;
 }
@@ -363,11 +364,132 @@ static void later_error_check(struct iris_session *s, const char *name)
 }
 #endif
 
+static unsigned buffer_count(uint32_t type)
+{
+    unsigned count = 0;
+    for (size_t pos = 0; pos < tx_size; pos += get32(tx + pos)) {
+        for (uint32_t off = 32; off < get32(tx + pos); off += get32(tx + pos + off)) {
+            const uint8_t *p = tx + pos + off;
+            if (get32(p + 4) == 0x01000009u && get32(p + 16) == 2 && get32(p + 32) == type) count++;
+        }
+    }
+    return count;
+}
+
+static void raw_count_check(struct iris_session *s, const char *name)
+{
+    unsigned minimum = 6;
+    const char *number = strrchr(name, '-');
+    if (strstr(name, "negotiated")) minimum = (unsigned)strtoul(number + 1, NULL, 10);
+    if (strstr(name, "unallocated")) minimum = 1;
+    if (strstr(name, "capacity-isolated")) minimum = 7;
+    if (strstr(name, "slot4")) s->session_id = 4;
+    if (strstr(name, "cd21-actual")) { s->width = 320; s->height = 192; }
+    assert(iris_hfi_session_open(s) == 0);
+    assert(s->raw_count == 4 && alloc_calls == 11);
+    uintptr_t initial[4];
+    for (unsigned i = 0; i < 4; i++) initial[i] = s->raw[i].kva;
+    if (strstr(name, "range-exact")) s->raw_frame_size = IRIS_IOVA_RAW_SESSION_STRIDE / 6;
+    if (strstr(name, "range-over")) s->raw_frame_size = IRIS_IOVA_RAW_SESSION_STRIDE / 6 + PAGE_SIZE;
+    if (strstr(name, "range-wrap")) s->raw_frame_size = 0x80000000u;
+    if (strstr(name, "zero-frame")) s->raw_frame_size = 0;
+    if (strstr(name, "dpb-short")) s->intern_dpb.size = 5 * s->dpb_frame_size;
+    if (strstr(name, "capacity-isolated")) s->intern_dpb.size = 8 * s->dpb_frame_size;
+    if (strstr(name, "closing")) s->closing = true;
+    bool failing_alloc = strstr(name, "alloc-fail") != NULL;
+    unsigned fail_index = strstr(name, "second") ? 5 : 4;
+    if (failing_alloc) {
+        alloc_fail_at = 8 + fail_index;
+        alloc_retained = strstr(name, "retained") != NULL;
+    }
+    s->input_queued = true; s->next_input_idx = 1;
+    size_t before = tx_size;
+    push_psc(s->wire_session_id);
+    int result = iris_receive(s, NULL);
+    bool invalid = minimum == 0 || minimum > 6 || strstr(name, "range-over") ||
+        strstr(name, "range-wrap") || strstr(name, "zero-frame") || strstr(name, "dpb-short") || strstr(name, "closing");
+    if (invalid || failing_alloc) {
+        assert(result < 0 && s->error == (failing_alloc ? ENOMEM : EOPNOTSUPP));
+        assert(s->started_ports == 2 && tx_size == before && free_calls == 0 && s->input_queued);
+        assert(s->raw_count == (failing_alloc ? fail_index : 4));
+        if (!failing_alloc) assert(alloc_calls == 11);
+        for (unsigned i = 0; i < 4; i++) assert(s->raw[i].kva == initial[i]);
+        if (failing_alloc) {
+            assert(alloc_calls == fail_index + 8);
+            assert((s->raw[fail_index].kva != 0) == alloc_retained);
+            assert(iris_hfi_session_close(s) == ENOMEM && free_calls == 0);
+            /* Isolate cleanup of host allocations after checking the live-session retention path. */
+            unsigned allocated = 7 + fail_index + (alloc_retained ? 1 : 0);
+            if (alloc_retained) {
+                free_fail_at = 8 + fail_index;
+                assert(!iris_free_session_buffers(s) && s->raw[fail_index].kva != 0);
+                free_fail_at = 0;
+            }
+            assert(iris_free_session_buffers(s) && free_calls == allocated);
+            for (unsigned i = 0; i < IRIS_RAW_POOL_MAX; i++) assert(!s->raw[i].kva);
+        }
+        return;
+    }
+    unsigned actual = minimum < 4 ? 4 : minimum;
+    assert(result == 1 && !s->error && s->started_ports == 6 && s->dpb_count == minimum);
+    assert(s->raw_count == actual && alloc_calls == 7 + actual && free_calls == 0);
+    assert(buffer_count(2) == actual && buffer_count(6) == minimum);
+    for (unsigned i = 0; i < actual; i++) {
+        if (i < 4) assert(s->raw[i].kva == initial[i]);
+        else assert(s->raw[i].iova == 0x60000000u + (s->session_id - 1u) * 0x03000000u + i * s->raw_frame_size);
+        assert(s->raw[i].kva && s->raw_state[i] == 1);
+        assert((uint64_t)s->raw[i].iova + s->raw[i].size <= 0x60000000ull + s->session_id * 0x03000000ull);
+    }
+    if (strstr(name, "return-last")) {
+        unsigned last = actual - 1;
+        emit_buffer(s->wire_session_id, 2, 2, last, s->raw[last].iova, s->raw[last].size,
+            s->raw[last].size, 0x9876, 0);
+        assert(iris_receive(s, NULL) == 1 && s->raw_state[last] == 2);
+        struct iris_decode_frame req = {0};
+        assert(iris_take_output(s, &req) == 1 && req.out_tag == 0x9876 && req.flags == 1);
+        assert(s->raw_state[last] == 1 && buffer_count(2) == actual + 1);
+    }
+    if (strstr(name, "drain-last")) {
+        s->raw_state[actual - 1] = IRIS_RAW_HOST;
+        s->draining = s->drain_ack = s->drain_last = true; s->input_queued = false;
+        assert(iris_finish_drain(s) == 0 && s->raw_state[actual - 1] == 1);
+        assert(buffer_count(2) == actual + 1);
+    }
+    if (strstr(name, "unallocated")) {
+        s->raw_state[4] = IRIS_RAW_QUEUED;
+        emit_buffer(s->wire_session_id, 2, 2, 4, 0, 0, 0, 0, 0);
+        assert(iris_receive(s, NULL) == -EIO && s->raw_state[4] == IRIS_RAW_QUEUED && free_calls == 0);
+        return;
+    }
+    if (strstr(name, "repeat") || strstr(name, "changing")) {
+        before = tx_size; unsigned allocations = alloc_calls;
+        if (strstr(name, "changing")) {
+            size_t n; uint8_t *blob = read_blob(psc_path, &n); put32(blob + 4, s->wire_session_id);
+            for (uint32_t off = 32; off < n; off += get32(blob + off))
+                if (get32(blob + off + 4) == 0x03000124u) put32(blob + off + 32, 5);
+            push_message(blob, n); free(blob);
+        } else push_psc(s->wire_session_id);
+        assert(iris_receive(s, NULL) == -EOPNOTSUPP && tx_size == before && alloc_calls == allocations);
+        assert(s->raw_count == actual && free_calls == 0);
+        return;
+    }
+    if (strstr(name, "stop-fail")) {
+        stop_port = strstr(name, "input") ? 1 : 2; stop_mode = 6;
+        assert(iris_hfi_session_close(s) == ETIMEDOUT && free_calls == 0);
+        for (unsigned i = 0; i < actual; i++) assert(s->raw[i].kva != 0);
+        stop_mode = 0;
+    }
+    s->input_queued = false;
+    assert(iris_hfi_session_close(s) == 0 && free_calls == 7 + actual);
+    for (unsigned i = 0; i < IRIS_RAW_POOL_MAX; i++) assert(!s->raw[i].kva);
+}
+
 int main(int argc, char **argv)
 {
 	assert(argc == 4); const char *name = argv[1]; psc_path = argv[2];
 	struct iris_session *s = prepare(strstr(name, "hevc") ? 2 : 1);
-	if (strncmp(name, "wire-", 5) == 0) {
+	if (strncmp(name, "raw-", 4) == 0) raw_count_check(s, name);
+	else if (strncmp(name, "wire-", 5) == 0) {
 #ifndef IRIS_LEGACY_WIRE
 		if (strncmp(name, "wire-psc-", 9) == 0) output_wire_check(s, argv[3]); else
 #endif

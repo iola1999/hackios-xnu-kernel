@@ -266,6 +266,8 @@ extern int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t ar
 #define IRIS_MAX_SESSIONS               4u
 #define IRIS_RAW_POOL_COUNT             4u
 #define IRIS_DPB_POOL_COUNT             6u
+/* Linear AVC/HEVC output uses the firmware minimum for both RAW and DPB. */
+#define IRIS_RAW_POOL_MAX               IRIS_DPB_POOL_COUNT
 #define IRIS_MAX_BITSTREAM_BYTES        (4u * 1024u * 1024u)
 #define IRIS_MAX_WIDTH                  4096u
 #define IRIS_MAX_HEIGHT                 4096u
@@ -373,6 +375,7 @@ struct iris_session {
 	uint32_t            next_input_idx;
 	uint32_t            dpb_frame_size;
 	uint32_t            dpb_count;
+	uint32_t            raw_count;
 	uint32_t            psc_seen;
 	uint32_t            psc_values[11];
 	struct iris_dma_buf bitstream;
@@ -382,9 +385,9 @@ struct iris_session {
 	struct iris_dma_buf intern_line;
 	struct iris_dma_buf intern_persist;
 	struct iris_dma_buf intern_dpb;
-	struct iris_dma_buf raw[IRIS_RAW_POOL_COUNT];
-	uint8_t             raw_state[IRIS_RAW_POOL_COUNT];
-	struct hfi_buffer   raw_done[IRIS_RAW_POOL_COUNT];
+	struct iris_dma_buf raw[IRIS_RAW_POOL_MAX];
+	uint8_t             raw_state[IRIS_RAW_POOL_MAX];
+	struct hfi_buffer   raw_done[IRIS_RAW_POOL_MAX];
 };
 
 struct iris_controller {
