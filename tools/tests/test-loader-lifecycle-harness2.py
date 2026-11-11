@@ -58,7 +58,7 @@ static void sc_affinity(void)
 	takebacks_n = held_irq_masked = 0;
 	aff_knobs();
 	psci_calls = 0;
-	lc_after_return(1, cpus, 3);
+	lc_after_return(1, cpus, 3, 0);
 	CK(psci_calls == 3 && kernel_resources_held == 0, "ret_off_one_query");
 	/* core 2 answers on, then pending, then off: the wait settles inside the budget */
 	aff_knobs();
@@ -67,7 +67,7 @@ static void sc_affinity(void)
 	psci_aff_flip_to = 1;
 	psci_calls = 0;
 	takebacks_n = 0;
-	lc_after_return(1, cpus, 3);
+	lc_after_return(1, cpus, 3, 0);
 	CK(kernel_resources_held == 0 && takebacks_n == 1, "ret_aff_settles_on");
 	aff_knobs();
 	psci_aff_ans[2] = 2;
@@ -75,7 +75,7 @@ static void sc_affinity(void)
 	psci_aff_flip_to = 1;
 	psci_calls = 0;
 	takebacks_n = 0;
-	lc_after_return(1, cpus, 3);
+	lc_after_return(1, cpus, 3, 0);
 	CK(kernel_resources_held == 0 && takebacks_n == 1, "ret_aff_settles_pending");
 	/* a permanent on is retried until the shared budget runs out: held, no takeback */
 	aff_knobs();
@@ -83,7 +83,7 @@ static void sc_affinity(void)
 	psci_tick = (int)(clk_freq / 500);   /* 2 ms per query: many retries fit the budget */
 	psci_calls = 0;
 	takebacks_n = 0;
-	lc_after_return(1, cpus, 3);
+	lc_after_return(1, cpus, 3, 0);
 	CK(kernel_resources_held == 1 && takebacks_n == 0, "ret_aff_never_off_holds");
 	/* eight cores share one budget: the gate stops issuing while cores wait, never eight times */
 	for (int i = 3; i < 8; i++) {
@@ -96,7 +96,7 @@ static void sc_affinity(void)
 	psci_tick = (int)(clk_freq / 50);   /* 20 ms per query: six issue inside 100 ms */
 	psci_calls = 0;
 	takebacks_n = 0;
-	lc_after_return(1, cpus, 8);
+	lc_after_return(1, cpus, 8, 0);
 	CK(kernel_resources_held == 1 && psci_calls == 6, "ret_aff_shared_budget");
 	for (int i = 3; i < 8; i++) {
 		cpus[i] = 0;
@@ -108,7 +108,7 @@ static void sc_affinity(void)
 	psci_calls = 0;
 	takebacks_n = 0;
 	cap_reset();
-	lc_after_return(1, cpus, 3);
+	lc_after_return(1, cpus, 3, 0);
 	CK(kernel_resources_held == 1 && psci_calls == 0 && takebacks_n == 0, "ret_nofreq_no_query");
 	CK(cap_has("no frequency"), "ret_nofreq_prints");
 	/* the counter wrapped between the snapshot and a query: unsigned distance still bounds */
@@ -117,9 +117,88 @@ static void sc_affinity(void)
 	psci_tick = (int)(clk_freq / 50);   /* 20 ms: three queries cross the wrap */
 	psci_calls = 0;
 	takebacks_n = 0;
-	lc_after_return(1, cpus, 3);
+	lc_after_return(1, cpus, 3, 0);
 	CK(kernel_resources_held == 0 && psci_calls == 3, "ret_aff_wrap_ok");
 	kernel_resources_held = 1;
+}
+static void sc_device_return(void)
+{
+	static const uint64_t codes[] = { 0, 9, 42 };
+	static const int64_t reset_answers[] = { 0, -3, 7 };
+	static const uint64_t legacy_reasons[] = { 0, 1, 2, 42 };
+	static uint64_t recording[2];
+	static struct kernel_live live;
+	static const char *const commands[] = { "download:100", "oem ramdisk", "oem ramdisk none",
+	    "oem ramdisk begin 100 200", "oem run", "oem selftest", "oem clearscreen",
+	    "oem stage 81000000 100", "oem recording", "oem sound", "oem memmap", "oem probe",
+	    "oem logwrite", "flash:boot_a", "flash:boot_b", "oem flash_boot", "oem android" };
+	CK(LOADER_RETURN_DEVICE_HELD == 3 && CTX_REASON == 29 && CTX_ESR == 30,
+	    "device_reason_and_context_numbers");
+	loader_ctx[CTX_LOG_PA] = 0;
+	loader_ctx[CTX_LOG_LEN] = 41;
+	loader_ctx[CTX_ELR] = 0x123;
+	recording[0] = (uint64_t)(uintptr_t)"kernel recording";
+	recording[1] = 1000;
+	live.magic2 = KERNEL_LIVE_MAGIC2;
+	live.recording = live.sound = (uint64_t)(uintptr_t)recording;
+	for (int other = 0; other < 2; other++) {
+		aff_knobs();
+		kernel_resources_held = held_irq_masked = 1;
+		active_watch = firmware_fault = 0;
+		psci_calls = takebacks_n = irq_restore_calls = 0;
+		lc_after_return(other, cpus, 3, 3);
+		CK(kernel_resources_held == 1 && psci_calls == 3 - !other, "device_off_stays_held");
+		CK(held_irq_masked == 1 && irq_restore_calls == 0 && takebacks_n == 0,
+		    "device_no_irq_restore_or_takeback");
+		lc_after_return_collect(&live, 0, 0);
+		CK(recording_data == NULL && sound_data == NULL, "device_no_kernel_record_reads");
+		for (unsigned i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
+			CK(lc_cmd_denied(kernel_resources_held, 0, 0, commands[i]), "device_later_command_denied");
+		}
+		CK(lc_stop_action(kernel_resources_held, 0) == LC_STOP_HELD, "device_stop_stays_held");
+		CK(!lc_cmd_denied(kernel_resources_held, 0, 0, "getvar:result") &&
+		    !lc_cmd_denied(kernel_resources_held, 0, 0, "upload"), "device_status_and_staged_log_open");
+		for (unsigned i = 0; i < sizeof(codes) / sizeof(codes[0]); i++) {
+			char expected[64];
+			cap_reset();
+			loader_ctx[CTX_ESR] = codes[i];
+			snprintf(expected, sizeof(expected), "device %u;", (unsigned)codes[i]);
+			return_result(3, 0, 0);
+			CK(!strcmp(last_result, "returned-held 41 0") && cap_has(expected) && cap_has("DEVICE SHUTDOWN FAILED"),
+			    "device_result_and_code_log_preserved");
+		}
+		for (unsigned i = 0; i < sizeof(reset_answers) / sizeof(reset_answers[0]); i++) {
+			psci_next = reset_answers[i];
+			CK(psci_reset_attempt() == reset_answers[i], "device_reset_answer_passed");
+			CK(kernel_resources_held == 1 && held_irq_masked == 1 && takebacks_n == 0 &&
+			    lc_cmd_denied(kernel_resources_held, 0, 0, "download:100"), "device_returned_reset_preserves_hold");
+		}
+		for (unsigned i = 0; i < sizeof(legacy_reasons) / sizeof(legacy_reasons[0]); i++) {
+			aff_knobs();
+			kernel_resources_held = held_irq_masked = 1;
+			takebacks_n = irq_restore_calls = 0;
+			lc_after_return(other, cpus, 3, legacy_reasons[i]);
+			CK(!kernel_resources_held && !held_irq_masked && takebacks_n == 1 && irq_restore_calls == 1,
+			    "device_legacy_release_preserved");
+			loader_ctx[CTX_ESR] = 9;
+			return_result(legacy_reasons[i], 0, 0);
+			const char *expected = legacy_reasons[i] == 1 ? "early-exception 0 123" :
+			    legacy_reasons[i] == 2 ? "checkpoint 9 0" : "returned 41 0";
+			CK(!strcmp(last_result, expected), "device_legacy_result_preserved");
+		}
+	}
+	return_result(0, CHECKPOINT_SELFTEST, 0);
+	CK(!strcmp(last_result, "selftest-ok 0 0"), "device_selftest_result_preserved");
+	kernel_resources_held = 1;
+	return_result(2, 0, 0);
+	CK(!strcmp(last_result, "checkpoint-held 9 0"), "device_held_checkpoint_result_preserved");
+	return_result(0, 0, 0);
+	CK(!strcmp(last_result, "returned-held 41 0"), "device_held_orderly_result_preserved");
+	return_result(1, 0, 0);
+	CK(!strcmp(last_result, "early-exception-held 0 123"), "device_held_exception_result_preserved");
+	return_result(0, CHECKPOINT_SELFTEST, 0);
+	CK(!strcmp(last_result, "selftest-ok-held 0 0"), "device_held_selftest_result_preserved");
+	kernel_resources_held = held_irq_masked = 0;
 }
 static void sc_reset_matrix(void)
 {

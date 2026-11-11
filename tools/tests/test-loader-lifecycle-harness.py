@@ -297,6 +297,10 @@ static void sc_commands(void)
 	}
 	CK(lc_cmd_denied(1, 0, 1, "download:1f000"), "live_block_cmd");
 	CK(lc_cmd_denied(0, 1, 0, "download:1f000"), "fault_block_cmd");
+	CK(lc_cmd_denied(1, 0, 0, "oem stage 81000000 100"), "device_stage_held_denied");
+	CK(lc_cmd_denied(0, 1, 0, "oem stage 81000000 100"), "device_stage_fault_denied");
+	CK(!lc_cmd_denied(1, 0, 1, "oem stage 81000000 100"), "device_stage_live_preserved");
+	CK(!lc_cmd_denied(0, 0, 0, "oem stage 81000000 100"), "device_stage_idle_preserved");
 	CK(lc_busy(1, 0, 0), "busy_held");
 	CK(lc_busy(0, 0, 1), "busy_live");
 	CK(!lc_busy(0, 0, 0), "busy_free");
@@ -411,7 +415,7 @@ static void sc_return(void)
 	static const int64_t bads[] = { 0, 2, -1, 5 };
 	kernel_resources_held = 1;
 	ret_reset(all_off);
-	lc_after_return(1, cpus, 3);
+	lc_after_return(1, cpus, 3, 0);
 	CK(kernel_resources_held == 0, "ret_other_off_releases");
 	CK(takebacks_n == 1 && takebacks[0] && !strcmp(takebacks[0], "the kernel came back"), "ret_other_off_takeback");
 	for (unsigned b = 0; b < 4; b++) {
@@ -420,7 +424,7 @@ static void sc_return(void)
 		kernel_resources_held = 1;
 		cap_reset();
 		ret_reset(st);
-		lc_after_return(1, cpus, 3);
+		lc_after_return(1, cpus, 3, 0);
 		CK(kernel_resources_held == 1, "ret_other_notoff_holds");
 		CK(takebacks_n == 0, "ret_other_notoff_no_takeback");
 		CK(psci_calls == (b < 2 ? 4 : 3), "ret_bad_calls");
@@ -431,12 +435,12 @@ static void sc_return(void)
 		cap_reset();
 		kernel_resources_held = 1;
 		ret_reset(st);
-		lc_after_return(1, cpus, 3);
+		lc_after_return(1, cpus, 3, 0);
 		CK(cap_has("answers -1"), "ret_prints_neg1");
 	}
 	kernel_resources_held = 0;
 	ret_reset(all_off);
-	lc_after_return(0, cpus, 3);
+	lc_after_return(0, cpus, 3, 0);
 	CK(kernel_resources_held == 0 && psci_calls == 2, "ret_same_off_free");
 	CK(takebacks_n == 1, "ret_same_off_takeback");
 	for (unsigned b = 0; b < 4; b++) {
@@ -444,7 +448,7 @@ static void sc_return(void)
 		st[1] = bads[b];
 		kernel_resources_held = 0;
 		ret_reset(st);
-		lc_after_return(0, cpus, 3);
+		lc_after_return(0, cpus, 3, 0);
 		CK(kernel_resources_held == 1 && psci_calls == (b < 2 ? 4 : 1), "same_notoff_holds");
 		CK(takebacks_n == 0, "same_notoff_no_takeback");
 		CK(lc_cmd_denied(kernel_resources_held, 0, 0, "download:1f000"), "same_notoff_download_denied");

@@ -87,6 +87,8 @@ static int escape_loop;
 static void print(const char *format, ...) { (void)format; }
 /* the panel status of loader_06a_screen_ui.inc: drawing is not what this test checks */
 static inline void ui_init(void) {}
+static int boot_fallback_active;
+static void reboot(void) { assert(0); }
 static void boot_fallback_check(void) {}
 static inline void ui_stage(const char *word) { (void)word; }
 static inline void ui_progress(uint64_t done, uint64_t total) { (void)done; (void)total; }
@@ -199,13 +201,20 @@ int main(void)
     CK(!ramdisk_begin("8 2c0000000")); fb_command("download:10000000000000008"); CK(ramdisk_transfer.failed);
     CK(!ramdisk_begin("8 2c0000000")); fb_command("download:9"); CK(ramdisk_transfer.failed);
 
-    const char *commands[] = { "oem ramdisk begin 8 2c0000000", "oem ramdisk none", "download:4", "oem run" };
+    const char *commands[] = { "oem ramdisk begin 8 2c0000000", "oem ramdisk none", "oem ramdisk",
+        "download:4", "oem run", "oem selftest" };
     for (unsigned mode = 0; mode < 3; mode++) {
         clean(); backing(0x2c0000000ULL); CK(!ramdisk_begin("8 2c0000000"));
         struct kernel_live live = {0};
         kernel_resources_held = mode == 0; firmware_fault = mode == 1; running_live = mode == 2 ? &live : NULL;
         for (unsigned i = 0; i < sizeof(commands)/sizeof(commands[0]); i++) {
+            answer[0] = 0;
             fb_command((char *)commands[i]); CK(!strncmp(answer, "FAIL", 4));
+            CK(ramdisk_transfer.total == 8 && ramdisk_transfer.received == 0 && rx_calls == 0);
+        }
+        if (mode != 2) {
+            answer[0] = 0;
+            fb_command("oem stage 81000000 100"); CK(!strncmp(answer, "FAIL", 4));
             CK(ramdisk_transfer.total == 8 && ramdisk_transfer.received == 0 && rx_calls == 0);
         }
         fb_command("getvar:ramdisk-state"); CK(!strncmp(answer, "OKAY", 4));
@@ -288,7 +297,8 @@ def test_resident_layout():
     payload_source = (ROOT / 'xnuloader/loader_04_fault_payload_nvram.inc').read_text()
     macros = '\n'.join(re.search(r'^#define ' + key + r'\s+\S+', BASE_SOURCE, re.M).group()
                        for key in ('PAYLOAD_MAGIC', 'PAYLOAD_CONTAINER_MAX', 'MAX_RESIDENT_BOOT_SIZE',
-                                   'KERNEL_VIRT_BASE', 'PAGE_SIZE_MAX', 'RESIDENT_RD_OFFSET', 'BASE_ALIGN', 'MAX_MEM_SIZE_LIMIT'))
+                                   'KERNEL_VIRT_BASE', 'PAGE_SIZE_MAX', 'RESIDENT_RD_OFFSET', 'BASE_ALIGN', 'MAX_MEM_SIZE_LIMIT',
+                                   'CHECKPOINT_SELFTEST'))
     info = payload_source[payload_source.index('struct payload_info {'):payload_source.index('static uint64_t\nparse_number')]
     layout = LAYOUT_SOURCE[LAYOUT_SOURCE.index('struct run_layout {'):LAYOUT_SOURCE.index('/* F10-PLAN-END */')]
     # Keep the production guard and its immediate I/O consumers in their actual order.
@@ -306,6 +316,11 @@ static uint64_t payload_bytes, resident_rd_size, win_base = 0x80000000ULL, win_s
 static const int platform_annibale, platform_qemu;
 static const int *PLAT = &platform_annibale;
 static unsigned disk_reads, memory_writes;
+static uint64_t checkpoint;
+static char log_buf[1];
+static uint32_t log_len;
+static void ui_boot_progress(int step, const char *text, const char *log, uint32_t length)
+{ (void)step; (void)text; (void)log; (void)length; }
 static void print(const char *format, ...) { (void)format; }
 static int str_eq(const char *a, const char *b) { return !strcmp(a, b); }
 struct payload_header { uint32_t magic, size; };

@@ -48,7 +48,10 @@ reboot(void)
  * window. loader_save_ctx() records the UEFI execution environment and
  * returns 0. When the kernel is done it jumps to loader_return_stub (mapped
  * 1:1 or with the MMU off) with x0 = PA of its log, x1 = length, x2 = reason
- * (0 = orderly, 1 = early exception, then x3..x7 = ESR, ELR, FAR, LR, SP).
+ * (0 = orderly, 1 = early exception, 2 = checkpoint, 3 = device resources held).
+ * x3 carries the exception ESR, checkpoint number or held device code; x4..x7 carry
+ * ELR, FAR, LR, SP for an exception. Reason 3 retains memory until reset, including
+ * for device codes this loader does not recognize.
  * The stub switches the MMU off, reinstates the saved environment and makes
  * loader_save_ctx() return a second time, with 1.
  *

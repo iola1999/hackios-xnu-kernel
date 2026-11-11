@@ -25,9 +25,9 @@ The USB event/status/link enums and the event union are injected verbatim from
 xnuloader/efi.h and pinned there by _Static_assert against raw numbers written from the
 ABL interface the header documents (review L10); counterexamples swap the link-state order
 and strip raw[8] from the injected text, and the compile must fail.
-Coverage note: the IRQ save/restore assembly and the note/IRQ-mask passes stay inline in
-run_on_other_cpu (assembly needs the target; host checks pin call sites and order) and the
-host never executes the restore path (held_irq_masked stays 0). In the exception handler the
+Coverage note: IRQ save/restore assembly becomes counted host calls; source checks preserve
+the instructions and their order. Return tests include device-held and legacy return reasons,
+their result fields, and failed reset attempts. In the exception handler the
 one IRQ mask instruction becomes a counted host no-op; the handler itself runs, with the
 reset and poll-loop escapes routed through setjmp.
 Usage: python3 tools/test-loader-lifecycle.py"""
@@ -42,7 +42,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 LOADER = os.path.join(ROOT, "xnuloader", "loader.c")
 EFIH = os.path.join(ROOT, "xnuloader", "efi.h")
 BUILD = os.environ.get("TMPDIR", "/tmp")
-BLOCKS = ("LC", "LC-WRITE", "LC-IRQ", "LC-ENTER", "LC-WATCH", "LC-TAIL", "LC-RETURN", "LC-RESET", "LC-USB", "LC-FB",
+BLOCKS = ("LC", "LC-WRITE", "LC-IRQ", "LC-ENTER", "LC-WATCH", "LC-TAIL", "LC-RETURN", "LC-RESULT", "LC-RESET", "LC-USB", "LC-FB",
           "LC-POLL", "LC-EXC")
 
 def read(path):
@@ -93,7 +93,7 @@ _spec3.loader.exec_module(_harness3)
 PRELUDE = _harness.PRELUDE
 SCENARIOS = (_harness.SCENARIOS.replace("static void ret_reset(int64_t *states)", _harness2.AFF_SCENARIO + "\nstatic void ret_reset(int64_t *states)")
              .replace("static void sc_usb_notify(void)", _harness2.USB2_SCENARIO + "\nstatic void sc_usb_notify(void)")
-             .replace("sc_psci_spec();", "sc_affinity(); sc_reset_matrix(); sc_psci_spec();")
+             .replace("sc_psci_spec();", "sc_affinity(); sc_device_return(); sc_reset_matrix(); sc_psci_spec();")
              .replace("sc_usb_guard(); sc_fault();", "sc_usb_guard(); sc_usb_dyn(); sc_fault();")
              .replace("static void sc_repeat(void)", _harness3.C_GROUP + "\nstatic void sc_repeat(void)")
              .replace("sc_fault(); sc_repeat();", "sc_fault(); sc_repeat(); cg_run_all();"))
@@ -102,7 +102,9 @@ SCENARIOS = (_harness.SCENARIOS.replace("static void ret_reset(int64_t *states)"
 MUTATIONS = [
 	("mut_nowatch_started", "watch_", "\t\t\t*status = OTHER_CPU_NOT_STARTED;\n\t\t\treturn 1;   /* held at once: the charger and the storage are not touched this round */", "\t\t\t*status = OTHER_CPU_NOT_STARTED;"),
 	("mut_nowatch_hung", "watch_", "\t\t\t*status = OTHER_CPU_HUNG;\n\t\t\treturn 1;   /* held at once: no block, USB or charger service past the decision */", "\t\t\t*status = OTHER_CPU_HUNG;"),
-	("mut_samecore", "same_", "\tkernel_resources_held = cores_off ? 0 : 1;  /* proof or no proof: the only release point */", "\tif (ran_other_core) {\n\t\tkernel_resources_held = cores_off ? 0 : 1;\n\t}"),
+	("mut_samecore", "same_", "\tkernel_resources_held = !cores_off || reason == LOADER_RETURN_DEVICE_HELD;", "\tif (ran_other_core) {\n\t\tkernel_resources_held = !cores_off || reason == LOADER_RETURN_DEVICE_HELD;\n\t}"),
+	("mut_device_hold", "device_", "\tkernel_resources_held = !cores_off || reason == LOADER_RETURN_DEVICE_HELD;", "\tkernel_resources_held = !cores_off;"),
+	("mut_held_stage", "device_stage_", '((fault || (hold && !live)) && lc_starts(cmd, "oem stage "))', '0'),
 	("mut_whitelist", "onissue_", "\treturn status == PSCI_E_NOT_SUPPORTED || status == PSCI_E_INVALID_PARAMS ||\n\t    status == PSCI_E_DENIED || status == PSCI_E_INVALID_ADDRESS;", "\treturn status != 0;"),
 	("mut_already_on_const", "psci_spec_", "#define PSCI_E_ALREADY_ON       (-4)", "#define PSCI_E_ALREADY_ON       (-6)"),
 	("mut_write_gate", "wlog_", "\tbio = ((kernel_resources_held || firmware_fault) && !active_watch) ? NULL : find_log_partition();", "\tbio = (kernel_resources_held && !active_watch) ? NULL : find_log_partition();"),
@@ -168,21 +170,25 @@ def build_c(src):
             txt = txt.replace('__asm__ volatile ("msr daifset, #0xf");', "harness_daifset();")
             txt = txt.replace("harness_daifset();\n\tfor (;;) {\n\t}",
                 "harness_daifset();\n\twhile (halt_armed) { halt_armed = 0; longjmp(jb_exit, 3); }")
-        elif name == "LC-TAIL":
+        elif name in ("LC-TAIL", "LC-RETURN"):
             # the restore writes two AArch64 registers: the host counts it instead of running it
             txt = txt.replace(
                 '__asm__ volatile ("msr S3_0_C12_C12_7, %0\\nisb" : : "r" (held_group1));\n'
                 '\t\t__asm__ volatile ("msr daif, %0" : : "r" (held_daif));',
                 "harness_irq_restore();")
             if "harness_irq_restore();" not in txt:
-                sys.exit("LC-TAIL block: the restore instructions moved, update the test")
-            txt = "static int64_t\nrun_tail(int64_t status)\n{\n" + txt + "\n}\n"
+                sys.exit("%s block: the restore instructions moved, update the test" % name)
+            if name == "LC-TAIL":
+                txt = "static int64_t\nrun_tail(int64_t status)\n{\n" + txt + "\n}\n"
+        elif name == "LC-RESULT":
+            txt = "static void\nreturn_result(uint64_t reason, uint64_t checkpoint, uint64_t slide)\n{\n" + txt + "\n}\n"
         elif name == "LC-POLL":
             txt = ("static void\npoll_once(void)\n{\n\tuint32_t msg = UsbDeviceEventNoEvent;\n\tuint64_t size = 0, n;\n"
                    "\tusb_device_event_data data;\n\tchar cmd[128];\n\n\tif (USB == NULL) {\n\t\treturn;\n\t}\n"
                    + txt + "\n}\nstatic void usb_poll_command(void) { poll_once(); }\n")
         blocks.append(txt)
-    prelude = PRELUDE
+    prelude = PRELUDE.replace("enum { CTX_LOG_PA = 0, CTX_KSP = 10 };\nstatic uint64_t loader_ctx[16];",
+        re.search(r"enum \{\n\tCTX_TTBR0,.*?\};\nuint64_t loader_ctx\[CTX_COUNT\];", src, re.S).group(0))
     exc = re.search(r"enum \{ EXC_CTX_.*?\};", read(EFIH), re.S).group(0)
     usb = re.search(r"enum \{ UsbDeviceEventNoEvent.*?\} usb_device_event_data;", read(EFIH), re.S).group(0)
     for token, value in (("@C_PRELUDE@", _harness3.C_PRELUDE), ("@START@", macro_value(src, "START_SECONDS")), ("@SILENCE@", macro_value(src, "SILENCE_SECONDS")),
@@ -374,9 +380,15 @@ def wiring_checks(src):
     ck(src.count("usb_tx_buf[") == 0, "single_copy_site")
     ck(blk_f.count("n < sizeof(msg) - 1") == 2, "fb_hard_limits")
     ck("usb_tx((const uint8_t *)msg, n);" in blk_f, "fb_via_guarded_tx")
-    i_g = i_of("lc_after_return(ran_other_core, cpu_mpidr, cpu_count);")
+    i_g = i_of("lc_after_return(ran_other_core, cpu_mpidr, cpu_count, reason);")
     ck(0 < i_g < i_of("lc_after_return_collect(", i_g), "gate_before_stats")
+    i_return = src.find("--- the kernel came back")
+    ck(0 < i_return < i_of("uint64_t reason = loader_ctx[CTX_REASON];", i_return) < i_g,
+       "reason_before_release")
     ck('set_result(kernel_resources_held ? "returned-held" : "returned", klog_len, 0);' in src, "held_result")
+    ck('"KERNEL DEVICE SHUTDOWN FAILED: device %d; memory and devices stay held until reset\\n", loader_ctx[CTX_ESR]' in src,
+       "device_code_logged")
+    ck(src.count('"  stp x2, x3, [x10, #232]\\n"') == 2, "reason_code_both_stubs")
     for s in ('kernel_resources_held ? "hung-held"', 'kernel_resources_held ? "no-such-core-held"',
               'kernel_resources_held ? "selftest-ok-held"', 'kernel_resources_held ? "checkpoint-held"',
               'kernel_resources_held ? "early-exception-held"'):
@@ -435,9 +447,10 @@ def wiring_checks(src):
     ck(blk_r.count("psci_call(PSCI_AFFINITY_INFO") == 1, "one_affinity_site")
     ck(blk_r.count("READ_SYSREG(CNTVCT_EL0) - began > budget") == 2, "budget_gates_issue_and_tail")
     ck("Stall" not in blk_r and "WFI" not in blk_r, "affinity_polls_without_stall")
-    ck(blk_r.find("off_seen[i] = 1") < blk_r.find("kernel_resources_held = cores_off"), "off_answer_cached")
+    ck(blk_r.find("off_seen[i] = 1") < blk_r.find("kernel_resources_held = !cores_off"), "off_answer_cached")
     blk_ret = extract(src, "LC-RETURN")
-    ck(0 < blk_ret.find("kernel_resources_held = cores_off ? 0 : 1;") < blk_ret.find('hc_take_back("the kernel came back")'), "release_before_takeback")
+    ck(0 < blk_ret.find("kernel_resources_held = !cores_off || reason == LOADER_RETURN_DEVICE_HELD;")
+       < blk_ret.find('hc_take_back("the kernel came back")'), "release_before_takeback")
     ck(blk_ret.count("msr S3_0_C12_C12_7") == 1, "restore_asm_in_gate")
     ck("if (!kernel_resources_held && held_irq_masked) {" in src, "restore_gated")
     return fails

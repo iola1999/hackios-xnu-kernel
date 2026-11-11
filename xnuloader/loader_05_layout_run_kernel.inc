@@ -233,12 +233,12 @@ static int starts_with(const char *s, const char *prefix);
 /* LC-RETURN-BEGIN -- extracted verbatim by tools/test-loader-lifecycle.py: what happens
  * the moment the kernel is back. Both run kinds consume the core answers (ruling
  * 2026-10-25): the cores asked are the ones this run handed to XNU (cpu_mpidr[0..]), the
- * loader's own core excluded. Memory and devices release only on the kernel's return plus
- * an explicit off from every one of them; hc_take_back and the interrupt restore follow
+ * loader's own core excluded. Memory and devices release only on a return without a
+ * device-held reason plus an explicit off from every core; hc_take_back and the interrupt restore follow
  * that decision, never precede it. (host coverage: hc_take_back and psci_call counted
  * through stubs; the interrupt-restore instructions themselves stay asm, wiring-checked.) */
 static void
-lc_after_return(int ran_other_core, const uint64_t *cpu_mpidr, int cpu_count)
+lc_after_return(int ran_other_core, const uint64_t *cpu_mpidr, int cpu_count, uint64_t reason)
 {
 	/* A returning core publishes done before its CPU_OFF call, so an answer of on seen
 	 * right after the return is the settled race, not yet a fault. How long this firmware
@@ -297,7 +297,7 @@ lc_after_return(int ran_other_core, const uint64_t *cpu_mpidr, int cpu_count)
 			cores_off = 0;   /* the shared budget ran out on cores that never answered off */
 		}
 	}
-	kernel_resources_held = cores_off ? 0 : 1;  /* proof or no proof: the only release point */
+	kernel_resources_held = !cores_off || reason == LOADER_RETURN_DEVICE_HELD;
 	if (!kernel_resources_held && held_irq_masked) {
 		__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" (held_group1));
 		__asm__ volatile ("msr daif, %0" : : "r" (held_daif));
@@ -312,7 +312,7 @@ lc_after_return(int ran_other_core, const uint64_t *cpu_mpidr, int cpu_count)
 			    (uint64_t)block_shared.kernel_native.switched_in, (uint64_t)block_shared.kernel_native.switched_out);
 		}
 	} else {
-		print("ufs: left as the kernel left it: not every core answered off (memory and devices stay held)\n");
+		print("ufs: kernel memory and devices stay held until reset\n");
 	}
 }
 
@@ -1054,13 +1054,14 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		held_irq_masked = 1;
 	}
 	wdt_set_ms(WDT_BITE_MS);
-	/* the cores this run handed to XNU are asked whether each is off; only on every yes do
-	 * memory and devices release (LC-RETURN block, same ruling for both run kinds) */
-	lc_after_return(ran_other_core, cpu_mpidr, cpu_count);
+	/* CPU_OFF does not stop device DMA. Read the return reason before deciding whether
+	 * this run's memory and devices can be reused. */
+	uint64_t reason = loader_ctx[CTX_REASON];
+	lc_after_return(ran_other_core, cpu_mpidr, cpu_count, reason);
 	lc_after_return_collect(kernel_live, slide, checkpoint);
+	/* LC-RESULT-BEGIN -- host-extracted return status and diagnostic formatting. */
 	const char *klog = (const char *)loader_ctx[CTX_LOG_PA];
 	uint64_t klog_len = loader_ctx[CTX_LOG_LEN];
-	uint64_t reason = loader_ctx[CTX_REASON];
 	if (checkpoint == CHECKPOINT_SELFTEST) {
 		print("return-path self test passed\n");
 		set_result(kernel_resources_held ? "selftest-ok-held" : "selftest-ok", 0, 0);
@@ -1078,9 +1079,13 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			set_result(kernel_resources_held ? "early-exception-held" : "early-exception", 0, loader_ctx[CTX_ELR]);
 			klog_len = klog_len > (1u << 20) ? 0 : klog_len;
 		} else {
+			if (reason == LOADER_RETURN_DEVICE_HELD) {
+				print("KERNEL DEVICE SHUTDOWN FAILED: device %d; memory and devices stay held until reset\n", loader_ctx[CTX_ESR]);
+			}
 			set_result(kernel_resources_held ? "returned-held" : "returned", klog_len, 0);
 		}
 	}
+	/* LC-RESULT-END */
 	write_logs(klog, klog_len);
 	return 1;
 }

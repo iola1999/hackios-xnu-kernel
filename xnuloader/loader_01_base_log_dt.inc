@@ -365,8 +365,8 @@ static int firmware_fault;              /* UEFI exception handler ran (set in ex
  * lifecycle logic, pure C with no UEFI dependencies so the host test compiles it as it is.
  * kernel_resources_held is separate from running_live, the log pointer: what was started on
  * another core may own memory and devices from the CPU_ON request on, and releases only on
- * proof (ruling 2026-10-25): the kernel returned and every core this run handed to XNU
- * answers AFFINITY_INFO off. A hung or never-arrived kernel keeps the hold, and so does a
+ * proof: the kernel returned without a device-held reason and every core this run handed
+ * to XNU answers AFFINITY_INFO off. A hung or never-arrived kernel keeps the hold, and so does a
  * CPU_ON answer outside the refusal whitelist below. While held the loader keeps to
  * operations that touch no shared hardware: status queries, staged logs, and reboot. The
  * cooperative services inside run_on_other_cpu's watch loop are the one listed exception
@@ -377,6 +377,9 @@ static int firmware_fault;              /* UEFI exception handler ran (set in ex
 #define LC_STOP_NOTIFY 0              /* a live kernel is told to end (oem stop) */
 #define LC_STOP_IDLE 1                /* nothing started: the reply stays the harmless OKAY */
 #define LC_STOP_HELD 2                /* held with no live kernel: nothing can be notified, say so */
+
+/* Return stub x2; x3 identifies the device. Iris PAS9 uses code 9. */
+#define LOADER_RETURN_DEVICE_HELD 3
 
 /* PSCI return codes as the SMC Calling Convention spells them out, the way TF-A defines
  * them in include/lib/psci/psci.h (PSCI_RET_*). tools/test-loader-lifecycle.py asserts
@@ -439,7 +442,10 @@ lc_busy(int hold, int fault, int live)
 static inline int
 lc_cmd_denied(int hold, int fault, int live, const char *cmd)
 {
-	return lc_busy(hold, fault, live) && lc_blocked_cmd(cmd);
+	/* A held return can leave a device writing kernel memory. Preserve live diagnostics,
+	 * but refuse new USB references to that memory after return or a firmware fault. */
+	return (lc_busy(hold, fault, live) && lc_blocked_cmd(cmd)) ||
+	    ((fault || (hold && !live)) && lc_starts(cmd, "oem stage "));
 }
 
 static inline int

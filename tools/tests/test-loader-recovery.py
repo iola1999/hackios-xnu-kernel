@@ -21,7 +21,8 @@ static int usb_menu_interrupted, boot_fallback_active;
 static uint64_t host_last_cmd;
 static char last_result[64];
 static char displayed[64];
-static struct { unsigned log_seen; } UI;
+static struct { unsigned log_seen; int ready; } UI;
+static struct { uint64_t base; } SCREEN;
 static unsigned log_len = 37;
 enum { CTX_LOG_PA, CTX_LOG_LEN };
 static uint64_t loader_ctx[2];
@@ -62,6 +63,16 @@ int main(void)
         assert(firmware_fault == ((state >> 2) & 1));
         assert(held_irq_masked == ((state >> 3) & 1));
         assert(live.stop == 17);
+    }
+    /* A device-held return stays unchanged through repeated recovery requests. */
+    running_live = NULL;
+    kernel_resources_held = held_irq_masked = 1;
+    firmware_fault = usb_menu_interrupted = 0;
+    strcpy(last_result, "returned-held 41 0");
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        assert(menu_enter_fastboot() != NULL);
+        assert(kernel_resources_held == 1 && held_irq_masked == 1 && !usb_menu_interrupted);
+        assert(!strcmp(last_result, "returned-held 41 0"));
     }
     puts("loader recovery: 16 ownership combinations passed");
 }
