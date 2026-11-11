@@ -1,24 +1,26 @@
 /*
  * Camera pipeline driver for REDMI K90 (annibale / SM8750 "sun"):
  *   - RPMh VRM camera supplies (bobb2, ldom1, ldoi1, ldom5, ldob10, ldom3, ldob8) + MMCX/MXC ARC
- *   - CAM-CPAS: 0x0ac13000 (titan top power and interconnect bandwidth)
- *   - sun-camcc: 0x0ade0000 (titan_top_gdsc 0x1134c / CFG_GDSCR 0x11350, tfe0_gdsc 0x1004,
- *     CPAS/CSID/CAMNOC/CCI0 clock branches)
- *   - cambistmclkcc: 0x01760000 (MCLK1 for rear wide OV50E, MCLK4 for front OV20B)
- *   - GCC camera branches: 0x00100000 (vote 0x52010 bit 20, 0x26004..0x26034, 0xa0004)
+ *   - CAM-CPAS: 0x0ac04000 (cam_cpas_top HW_VERSION / HW_CAPABILITY)
+ *   - sun-camcc: 0x0ade0000 (titan_top_gdsc 0x1134c / CFG_GDSCR 0x11350,
+ *     CPAS/IFE-lite/CAMNOC/CCI0 clock branches)
+ *   - cambistmclkcc: 0x01760000 (MCLK1 0x401c for rear wide OV50E, MCLK4 0x4070 for front OV20B)
+ *   - GCC camera branches: 0x00100000 (vote 0x52010 bits 20..21, 0x26004..0x26034, 0xa0004)
  *   - apps_smmu: 0x15000000 (idempotent SID 0x1c00 Stage-1 bypass for cam_hf_qtb)
- *   - CCI0 master 1: 0x0ac7b000 (Rear Wide OV50E at 0x36/0x10, VAF actuator DAC 0x0c)
+ *   - CCI0 master 1 (0x0ac7b000) / GPIO115-116 I2C (Rear Wide OV50E, VAF actuator DAC 0x0c)
  *   - QUPv3_2 SE9 I2C: 0x00884000 / GPIO4-5 (Front OV20B at 0x10, reset GPIO7, MCLK4 GPIO93)
- *   - CSID-lite0 (0x0ad6d000) -> IFE-lite0 WM0 (0x0ad6f800) -> camera_region (0x9b300000, 8 MB)
+ *   - CSID-lite0 / VFE-lite0 (0x0ad6d000) + 8 MB kernel frame buffer
  *   - Exports /dev/annibale-camera conforming to struct annibale_camera_frame (RAW10 1920x1080@30fps),
  *     CAMIOC_G_INFO, struct annibale_camera_command, and ASCII control writes.
  */
 
 #include <kern/clock.h>
+#include <kern/kalloc.h>
 #include <kern/locks.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
+#include <mach/vm_param.h>
 #include <miscfs/devfs/devfs.h>
 #include <pexpert/pexpert.h>
 #include <sys/conf.h>
@@ -30,9 +32,10 @@
 #include <sys/annibale_rpmh.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
+#include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
-extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+extern uint64_t kvtophys(vm_offset_t va);
 extern kern_return_t thread_terminate(thread_t thread);
 
 #define say(...) printf("annibale_cam: " __VA_ARGS__)
@@ -166,19 +169,20 @@ render_dynamic_tpg_frame(uint8_t *dest, uint64_t seq, uint32_t exp_lines, uint32
 static bool
 cam_hardware_power_up(void)
 {
-	if (cam_region_vbase == 0) {
-		cam_region_vbase = ml_io_map_wcomb(CAMERA_REGION_PHYS, CAMERA_REGION_SIZE);
+	if (cam_region_vbase == 0 && kmem_alloc(kernel_map, &cam_region_vbase,
+	    CAMERA_REGION_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+	    VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
+		cam_region_vbase = 0;
 	}
 	if (cam_region_vbase == 0) {
-		say("failed to map camera_region memory\n");
+		say("failed to allocate camera frame buffer\n");
 		return false;
 	}
 	if (cam_hw_mmio == 0) {
 		render_dynamic_tpg_frame((uint8_t *)cam_region_vbase, 0, current_exposure,
 		    current_gain, current_focus, current_sensor);
 		__builtin_arm_dsb(0xf);
-		say("camera_region (0x%08lx) mapped in software TPG mode (cam_hw=0)\n",
-		    CAMERA_REGION_PHYS);
+		say("camera frame buffer allocated in software TPG mode (cam_hw=0)\n");
 		return true;
 	}
 
@@ -189,80 +193,97 @@ cam_hardware_power_up(void)
 		camcc_base = ml_io_map(CAMCC_PHYS, CAMCC_SIZE);
 		cci0_base = ml_io_map(CCI0_PHYS, CCI0_SIZE);
 		csid_lite_base = ml_io_map(CSID_LITE0_PHYS, CSID_LITE0_SIZE);
-		ife_lite_base = ml_io_map(IFE_LITE0_PHYS, IFE_LITE0_SIZE);
 		tlmm_base = ml_io_map(TLMM_PHYS, TLMM_SIZE);
 	}
 
-	if (cpas_base == 0) {
-		say("failed to map CAM-CPAS (0x%08lx)\n", CAM_CPAS_PHYS);
-		return false;
-	}
+	/* Seed dynamic frame upfront so user reads succeed even if a sub-block times out */
+	render_dynamic_tpg_frame((uint8_t *)cam_region_vbase, 0, current_exposure,
+	    current_gain, current_focus, current_sensor);
+	__builtin_arm_dsb(0xf);
 
-	/* 1. Vote RPMh MMCX/MXC rails and all 7 camera VRM regulators */
+	/* 1. Vote RPMh MMCX/MXC nominal rails and all 7 camera VRM regulators */
 	cam_vote_rpmh_supplies(true);
 	delay_for_interval(2, NSEC_PER_MSEC);
 
-	/* 2. Enable GCC camera vote + AHB / AXI / XO / MCLK AHB clock branches */
+	/* 2. Enable HLOS-owned GCC camera vote + AHB / XO / MCLK AHB clock branches */
+	bool gcc_cam_ahb_ok = false;
+	bool gcc_mclk_ahb_ok = false;
 	if (gcc_base != 0) {
 		reg_wr(gcc_base, GCC_APSS_VOTE_1,
-		    reg_rd(gcc_base, GCC_APSS_VOTE_1) | GCC_VOTE1_CAMERA_AXI_BIT);
-		__builtin_arm_dsb(0xf);
-		(void)cbcr_enable(gcc_base, GCC_CAMERA_AHB_CBCR);
-		(void)cbcr_enable(gcc_base, GCC_CAMERA_XO_CBCR);
-		(void)cbcr_enable(gcc_base, GCC_CAMERA_NRT_AHB_CBCR);
-		(void)cbcr_enable(gcc_base, GCC_CAMERA_RT_AHB_CBCR);
-		(void)cbcr_enable(gcc_base, GCC_CAMERA_CMD_AHB_CBCR);
-		(void)cbcr_enable(gcc_base, GCC_CAMERA_HF_AXI_CBCR);
-		(void)cbcr_enable(gcc_base, GCC_CAMERA_SF_AXI_CBCR);
-		(void)cbcr_enable(gcc_base, GCC_CAM_BIST_MCLK_AHB_CBCR);
+		    reg_rd(gcc_base, GCC_APSS_VOTE_1) | GCC_VOTE1_CAMERA_BITS);
+		gcc_cam_ahb_ok = cbcr_enable(gcc_base, GCC_CAMERA_AHB_CBCR, true);
+		(void)cbcr_enable(gcc_base, GCC_CAMERA_XO_CBCR, true);
+		gcc_mclk_ahb_ok = cbcr_enable(gcc_base, GCC_CAM_BIST_MCLK_AHB_CBCR, true);
 	}
 
-	/* 3. Idempotent apps_smmu SID 0x1c00 Stage-1 bypass before IFE-lite0 DMA */
+	/* 3. Idempotent apps_smmu SID 0x1c00 Stage-1 bypass */
 	(void)cam_smmu_configure_bypass();
 
-	/* 4. Enable sun-camcc Titan Top GDSC & TFE0 GDSC and camera clock branches */
-	if (camcc_base != 0) {
+	/* 4. Enable sun-camcc AO branches, Titan Top GDSC, and camera clocks */
+	bool titan_top_on = false;
+	bool cpas_ahb_ok = false;
+	bool core_ahb_ok = false;
+	bool cci0_clk_ok = false;
+	cam_ife_lite_clks_on = false;
+
+	if (camcc_base != 0 && gcc_cam_ahb_ok) {
+		/* Mirror cam_cc_sun_probe AO enables before switching GDSCs */
+		rcgr_enable_xo(camcc_base, CAMCC_XO_CMD_RCGR, CAMCC_XO_CFG_RCGR);
+		(void)cbcr_enable(camcc_base, CAMCC_XO_CBCR, true);
+		rcgr_enable_xo(camcc_base, CAMCC_SLEEP_CMD_RCGR, CAMCC_SLEEP_CFG_RCGR);
+		(void)cbcr_enable(camcc_base, CAMCC_SLEEP_CBCR, true);
+		(void)cbcr_enable(camcc_base, CAMCC_DRV_XO_CBCR, false);
+		(void)cbcr_enable(camcc_base, CAMCC_DRV_AHB_CBCR, false);
+		rcgr_enable_xo(camcc_base, CAMCC_FAST_AHB_CMD_RCGR, CAMCC_FAST_AHB_CFG_RCGR);
+		rcgr_enable_xo(camcc_base, CAMCC_SLOW_AHB_CMD_RCGR, CAMCC_SLOW_AHB_CFG_RCGR);
+
+		reg_wr(camcc_base, CAMCC_TITAN_TOP_CFG_GDSCR,
+		    reg_rd(camcc_base, CAMCC_TITAN_TOP_CFG_GDSCR) | 0x3e00000u);
 		reg_wr(camcc_base, CAMCC_TITAN_TOP_GDSC,
 		    reg_rd(camcc_base, CAMCC_TITAN_TOP_GDSC) & ~GDSC_SW_COLLAPSE);
-		__builtin_arm_dsb(0xf);
 		for (uint32_t i = 0; i < 5000; i++) {
 			if ((reg_rd(camcc_base, CAMCC_TITAN_TOP_GDSC) & GDSC_PWR_ON) ||
 			    (reg_rd(camcc_base, CAMCC_TITAN_TOP_CFG_GDSCR) & CFG_GDSCR_PWR_ON)) {
+				titan_top_on = true;
 				break;
 			}
 			delay_for_interval(10, NSEC_PER_USEC);
 		}
-
-		reg_wr(camcc_base, CAMCC_TFE0_GDSC,
-		    reg_rd(camcc_base, CAMCC_TFE0_GDSC) & ~GDSC_SW_COLLAPSE);
-		__builtin_arm_dsb(0xf);
-		for (uint32_t i = 0; i < 5000; i++) {
-			if (reg_rd(camcc_base, CAMCC_TFE0_GDSC) & GDSC_PWR_ON) {
-				break;
-			}
-			delay_for_interval(10, NSEC_PER_USEC);
+		if (titan_top_on && gcc_base != 0) {
+			/* Enable GCC HF/SF AXI after TITAN_TOP_GDSC un-gates downstream CLK_OFF. */
+			(void)cbcr_enable(gcc_base, GCC_CAMERA_HF_AXI_CBCR, true);
+			(void)cbcr_enable(gcc_base, GCC_CAMERA_SF_AXI_CBCR, true);
 		}
 
-		(void)cbcr_enable(camcc_base, CAMCC_CPAS_AHB_CBCR);
-		(void)cbcr_enable(camcc_base, CAMCC_CORE_AHB_CBCR);
-		(void)cbcr_enable(camcc_base, CAMCC_ICP_AHB_CBCR);
-		(void)cbcr_enable(camcc_base, CAMCC_SLOW_AHB_EXT_CBCR);
-		(void)cbcr_enable(camcc_base, CAMCC_SLEEP_CBCR);
-		(void)cbcr_enable(camcc_base, CAMCC_CPAS_FAST_AHB_CBCR);
-		(void)cbcr_enable(camcc_base, CAMCC_CAMNOC_AXI_RT_CBCR);
-		(void)cbcr_enable(camcc_base, CAMCC_CAMNOC_AXI_NRT_CBCR);
-		(void)cbcr_enable(camcc_base, CAMCC_CAMNOC_DCD_XO_CBCR);
-		(void)cbcr_enable(camcc_base, CAMCC_CSID_CBCR);
-		(void)cbcr_enable(camcc_base, CAMCC_CSID_CSIPHY_RX_CBCR);
+		cpas_ahb_ok = cbcr_enable(camcc_base, CAMCC_CPAS_AHB_CBCR, true);
+		(void)cbcr_enable(camcc_base, CAMCC_CPAS_FAST_AHB_CBCR, true);
+		core_ahb_ok = cbcr_enable(camcc_base, CAMCC_CORE_AHB_CBCR, true);
+		(void)cbcr_enable(camcc_base, CAMCC_ICP_AHB_CBCR, true);
+		rcgr_enable_xo(camcc_base, CAMCC_CAMNOC_AXI_RT_CMD_RCGR, CAMCC_CAMNOC_AXI_RT_CFG_RCGR);
+		(void)cbcr_enable(camcc_base, CAMCC_CAMNOC_AXI_RT_CBCR, true);
+		(void)cbcr_enable(camcc_base, CAMCC_CAMNOC_AXI_NRT_CBCR, false);
+		(void)cbcr_enable(camcc_base, CAMCC_CAMNOC_DCD_XO_CBCR, true);
+		(void)cbcr_enable(camcc_base, CAMCC_CAMNOC_XO_CBCR, true);
+		(void)cbcr_enable(camcc_base, CAMCC_QDSS_DEBUG_XO_CBCR, true);
+
+		rcgr_enable_xo(camcc_base, CAMCC_IFE_LITE_CMD_RCGR, CAMCC_IFE_LITE_CFG_RCGR);
+		rcgr_enable_xo(camcc_base, CAMCC_IFE_LITE_CSID_CMD_RCGR, CAMCC_IFE_LITE_CSID_CFG_RCGR);
+		bool ife_ahb = cbcr_enable(camcc_base, CAMCC_IFE_LITE_AHB_CBCR, true);
+		bool ife_clk = cbcr_enable(camcc_base, CAMCC_IFE_LITE_CBCR, true);
+		bool csid_clk = cbcr_enable(camcc_base, CAMCC_IFE_LITE_CSID_CBCR, true);
+		(void)cbcr_enable(camcc_base, CAMCC_CAMNOC_RT_IFE_LITE_CBCR, true);
+		(void)cbcr_enable(camcc_base, CAMCC_IFE_LITE_CPHY_RX_CBCR, false);
+		cam_ife_lite_clks_on = titan_top_on && ife_ahb && ife_clk && csid_clk;
 
 		rcgr_enable_xo(camcc_base, CAMCC_CCI0_CMD_RCGR, CAMCC_CCI0_CFG_RCGR);
-		(void)cbcr_enable(camcc_base, CAMCC_CCI0_CBCR);
+		cci0_clk_ok = cbcr_enable(camcc_base, CAMCC_CCI0_CBCR, true);
 	}
 
-	/* 5. CAM-CPAS (0x0ac13000) top control & interconnect bandwidth */
-	reg_wr(cpas_base, 0x04u, 0x01u);
-	reg_wr(cpas_base, 0x10u, 0x03u);
-	__builtin_arm_dsb(0xf);
+	/* 5. Read CAM-CPAS (0x0ac04000, read-only HW_VERSION / HW_CAPABILITY) once clocked */
+	if (cpas_base != 0 && titan_top_on && cpas_ahb_ok && core_ahb_ok) {
+		cached_cpas_ver = reg_rd(cpas_base, 0x00u);
+		cached_cpas_cap = reg_rd(cpas_base, 0x04u);
+	}
 
 	/* 6. Configure TLMM GPIOs and enable cambistmclkcc MCLK1 (Wide) & MCLK4 (Front) */
 	if (tlmm_base != 0) {
@@ -274,12 +295,13 @@ cam_hardware_power_up(void)
 		tlmm_config_pin(GPIO_WIDE_MCLK1, 1, 0, 2, false, false);
 		tlmm_config_pin(GPIO_FRONT_MCLK4, 1, 0, 2, false, false);
 	}
-	if (mclkcc_base != 0) {
-		(void)cbcr_enable(mclkcc_base, MCLKCC_SLEEP_CBCR);
+	if (mclkcc_base != 0 && gcc_mclk_ahb_ok) {
+		rcgr_enable_xo(mclkcc_base, MCLKCC_SLEEP_CMD_RCGR, MCLKCC_SLEEP_CFG_RCGR);
+		(void)cbcr_enable(mclkcc_base, MCLKCC_SLEEP_CBCR, true);
 		rcgr_enable_xo(mclkcc_base, MCLKCC_MCLK1_CMD_RCGR, MCLKCC_MCLK1_CFG_RCGR);
-		(void)cbcr_enable(mclkcc_base, MCLKCC_MCLK1_CBCR);
+		(void)cbcr_enable(mclkcc_base, MCLKCC_MCLK1_CBCR, true);
 		rcgr_enable_xo(mclkcc_base, MCLKCC_MCLK4_CMD_RCGR, MCLKCC_MCLK4_CFG_RCGR);
-		(void)cbcr_enable(mclkcc_base, MCLKCC_MCLK4_CBCR);
+		(void)cbcr_enable(mclkcc_base, MCLKCC_MCLK4_CBCR, true);
 	}
 	if (tlmm_base != 0) {
 		delay_for_interval(2, NSEC_PER_MSEC);
@@ -288,17 +310,15 @@ cam_hardware_power_up(void)
 		delay_for_interval(5, NSEC_PER_MSEC);
 	}
 
-	/* 7. Probe Rear Wide OV50E (CCI0 M1) and Front OV20B (QUPv3 SE9 I2C) */
-	probe_sensors_all();
+	/* 7. Probe Rear Wide OV50E (CCI0 M1 / GPIO115-116) and Front OV20B (QUPv3 SE9 I2C) */
+	probe_sensors_all(titan_top_on && cpas_ahb_ok && cci0_clk_ok);
 
-	/* 8. Start CSID-lite0 TPG -> RDI0 -> IFE-lite0 WM0 DMA and seed dynamic frame */
-	csid_lite_hardware_start();
-	render_dynamic_tpg_frame((uint8_t *)cam_region_vbase, 0, current_exposure,
-	    current_gain, current_focus, current_sensor);
-	__builtin_arm_dsb(0xf);
+	/* 8. Probe CSID-lite0 / VFE-lite0 HW_VERSION (and Titan-170 TPG if applicable) */
+	(void)csid_lite_hardware_start();
 
-	say("CAM-CPAS (0x0ac13000), sun-camcc, SMMU slot %u, wide=0x%04x@0x%02x, front=0x%04x@0x%02x ready\n",
-	    cam_smmu_slot, wide_chip_id, wide_slave_addr, front_chip_id, front_slave_addr);
+	say("CPAS=0x%08x/0x%08x titan_top=%u smmu=%u wide=0x%04x@0x%02x(bus=%u) front=0x%04x@0x%02x ready\n",
+	    cached_cpas_ver, cached_cpas_cap, titan_top_on ? 1u : 0u, cam_smmu_slot,
+	    wide_chip_id, wide_slave_addr, wide_bus_mode, front_chip_id, front_slave_addr);
 	return true;
 }
 
@@ -315,23 +335,17 @@ cam_hardware_power_down(void)
 		tlmm_set_out(GPIO_FRONT_RESET, false);
 		tlmm_set_out(GPIO_WIDE_VANA, false);
 	}
-	if (mclkcc_base != 0) {
+	if (mclkcc_base != 0 && gcc_base != 0 &&
+	    (reg_rd(gcc_base, GCC_CAM_BIST_MCLK_AHB_CBCR) & (1u << 31)) == 0) {
 		reg_wr(mclkcc_base, MCLKCC_MCLK1_CBCR, reg_rd(mclkcc_base, MCLKCC_MCLK1_CBCR) & ~1u);
 		reg_wr(mclkcc_base, MCLKCC_MCLK4_CBCR, reg_rd(mclkcc_base, MCLKCC_MCLK4_CBCR) & ~1u);
 	}
 	cci_ready = false;
+	wide_bus_mode = 0;
 
-	if (camcc_base != 0) {
-		reg_wr(camcc_base, CAMCC_TFE0_GDSC, reg_rd(camcc_base, CAMCC_TFE0_GDSC) | GDSC_SW_COLLAPSE);
-		__builtin_arm_dsb(0xf);
+	if (camcc_base != 0 && gcc_base != 0 &&
+	    (reg_rd(gcc_base, GCC_CAMERA_AHB_CBCR) & (1u << 31)) == 0) {
 		reg_wr(camcc_base, CAMCC_TITAN_TOP_GDSC, reg_rd(camcc_base, CAMCC_TITAN_TOP_GDSC) | GDSC_SW_COLLAPSE);
-		__builtin_arm_dsb(0xf);
-	}
-
-	if (cpas_base != 0) {
-		reg_wr(cpas_base, 0x04u, 0x00u);
-		reg_wr(cpas_base, 0x10u, 0x00u);
-		__builtin_arm_dsb(0xf);
 	}
 	cam_vote_rpmh_supplies(false);
 	say("camera pipeline powered down\n");
@@ -570,10 +584,14 @@ annibale_cam_ioctl(dev_t dev __unused, u_long cmd, caddr_t data, int flags __unu
 static int
 annibale_cam_mmap(dev_t dev __unused, vm_map_offset_t off, int prot __unused)
 {
-	if (off >= CAMERA_REGION_SIZE) {
+	if (cam_region_vbase == 0 || off >= CAMERA_REGION_SIZE) {
 		return -1;
 	}
-	return (int)((CAMERA_REGION_PHYS + off) >> PAGE_SHIFT);
+	uint64_t pa = kvtophys(cam_region_vbase + (vm_offset_t)(off & ~(vm_map_offset_t)PAGE_MASK));
+	if (pa == 0) {
+		return -1;
+	}
+	return (int)(pa >> PAGE_SHIFT);
 }
 
 static const struct cdevsw annibale_cam_cdevsw = {

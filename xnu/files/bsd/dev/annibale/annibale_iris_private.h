@@ -22,17 +22,25 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/vnode.h>
+#include <vm/memory_types.h>
 #include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
+extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 extern uint64_t kvtophys(vm_offset_t va);
 extern const uint8_t *annibale_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+extern bool annibale_ufs_fat16_fw_read(const char *name, uint64_t *size_out, volatile void *dst_buf, uint64_t dst_cap);
 extern int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t argument0,
     uint64_t argument1, uint64_t argument2, uint64_t argument3, uint64_t *answer);
 #endif /* !ANNIBALE_IRIS_HOST_TEST */
 
+#ifdef ANNIBALE_IRIS_HOST_TEST
 #define iris_say(...) printf("iris: " __VA_ARGS__)
+#else
+#define iris_say(...) kprintf("iris: " __VA_ARGS__)
+#endif
 
 /* Hardware physical apertures on SM8750 ("sun") */
 #define IRIS_GCC_PHYS                   0x00100000UL
@@ -40,38 +48,56 @@ extern int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t ar
 #define IRIS_VIDCC_PHYS                 0x0aaf0000UL
 #define IRIS_VIDCC_SIZE                 0x00010000UL
 #define IRIS_MMIO_PHYS                  0x0aa00000UL
-#define IRIS_MMIO_SIZE                  0x00100000UL
+#define IRIS_MMIO_SIZE                  0x000f0000UL
 #define IRIS_APPS_SMMU_PHYS             0x15000000UL
 #define IRIS_APPS_SMMU_SIZE             0x00100000UL
 #define IRIS_VIDEO_MEM_PHYS             0x9c300000ULL
 #define IRIS_VIDEO_MEM_SIZE             0x00800000u
 #define IRIS_PAS_ID                     9u
 
-/* GCC video branches */
-#define GCC_VIDEO_AHB_CBCR              0x32008u
-#define GCC_VIDEO_AXI0_CBCR             0x3200cu
-#define GCC_VIDEO_AXI1_CBCR             0x32010u
-#define GCC_VIDEO_VCODEC_AHB_CBCR       0x32014u
-#define GCC_VIDEO_AXI0_IPC_CBCR         0x32018u
-#define GCC_VIDEO_AXI1_IPC_CBCR         0x32028u
+/* GCC video branches (verified against gcc-sun.ko & annibale.dts) */
+#define GCC_VIDEO_AHB_CBCR              0x32004u
+#define GCC_VIDEO_AXI0_CBCR             0x32018u
+#define GCC_VIDEO_AXI1_CBCR             0x32028u
+#define GCC_VIDEO_XO_CBCR               0x32038u
 
-/* VIDEO_CC (0x0aaf0000) Lucid Ole PLL0, GDSCs, RCG, and branches */
+/* VIDEO_CC (0x0aaf0000, Lucid Ole clk_alpha_pll_regs+0xfa & videocc-sun.ko) */
 #define VIDCC_PLL0_MODE                 0x0000u
-#define VIDCC_PLL0_L_VAL                0x0004u
-#define VIDCC_PLL0_USER_CTL             0x000cu
-#define VIDCC_PLL0_OPMODE               0x001cu
+#define VIDCC_PLL0_OPMODE               0x0004u
+#define VIDCC_PLL0_L_VAL                0x0010u
+#define VIDCC_PLL0_ALPHA_VAL            0x0014u
+#define VIDCC_PLL0_USER_CTL             0x0018u
+#define VIDCC_PLL0_USER_CTL_U           0x001cu
+#define VIDCC_PLL0_CONFIG_CTL           0x0020u
+#define VIDCC_PLL0_CONFIG_CTL_U         0x0024u
+#define VIDCC_PLL0_CONFIG_CTL_U1        0x0028u
+#define VIDCC_PLL0_TEST_CTL             0x002cu
+#define VIDCC_PLL0_TEST_CTL_U           0x0030u
 #define VIDCC_MVS0_CMD_RCGR             0x8000u
 #define VIDCC_MVS0_CFG_RCGR             0x8004u
-#define VIDCC_MVS0C_GDSCR               0x8044u
+#define VIDCC_AHB_CMD_RCGR              0x8018u
+#define VIDCC_AHB_CFG_RCGR              0x801cu
+#define VIDCC_MVS0C_GDSCR               0x8034u
+#define VIDCC_MVS0C_CFG_GDSCR           0x8040u
 #define VIDCC_MVS0C_CBCR                0x804cu
 #define VIDCC_MVS0C_FREERUN_CBCR        0x805cu
 #define VIDCC_MVS0C_DIV2_CDIVR          0x8060u
-#define VIDCC_MVS0_GDSCR                0x8074u
+#define VIDCC_MVS0_GDSCR                0x8068u
+#define VIDCC_MVS0_CFG_GDSCR            0x8074u
 #define VIDCC_MVS0_CBCR                 0x807cu
+#define VIDCC_MVS0_FREERUN_EN           0x808cu
 #define VIDCC_MVS0_FREERUN_CBCR         0x8090u
 #define VIDCC_MVS0_DIV_CDIVR            0x809cu
+#define VIDCC_AHB_CBCR                  0x80a4u
+#define VIDCC_XO_CMD_RCGR               0x80bcu
+#define VIDCC_XO_CFG_RCGR               0x80c0u
+#define VIDCC_XO_CBCR                   0x80d4u
 #define VIDCC_MVS0_SHIFT_CBCR           0x80d8u
 #define VIDCC_MVS0C_SHIFT_CBCR          0x80dcu
+#define VIDCC_SLEEP_CMD_RCGR            0x80e0u
+#define VIDCC_SLEEP_CFG_RCGR            0x80e4u
+#define VIDCC_SLEEP_CBCR                0x80f8u
+#define VIDCC_MISC_AO_EN                0x9f24u
 
 /* VPU35 MMIO offsets (0x0aa00000) */
 #define VPU_WRAPPER_INTR_CLEAR          0xa001cu
@@ -104,6 +130,7 @@ extern int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t ar
 #define IRIS_CB_SCTLR                   0x0000u
 #define IRIS_CB_TCR2                    0x0010u
 #define IRIS_CB_TTBR0                   0x0020u
+#define IRIS_CB_TTBR1                   0x0028u
 #define IRIS_CB_TCR                     0x0030u
 #define IRIS_CB_MAIR0                   0x0038u
 #define IRIS_CB_MAIR1                   0x003cu
@@ -114,16 +141,21 @@ extern int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t ar
 #define IRIS_CB_TLBSYNC                 0x07f0u
 #define IRIS_CB_TLBSTATUS               0x07f4u
 
-/* IOVA layout within 39-bit Stage-1 context bank */
-#define IRIS_IOVA_UC_BASE               0x00500000u
+/*
+ * IOVA layout within [0x25800000, 0xe0000000) matching SM8750 sun_context_bank_table:
+ *   non_secure_cb (SID 0x1940):       [0x25800000, 0xe0000000)
+ *   non_secure_pixel_cb (SID 0x1947): [0x00100000, 0xe0000000)
+ *   secure_non_pixel_cb (SID 0x1944): [0x01000000, 0x25800000) -- must not overlap
+ */
+#define IRIS_IOVA_UC_BASE               0x25800000u
 #define IRIS_IOVA_UC_SIZE               0x00300000u
-#define IRIS_IOVA_SFR_BASE              0x00800000u
+#define IRIS_IOVA_SFR_BASE              0x25c00000u
 #define IRIS_IOVA_SFR_SIZE              0x00001000u
-#define IRIS_IOVA_INTERNAL_BASE         0x02000000u
-#define IRIS_IOVA_SESSION_STRIDE        0x04000000u
 #define IRIS_IOVA_BITSTREAM_BASE        0x26000000u
 #define IRIS_IOVA_BITSTREAM_STRIDE      0x01000000u
-#define IRIS_IOVA_RAW_BASE              0xe0000000u
+#define IRIS_IOVA_INTERNAL_BASE         0x30000000u
+#define IRIS_IOVA_SESSION_STRIDE        0x04000000u
+#define IRIS_IOVA_RAW_BASE              0x60000000u
 #define IRIS_IOVA_RAW_SESSION_STRIDE    0x03000000u
 #define IRIS_IOVA_DEV_QTIMER            0xffade000u
 #define IRIS_PHYS_DEV_QTIMER            0x17421000ULL

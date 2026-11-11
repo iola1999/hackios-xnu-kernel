@@ -13,7 +13,9 @@
 #ifdef KERNEL
 
 /* RPMh VRM regulator modes (PMIC5 / PM8550 / PMH8550). */
+#define ANNIBALE_RPMH_MODE_NONE 0u
 #define ANNIBALE_RPMH_MODE_LPM  4u
+#define ANNIBALE_RPMH_MODE_AUTO 6u
 #define ANNIBALE_RPMH_MODE_HPM  7u
 
 /* RPMh ARC power-domain corner levels (dt-bindings/power/qcom-rpmpd.h). */

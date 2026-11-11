@@ -237,6 +237,18 @@ iris_hw_probe_firmware(void)
 	if (data == NULL) {
 		data = iris_vfs_read_fw("/private/var/firmware/vpu35_4v.mbn", &sz);
 	}
+	if (data == NULL && annibale_ufs_fat16_fw_read("vpu35_4v.mbn", &sz, NULL, 0) &&
+	    sz >= 4096 && sz <= 8 * 1024 * 1024) {
+		uint8_t *buf = kalloc_data((size_t)sz, Z_WAITOK | Z_ZERO);
+		if (buf != NULL) {
+			if (annibale_ufs_fat16_fw_read("vpu35_4v.mbn", &sz, buf, sz)) {
+				g_iris.fw_vfs_buf = buf;
+				data = buf;
+			} else {
+				kfree_data(buf, (size_t)sz);
+			}
+		}
+	}
 	if (data == NULL || !iris_mbn_parse(data, (size_t)sz, &img)) {
 		iris_say("vpu35_4v.mbn not present or invalid (sz=%llu)\n", (unsigned long long)sz);
 		return false;
@@ -425,7 +437,7 @@ iris_smmu_setup(void)
 
 	/* Locate existing or free SMR slots for SID 0x1940 and SID 0x1947. */
 	int smr_non_pix = -1, smr_pix = -1;
-	uint64_t used_cbs = 0;
+	uint64_t used_cbs[2] = { 0, 0 };
 	for (uint32_t i = 0; i < streams; i++) {
 		uint32_t smr = mmio_r32(g_iris.smmu, IRIS_SMMU_SMR(i));
 		uint32_t s2cr = mmio_r32(g_iris.smmu, IRIS_SMMU_S2CR(i));
@@ -435,8 +447,9 @@ iris_smmu_setup(void)
 				smr_non_pix = (int)i;
 			} else if (sid == IRIS_SID_PIXEL) {
 				smr_pix = (int)i;
-			} else if (((s2cr >> 16) & 3u) == 0) {
-				used_cbs |= (1ULL << (s2cr & 0x3fu));
+			} else {
+				uint32_t cb_idx = s2cr & 0x7fu;
+				used_cbs[cb_idx >> 6] |= (1ULL << (cb_idx & 63u));
 			}
 		}
 	}
@@ -455,15 +468,30 @@ iris_smmu_setup(void)
 		return false;
 	}
 
-	/* Pick an unused Stage-1 context bank below banks - 1 (last bank is Wi-Fi bypass). */
+	/*
+	 * Pick an HLOS-usable Stage-1 context bank searching downward from banks - 2
+	 * (banks - 1 is the shared bypass bank). Probe GR1_CBAR first as qcom_smmu_cfg_probe
+	 * does so HYP-protected secure context bank pages are never touched.
+	 */
+	uint32_t gr1_off = page;
+	uint32_t cbar_s1 = (1u << 16) | (0xfu << 12) | (3u << 8);
 	int chosen_cb = -1;
-	for (uint32_t cb = 1; cb + 1 < banks; cb++) {
-		if ((pages + cb + 1u) * page > IRIS_APPS_SMMU_SIZE || (used_cbs & (1ULL << cb)) != 0) {
+	for (uint32_t idx = banks - 1u; idx > 1u; idx--) {
+		uint32_t cb = idx - 1u;
+		if (cb >= 128u || (pages + cb + 1u) * page > IRIS_APPS_SMMU_SIZE ||
+		    (used_cbs[cb >> 6] & (1ULL << (cb & 63u))) != 0) {
+			continue;
+		}
+		uint32_t old_cbar = mmio_r32(g_iris.smmu, gr1_off + IRIS_SMMU_GR1_CBAR(cb));
+		if ((old_cbar & 0x30000u) == 0x30000u) {
+			continue;
+		}
+		mmio_w32(g_iris.smmu, gr1_off + IRIS_SMMU_GR1_CBAR(cb), cbar_s1);
+		if ((mmio_r32(g_iris.smmu, gr1_off + IRIS_SMMU_GR1_CBAR(cb)) & 0x30000u) != 0x10000u) {
 			continue;
 		}
 		uint32_t cb_off = (pages + cb) * page;
-		uint32_t sctlr = mmio_r32(g_iris.smmu, cb_off + IRIS_CB_SCTLR);
-		if (sctlr == 0) {
+		if (mmio_r32(g_iris.smmu, cb_off + IRIS_CB_SCTLR) == 0) {
 			chosen_cb = (int)cb;
 			break;
 		}
@@ -483,26 +511,47 @@ iris_smmu_setup(void)
 	}
 
 	uint32_t cb = (uint32_t)chosen_cb;
-	uint32_t gr1_off = page;
 	uint32_t cb_off = (pages + cb) * page;
+	uint32_t s2cr_fault = (2u << 16) | (3u << 8);
+	uint32_t smr0_val = (1u << 31) | IRIS_SID_NON_PIXEL;
+	uint32_t smr1_val = (1u << 31) | IRIS_SID_PIXEL;
 
+	mmio_w32(g_iris.smmu, IRIS_SMMU_S2CR((uint32_t)smr_non_pix), s2cr_fault);
+	mmio_w32(g_iris.smmu, IRIS_SMMU_SMR((uint32_t)smr_non_pix), smr0_val);
+	mmio_w32(g_iris.smmu, IRIS_SMMU_S2CR((uint32_t)smr_pix), s2cr_fault);
+	mmio_w32(g_iris.smmu, IRIS_SMMU_SMR((uint32_t)smr_pix), smr1_val);
+	if (mmio_r32(g_iris.smmu, IRIS_SMMU_SMR((uint32_t)smr_non_pix)) != smr0_val ||
+	    mmio_r32(g_iris.smmu, IRIS_SMMU_SMR((uint32_t)smr_pix)) != smr1_val) {
+		iris_say("apps-smmu rejected SID 0x1940/0x1947 SMR programming\n");
+		return false;
+	}
+
+	mmio_w32(g_iris.smmu, cb_off + IRIS_CB_SCTLR, 0u);
 	mmio_w32(g_iris.smmu, gr1_off + IRIS_SMMU_GR1_CBA2R(cb), 1u);
-	mmio_w32(g_iris.smmu, gr1_off + IRIS_SMMU_GR1_CBAR(cb), (1u << 16) | (0xfu << 12) | (3u << 8));
+	mmio_w32(g_iris.smmu, gr1_off + IRIS_SMMU_GR1_CBAR(cb), cbar_s1);
 	mmio_w32(g_iris.smmu, cb_off + IRIS_CB_TCR2, 0x00038011u);
 	mmio_w32(g_iris.smmu, cb_off + IRIS_CB_TCR, 0x00803519u);
 	uint64_t ttbr0 = (root_pa & IRIS_PTE_ADDR_MASK) | ((uint64_t)cb << 48);
 	mmio_w32(g_iris.smmu, cb_off + IRIS_CB_TTBR0, (uint32_t)ttbr0);
 	mmio_w32(g_iris.smmu, cb_off + IRIS_CB_TTBR0 + 4u, (uint32_t)(ttbr0 >> 32));
+	mmio_w32(g_iris.smmu, cb_off + IRIS_CB_TTBR1, 0u);
+	mmio_w32(g_iris.smmu, cb_off + IRIS_CB_TTBR1 + 4u, 0u);
 	mmio_w32(g_iris.smmu, cb_off + IRIS_CB_MAIR0, 0xf404ff44u);
 	mmio_w32(g_iris.smmu, cb_off + IRIS_CB_MAIR1, 0u);
 	mmio_w32(g_iris.smmu, cb_off + IRIS_CB_FSR, 0xc00001feu);
+	mmio_w32(g_iris.smmu, cb_off + IRIS_CB_TLBIASID, cb);
+	mmio_w32(g_iris.smmu, cb_off + IRIS_CB_TLBSYNC, 0u);
+	for (uint32_t i = 0; i < 2000u; i++) {
+		if ((mmio_r32(g_iris.smmu, cb_off + IRIS_CB_TLBSTATUS) & 1u) == 0) {
+			break;
+		}
+		iris_sleep_us(2);
+	}
 	mmio_w32(g_iris.smmu, cb_off + IRIS_CB_SCTLR, 0x27u);
 
 	uint32_t s2cr_val = (3u << 8) | cb;
 	mmio_w32(g_iris.smmu, IRIS_SMMU_S2CR((uint32_t)smr_non_pix), s2cr_val);
-	mmio_w32(g_iris.smmu, IRIS_SMMU_SMR((uint32_t)smr_non_pix), (1u << 31) | IRIS_SID_NON_PIXEL);
 	mmio_w32(g_iris.smmu, IRIS_SMMU_S2CR((uint32_t)smr_pix), s2cr_val);
-	mmio_w32(g_iris.smmu, IRIS_SMMU_SMR((uint32_t)smr_pix), (1u << 31) | IRIS_SID_PIXEL);
 
 	g_iris.smmu_cb = cb;
 	g_iris.smmu_smr_non_pix = (uint32_t)smr_non_pix;
@@ -531,7 +580,21 @@ iris_enable_cbcr(vm_offset_t base, uint32_t off, bool check_off)
 		}
 		iris_sleep_us(5);
 	}
-	return true;
+	iris_say("CBCR +%#x enable timeout (%#x)\n", off, mmio_r32(base, off));
+	return false;
+}
+
+static void
+iris_rcgr_enable_xo(vm_offset_t base, uint32_t cmd_off, uint32_t cfg_off)
+{
+	mmio_w32(base, cfg_off, 0x01u); /* src=0 (bi_tcxo 19.2 MHz), div=1 */
+	mmio_w32(base, cmd_off, mmio_r32(base, cmd_off) | 0x03u); /* UPDATE | ROOT_EN */
+	for (uint32_t i = 0; i < 500u; i++) {
+		if ((mmio_r32(base, cmd_off) & 1u) == 0) {
+			break;
+		}
+		iris_sleep_us(5);
+	}
 }
 
 static bool
@@ -571,36 +634,63 @@ iris_power_and_clocks(void)
 		return false;
 	}
 
-	iris_enable_cbcr(g_iris.gcc, GCC_VIDEO_AHB_CBCR, false);
-	iris_enable_cbcr(g_iris.gcc, GCC_VIDEO_AXI0_CBCR, true);
-	iris_enable_cbcr(g_iris.gcc, GCC_VIDEO_AXI1_CBCR, true);
-	iris_enable_cbcr(g_iris.gcc, GCC_VIDEO_VCODEC_AHB_CBCR, false);
-	iris_enable_cbcr(g_iris.gcc, GCC_VIDEO_AXI0_IPC_CBCR, true);
-	iris_enable_cbcr(g_iris.gcc, GCC_VIDEO_AXI1_IPC_CBCR, true);
+	/* Enable HLOS-owned GCC video AHB/XO branches before touching VIDEO_CC (0x0aaf0000) */
+	if (!iris_enable_cbcr(g_iris.gcc, GCC_VIDEO_AHB_CBCR, true) ||
+	    !iris_enable_cbcr(g_iris.gcc, GCC_VIDEO_XO_CBCR, true)) {
+		return false;
+	}
+
+	/* Mirror video_cc_sun_probe AO & CFG_GDSCR presets */
+	mmio_w32(g_iris.vidcc, VIDCC_MVS0C_CFG_GDSCR,
+	    mmio_r32(g_iris.vidcc, VIDCC_MVS0C_CFG_GDSCR) | 0x3e00000u);
+	mmio_w32(g_iris.vidcc, VIDCC_MVS0_CFG_GDSCR,
+	    mmio_r32(g_iris.vidcc, VIDCC_MVS0_CFG_GDSCR) | 0x3e00000u);
+	mmio_w32(g_iris.vidcc, VIDCC_MISC_AO_EN, mmio_r32(g_iris.vidcc, VIDCC_MISC_AO_EN) | 1u);
+	iris_rcgr_enable_xo(g_iris.vidcc, VIDCC_AHB_CMD_RCGR, VIDCC_AHB_CFG_RCGR);
+	(void)iris_enable_cbcr(g_iris.vidcc, VIDCC_AHB_CBCR, true);
+	iris_rcgr_enable_xo(g_iris.vidcc, VIDCC_XO_CMD_RCGR, VIDCC_XO_CFG_RCGR);
+	(void)iris_enable_cbcr(g_iris.vidcc, VIDCC_XO_CBCR, true);
+	iris_rcgr_enable_xo(g_iris.vidcc, VIDCC_SLEEP_CMD_RCGR, VIDCC_SLEEP_CFG_RCGR);
+	(void)iris_enable_cbcr(g_iris.vidcc, VIDCC_SLEEP_CBCR, true);
 
 	if (!iris_enable_gdsc(g_iris.vidcc, VIDCC_MVS0C_GDSCR, "mvs0c")) {
 		return false;
 	}
 
-	/* Lucid Ole video_cc_pll0: enable if not already locked (bit 31). */
+	/*
+	 * Configure & enable Lucid Ole video_cc_pll0 per clk_lucid_evo_pll_configure()
+	 * and _alpha_pll_lucid_evo_enable() (video_cc_pll0_config: l=0x25, cal_l=0x44, alpha=0x8000).
+	 */
+	mmio_w32(g_iris.vidcc, VIDCC_PLL0_USER_CTL,
+	    mmio_r32(g_iris.vidcc, VIDCC_PLL0_USER_CTL) | 7u);
 	uint32_t pll_mode = mmio_r32(g_iris.vidcc, VIDCC_PLL0_MODE);
-	if ((pll_mode & (1u << 31)) == 0) {
-		if ((mmio_r32(g_iris.vidcc, VIDCC_PLL0_L_VAL) & 0xffu) == 0) {
-			mmio_w32(g_iris.vidcc, VIDCC_PLL0_L_VAL, 0x25u);
+	uint32_t pll_opmode = mmio_r32(g_iris.vidcc, VIDCC_PLL0_OPMODE);
+	if ((pll_mode & 1u) == 0 || (pll_opmode & 1u) == 0) {
+		if ((mmio_r32(g_iris.vidcc, VIDCC_PLL0_L_VAL) & 0xffffu) == 0) {
+			mmio_w32(g_iris.vidcc, VIDCC_PLL0_MODE, pll_mode & ~4u);
+			mmio_w32(g_iris.vidcc, VIDCC_PLL0_L_VAL, 0x44440025u);
+			mmio_w32(g_iris.vidcc, VIDCC_PLL0_ALPHA_VAL, 0x8000u);
+			mmio_w32(g_iris.vidcc, VIDCC_PLL0_CONFIG_CTL, 0x19660387u);
+			mmio_w32(g_iris.vidcc, VIDCC_PLL0_CONFIG_CTL_U, 0x098060a0u);
+			mmio_w32(g_iris.vidcc, VIDCC_PLL0_CONFIG_CTL_U1, 0xb416cb20u);
+			mmio_w32(g_iris.vidcc, VIDCC_PLL0_USER_CTL, 7u);
+			mmio_w32(g_iris.vidcc, VIDCC_PLL0_USER_CTL_U, 2u);
+			mmio_w32(g_iris.vidcc, VIDCC_PLL0_TEST_CTL, 0u);
+			mmio_w32(g_iris.vidcc, VIDCC_PLL0_TEST_CTL_U, 0u);
+			mmio_w32(g_iris.vidcc, VIDCC_PLL0_MODE,
+			    mmio_r32(g_iris.vidcc, VIDCC_PLL0_MODE) & ~1u);
 		}
-		mmio_w32(g_iris.vidcc, VIDCC_PLL0_USER_CTL,
-		    mmio_r32(g_iris.vidcc, VIDCC_PLL0_USER_CTL) | 1u | (1u << 1));
+		mmio_w32(g_iris.vidcc, VIDCC_PLL0_MODE,
+		    mmio_r32(g_iris.vidcc, VIDCC_PLL0_MODE) | 4u);
 		mmio_w32(g_iris.vidcc, VIDCC_PLL0_OPMODE, 1u);
-		mmio_w32(g_iris.vidcc, VIDCC_PLL0_MODE, (pll_mode & ~7u) | 2u);
-		iris_sleep_us(50);
-		mmio_w32(g_iris.vidcc, VIDCC_PLL0_MODE, mmio_r32(g_iris.vidcc, VIDCC_PLL0_MODE) | 4u);
 		for (uint32_t i = 0; i < 2000u; i++) {
 			if ((mmio_r32(g_iris.vidcc, VIDCC_PLL0_MODE) & (1u << 31)) != 0) {
 				break;
 			}
 			iris_sleep_us(5);
 		}
-		mmio_w32(g_iris.vidcc, VIDCC_PLL0_MODE, mmio_r32(g_iris.vidcc, VIDCC_PLL0_MODE) | 1u);
+		mmio_w32(g_iris.vidcc, VIDCC_PLL0_MODE,
+		    mmio_r32(g_iris.vidcc, VIDCC_PLL0_MODE) | 1u);
 	}
 
 	if ((mmio_r32(g_iris.vidcc, VIDCC_PLL0_MODE) & (1u << 31)) != 0) {
@@ -616,16 +706,42 @@ iris_power_and_clocks(void)
 	mmio_w32(g_iris.vidcc, VIDCC_MVS0_DIV_CDIVR, 1u);
 	mmio_w32(g_iris.vidcc, VIDCC_MVS0C_DIV2_CDIVR, 1u);
 
-	iris_enable_cbcr(g_iris.vidcc, VIDCC_MVS0C_FREERUN_CBCR, true);
-	iris_enable_cbcr(g_iris.vidcc, VIDCC_MVS0C_CBCR, true);
-	iris_enable_cbcr(g_iris.vidcc, VIDCC_MVS0C_SHIFT_CBCR, false);
+	if (!iris_enable_cbcr(g_iris.vidcc, VIDCC_MVS0C_FREERUN_CBCR, true) ||
+	    !iris_enable_cbcr(g_iris.vidcc, VIDCC_MVS0C_CBCR, true)) {
+		return false;
+	}
+	(void)iris_enable_cbcr(g_iris.vidcc, VIDCC_MVS0C_SHIFT_CBCR, false);
 
 	if (!iris_enable_gdsc(g_iris.vidcc, VIDCC_MVS0_GDSCR, "mvs0")) {
 		return false;
 	}
-	iris_enable_cbcr(g_iris.vidcc, VIDCC_MVS0_FREERUN_CBCR, true);
-	iris_enable_cbcr(g_iris.vidcc, VIDCC_MVS0_CBCR, true);
-	iris_enable_cbcr(g_iris.vidcc, VIDCC_MVS0_SHIFT_CBCR, false);
+	/* video_cc_mvs0_freerun_clk enables via 0x808c bit 0 and polls halt status in 0x8090. */
+	mmio_w32(g_iris.vidcc, VIDCC_MVS0_FREERUN_EN,
+	    mmio_r32(g_iris.vidcc, VIDCC_MVS0_FREERUN_EN) | 1u);
+	bool mvs0_freerun_ok = false;
+	for (uint32_t i = 0; i < 2000u; i++) {
+		uint32_t v = mmio_r32(g_iris.vidcc, VIDCC_MVS0_FREERUN_CBCR);
+		if ((v & (1u << 31)) == 0 || ((v >> 28) & 7u) == 2u) {
+			mvs0_freerun_ok = true;
+			break;
+		}
+		iris_sleep_us(5);
+	}
+	if (!mvs0_freerun_ok) {
+		iris_say("CBCR +%#x enable timeout (%#x)\n",
+		    VIDCC_MVS0_FREERUN_CBCR, mmio_r32(g_iris.vidcc, VIDCC_MVS0_FREERUN_CBCR));
+		return false;
+	}
+	if (!iris_enable_cbcr(g_iris.vidcc, VIDCC_MVS0_CBCR, true)) {
+		return false;
+	}
+	(void)iris_enable_cbcr(g_iris.vidcc, VIDCC_MVS0_SHIFT_CBCR, false);
+
+	/* Enable GCC video AXI0/1 branches after MVS0C and MVS0 GDSCs are awake. */
+	if (!iris_enable_cbcr(g_iris.gcc, GCC_VIDEO_AXI0_CBCR, true) ||
+	    !iris_enable_cbcr(g_iris.gcc, GCC_VIDEO_AXI1_CBCR, true)) {
+		return false;
+	}
 	return true;
 }
 
@@ -680,33 +796,52 @@ iris_pas_authenticate(void)
 		return false;
 	}
 
-	vm_offset_t meta_wc = ml_io_map_wcomb((vm_offset_t)meta_pa, IRIS_MBN_META_MAX);
-	vm_offset_t vmem_wc = ml_io_map_wcomb((vm_offset_t)IRIS_VIDEO_MEM_PHYS, img.total_mem_size);
-	if (meta_wc == 0 || vmem_wc == 0) {
+	memset((void *)meta_va, 0, IRIS_MBN_META_MAX);
+	memcpy((void *)meta_va, g_iris.fw_data, img.header_size);
+	memcpy((void *)(meta_va + img.header_size), g_iris.fw_data + img.hash_off, img.hash_size);
+	iris_cache_clean_inval((const void *)meta_va, IRIS_MBN_META_MAX);
+
+	uint64_t ans = ~0ULL;
+	int32_t st = adreno8_scm_call(0x42000201ULL, 0x82ULL, IRIS_PAS_ID, meta_pa, 0, 0, &ans);
+	if (st != 0 || ans != 0) {
+		st = adreno8_scm_call(0x42000201ULL, 0x22ULL, IRIS_PAS_ID, meta_pa, 0, 0, &ans);
+	}
+	if (st != 0 || ans != 0) {
+		iris_say("PAS 9 INIT_IMAGE failed: st=%d ans=%#llx\n", st, (unsigned long long)ans);
 		return false;
 	}
-	(void)meta_va;
-
-	memcpy((void *)meta_wc, g_iris.fw_data, img.header_size);
-	memcpy((void *)(meta_wc + img.header_size), g_iris.fw_data + img.hash_off, img.hash_size);
-	__asm__ volatile("dsb sy" ::: "memory");
-
-	if (!iris_pas_call(0x42000201ULL, 0x82ULL, meta_pa, 0) ||
-	    !iris_pas_call(0x42000202ULL, 3ULL, IRIS_VIDEO_MEM_PHYS, img.total_mem_size)) {
+	if (!iris_pas_call(0x42000202ULL, 3ULL, IRIS_VIDEO_MEM_PHYS, img.total_mem_size)) {
 		return false;
 	}
 
+	volatile uint8_t *carveout = (volatile uint8_t *)ml_io_map_unmappable(
+	    (vm_offset_t)IRIS_VIDEO_MEM_PHYS, img.total_mem_size, VM_WIMG_WCOMB);
+	if (carveout == NULL) {
+		iris_say("PAS 9 carveout map failed (%#x bytes)\n", img.total_mem_size);
+		return false;
+	}
 	for (uint32_t i = 0; i < img.seg_count; i++) {
 		const struct iris_mbn_seg *s = &img.segs[i];
-		vm_offset_t dst = vmem_wc + (vm_offset_t)(s->paddr - img.min_paddr);
-		if (s->file_sz > 0) {
-			memcpy((void *)dst, g_iris.fw_data + s->file_off, s->file_sz);
+		uint32_t at = (uint32_t)(s->paddr - img.min_paddr);
+		const uint8_t *src = g_iris.fw_data + s->file_off;
+		for (uint32_t j = 0; j < s->file_sz; j++) {
+			carveout[at + j] = src[j];
 		}
-		if (s->mem_sz > s->file_sz) {
-			memset((void *)(dst + s->file_sz), 0, s->mem_sz - s->file_sz);
+		uint32_t cur = at + s->file_sz;
+		uint32_t end = at + s->mem_sz;
+		while (cur < end && ((uintptr_t)(carveout + cur) & 7UL) != 0) {
+			carveout[cur++] = 0;
+		}
+		while (cur + 8u <= end) {
+			*(volatile uint64_t *)(carveout + cur) = 0ULL;
+			cur += 8u;
+		}
+		while (cur < end) {
+			carveout[cur++] = 0;
 		}
 	}
 	__asm__ volatile("dsb sy" ::: "memory");
+	ml_io_unmap((vm_offset_t)carveout, img.total_mem_size);
 
 	if (!iris_pas_call(0x42000205ULL, 1ULL, 0, 0)) {
 		return false;
@@ -836,9 +971,24 @@ iris_hw_ensure_ready(void)
 	}
 
 	g_iris.hw_attempted = true;
-	if (!iris_power_and_clocks() || !iris_smmu_setup() ||
-	    !iris_pas_authenticate() || !iris_boot_controller()) {
-		iris_say("controller bring-up incomplete; leaving software fallback active\n");
+	iris_say("power/clocks begin\n");
+	if (!iris_power_and_clocks()) {
+		iris_say("power/clocks failed\n");
+		return false;
+	}
+	iris_say("SMMU begin\n");
+	if (!iris_smmu_setup()) {
+		iris_say("SMMU failed\n");
+		return false;
+	}
+	iris_say("PAS begin\n");
+	if (!iris_pas_authenticate()) {
+		iris_say("PAS failed\n");
+		return false;
+	}
+	iris_say("HFI begin\n");
+	if (!iris_boot_controller()) {
+		iris_say("HFI failed\n");
 		return false;
 	}
 

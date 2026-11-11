@@ -1,5 +1,5 @@
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
-index 0554aa8021cb..37450e20578b 100644
+index 0554aa8021cb..b92910a1fb48 100644
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
 @@ -141,6 +141,7 @@ _Static_assert(ARM64_KDBG_CODE_GUEST <= KDBG_CODE_MAX, "arm64 KDBG trace codes o
@@ -10,7 +10,19 @@ index 0554aa8021cb..37450e20578b 100644
  
  void sleh_synchronous_sp1(arm_context_t *, uint64_t, vm_offset_t) __abortlike;
  void sleh_synchronous(arm_context_t *, uint64_t, vm_offset_t, bool);
-@@ -624,7 +625,7 @@ panic_with_thread_kernel_state(const char *msg, arm_saved_state_t *ss)
+@@ -550,6 +551,9 @@ __dead2 __unused
+ static void
+ arm64_implementation_specific_error(arm_saved_state_t *state, uint64_t esr, vm_offset_t far)
+ {
+-#pragma unused (state, esr, far)
+-	panic_plain("Unhandled implementation specific error\n");
++	uint64_t pc = (state != NULL && is_saved_state64(state)) ? saved_state64(state)->pc : 0;
++	uint64_t lr = (state != NULL && is_saved_state64(state)) ? saved_state64(state)->lr : 0;
++	loader_fault_log("Unhandled implementation specific error", pc, lr, (uint32_t)esr, far);
++	panic_plain("Unhandled implementation specific error (pc=0x%llx lr=0x%llx esr=0x%llx far=0x%lx)\n",
++	    (unsigned long long)pc, (unsigned long long)lr, (unsigned long long)esr, (unsigned long)far);
+ }
+@@ -624,7 +628,7 @@ panic_with_thread_kernel_state(const char *msg, arm_saved_state_t *ss)
  
  	ss_valid = is_saved_state64(ss);
  	arm_saved_state64_t *state = saved_state64(ss);
