@@ -170,8 +170,9 @@ class TestSourceContracts(unittest.TestCase):
         self.assertIn("usb_command_loop()", text)
         self.assertIn("menu_enter_fastboot();", text)
         self.assertNotIn("(void)menu_enter_fastboot();", text)
-        self.assertIn("spmi_reboot_lk_prepare();", text)
-        self.assertIn("spmi_reboot_lk_prepare(void)", (HERE / "loader_06a_screen_ui.inc").read_text())
+        self.assertIn("if (!spmi_reboot_lk_prepare())", text)
+        self.assertIn('fb_reply("FAIL", "LK reboot target preparation failed");', text)
+        self.assertIn("spmi_reboot_lk_prepare(void)", (HERE / "loader_spmi_reboot_private.h").read_text())
 
     def test_run_kernel_null_fallback(self):
         run_inc = HERE / "loader_05_layout_run_kernel.inc"
@@ -183,7 +184,8 @@ class TestSourceContracts(unittest.TestCase):
 
     def test_file_line_limits(self):
         for fname in ["loader_05_layout_run_kernel.inc", "loader_06_usb_entry.inc",
-                      "loader_06a_screen_ui.inc", "ui_font_private.h", "mkstandalone.py"]:
+                      "loader_06a_screen_ui.inc", "loader_spmi_reboot_private.h",
+                      "ui_font_private.h", "mkstandalone.py"]:
             f = HERE / fname
             self.assertTrue(f.is_file(), f"{f} missing")
             lines = len(f.read_text().splitlines())

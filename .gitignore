@@ -48,6 +48,7 @@ __pycache__/
 !/xnuloader/loader_*.inc
 !/xnuloader/platform_private.h
 !/xnuloader/slot_choice.h
+!/xnuloader/loader_spmi_reboot_private.h
 !/xnuloader/ui_font_private.h
 !/xnuloader/mkidentity.py
 !/xnuloader/mkpayload.py

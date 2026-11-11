@@ -656,27 +656,7 @@ spmi_obsrv_read(int ch, uint8_t reg, uint8_t *buf, uint32_t count)
 	return 1;
 }
 
-/* Write PMK8550 SID 0 SDAM 0x7148 = (orig & 1) | (2 << 1) so PSCI reset enters LK Fastboot. */
-static void
-spmi_reboot_lk_prepare(void)
-{
-	if (SCREEN.base != platform_annibale.fb_base) return;
-	if (*(volatile uint32_t *)(SPMI_ARB_CORE + 0x000) < 0x70000000u) return;
-	uint32_t channels = *(volatile uint32_t *)(SPMI_ARB_CORE + 0x004) & 0x7ffu;
-	if (channels == 0 || channels > 1024) channels = 1024;
-	for (uint32_t n = 0; n < channels; n++) {
-		uint32_t map = *(volatile uint32_t *)(SPMI_ARB_CORE + (uintptr_t)0x2000ULL + (uintptr_t)(4 * n));
-		if (((map >> 8) & 0xfffu) != 0x071u) continue;
-		if ((*(volatile uint32_t *)(SPMI_ARB_CORE + (uintptr_t)0x2d000ULL + (uintptr_t)(4 * n)) & 0xfu) != 0) break;
-		uint8_t orig = 0;
-		if (!spmi_obsrv_read((int)n, 0x48, &orig, 1)) break;
-		uintptr_t wbase = (uintptr_t)0x0c500000ULL + (uintptr_t)0x1000ULL * n;
-		*(volatile uint32_t *)(wbase + 0x10) = (uint32_t)((orig & 1u) | 4u);
-		*(volatile uint32_t *)(wbase + 0x00) = 0x48u << 4;
-		for (int i = 0; i < 4000 && !(*(volatile uint32_t *)(wbase + 0x08) & 0x1u); i++) {}
-		break;
-	}
-}
+#include "loader_spmi_reboot_private.h"
 
 static void
 spmi_buttons_init(struct spmi_btn_ctx *ctx)

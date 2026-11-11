@@ -883,8 +883,12 @@ fb_command(char *cmd)
 			}
 			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "reboot") || starts_with(cmd, "oem reboot")) {
-			if (str_eq(cmd, "reboot-bootloader") || str_eq(cmd, "oem reboot-lk")) {
-				spmi_reboot_lk_prepare();
+			if (PLAT == &platform_annibale &&
+			    (str_eq(cmd, "reboot-bootloader") || str_eq(cmd, "oem reboot-lk"))) {
+				if (!spmi_reboot_lk_prepare()) {
+					fb_reply("FAIL", "LK reboot target preparation failed");
+					return;
+				}
 			}
 			fb_reply("OKAY", "");
 			if (PLAT == &platform_annibale || kernel_resources_held || firmware_fault) {
