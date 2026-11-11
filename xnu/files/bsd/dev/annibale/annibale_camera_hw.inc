@@ -161,7 +161,7 @@
 #define CSID_TPG_DT0_CFG2               0x618u
 #define CSID_TPG_COLOR_BARS_CFG         0x640u
 #define CSID_TPG_COMMON_GEN_CFG         0x648u
-#define VFE_LITE_SUB_HW_VERSION         0x0a00u
+#define VFE_LITE_SUB_HW_VERSION         0x1000u
 
 #define RAW10_DT                        0x2bu
 
