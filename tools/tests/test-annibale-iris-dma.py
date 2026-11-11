@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify actual Iris DMA allocation and release retain pages after failed TLB synchronization."""
+"""Verify Iris DMA permissions and retained pages after failed TLB synchronization."""
 import argparse
 import hashlib
 import json
@@ -30,7 +30,7 @@ HARNESS = r'''
 static const int kernel_map = 0;
 __PTE_DEFINES__
 struct iris_controller g_iris;
-static uint64_t entries[512];
+static uint64_t entries[512], expected_attributes;
 static unsigned allocated, freed, mapped, sleeps, sync_writes;
 static unsigned fail_map_at = UINT32_MAX;
 static bool busy, allocation_fails;
@@ -59,6 +59,7 @@ void iris_cache_clean_inval(const void *p, size_t n) { (void)p; (void)n; }
 static bool iris_smmu_map_page(uint32_t iova, uint64_t p, uint64_t attributes)
 {
     assert(iova >= 0x26000000u && iova < 0x26004000u && (p & 4095u) == 0);
+    assert(attributes == expected_attributes);
     if (mapped++ == fail_map_at) return false;
     entries[(iova >> 12) & 511u] = p | attributes;
     return true;
@@ -82,8 +83,10 @@ __FUNCTIONS__
 int main(int argc, char **argv)
 {
     assert(argc == 2);
+    assert(IRIS_PTE_DEVICE_XN == (3ULL | (2ULL << 2) | (1ULL << 10) | (1ULL << 11) | (3ULL << 53)));
     const char *name = argv[1];
     bool freeing = !strncmp(name, "free_", 5) || !strcmp(name, "retry_free");
+    expected_attributes = freeing ? 0xf43u : 0xf47u;
     bool failed_sync = strstr(name, "sync_fail") || !strcmp(name, "partial_held") || !strcmp(name, "retry_free");
     g_iris.smmu = 1;
     g_iris.smmu_ready = g_iris.smmu_owned = true;
@@ -188,6 +191,19 @@ def verify(args, directory):
             'partial_release_without_sync': ('if (iris_smmu_unmap_range(iova, off))', 'if (true)'),
             'tlb_timeout_success': ('\treturn false;\n}\n\nstatic bool\niris_smmu_map_page', '\treturn true;\n}\n\nstatic bool\niris_smmu_map_page'),
         }
+        permission_bit = '(1ULL << 6) | '
+        normal = []
+        for suffix in ('NORMAL_NC', 'NORMAL_WB', 'DEVICE_XN'):
+            line = next(line for line in source.splitlines()
+                        if line.startswith('#define IRIS_PTE_' + suffix + ' '))
+            if suffix == 'DEVICE_XN':
+                changed = line.replace('(3ULL | ', '(3ULL | ' + permission_bit, 1)
+            else:
+                normal.append(line)
+                changed = line.replace(permission_bit, '', 1)
+            changes['permission_' + suffix.lower()] = (line, changed)
+        normal_block = '\n'.join(normal)
+        changes['permissions_privileged_only'] = (normal_block, normal_block.replace(permission_bit, ''))
         for name, (old, new) in changes.items():
             if source.count(old) != 1: raise AssertionError('Mutation boundary changed: ' + name)
             cases = run(args.source_root, source.replace(old, new, 1), directory / name)
@@ -195,8 +211,8 @@ def verify(args, directory):
             if all(c['passed'] for c in cases): failures.append(name + '_accepted')
     (directory / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
     if failures: raise AssertionError('Iris DMA regression failed: ' + ', '.join(failures))
-    print(f'PASS: {len(CASES)} actual DMA lifetime cases')
-    if args.mutations: print('PASS: 4 compiled release/synchronization variants rejected')
+    print(f'PASS: {len(CASES)} actual DMA permission/lifetime cases')
+    if args.mutations: print(f'PASS: {len(changes)} compiled permission/release/synchronization variants rejected')
 
 
 def main():

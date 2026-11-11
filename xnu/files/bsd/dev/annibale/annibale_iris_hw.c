@@ -14,8 +14,9 @@
 /* SMMU Stage-1 PTE flags (MAIR0 = 0xf404ff44: idx0=NC, idx1=WBWA, idx2=Device-nGnRE) */
 #define IRIS_PTE_TABLE          3ULL
 #define IRIS_PTE_ADDR_MASK      0x0000fffffffff000ULL
-#define IRIS_PTE_NORMAL_NC      (3ULL | (0ULL << 2) | (3ULL << 8) | (1ULL << 10) | (1ULL << 11))
-#define IRIS_PTE_NORMAL_WB      (3ULL | (1ULL << 2) | (3ULL << 8) | (1ULL << 10) | (1ULL << 11))
+/* Native data DMA mappings clear IOMMU_PRIV and set AP_UNPRIV (bit 6). */
+#define IRIS_PTE_NORMAL_NC      (3ULL | (1ULL << 6) | (0ULL << 2) | (3ULL << 8) | (1ULL << 10) | (1ULL << 11))
+#define IRIS_PTE_NORMAL_WB      (3ULL | (1ULL << 6) | (1ULL << 2) | (3ULL << 8) | (1ULL << 10) | (1ULL << 11))
 #define IRIS_PTE_DEVICE_XN      (3ULL | (2ULL << 2) | (1ULL << 10) | (1ULL << 11) | (3ULL << 53))
 
 struct iris_mbn_seg {
