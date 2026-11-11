@@ -378,6 +378,7 @@ struct ann_format {
 static const struct ann_format ann_formats[] = {
 	{  10, 'A008', 1, 0, "MTLPixelFormatR8Unorm" },
 	{  11, 'A008', 1, 0, "MTLPixelFormatR8Unorm_sRGB" },
+	{  25, 'L00h', 2, 0, "MTLPixelFormatR16Float" },
 	{  30, 'LA08', 2, 0, "MTLPixelFormatRG8Unorm" },
 	{  65, '2C0h', 4, 0, "MTLPixelFormatRG16Float" },
 	{  70, 'RGBA', 4, 0, "MTLPixelFormatRGBA8Unorm" },
