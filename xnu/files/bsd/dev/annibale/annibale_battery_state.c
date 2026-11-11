@@ -67,7 +67,7 @@ annibale_battery_report(const struct annibale_battery_state *b)
 	battery_soc_percent = percent < 0 ? 0 : percent > 100 ? 100 : percent;
 	battery_voltage_mv = b->voltage_uv / 1000;
 	battery_current_ma = b->current_ua / 1000;
-	battery_temperature_c = (b->temperature_hundredths + 50) / 100;
+	battery_temperature_c = (b->temperature_hundredths + (b->temperature_hundredths < 0 ? -50 : 50)) / 100;
 	battery_present = b->present != 0;
 	battery_charger_present = b->external != 0;
 	battery_charging = b->status == 1;      /* POWER_SUPPLY_STATUS_CHARGING */

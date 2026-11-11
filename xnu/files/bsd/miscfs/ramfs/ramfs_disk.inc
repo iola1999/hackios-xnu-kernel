@@ -571,45 +571,59 @@ ramfs_disk_meta_thread(thread_call_param_t param0, __unused thread_call_param_t 
 	}
 }
 
-void ramfs_disk_flush_all(void);
+int ramfs_disk_flush_all(void);
 
-void
+int
 ramfs_disk_flush_all(void)
 {
 	struct ramfs_mount *rm = ramfs_disk_rm;
+	int error = 0;
 
-	if (rm != NULL) {
-		if (rm->rm_disk_enabled && rm->rm_seed_done && !rm->rm_disk_loading) {
-			lck_mtx_lock(&rm->rm_lock);
-			for (uint32_t h = 0; h < RAMFS_HASH_SIZE; h++) {
-				vnode_t vps[8];
-				uint32_t vids[8];
-				unsigned n = 0;
-
-				for (struct ramfs_node *node = rm->rm_hash[h]; node != NULL && n < 8; node = node->rn_hnext) {
-					if (node->rn_type == VREG && node->rn_nlink > 0 &&
-					    node->rn_mapped_write && node->rn_vp != NULLVP) {
-						vps[n] = node->rn_vp;
-						vids[n] = node->rn_vid;
-						n++;
-					}
-				}
-				if (n == 0) {
-					continue;
-				}
-				lck_mtx_unlock(&rm->rm_lock);
-				for (unsigned i = 0; i < n; i++) {
-					if (vnode_getwithvid(vps[i], vids[i]) == 0) {
-						(void)ubc_msync(vps[i], 0, ubc_getsize(vps[i]), NULL, UBC_PUSHDIRTY | UBC_SYNC);
-						vnode_put(vps[i]);
-					}
-				}
-				lck_mtx_lock(&rm->rm_lock);
-			}
-			lck_mtx_unlock(&rm->rm_lock);
-		}
-		(void)ramfs_disk_sync(rm);
+	if (rm == NULL || !rm->rm_disk_enabled || !rm->rm_seed_done || rm->rm_disk_loading) {
+		return 0;
 	}
+	lck_mtx_lock(&rm->rm_lock);
+	/* New inodes cannot extend this pass indefinitely while mapped pages are flushed. */
+	uint64_t limit = rm->rm_next_ino;
+	for (uint32_t h = 0; h < RAMFS_HASH_SIZE; h++) {
+		uint64_t after = 0;
+
+		for (;;) {
+			uint64_t next = limit;
+			vnode_t vp = NULLVP;
+			uint32_t vid = 0;
+
+			/* Inode order survives removals while the lock is dropped; node pointers do not. */
+			for (struct ramfs_node *node = rm->rm_hash[h]; node != NULL; node = node->rn_hnext) {
+				if (node->rn_ino > after && node->rn_ino < next && node->rn_type == VREG &&
+				    node->rn_nlink > 0 && node->rn_mapped_write && node->rn_vp != NULLVP) {
+					next = node->rn_ino;
+					vp = node->rn_vp;
+					vid = node->rn_vid;
+				}
+			}
+			if (vp == NULLVP) {
+				break;
+			}
+			after = next;
+			/* rm_lock also protects VNOP_RECLAIM; hold keeps vnode memory valid until vget. */
+			vnode_hold(vp);
+			lck_mtx_unlock(&rm->rm_lock);
+			int sync_error = vnode_getwithvid(vp, vid);
+			vnode_drop(vp);
+			if (sync_error == 0) {
+				sync_error = ubc_msync(vp, 0, ubc_getsize(vp), NULL, UBC_PUSHDIRTY | UBC_SYNC);
+				vnode_put(vp);
+			}
+			if (error == 0) {
+				error = sync_error;
+			}
+			lck_mtx_lock(&rm->rm_lock);
+		}
+	}
+	lck_mtx_unlock(&rm->rm_lock);
+	/* Skip this final checkpoint after a failed page flush; periodic sync remains independent. */
+	return error != 0 ? error : ramfs_disk_sync(rm);
 }
 
 static struct ramfs_node *

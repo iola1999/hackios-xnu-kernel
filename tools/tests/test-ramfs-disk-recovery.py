@@ -11,7 +11,7 @@ disk = (SRC / 'ramfs_disk.inc').read_text()
 structs = main[main.index('struct ramfs_mount;'):main.index('/* file pages in use')]
 format_defs = disk[disk.index('#define ANNFS_MAGIC_STR'):disk.index('static void ramfs_disk_dirty_locked')]
 find_ino = disk[disk.index('static struct ramfs_node *\nramfs_disk_find_ino'):disk.index('#include "ramfs_disk_restore.inc"')]
-pack_sync = disk[disk.index('static void\nramfs_disk_dirty_locked'):disk.index('void ramfs_disk_flush_all(void);')]
+pack_sync = disk[disk.index('static void\nramfs_disk_dirty_locked'):disk.index('int ramfs_disk_flush_all(void);')]
 source = r'''
 #include <assert.h>
 #include <stdbool.h>
