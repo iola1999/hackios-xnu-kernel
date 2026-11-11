@@ -118,7 +118,7 @@ def expected_output(row):
     return result
 
 
-def psc(codec=1, variation='valid'):
+def psc(codec=1, variation='valid', native=False, malformed=None):
     fields = [(0x03000103, 10, [640 << 16 | 480]), (0x03000105, 13, [0, 0]),
               (0x0300010f, 1, [0x00080008])]
     if codec == 1:
@@ -135,7 +135,10 @@ def psc(codec=1, variation='valid'):
                'min7': (0x03000124, [7]), 'resolution': (0x03000103, [768 << 16 | 480]),
                'crop': (0x03000105, [1, 0]), 'interlace': (0x03000120, [0])}
     packets = []
+    # Observed AVC metadata; payload values remain the supported host fixture values.
+    reply_types = {0x03000105: 3, 0x0300010f: 10, 0x03000120: 10, 0x03000155: 10}
     for kind, info, values in fields:
+        if native: info = reply_types.get(kind, info)
         if variation == 'missing' and kind == 0x03000155:
             continue
         if variation in changes and kind == changes[variation][0]:
@@ -143,8 +146,26 @@ def psc(codec=1, variation='valid'):
         if variation == 'bad-payload' and kind == 0x03000103:
             info = 13
         payload = struct.pack('<' + 'I' * len(values), *values)
-        packets.append(packet(kind, 1, info, 1, 3000 + len(packets), payload))
-    packets.append(packet(0x0100000c, 1, 0, 1, 3099))
+        flags, port = (0 if native else 1), 1
+        if malformed and kind == malformed[0]:
+            mode = malformed[1]
+            if mode in ('short', 'short-buffer'): payload = payload[:-4]
+            elif mode == 'wrong-info':
+                info = 1 if kind == 0x03000105 else 3
+                if info == 3: payload += b'\0' * 4
+            elif mode == 'wrong-port': port = 2
+            elif mode == 'information': flags = 2
+        packets.append(packet(kind, flags, info, port, 3000 + len(packets), payload))
+    packets.append(packet(0x0100000c, 0 if native else 1, 0, 1, 3099))
+    if native:
+        # cd20 AVC replies put SETTINGS_CHANGE first and use flags=0.
+        order = [0x0100000c, 0x03000103, 0x03000105, 0x03000107, 0x03000108, 0x03000109,
+                 0x0300010f, 0x03000120, 0x03000124, 0x03000128, 0x03000155]
+        packets.sort(key=lambda p: order.index(struct.unpack_from('<I', p, 4)[0]))
+    if malformed and malformed[1] == 'short-buffer':
+        payload = struct.pack('<IIQIIIIQI5I', 1, 0, 0x26000000, 0, 0x400000,
+                              0, 0, 0, 0, 0, 0, 0, 0, 0)
+        packets.insert(0, packet(0x01000009, 0, 5, 1, 5000, payload))
     return header(101, 4000, packets)
 
 
@@ -163,6 +184,11 @@ def write_fixtures(directory):
         output.write_bytes(expected_open(rows[codec]) + expected_output(rows[codec]))
         cases.append((f"wire-psc-{'h264' if codec == 1 else 'hevc'}", path, output))
         cases.append((f"psc-valid{'-hevc' if codec == 2 else ''}", path, wire))
+        native_path = directory / f'psc-native-{codec}.bin'
+        native_path.write_bytes(psc(codec, native=True))
+        label = 'h264' if codec == 1 else 'hevc'
+        cases.append(('psc-valid-native-' + label, native_path, wire))
+        cases.append(('wire-psc-' + label + '-native', native_path, output))
     default = directory / 'psc-1.bin'
     expected = directory / 'open-1.bin'
     names = ['close-success', 'tlb-failure', 'input-immutable', 'output-copy', 'decode-psc',
@@ -184,6 +210,12 @@ def write_fixtures(directory):
         path = directory / f'psc-{variation}.bin'
         path.write_bytes(psc(variation=variation))
         cases.append(('psc-' + variation, path, expected))
+    for kind in (0x03000105, 0x0300010f, 0x03000120, 0x03000155):
+        for mode in ('short', 'wrong-info', 'wrong-port', 'information', 'short-buffer'):
+            name = f'psc-metadata-{kind:x}-{mode}'
+            path = directory / (name + '.bin')
+            path.write_bytes(psc(native=True, malformed=(kind, mode)))
+            cases.append((name, path, expected))
     for row in sizes['cases']:
         name = f"sizes-{'h264' if row['codec'] == 1 else 'hevc'}-{row['width']}x{row['height']}"
         path = directory / (name + '.bin')
@@ -251,6 +283,14 @@ def mutations():
         '\tif (!pkt_add(b, HFI_CMD_SUBSCRIBE_MODE, flags, HFI_PAYLOAD_U32_ARRAY,\n'
         '\t    port, payload, (count + 1u) * sizeof(uint32_t))) return false;\n')
     return {
+        'psc_crop_u64': (HFI, 'static int\niris_read_property', 'static int\niris_start_output',
+                         'pkt->payload_info == HFI_PAYLOAD_U64 ||', '', ['psc-valid-native-h264']),
+        'psc_depth_packed': (HFI, 'static int\niris_read_property', 'static int\niris_start_output',
+                             'index == PSC_DEPTH ||', '', ['psc-valid-native-h264']),
+        'psc_coded_packed': (HFI, 'static int\niris_read_property', 'static int\niris_start_output',
+                             'index == PSC_CODED ||', '', ['psc-valid-native-h264']),
+        'psc_color_packed': (HFI, 'static int\niris_read_property', 'static int\niris_start_output',
+                             ' || index == PSC_COLOR', '', ['psc-valid-native-h264']),
         'initial_min_missing': (HFI, 'static bool\niris_subscribe_port', 'static bool\niris_send_command',
                                 initial_min, '', ['wire-h264', 'wire-hevc']),
         'initial_min_property': (HFI, 'static bool\niris_subscribe_port', 'static bool\niris_send_command',

@@ -629,10 +629,14 @@ iris_read_property(struct iris_session *s, const struct hfi_packet *pkt)
 	if (index < 0 || pkt->port != HFI_PORT_BITSTREAM ||
 	    (pkt->flags & HFI_FW_FLAGS_INFORMATION) != 0) return 0;
 	uint32_t size = index == PSC_CROP_LT ? 8u : 4u;
+	/* VPU replies use U64 crop and 32_PACKED depth, coded-frame and color fields. */
 	bool info_ok = index == PSC_RES ? (pkt->payload_info == HFI_PAYLOAD_32_PACKED ||
 	    pkt->payload_info == HFI_PAYLOAD_U32) :
-	    index == PSC_CROP_LT ? pkt->payload_info == HFI_PAYLOAD_64_PACKED :
-	    (pkt->payload_info == HFI_PAYLOAD_U32 || pkt->payload_info == HFI_PAYLOAD_U32_ENUM);
+	    index == PSC_CROP_LT ? (pkt->payload_info == HFI_PAYLOAD_U64 ||
+	    pkt->payload_info == HFI_PAYLOAD_64_PACKED) :
+	    (pkt->payload_info == HFI_PAYLOAD_U32 || pkt->payload_info == HFI_PAYLOAD_U32_ENUM ||
+	    ((index == PSC_DEPTH || index == PSC_CODED || index == PSC_COLOR) &&
+	    pkt->payload_info == HFI_PAYLOAD_32_PACKED));
 	if (!info_ok || pkt->size - sizeof(*pkt) < size) return EIO;
 	memcpy(&s->psc_values[index], (const uint8_t *)pkt + sizeof(*pkt), size);
 	s->psc_seen |= 1u << index;

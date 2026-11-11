@@ -396,11 +396,13 @@ int main(int argc, char **argv)
 	}
 	else if (strncmp(name, "psc-", 4) == 0) {
 		assert(iris_hfi_session_open(s) == 0); size_t before = tx_size;
+		s->input_queued = true; s->next_input_idx = 1;
 		push_psc(s->wire_session_id); int r = iris_receive(s, NULL);
-		if (strcmp(name, "psc-valid") == 0 || strcmp(name, "psc-valid-hevc") == 0) {
+		if (strncmp(name, "psc-valid", 9) == 0) {
 			assert(r == 1 && s->error == 0 && s->started_ports == 6 && s->dpb_count == 2);
 			assert(count_type(0x01000009u, 2) == 6);
-		} else assert(r < 0 && s->error != 0 && s->started_ports == 2 && tx_size == before && free_calls == 0);
+		} else assert(r < 0 && s->error != 0 && s->started_ports == 2 && tx_size == before &&
+		    s->input_queued && free_calls == 0);
 	}
 	else if (strcmp(name, "stale-wire") == 0) {
 		assert(iris_hfi_session_open(s) == 0); uint32_t old = s->wire_session_id;
