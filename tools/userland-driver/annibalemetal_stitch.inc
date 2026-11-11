@@ -475,21 +475,25 @@ rw_stitch_install_hooks(void)
  * node (rw_linked_fragment_functions).
  *
  * The function is a proxy over the MTLFunction of the graph's output node, which answers the
- * reflection RenderBox reads after making the library (returnType, arguments); its name, type and
+ * reflection RenderBox reads after making the library (returnType, arguments); its name, label, type and
  * graph are its own.
  */
 @interface AnnibaleMetalStitchedFunction : NSProxy {
 	id _output;
 	NSString *_name;
+	NSString *_label;
 	id _graph;
 	NSArray *_functions;
 }
+@property (nullable, copy, atomic) NSString *label;
 - (instancetype)initWithGraph:(id)graph functions:(NSArray *)functions output:(id)output;
 - (id)annibaleGraph;
 - (NSArray *)annibaleGraphFunctions;
 @end
 
 @implementation AnnibaleMetalStitchedFunction
+
+@synthesize label = _label;
 
 - (instancetype)initWithGraph:(id)graph functions:(NSArray *)functions output:(id)output
 {
@@ -506,6 +510,7 @@ rw_stitch_install_hooks(void)
 	[_functions release];
 	[_output release];
 	[_name release];
+	[_label release];
 	[super dealloc];
 }
 
@@ -525,6 +530,7 @@ rw_stitch_install_hooks(void)
 - (BOOL)respondsToSelector:(SEL)sel
 {
 	return sel == @selector(name) || sel == @selector(functionType) ||
+	       sel == @selector(label) || sel == @selector(setLabel:) ||
 	       sel == @selector(annibaleGraph) || sel == @selector(annibaleGraphFunctions) ||
 	       [_output respondsToSelector:sel];
 }

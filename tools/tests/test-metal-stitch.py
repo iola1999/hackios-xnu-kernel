@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """Exercise the production graph converter with native Metal stitching objects."""
+import argparse
 from pathlib import Path
 import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-source = (ROOT / "tools/userland-driver/annibalemetal_stitch.inc").read_text()
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--stitch-source", type=Path,
+                    default=ROOT / "tools/userland-driver/annibalemetal_stitch.inc")
+args = parser.parse_args()
+source = args.stitch_source.read_text()
+specialized = source[source.index("@interface AnnibaleMetalSpecializedFunction"):
+                     source.index("static NSCache *rw_air_memcache")]
 production = source[source.index("@interface AnnibaleMetalStitchedFunction"):]
 reflection = (ROOT / "tools/userland-driver/annibalemetal_reflection.inc").read_text()
 preamble = r'''
@@ -33,12 +40,66 @@ static void air_fail_dump(const void *p, size_t n, const char *s, const char *f)
 @end
 '''
 fixture = r'''
+static unsigned live_labels;
+@interface OwnedLabel : NSString { NSString *_text; }
+@end
+@implementation OwnedLabel
+- (instancetype)init {
+    self = [super init];
+    _text = [@"owned function label with enough text for heap storage" retain];
+    ++live_labels; return self;
+}
+- (NSUInteger)length { return _text.length; }
+- (unichar)characterAtIndex:(NSUInteger)i { return [_text characterAtIndex:i]; }
+- (void)getCharacters:(unichar *)buffer range:(NSRange)range { [_text getCharacters:buffer range:range]; }
+- (id)copyWithZone:(NSZone *)zone { (void)zone; return [self retain]; }
+- (void)dealloc { --live_labels; [_text release]; [super dealloc]; }
+@end
 static void set(id object, const char *selector, NSUInteger value) {
     ((void (*)(id, SEL, NSUInteger))objc_msgSend)(object, sel_getUid(selector), value);
 }
 static id make(NSString *name) { return [[[NSClassFromString(name) alloc] init] autorelease]; }
 static void check(BOOL value, const char *message) {
     if (!value) { fprintf(stderr, "FAIL %s\n", message); exit(1); }
+}
+static void check_label(id<MTLFunction> function) {
+    check([function respondsToSelector:@selector(label)] &&
+          [function respondsToSelector:@selector(setLabel:)], "function label selectors");
+    check(function.label == nil, "default nil label");
+    @autoreleasepool {
+        NSMutableString *label = [[NSMutableString alloc] initWithString:
+            @"mutable function label with enough text for heap storage"];
+        NSString *expected = [label copy];
+        function.label = label;
+        [label appendString:@" changed"];
+        check([function.label isEqualToString:expected], "label copies mutable strings");
+        [label release];
+        function.label = function.label;
+        check([function.label isEqualToString:expected], "label self assignment");
+        [expected release];
+        function.label = @"replacement";
+        function.label = @"replacement";
+        check([function.label isEqualToString:@"replacement"], "repeated label assignment");
+        function.label = nil;
+        check(function.label == nil, "nil clears label");
+        OwnedLabel *owned = [[OwnedLabel alloc] init];
+        function.label = owned;
+        [owned release];
+        check(live_labels == 1, "function owns copied label");
+        function.label = @"replacement";
+    }
+    check(live_labels == 0, "replacement releases old label");
+    function.label = nil;
+}
+static void check_label_dealloc(id<MTLFunction> owned_function) {
+    @autoreleasepool {
+        OwnedLabel *owned = [[OwnedLabel alloc] init];
+        owned_function.label = owned;
+        [owned release];
+        check(live_labels == 1, "label survives caller release");
+        [owned_function release];
+    }
+    check(live_labels == 0, "function dealloc releases label");
 }
 static id graph(BOOL kernel, NSArray *nodes, id output) {
     Class cls = NSClassFromString(kernel ? @"MTLFunctionStitchingGraphSPI" : @"MTLFunctionStitchingGraph");
@@ -49,6 +110,23 @@ static id call(NSArray *args, NSArray *after) {
         controlDependencies:after] autorelease];
 }
 int main(void) { @autoreleasepool {
+    id<MTLDevice> native_device = MTLCreateSystemDefaultDevice();
+    NSError *native_error = nil;
+    id<MTLLibrary> native_library = [native_device newLibraryWithSource:
+        @"#include <metal_stdlib>\nusing namespace metal; kernel void label_test() {}"
+        options:nil error:&native_error];
+    check(native_library != nil, "native function library");
+    id<MTLFunction> native_function = [native_library newFunctionWithName:@"label_test"];
+    check_label(native_function);
+    id specialized_function = [[AnnibaleMetalSpecializedFunction alloc]
+        initWithFunction:native_function name:@"specialized" constantValues:nil];
+    check_label(specialized_function);
+    [specialized_function setLabel:@"forwarded label"];
+    check([native_function.label isEqualToString:@"forwarded label"], "specialized setter forwards");
+    native_function.label = @"underlying label";
+    check([[specialized_function label] isEqualToString:@"underlying label"], "specialized getter forwards");
+    [specialized_function release];
+    native_function.label = nil;
     check(NSClassFromString(@"MTLFunctionStitchingGraphSPI") != Nil, "GraphSPI runtime class");
     id position = make(@"MTLFunctionStitchingBuiltinThreadPositionInGrid");
     id buffer = make(@"MTLFunctionStitchingInputBufferAddress");
@@ -70,6 +148,15 @@ int main(void) { @autoreleasepool {
     check(library != nil, "kernel library");
     id function = [library newFunctionWithName:@"test"];
     check([function functionType] == 3, "GraphSPI kernel classification");
+    check_label(function);
+    check_label_dealloc((id)[[AnnibaleMetalStitchedFunction alloc]
+        initWithGraph:desc.functionGraphs[0] functions:desc.functions output:nil]);
+    id independent = [[AnnibaleMetalStitchedFunction alloc]
+        initWithGraph:desc.functionGraphs[0] functions:desc.functions output:native_function];
+    [independent setLabel:@"graph label"];
+    check(native_function.label == nil, "graph label belongs to graph function");
+    check([[independent label] isEqualToString:@"graph label"], "graph stores independent label");
+    [independent release];
     MTLComputePipelineDescriptor *pipeline = [[[MTLComputePipelineDescriptor alloc] init] autorelease];
     pipeline.computeFunction = function;
     MTLComputePipelineDescriptor *pipeline_copy = [pipeline copy];
@@ -134,14 +221,16 @@ int main(void) { @autoreleasepool {
     id missing = call(@[], @[dependency]);
     desc.functionGraphs = @[graph(YES, @[missing], nil)];
     check([device newLibraryWithStitchedDescriptor:desc error:&error] == nil, "missing dependency");
-    puts("PASS native GraphSPI inputs/early return, visible value/void, dependency rejection");
+    [native_function release]; [native_library release]; [native_device release];
+    puts("PASS native function label copy/lifetime, specialized forwarding, GraphSPI and visible graph contracts");
 } }
 '''
 with tempfile.TemporaryDirectory(prefix="metal-stitch-") as tmp:
     path = Path(tmp)
-    (path / "test.m").write_text(preamble + reflection + production + fixture)
+    (path / "test.m").write_text(preamble + reflection + specialized + production + fixture)
     subprocess.run(["xcrun", "-sdk", "macosx", "clang", "-Wno-deprecated-declarations",
-                    "-Wno-objc-method-access", "-fno-objc-arc", "-framework", "Foundation",
+                    "-Wno-objc-method-access", "-fno-objc-arc", "-fblocks",
+                    "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-framework", "Foundation",
                     "-framework", "Metal", "-I" + str(ROOT / "tools/userland-driver"),
                     str(path / "test.m"), "-o", str(path / "test")], check=True)
     subprocess.run([str(path / "test")], check=True, timeout=30)
