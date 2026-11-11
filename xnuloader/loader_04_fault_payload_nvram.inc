@@ -4,13 +4,13 @@
 /* in the loader and the kernel: any hang ends in a reset without a human.   */
 
 /*
- * The loader feeds it only while the host has sent a command within HOST_SILENCE_SECONDS: a loader
- * the host can no longer reach (its USB wedged, or the loader stuck) lets the watchdog reset the
- * phone, which comes back as the loader again (slot A) or, once slot A's retries are spent, as
- * Android. A running kernel feeds it on its own (hv_wdt_pet), whatever the host does.
+ * Explicit Fastboot residency feeds the watchdog while resources are idle and USB endpoints
+ * remain usable, including with the cable unplugged. Other states retain the host-silence
+ * deadline. A running kernel feeds it on its own (hv_wdt_pet), whatever the host does.
  */
 #define HOST_SILENCE_SECONDS 180
 static uint64_t host_last_cmd;
+static int fastboot_idle_resident(void);
 
 #define VIRT_WDT_CONTROL   0x86000005u
 #define VIRT_WDT_STATUS    0x86000006u
@@ -48,7 +48,8 @@ wdt_pet(void)
 	if (running_live != NULL) {
 		host_last_cmd = READ_SYSREG(CNTVCT_EL0);
 	}
-	if (wdt_armed && READ_SYSREG(CNTVCT_EL0) - host_last_cmd < HOST_SILENCE_SECONDS * READ_SYSREG(CNTFRQ_EL0)) {
+	if (wdt_armed && (fastboot_idle_resident() ||
+	    READ_SYSREG(CNTVCT_EL0) - host_last_cmd < HOST_SILENCE_SECONDS * READ_SYSREG(CNTFRQ_EL0))) {
 		smc_call(VIRT_WDT_PET, 0, 0, NULL, NULL);
 	}
 }

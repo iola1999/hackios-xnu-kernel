@@ -29,4 +29,5 @@
 #include "loader_03_ufs_block_watch.inc"
 #include "loader_04_fault_payload_nvram.inc"
 #include "loader_05_layout_run_kernel.inc"
+#include "loader_ramfb.inc"
 #include "loader_06_usb_entry.inc"

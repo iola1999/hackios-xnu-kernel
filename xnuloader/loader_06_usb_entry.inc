@@ -426,6 +426,14 @@ usb_tx(const uint8_t *data, uint64_t len)
 }
 /* LC-USB-END */
 
+static int
+fastboot_idle_resident(void)
+{
+	return usb_menu_interrupted && !boot_fallback_active && running_live == NULL &&
+	    !kernel_resources_held && !firmware_fault && !held_irq_masked &&
+	    !usb_out_lost && !usb_in_lost;
+}
+
 /* LC-FB-BEGIN -- extracted verbatim by tools/test-loader-lifecycle.py: both reply forms pack
  * into their own stack buffers, so usb_tx stays the one place allowed to touch usb_tx_buf
  * (rev3 review: a reply written while the IN transfer was owned or lost overwrote the
@@ -829,6 +837,7 @@ fb_command(char *cmd)
 			print("== XNULOADER run (usb) ==\n");
 			ui_stage("BOOTING KERNEL");
 			usb_run_requested = 1;
+			usb_menu_interrupted = 0;
 			int ok = run_kernel(have_cp, cp);
 			usb_run_requested = 0;
 			if (!ok) {
@@ -1033,85 +1042,6 @@ usb_command_loop(void)
 
 /* ------------------------------------------------------------------------ */
 
-/*
- * QEMU's "ramfb" display shows whatever guest memory it is told to, in any size; the firmware
- * only offers a few small landscape modes of it. So we point it at memory of our own with the
- * shape of the iPhone's screen, through the fw_cfg file "etc/ramfb" (the firmware's own mode
- * is simply replaced). In QEMU the display is then exactly what iOS expects; on the real phone
- * the kernel's display driver scales that picture to the panel.
- */
-#define PHONE_WIDTH     1125            /* the screen of the iPhone X, whose identity we carry */
-#define PHONE_HEIGHT    2436
-#define FW_CFG_BASE     0x09020000ULL   /* QEMU virt: data at +0, selector at +8, DMA address at +16 */
-#define FW_CFG_FILE_DIR 0x19
-#define FW_CFG_DMA_SELECT 0x08
-#define FW_CFG_DMA_WRITE  0x10
-
-static uint32_t
-be32(uint32_t v)
-{
-	return __builtin_bswap32(v);
-}
-
-static void
-fw_cfg_read(void *buf, uint32_t len)
-{
-	for (uint32_t i = 0; i < len; i++) {
-		((uint8_t *)buf)[i] = *(volatile uint8_t *)FW_CFG_BASE;
-	}
-}
-
-static void
-ramfb_phone_screen(void)
-{
-	static struct {
-		uint64_t addr;
-		uint32_t fourcc, flags, width, height, stride;
-	} __attribute__((packed)) cfg;
-	static struct {
-		uint32_t control, length;
-		uint64_t address;
-	} dma;
-	struct {
-		uint32_t size;
-		uint16_t select, reserved;
-		char name[56];
-	} file;
-	uint32_t count, select = 0;
-	uint64_t fb = 0, bytes = (uint64_t)PHONE_WIDTH * 4 * PHONE_HEIGHT;
-
-	*(volatile uint16_t *)(FW_CFG_BASE + 8) = __builtin_bswap16(FW_CFG_FILE_DIR);
-	fw_cfg_read(&count, sizeof(count));
-	count = be32(count);
-	for (uint32_t i = 0; i < count && i < 256 && select == 0; i++) {
-		fw_cfg_read(&file, sizeof(file));
-		if (str_eq(file.name, "etc/ramfb")) {
-			select = __builtin_bswap16(file.select);
-		}
-	}
-	if (select == 0 || EFI_ERROR(BS->allocate_pages(AllocateAnyPages, EfiLoaderData, (bytes + 0xFFF) >> 12, &fb))) {
-		return;
-	}
-	memset((void *)(uintptr_t)fb, 0, (size_t)bytes);
-	cfg.addr = __builtin_bswap64(fb);
-	cfg.fourcc = be32(0x34325258);          /* 'XR24': blue, green, red, unused */
-	cfg.flags = 0;
-	cfg.width = be32(PHONE_WIDTH);
-	cfg.height = be32(PHONE_HEIGHT);
-	cfg.stride = be32(PHONE_WIDTH * 4);
-	dma.control = be32(select << 16 | FW_CFG_DMA_SELECT | FW_CFG_DMA_WRITE);
-	dma.length = be32(sizeof(cfg));
-	dma.address = __builtin_bswap64((uint64_t)(uintptr_t)&cfg);
-	*(volatile uint64_t *)(FW_CFG_BASE + 16) = __builtin_bswap64((uint64_t)(uintptr_t)&dma);
-	if (dma.control != 0) {
-		print("ramfb: control %x after the request\n", (uint64_t)be32(dma.control));
-		return;
-	}
-	SCREEN.base = fb;
-	SCREEN.width = PHONE_WIDTH;
-	SCREEN.height = PHONE_HEIGHT;
-	SCREEN.stride = PHONE_WIDTH * 4;
-}
 
 efi_status EFIAPI
 efi_main(efi_handle image, efi_system_table *st)
@@ -1175,6 +1105,7 @@ efi_main(efi_handle image, efi_system_table *st)
 		slot_set_active_other();
 		reboot();
 	} else if (menu_choice == MENU_CHOICE_FASTBOOT) {
+		(void)menu_enter_fastboot();
 		if (USB != NULL || usb_start()) {
 			flush_log();
 			usb_command_loop();
@@ -1189,6 +1120,7 @@ efi_main(efi_handle image, efi_system_table *st)
 		boot_fallback_enter();
 	}
 	if (USB != NULL || usb_start()) {
+		if (!boot_fallback_active) (void)menu_enter_fastboot();
 		usb_command_loop();
 	}
 	for (;;) {
