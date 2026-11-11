@@ -188,9 +188,8 @@ ann_surface_call(io_connect_t connection, struct ann_surface *surface, const cha
 		 * those two are translated. kIOReturnNotFound (0xe00002f0) is a surface ID the
 		 * kernel's table does not hold -- a surface from another process that was never
 		 * made shareable, or one already released. kIOReturnUnsupported (0xe00002c7) has
-		 * exactly one cause here (AnnibaleGPU.cpp:830): the surface was built around
-		 * memory the process already had, which is neither whole pages nor in rows the
-		 * GPU takes.
+		 * one cause in AnnibaleGPUMemory.inc surfaceBuffer: IOSurfaceAddress storage.
+		 * Its describe request is refused before geometry is returned.
 		 */
 		ann_say(why, why_size, "the kernel would not %s surface %u: %#x%s", what,
 		    surface->surface, result,
@@ -200,7 +199,7 @@ ann_surface_call(io_connect_t connection, struct ann_surface *surface, const cha
 			: result == kIOReturnNotFound
 			    ? " (no surface of that ID in the kernel's table)"
 			    : "");
-		return -1;
+		return result;
 	}
 	if (size < sizeof(reply)) {
 		ann_say(why, why_size, "the kernel answered %zu bytes about surface %u, not %zu",
@@ -610,7 +609,8 @@ ann_import_available(void)
 
 struct rwa_texture *
 ann_texture_for_surface(struct rwa_device *mesa_device, const struct ann_surface *selected,
-    unsigned long plane, const struct ann_texture_shape *want, char *why, size_t why_size)
+    unsigned long plane, const struct ann_texture_shape *want, int *client_memory,
+    char *why, size_t why_size)
 {
 	struct ann_surface surface = *selected, kernel;
 	io_connect_t connection;
@@ -618,14 +618,18 @@ ann_texture_for_surface(struct rwa_device *mesa_device, const struct ann_surface
 	struct rwa_texture *texture;
 	uint32_t id = surface.surface;
 
+	*client_memory = 0;
 	connection = ann_shared_connection();
 	if (connection == 0) {
 		ann_say(why, why_size, "no connection to AnnibaleGPU: this kernel was booted "
 		    "without gpu=1, so a surface's memory cannot be given to the GPU");
 		return NULL;
 	}
-	if (ann_surface_describe(connection, id, &kernel, why, why_size) != 0)
+	int result = ann_surface_describe(connection, id, &kernel, why, why_size);
+	if (result != 0) {
+		*client_memory = result == (int)kIOReturnUnsupported;
 		return NULL;
+	}
 	if (surface.size > kernel.size || surface.pixelFormat != kernel.pixelFormat ||
 	    surface.planes != kernel.planes) {
 		ann_say(why, why_size, "surface %u geometry differs from the kernel allocation", id);
