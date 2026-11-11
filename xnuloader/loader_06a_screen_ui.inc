@@ -256,26 +256,33 @@ ui_progress(uint64_t done, uint64_t total)
 }
 
 static void
+ui_flush_splash_fb(void)
+{
+	if (skip_ufs_arbitration && SCREEN.base == 0xfc800000ULL) {
+		uint64_t bytes = (uint64_t)SCREEN.height * SCREEN.stride;
+		clean_dcache(SCREEN.base, SCREEN.base + bytes);
+		memcpy((void *)(uintptr_t)0xfd400000ULL, (const void *)(uintptr_t)SCREEN.base, bytes);
+		clean_dcache(0xfd400000ULL, 0xfd400000ULL + bytes);
+	}
+}
+
+static void
 ui_init(void)
 {
-	if (SCREEN.base == 0) {
-		return;
-	}
+	if (SCREEN.base == 0) return;
 	const char *prev_stage = UI.stage;
 	memset(&UI, 0, sizeof(UI));
 	memset(&UI_BOOT, 0, sizeof(UI_BOOT));
 	UI.pct = -1;
 	UI.ready = 1;
 	UI.spin_at = ui_now();
-	if (!ui_on()) {
-		return;
-	}
-	if (boot_fallback_active) {
-		ui_ensure_usb_chrome();
-		ui_stage(prev_stage ? prev_stage : "BOOT FALLBACK - FASTBOOT MODE");
-		return;
-	}
+	if (!ui_on()) return;
 	ui_ensure_usb_chrome();
+	if (boot_fallback_active) {
+		ui_stage(prev_stage ? prev_stage : "BOOT FALLBACK - FASTBOOT MODE");
+		ui_flush_splash_fb();
+		return;
+	}
 	ui_stage("WAITING FOR HOST");
 }
 
@@ -1147,13 +1154,10 @@ ui_draw_fault_banner(const char *status_line, const char *klog, uint64_t klog_le
 			y += UI_LOG_STEP;
 		}
 	}
-	if (skip_ufs_arbitration && SCREEN.base == 0xfc800000ULL) {
-		uint64_t off = 0;
-		uint64_t bytes = (uint64_t)SCREEN.height * SCREEN.stride;
-		memcpy((void *)(uintptr_t)(0xfd400000ULL + off), (const void *)(uintptr_t)(SCREEN.base + off), bytes);
-		clean_dcache(0xfd400000ULL + off, 0xfd400000ULL + off + bytes);
-	}
+	ui_flush_splash_fb();
 }
+
+static void reboot(void);
 
 static const char *
 menu_enter_fastboot(void)
@@ -1179,6 +1183,7 @@ boot_fallback_enter(void)
 	saved_status[i] = 0;
 	print("boot fallback: entering Fastboot debug mode (%s)\n", saved_status);
 	boot_fallback_active = 1;
+	if (SCREEN.base != 0) UI.ready = 1;
 	host_last_cmd = READ_SYSREG(CNTVCT_EL0);
 	ui_stage("BOOT FALLBACK - FASTBOOT MODE");
 	ui_draw_fault_banner(saved_status, (const char *)loader_ctx[CTX_LOG_PA], loader_ctx[CTX_LOG_LEN]);
@@ -1190,6 +1195,6 @@ boot_fallback_check(void)
 {
 	if (boot_fallback_active &&
 	    READ_SYSREG(CNTVCT_EL0) - host_last_cmd > 120 * READ_SYSREG(CNTFRQ_EL0)) {
-		host_last_cmd = READ_SYSREG(CNTVCT_EL0);
+		reboot();
 	}
 }

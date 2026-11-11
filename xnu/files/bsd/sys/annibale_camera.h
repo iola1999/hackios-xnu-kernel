@@ -14,6 +14,7 @@
 #define _SYS_ANNIBALE_CAMERA_H_
 
 #include <stdint.h>
+#include <sys/ioccom.h>
 
 #define ANNIBALE_CAMERA_DEVICE           "/dev/annibale-camera"
 #define ANNIBALE_CAMERA_MAGIC            "RWFRAME1"
@@ -59,5 +60,25 @@ struct annibale_camera_command {
 	uint32_t        bytes;          /* of what follows this structure */
 	uint32_t        a, b, c, d;
 };
+
+#define ANNIBALE_CAM_INFO_FLAG_TPG_FALLBACK     (1u << 0)
+#define ANNIBALE_CAM_INFO_FLAG_SMMU_BYPASS      (1u << 1)
+#define ANNIBALE_CAM_INFO_FLAG_WIDE_DETECTED    (1u << 2)
+#define ANNIBALE_CAM_INFO_FLAG_FRONT_DETECTED   (1u << 3)
+#define ANNIBALE_CAM_INFO_FLAG_HW_DMA_VERIFIED  (1u << 4)
+
+struct annibale_camera_info {
+	uint32_t        flags;          /* 0 when live sensor stream is active; bit 0 set on TPG fallback */
+	uint16_t        wide_chip_id;   /* Rear Wide OV50E chip ID (0x5650 / 0x5045) or 0 */
+	uint16_t        front_chip_id;  /* Front OV20B chip ID (0x2042 / 0x1641) or 0 */
+	uint8_t         wide_slave;     /* 7-bit I2C slave on CCI0 M1 (0x36 or 0x10) */
+	uint8_t         front_slave;    /* 7-bit I2C slave on QUPv3 SE9 I2C (0x10 or 0x36) */
+	uint8_t         active_sensor;  /* 1 = Rear Wide, 2 = Front */
+	uint8_t         smmu_slot;      /* apps_smmu SMR slot for SID 0x1c00 (0xff if unmapped) */
+	uint32_t        csid_hw_ver;    /* CSID-lite0 HW_VERSION (0x0ad6d000) */
+	uint32_t        ife_hw_ver;     /* IFE-lite0 HW_VERSION (0x0ad6f800) */
+};
+
+#define CAMIOC_G_INFO           _IOR('C', 1, struct annibale_camera_info)
 
 #endif /* _SYS_ANNIBALE_CAMERA_H_ */

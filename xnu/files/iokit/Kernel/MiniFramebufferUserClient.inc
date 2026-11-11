@@ -453,16 +453,20 @@ static void
 publishAccelerator(IOService * provider)
 {
 	IOAcceleratorES * accelerator = OSTypeAlloc(IOAcceleratorES);
-	uint32_t metal = 0;
+	uint32_t metal = 0, metal_native = 1;
 
 	gAcceleratorTakesProperties = PE_parse_boot_argn("metal", &metal, sizeof(metal)) && metal != 0;
+	PE_parse_boot_argn("metal_native", &metal_native, sizeof(metal_native));
 	if (accelerator != NULL && accelerator->init() && accelerator->attach(provider)) {
 		accelerator->setName("sgx");
+		if (gAcceleratorTakesProperties && metal_native != 0) {
+			accelerator->setProperty(kAcceleratorPluginNameKey, "AnnibaleMetal");
+			accelerator->setProperty(kAcceleratorPluginClassNameKey, "AnnibaleMetalDevice");
+		}
 		accelerator->registerService();
-		/* the first line to look for in the log of such a boot: the gate is open, nothing is set yet */
 		if (gAcceleratorTakesProperties) {
-			IOLog("IOAcceleratorES: metal=%u: this service takes " kAcceleratorPluginNameKey
-			    " and " kAcceleratorPluginClassNameKey " from user space\n", metal);
+			IOLog("IOAcceleratorES: metal=%u metal_native=%u: service published\n",
+			    metal, metal_native);
 		}
 	}
 	OSSafeReleaseNULL(accelerator);

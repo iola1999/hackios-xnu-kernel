@@ -61,6 +61,9 @@ rw_image_uuid(const void *addr, char *out, size_t out_size)
 	if (port != IO_OBJECT_NULL) {
 		IOObjectRetain(port);
 	}
+	/* Adreno 830 imports linear uncompressed IOSurfaces; disable CoreAnimation lossless compression in-process. */
+	CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse,
+	                         kCFPreferencesCurrentApplication);
 
 	/* The gpu this driver would actually drive. Not fatal if it is absent: the port
 	 * starts the Adreno only with the boot argument gpu=1, and a device object that
@@ -183,14 +186,14 @@ rw_image_uuid(const void *addr, char *out, size_t out_size)
 		size_t size = sizeof(args) - 1;
 		const char *at;
 
-		profile = 0;
+		profile = 4;
 		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 &&
 		    (at = strstr(args, "metal_profile=")) != NULL && (at == args || at[-1] == ' ')) {
 			profile = (NSUInteger)strtoul(at + strlen("metal_profile="), NULL, 10);
 		}
 		rw_print("feature profile %lu, which is what Metal reads this device's "
-		         "whole capability surface out of (metal_profile= to change it; 0 claims Apple1 "
-		         "alone, 1 adds Apple2, which is the lowest rung MPS asks about)\n",
+		         "whole capability surface out of (metal_profile= to change it; 4 claims Apple3 "
+		         "and Common2)\n",
 		         (unsigned long)profile);
 	}
 	return profile;

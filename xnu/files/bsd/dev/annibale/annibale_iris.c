@@ -1,74 +1,197 @@
 /*
- * Iris device ABI for REDMI K90 (annibale / SM8750).
- * HFI session handling and the native VideoToolbox decoder are pending.
- * Registration only publishes the device node; open does not access hardware.
+ * Character device /dev/annibale-iris for SM8750 Iris VPU v3.5.
+ * Registration and open() perform zero hardware or firmware accesses; hardware
+ * bring-up runs lazily on ioctl under iris_lock.
  */
-
+#ifndef ANNIBALE_IRIS_HOST_TEST
+#include <kern/locks.h>
 #include <libkern/libkern.h>
 #include <miscfs/devfs/devfs.h>
 #include <sys/conf.h>
 #include <sys/errno.h>
 #include <sys/ioccom.h>
 #include <sys/proc.h>
+#endif
 
-#define say(...) printf("iris: " __VA_ARGS__)
+#include "annibale_iris_private.h"
 
-/* IOCTL interface for /dev/annibale-iris */
-struct iris_session_params {
-	uint32_t codec_type;    /* 1: H.264 (avc1), 2: HEVC (hvc1), 3: VP9 (vp09) */
-	uint32_t width;
-	uint32_t height;
-	uint32_t session_id;    /* Out */
-};
+struct iris_controller g_iris;
 
-struct iris_decode_frame {
-	uint32_t session_id;
-	uint64_t input_user_addr;
-	uint32_t input_len;
-	uint64_t out_user_y;    /* In: 用户态 CVPixelBuffer 平面 0 (Y) 目标地址 */
-	uint64_t out_user_uv;   /* In: 用户态 CVPixelBuffer 平面 1 (UV) 目标地址 */
-	uint64_t out_phys_y;    /* Out: 硬件解码平面 0 物理基址 */
-	uint64_t out_phys_uv;   /* Out: 硬件解码平面 1 物理基址 */
-	uint32_t out_stride;    /* In/Out: 跨距 (对齐至 128 字节) */
-	uint32_t flags;         /* Out: 状态标志位 (0x01: 成功) */
-};
+#ifndef ANNIBALE_IRIS_HOST_TEST
+static LCK_GRP_DECLARE(iris_lck_grp, "annibale-iris");
+static LCK_MTX_DECLARE(iris_lock, &iris_lck_grp);
 
-#define IRIS_IOC_OPEN_SESSION   _IOWR('V', 1, struct iris_session_params)
-#define IRIS_IOC_DECODE_FRAME   _IOWR('V', 2, struct iris_decode_frame)
-#define IRIS_IOC_CLOSE_SESSION  _IOW('V', 3, uint32_t)
-
-/* Character device callbacks */
-
-static int
-iris_dev_open(dev_t dev __unused, int flags __unused, int devtype __unused, struct proc *p __unused)
+static void
+iris_lock_acquire(void)
 {
-	return EOPNOTSUPP;
+	lck_mtx_lock(&iris_lock);
+}
+
+static void
+iris_lock_release(void)
+{
+	lck_mtx_unlock(&iris_lock);
 }
 
 static int
-iris_dev_close(dev_t dev __unused, int flags __unused, int devtype __unused, struct proc *p __unused)
+iris_caller_pid(struct proc *p)
+{
+	return p != NULL ? proc_pid(p) : 0;
+}
+#endif /* !ANNIBALE_IRIS_HOST_TEST */
+
+static int
+iris_dev_open(dev_t dev __unused, int flags __unused, int devtype __unused, struct proc *p __unused)
 {
 	return 0;
 }
 
 static int
-iris_dev_ioctl(dev_t dev __unused, u_long cmd, caddr_t data __unused, int flags __unused, struct proc *p __unused)
+iris_dev_close(dev_t dev __unused, int flags __unused, int devtype __unused, struct proc *p)
 {
-	int error = 0;
+	int pid = iris_caller_pid(p);
 
+	iris_lock_acquire();
+	for (uint32_t i = 0; i < IRIS_MAX_SESSIONS; i++) {
+		struct iris_session *s = &g_iris.sessions[i];
+		if (s->active && (pid == 0 || s->owner_pid == pid)) {
+			iris_hfi_session_close(s);
+			memset(s, 0, sizeof(*s));
+		}
+	}
+	iris_lock_release();
+	return 0;
+}
+
+static int
+iris_ioctl_get_info(struct iris_device_info *info)
+{
+	struct iris_device_info out;
+
+	memset(&out, 0, sizeof(out));
+	out.version = IRIS_ABI_VERSION;
+	out.flags = IRIS_INFO_DEV_PRESENT;
+	out.max_width = IRIS_MAX_WIDTH;
+	out.max_height = IRIS_MAX_HEIGHT;
+
+	if (iris_hw_probe_firmware()) {
+		out.flags |= IRIS_INFO_FW_PRESENT;
+		out.fw_size = g_iris.fw_size;
+	}
+	if (iris_hw_ensure_ready()) {
+		out.flags |= IRIS_INFO_HW_READY;
+		out.codecs_mask = IRIS_CODEC_MASK_H264 | IRIS_CODEC_MASK_HEVC;
+	}
+	*info = out;
+	return 0;
+}
+
+static int
+iris_ioctl_open_session(struct iris_session_params *params, int pid)
+{
+	if ((params->codec_type != IRIS_CODEC_H264 && params->codec_type != IRIS_CODEC_HEVC) ||
+	    params->width < IRIS_MIN_DIM || params->width > IRIS_MAX_WIDTH ||
+	    params->height < IRIS_MIN_DIM || params->height > IRIS_MAX_HEIGHT) {
+		return EINVAL;
+	}
+	if (!iris_hw_ensure_ready()) {
+		return EOPNOTSUPP;
+	}
+
+	struct iris_session *slot = NULL;
+	uint32_t sid = 0;
+	for (uint32_t i = 0; i < IRIS_MAX_SESSIONS; i++) {
+		if (!g_iris.sessions[i].active) {
+			slot = &g_iris.sessions[i];
+			sid = i + 1u;
+			break;
+		}
+	}
+	if (slot == NULL) {
+		return EBUSY;
+	}
+
+	memset(slot, 0, sizeof(*slot));
+	slot->session_id = sid;
+	slot->codec_type = params->codec_type;
+	slot->width = params->width;
+	slot->height = params->height;
+	slot->owner_pid = pid;
+
+	int err = iris_hfi_session_open(slot);
+	if (err != 0) {
+		memset(slot, 0, sizeof(*slot));
+		return err;
+	}
+	slot->active = true;
+	params->session_id = sid;
+	return 0;
+}
+
+static struct iris_session *
+iris_find_session(uint32_t session_id)
+{
+	if (session_id == 0 || session_id > IRIS_MAX_SESSIONS) {
+		return NULL;
+	}
+	struct iris_session *s = &g_iris.sessions[session_id - 1u];
+	return s->active ? s : NULL;
+}
+
+static int
+iris_dev_ioctl(dev_t dev __unused, u_long cmd, caddr_t data, int flags __unused, struct proc *p)
+{
+	if (data == NULL) {
+		switch (cmd) {
+		case IRIS_IOC_GET_INFO:
+		case IRIS_IOC_OPEN_SESSION:
+		case IRIS_IOC_DECODE_FRAME:
+		case IRIS_IOC_FLUSH_SESSION:
+		case IRIS_IOC_CLOSE_SESSION:
+			return EINVAL;
+		default:
+			return ENOTTY;
+		}
+	}
+
+	int err = 0;
+	iris_lock_acquire();
 	switch (cmd) {
-	case IRIS_IOC_OPEN_SESSION:
-	case IRIS_IOC_DECODE_FRAME:
-	case IRIS_IOC_CLOSE_SESSION:
-		/* HFI gen2 session and completion packets are not implemented yet. */
-		say("Iris HFI session ioctl %#lx is unavailable until native packet handling is implemented\n", cmd);
-		error = EOPNOTSUPP;
+	case IRIS_IOC_GET_INFO:
+		err = iris_ioctl_get_info((struct iris_device_info *)data);
 		break;
-	default:
-		error = ENOTTY;
+	case IRIS_IOC_OPEN_SESSION:
+		err = iris_ioctl_open_session((struct iris_session_params *)data, iris_caller_pid(p));
+		break;
+	case IRIS_IOC_DECODE_FRAME: {
+		struct iris_decode_frame *req = (struct iris_decode_frame *)data;
+		struct iris_session *s = iris_find_session(req->session_id);
+		err = (s != NULL) ? iris_hfi_decode_frame(s, req) : EINVAL;
 		break;
 	}
-	return error;
+	case IRIS_IOC_FLUSH_SESSION: {
+		uint32_t sid = *(const uint32_t *)data;
+		struct iris_session *s = iris_find_session(sid);
+		err = (s != NULL) ? iris_hfi_session_flush(s) : EINVAL;
+		break;
+	}
+	case IRIS_IOC_CLOSE_SESSION: {
+		uint32_t sid = *(const uint32_t *)data;
+		struct iris_session *s = iris_find_session(sid);
+		if (s == NULL) {
+			err = EINVAL;
+		} else {
+			iris_hfi_session_close(s);
+			memset(s, 0, sizeof(*s));
+		}
+		break;
+	}
+	default:
+		err = ENOTTY;
+		break;
+	}
+	iris_lock_release();
+	return err;
 }
 
 static const struct cdevsw iris_cdevsw = {
@@ -94,16 +217,16 @@ annibale_iris_init(void)
 	}
 	initialized = true;
 
-	say("registering SM8750 Iris VPU v3.5 (/dev/annibale-iris)...\n");
+	iris_say("registering SM8750 Iris VPU v3.5 (/dev/annibale-iris)...\n");
 
 	int major = cdevsw_add(-1, &iris_cdevsw);
 	if (major >= 0) {
 		if (devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "annibale-iris") != NULL) {
-			say("/dev/annibale-iris created successfully\n");
+			iris_say("/dev/annibale-iris created successfully\n");
 		} else {
-			say("warning: failed to create devfs node /dev/annibale-iris\n");
+			iris_say("warning: failed to create devfs node /dev/annibale-iris\n");
 		}
 	} else {
-		say("warning: failed to allocate cdevsw major for iris\n");
+		iris_say("warning: failed to allocate cdevsw major for iris\n");
 	}
 }

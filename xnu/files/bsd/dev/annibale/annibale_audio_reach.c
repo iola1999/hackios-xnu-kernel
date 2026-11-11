@@ -13,6 +13,7 @@
 #include <kern/clock.h>
 #include <kern/kalloc.h>
 #include <kern/locks.h>
+#include <kern/sched_prim.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -28,10 +29,14 @@ extern kern_return_t thread_terminate(thread_t thread);
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 
+typedef bool (*annibale_gpr_event_fn)(uint32_t src_port, uint32_t dst_port, uint32_t opcode,
+    uint32_t token, const void *payload, uint32_t len);
+
 extern void annibale_adsp_init(void);
 extern bool annibale_adsp_gpr_ready(void);
 extern bool annibale_adsp_gpr_send(const void *pkt, uint32_t len, uint32_t wait_ms,
     uint32_t *rsp_opcode, uint32_t *rsp_words, uint32_t max_words);
+extern void annibale_adsp_set_gpr_event(annibale_gpr_event_fn handler);
 extern bool annibale_audio_amp_probe(void);
 extern void annibale_audio_amp_power(bool on);
 extern void annibale_audio_amp_set_volume(uint32_t below_eighths_db, bool muted);
@@ -94,6 +99,7 @@ bool annibale_audio_reach_send_cmd(const void *raw_pkt, uint32_t raw_len, const 
     uint32_t *rsp_opcode, uint32_t *rsp_words, uint32_t max_words);
 bool annibale_audio_reach_dma_info(volatile uint8_t **va_out, uint64_t *pa_out,
     uint64_t *dsp_addr_out, uint32_t *map_handle_out);
+bool annibale_audio_reach_is_active(void);
 void annibale_audio_reach_init(void);
 
 #define RATE                    48000u
@@ -118,6 +124,10 @@ static uint32_t gpr_token = 100;
 
 static volatile uint32_t reach_sent_count;
 static volatile uint32_t reach_done_count;
+static volatile uint32_t in_flight_mask;
+static volatile bool reach_write_failed;
+static volatile bool reach_stream_active;
+static uint32_t reach_sync_mode;
 
 static int16_t *ring_storage;
 static uint32_t ring_head;
@@ -620,9 +630,86 @@ send_audio_period(uint32_t slot)
 	return true;
 }
 
+bool
+annibale_audio_reach_is_active(void)
+{
+	return __atomic_load_n(&reach_stream_active, __ATOMIC_RELAXED) ||
+	    __atomic_load_n(&in_flight_mask, __ATOMIC_RELAXED) != 0;
+}
+
+static bool
+reach_gpr_event(uint32_t src_port, uint32_t dst_port, uint32_t opcode,
+    uint32_t token __unused, const void *payload, uint32_t len)
+{
+	if (src_port != IID_PLAY_SHMEM || dst_port != OUR_PORT || opcode != OP_WRITE_DONE) {
+		return false;
+	}
+	if (payload == NULL || len < 32) {
+		__atomic_store_n(&reach_write_failed, true, __ATOMIC_RELEASE);
+		thread_wakeup((event_t)&in_flight_mask);
+		return true;
+	}
+	uint32_t words[8];
+	memcpy(words, payload, sizeof(words));
+	uint64_t done_addr = ((uint64_t)words[1] << 32) | words[0];
+	if (words[2] != map_handle || words[3] != 0 || words[7] != 0 ||
+	    done_addr < dsp_address || done_addr >= dsp_address + (uint64_t)SLOTS * PERIOD_BYTES ||
+	    ((done_addr - dsp_address) % PERIOD_BYTES) != 0) {
+		__atomic_store_n(&reach_write_failed, true, __ATOMIC_RELEASE);
+		thread_wakeup((event_t)&in_flight_mask);
+		return true;
+	}
+
+	uint32_t slot = (uint32_t)((done_addr - dsp_address) / PERIOD_BYTES);
+	uint32_t done = 0, sent = 0;
+	lck_spin_lock(audio_spin_lock);
+	in_flight_mask &= ~(1u << slot);
+	done = ++reach_done_count;
+	sent = reach_sent_count;
+	lck_spin_unlock(audio_spin_lock);
+
+	if (done == 1 || done % 50 == 0) {
+		say("PCM periods: slot %u sent %u done %u\n", slot, sent, done);
+	}
+	thread_wakeup((event_t)&in_flight_mask);
+	return true;
+}
+
+static bool
+queue_audio_period_async(uint32_t slot)
+{
+	struct gpr_pkt p;
+	uint64_t period_addr = dsp_address + (uint64_t)slot * PERIOD_BYTES;
+
+	__builtin_arm_dsb(0xf);
+	gpr_begin(&p, OUR_PORT, IID_PLAY_SHMEM, OP_WRITE);
+	gpr_put32(&p, (uint32_t)period_addr);
+	gpr_put32(&p, (uint32_t)(period_addr >> 32));
+	gpr_put32(&p, map_handle);
+	gpr_put32(&p, PERIOD_BYTES);
+	gpr_put32(&p, 0); gpr_put32(&p, 0); gpr_put32(&p, 0);
+	for (unsigned i = 0; i < 4; i++) gpr_put32(&p, 0);
+	gpr_finish(&p);
+
+	lck_spin_lock(audio_spin_lock);
+	in_flight_mask |= (1u << slot);
+	lck_spin_unlock(audio_spin_lock);
+
+	if (!annibale_adsp_gpr_send(p.buf, p.len, 0, NULL, NULL, 0)) {
+		lck_spin_lock(audio_spin_lock);
+		in_flight_mask &= ~(1u << slot);
+		lck_spin_unlock(audio_spin_lock);
+		return false;
+	}
+	lck_spin_lock(audio_spin_lock);
+	reach_sent_count++;
+	lck_spin_unlock(audio_spin_lock);
+	return true;
+}
+
 /* Consume audio from ring buffer, run speaker guard, and fill DMA slot */
 static bool
-fill_period_slot(uint32_t slot, bool muted, uint32_t below_eighths)
+fill_period_slot(uint32_t slot, bool muted)
 {
 	int16_t local[PERIOD_FRAMES * CHANNELS];
 	volatile int16_t *out = (volatile int16_t *)(volatile void *)(reach_buffer + slot * PERIOD_BYTES);
@@ -649,20 +736,6 @@ fill_period_slot(uint32_t slot, bool muted, uint32_t below_eighths)
 	}
 	lck_spin_unlock(audio_spin_lock);
 
-	/* Apply digital attenuation when iOS volume is below full scale */
-	if (has_audio && below_eighths > 0 && !muted) {
-		uint32_t db = below_eighths / 8u;
-		uint32_t shift = db / 6u;
-		if (shift >= 12u) {
-			bzero(local, sizeof(local));
-			has_audio = false;
-		} else if (shift > 0) {
-			for (uint32_t s = 0; s < PERIOD_FRAMES * CHANNELS; s++) {
-				local[s] = (int16_t)(local[s] >> shift);
-			}
-		}
-	}
-
 	/* Run speaker protection (200 Hz 4th-order HPF + thermal/excursion limiter) */
 	annibale_guard_process(local, PERIOD_FRAMES);
 	if (annibale_audio_recording_fed()) {
@@ -675,7 +748,7 @@ fill_period_slot(uint32_t slot, bool muted, uint32_t below_eighths)
 	return has_audio;
 }
 
-/* Feeder background thread with burst draining to prevent ring buffer overrun */
+/* Feeder background thread with 4-slot async GPR pipelining paced by ADSP I2S1 clock */
 static void
 reach_feeder_thread(void *arg __unused, wait_result_t w __unused)
 {
@@ -700,6 +773,14 @@ reach_feeder_thread(void *arg __unused, wait_result_t w __unused)
 		return;
 	}
 	for (;;) {
+		if (__atomic_load_n(&reach_write_failed, __ATOMIC_ACQUIRE)) {
+			__atomic_store_n(&reach_stream_active, false, __ATOMIC_RELAXED);
+			annibale_audio_amp_power(false);
+			say("PCM completion failed; playback stopped\n");
+			thread_terminate(current_thread());
+			return;
+		}
+
 		uint32_t cur_below = 0, cur_gen = 0;
 		bool cur_muted = false;
 		if (annibale_audio_volume(&cur_below, &cur_muted, &cur_gen) && cur_gen != last_vol_gen) {
@@ -710,33 +791,39 @@ reach_feeder_thread(void *arg __unused, wait_result_t w __unused)
 			annibale_audio_amp_set_volume(vol_below, vol_muted);
 		}
 
-		uint32_t backlog = 0;
+		uint32_t backlog = 0, inflight = 0;
+		bool slot_busy = false;
 		lck_spin_lock(audio_spin_lock);
 		backlog = ring_head - ring_tail;
+		inflight = (uint32_t)__builtin_popcount(in_flight_mask);
+		slot_busy = (in_flight_mask & (1u << (next % SLOTS))) != 0;
 		lck_spin_unlock(audio_spin_lock);
 
-		/* Drain up to IN_FLIGHT periods when writer is ahead to prevent sink overrun */
-		uint32_t bursts = 0;
-		if (backlog > 0) {
-			bursts = (backlog + PERIOD_FRAMES - 1u) / PERIOD_FRAMES;
-			if (bursts > IN_FLIGHT) {
-				bursts = IN_FLIGHT;
-			}
-		} else if (amp_powered && quiet_count < QUIET_PERIODS) {
-			bursts = 1;
-		}
+		bool active = (backlog > 0) || (inflight > 0) || (amp_powered && quiet_count < QUIET_PERIODS);
+		__atomic_store_n(&reach_stream_active, active, __ATOMIC_RELAXED);
 
-		for (uint32_t b = 0; b < bursts; b++) {
-			bool loud = fill_period_slot(next % SLOTS, vol_muted, vol_below);
+		bool want_amp_on = false;
+		while (inflight < IN_FLIGHT && !slot_busy) {
+			bool have_work = (backlog >= PERIOD_FRAMES) ||
+			    (backlog > 0 && inflight == 0) ||
+			    (backlog == 0 && amp_powered && quiet_count < QUIET_PERIODS && inflight < 2);
+			if (!have_work) {
+				break;
+			}
+			uint32_t slot = next % SLOTS;
+			bool loud = fill_period_slot(slot, vol_muted);
 			quiet_count = loud ? 0 : quiet_count + 1;
-
 			if (loud && !amp_powered) {
-				annibale_audio_amp_power(true);
-				amp_powered = true;
+				want_amp_on = true;
 			}
-			if (!send_audio_period(next % SLOTS)) {
+			__atomic_store_n(&reach_stream_active, true, __ATOMIC_RELAXED);
+
+			bool ok = reach_sync_mode != 0 ?
+			    send_audio_period(slot) : queue_audio_period_async(slot);
+			if (!ok) {
+				__atomic_store_n(&reach_stream_active, false, __ATOMIC_RELAXED);
 				annibale_audio_amp_power(false);
-				say("PCM completion failed; playback stopped\n");
+				say("PCM submission failed; playback stopped\n");
 				thread_terminate(current_thread());
 				return;
 			}
@@ -744,24 +831,42 @@ reach_feeder_thread(void *arg __unused, wait_result_t w __unused)
 
 			lck_spin_lock(audio_spin_lock);
 			backlog = ring_head - ring_tail;
+			inflight = (uint32_t)__builtin_popcount(in_flight_mask);
+			slot_busy = (in_flight_mask & (1u << (next % SLOTS))) != 0;
 			lck_spin_unlock(audio_spin_lock);
-			if (backlog < PERIOD_FRAMES && b + 1 < bursts) {
+			if (reach_sync_mode != 0 && backlog < PERIOD_FRAMES) {
 				break;
 			}
 		}
 
-		if (amp_powered && quiet_count >= QUIET_PERIODS) {
+		if (want_amp_on && !amp_powered) {
+			annibale_audio_amp_power(true);
+			amp_powered = true;
+		}
+		if (amp_powered && quiet_count >= QUIET_PERIODS && inflight == 0 && backlog == 0) {
 			annibale_audio_amp_power(false);
 			amp_powered = false;
+			__atomic_store_n(&reach_stream_active, false, __ATOMIC_RELAXED);
 		}
 
-		uint32_t sleep_ms = 16;
-		if (backlog >= 2 * PERIOD_FRAMES) {
-			sleep_ms = 4;
-		} else if (backlog >= PERIOD_FRAMES) {
-			sleep_ms = 8;
+		uint32_t wait_ms = active ? 5u : 25u;
+		uint64_t deadline = 0;
+		clock_interval_to_deadline(wait_ms, NSEC_PER_MSEC, &deadline);
+		assert_wait_deadline((event_t)&in_flight_mask, THREAD_UNINT, deadline);
+
+		lck_spin_lock(audio_spin_lock);
+		uint32_t cur_backlog = ring_head - ring_tail;
+		uint32_t cur_inflight = (uint32_t)__builtin_popcount(in_flight_mask);
+		bool can_feed = cur_inflight < IN_FLIGHT &&
+		    (in_flight_mask & (1u << (next % SLOTS))) == 0 &&
+		    (cur_backlog >= PERIOD_FRAMES || (cur_backlog > 0 && cur_inflight == 0));
+		lck_spin_unlock(audio_spin_lock);
+
+		if (can_feed || __atomic_load_n(&reach_write_failed, __ATOMIC_ACQUIRE)) {
+			clear_wait(current_thread(), THREAD_AWAKENED);
+		} else {
+			thread_block(THREAD_CONTINUE_NULL);
 		}
-		delay_for_interval(sleep_ms, NSEC_PER_MSEC);
 	}
 }
 
@@ -787,6 +892,9 @@ reach_audio_sink(const int16_t *frames, uint32_t count)
 		taken++;
 	}
 	lck_spin_unlock(audio_spin_lock);
+	if (taken > 0) {
+		thread_wakeup((event_t)&in_flight_mask);
+	}
 	return taken;
 }
 
@@ -873,7 +981,9 @@ annibale_audio_reach_init(void)
 	/* 6. Probe Smart Amplifiers on I2C */
 	(void)annibale_audio_amp_probe();
 
-	/* 7. Register Annibale Audio sink (AudioReach graphs are built by feeder once ADSP GLINK is ready) */
+	/* 7. Register GPR completion handler and Annibale Audio sink */
+	(void)PE_parse_boot_argn("reach_sync", &reach_sync_mode, sizeof(reach_sync_mode));
+	annibale_adsp_set_gpr_event(reach_gpr_event);
 	annibale_audio_set_sink("annibale-reach", reach_audio_sink);
 
 	/* 8. Launch feeder thread */

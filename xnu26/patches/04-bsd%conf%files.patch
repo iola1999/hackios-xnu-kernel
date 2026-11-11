@@ -1,8 +1,8 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 60d8aa6148d8..6d157a86c272 100644
+index 60d8aa6..f8d3038 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -108,6 +108,68 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -108,6 +108,71 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c         optional config_cpu_counters
@@ -64,7 +64,10 @@ index 60d8aa6148d8..6d157a86c272 100644
 +bsd/dev/annibale/annibale_adsp.c		standard
 +bsd/dev/annibale/annibale_mic.c		standard
 +bsd/dev/annibale/annibale_camera.c	standard
++bsd/dev/annibale/annibale_rpmh.c	standard
 +bsd/dev/annibale/annibale_iris.c		standard
++bsd/dev/annibale/annibale_iris_hw.c	standard
++bsd/dev/annibale/annibale_iris_hfi.c	standard
 +bsd/dev/annibale/annibale_sensors.c	standard
 +bsd/dev/annibale/annibale_ipa.c		standard
 +bsd/dev/annibale/annibale_modem.c	standard

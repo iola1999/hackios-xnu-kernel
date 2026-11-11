@@ -316,13 +316,20 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 	used = (size_t) snprintf(bl.line, sizeof(bl.line), "%s[%d] to the %s:", who, proc_selfpid(),
 	    value_key != NULL ? "backlight" : "framebuffer");
 	used = list_keys(bl.line, sizeof(bl.line), used < sizeof(bl.line) ? used : sizeof(bl.line), dict);
-	if (nits != NULL) {
+	if (slider_moved) {
+		millinits = kBLMilliNitsMin + slider_pos * (kBLMilliNitsMax - kBLMilliNitsMin) / 65536;
+		v = kBLValueMin + (millinits - kBLMilliNitsMin) * (kBLValueMax - kBLValueMin) / (kBLMilliNitsMax - kBLMilliNitsMin);
+	} else if (nits != NULL) {
 		uint64_t n16 = nits->unsigned64BitValue();
 		int64_t s16 = (int64_t) n16;
 
 		if (s16 <= 0) {
+			if (!MiniIOMobileFramebufferDCS(0) && annibale_backlight_level != 0) {
+				annibale_backlight_level = 0;
+				MiniIOMobileFramebufferDim(0);
+			}
 			snprintf(bl.line + used, sizeof(bl.line) - used,
-			    "; discarded non-positive level %lld, keeping %llu.%03llu nits",
+			    "; panel off (%lld), keeping %llu.%03llu nits",
 			    (long long) s16, bl.last_millinits / 1000, bl.last_millinits % 1000);
 			bl_log();
 			return;
@@ -356,11 +363,19 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 		}
 	} else if (value != NULL) {
 		v = value->unsigned64BitValue();
+		if (v == 0) {
+			if (!MiniIOMobileFramebufferDCS(0) && annibale_backlight_level != 0) {
+				annibale_backlight_level = 0;
+				MiniIOMobileFramebufferDim(0);
+			}
+			snprintf(bl.line + used, sizeof(bl.line) - used,
+			    "; panel off (value 0), keeping %llu.%03llu nits",
+			    bl.last_millinits / 1000, bl.last_millinits % 1000);
+			bl_log();
+			return;
+		}
 		v = v < kBLValueMin ? kBLValueMin : v > kBLValueMax ? kBLValueMax : v;
 		millinits = kBLMilliNitsMin + (v - kBLValueMin) * (kBLMilliNitsMax - kBLMilliNitsMin) / (kBLValueMax - kBLValueMin);
-	} else if (slider_moved) {
-		millinits = kBLMilliNitsMin + slider_pos * (kBLMilliNitsMax - kBLMilliNitsMin) / 65536;
-		v = kBLValueMin + (millinits - kBLMilliNitsMin) * (kBLValueMax - kBLValueMin) / (kBLMilliNitsMax - kBLMilliNitsMin);
 	} else {
 		snprintf(bl.line + used, sizeof(bl.line) - used, "; nothing taken");
 		bl_log();

@@ -25,6 +25,7 @@
 #include <sys/errno.h>
 #include <sys/kauth.h>
 #include <sys/annibale_audio.h>
+#include <sys/annibale_rpmh.h>
 #include <sys/systm.h>
 #include <sys/vnode.h>
 #include <sys/vnode_internal.h>
@@ -65,17 +66,6 @@ LCK_MTX_DECLARE(annibale_smem_alloc_lock, &annibale_ipc_lock_group);
 #define SMP2P_SSR_ACK             (1u << 0)
 #define SSR_ACK                   (1u << 0)
 #define DSP_READY                 (1u << 1)
-#define CMD_DB_PHYS               0x81c60000UL
-#define CMD_DB_SIZE               0x00020000UL
-#define RSC_PHYS                  0x16520000UL
-#define RSC_SIZE                  0x00010000UL
-#define RSC_TCS_BASE              0x0d00u
-#define RSC_IRQ_STATUS            (RSC_TCS_BASE + 0x04u)
-#define RSC_IRQ_CLEAR             (RSC_TCS_BASE + 0x08u)
-#define RSC_TCS(n)                (RSC_TCS_BASE + 0x2a0u * (n))
-#define TCS_ACTIVE_MODE           (1u << 16)
-#define TCS_TRIGGER               (1u << 24)
-#define MSGID_WRITE_WAITED        (8u | (1u << 8) | (1u << 16))
 #define AOSS_PHYS                 0x0c300000UL
 #define AOSS_SIZE                 0x00000400UL
 #define QMP_MAGIC_VALUE           0x4d41494cu
@@ -163,24 +153,6 @@ struct smp2p_item {
 	struct { char name[16]; uint32_t value; } entry[16];
 };
 
-struct cmd_db_slave {
-	uint16_t id, header_offset, data_offset, count, version, reserved[3];
-};
-
-struct cmd_db_header {
-	uint32_t version;
-	uint8_t  magic[4];
-	struct cmd_db_slave slave[8];
-	uint32_t checksum, reserved;
-	uint8_t  data[];
-};
-
-struct cmd_db_entry {
-	char     id[8];
-	uint32_t priority[2], address;
-	uint16_t length, offset;
-};
-
 struct elf_segment {
 	uint32_t type, offset, vaddr, paddr, file_size, memory_size, flags, align;
 };
@@ -207,7 +179,7 @@ bool annibale_adsp_is_hw_up(void);
 bool annibale_adsp_gpr_send(const void *pkt, uint32_t len, uint32_t wait_ms,
     uint32_t *rsp_opcode, uint32_t *rsp_words, uint32_t max_words);
 void annibale_adsp_set_gpr_event(annibale_gpr_event_fn handler);
-bool annibale_rpmh_regulator(const char *name, uint32_t mv, bool enable, uint32_t mode);
+extern bool annibale_audio_reach_is_active(void);
 extern void annibale_pmic_glink_set_tx(int (*tx_fn)(const void *data, uint32_t len));
 extern void annibale_pmic_glink_rx(const void *data, uint32_t len);
 
@@ -215,7 +187,6 @@ extern void annibale_pmic_glink_rx(const void *data, uint32_t len);
 
 static LCK_GRP_DECLARE(aadsp_lck_grp, "annibale-adsp");
 static LCK_MTX_DECLARE(aadsp_lock, &aadsp_lck_grp);
-static LCK_MTX_DECLARE(aadsp_rsc_lock, &aadsp_lck_grp);
 static LCK_MTX_DECLARE(aadsp_gpr_lock, &aadsp_lck_grp);
 static LCK_MTX_DECLARE(aadsp_tx_lock, &aadsp_lck_grp);
 static LCK_MTX_DECLARE(glink_tx_lock, &aadsp_lck_grp);
@@ -225,8 +196,7 @@ static LCK_MTX_DECLARE(glink_intent_lock, &aadsp_lck_grp);
  * polling RX. Receive callbacks run under glink_rx_lock and must not send or poll. */
 
 static volatile uint8_t *smem_base;
-static const struct cmd_db_header *cmd_db_base;
-static vm_offset_t rsc_base, aoss_base, ipcc_base;
+static vm_offset_t aoss_base, ipcc_base;
 static uint32_t aoss_our_box;
 
 static bool adsp_inited, adsp_hw_up;
@@ -428,133 +398,12 @@ static uint32_t smem_alloc_item(uint32_t item, uint32_t size)
 	return data;
 }
 
-/* ---- RPMh CMD DB & RSC v3 Voter -------------------------------------------------------------- */
-
-static uint32_t cmd_db_find_addr(const char *name, const uint8_t **data_out, uint32_t *len_out)
-{
-	char id[8] = { 0 };
-	if (cmd_db_base == NULL) {
-		cmd_db_base = (const struct cmd_db_header *)ml_io_map_wcomb(CMD_DB_PHYS, CMD_DB_SIZE);
-		if (cmd_db_base == NULL) return 0;
-	}
-	if (cmd_db_base->magic[0] != 0xdb || cmd_db_base->magic[1] != 0x30 ||
-	    cmd_db_base->magic[2] != 0x03 || cmd_db_base->magic[3] != 0x0c) {
-		return 0;
-	}
-	strlcpy(id, name, sizeof(id));
-	for (unsigned s = 0; s < 8; s++) {
-		const struct cmd_db_slave *slv = &cmd_db_base->slave[s];
-		const struct cmd_db_entry *ent = (const struct cmd_db_entry *)(const void *)(cmd_db_base->data + slv->header_offset);
-		if (slv->id == 0 || slv->count > 512) continue;
-		for (unsigned i = 0; i < slv->count; i++) {
-			if (memcmp(ent[i].id, id, sizeof(id)) != 0) continue;
-			if ((uint32_t)slv->data_offset + ent[i].offset + ent[i].length > CMD_DB_SIZE - 0x1000) return 0;
-			if (data_out != NULL) *data_out = cmd_db_base->data + slv->data_offset + ent[i].offset;
-			if (len_out != NULL) *len_out = ent[i].length;
-			return ent[i].address;
-		}
-	}
-	return 0;
-}
-
-static bool rpmh_tcs_send(const uint32_t *addrs, const uint32_t *vals, unsigned count)
-{
-	if (count == 0 || count > 8) return false;
-	lck_mtx_lock(&aadsp_rsc_lock);
-	if (rsc_base == 0) {
-		rsc_base = ml_io_map(RSC_PHYS, RSC_SIZE);
-		if (rsc_base == 0) {
-			lck_mtx_unlock(&aadsp_rsc_lock);
-			return false;
-		}
-	}
-	uint32_t major = (mmio_rd(rsc_base) >> 16) & 0xff;
-	uint32_t off_wait = major >= 3 ? 0x20u : 0x10u, off_ctrl = major >= 3 ? 0x24u : 0x14u;
-	uint32_t off_stat = major >= 3 ? 0x28u : 0x18u, off_en = major >= 3 ? 0x2cu : 0x1cu;
-	uint32_t off_cmd = major >= 3 ? 0x34u : 0x30u, stride = major >= 3 ? 24u : 20u;
-
-	unsigned tcs = 0;
-	bool found = false;
-	for (unsigned n = 0; n < 3; n++) {
-		if (mmio_rd(rsc_base + RSC_TCS(n) + off_stat) != 0) {
-			tcs = n;
-			found = true;
-			break;
-		}
-	}
-	if (!found) {
-		lck_mtx_unlock(&aadsp_rsc_lock);
-		return false;
-	}
-	uint32_t mask = (1u << count) - 1u;
-	mmio_wr(rsc_base + RSC_IRQ_CLEAR, 1u << tcs);
-	for (unsigned i = 0; i < count; i++) {
-		uint32_t cbase = RSC_TCS(tcs) + off_cmd + i * stride;
-		mmio_wr(rsc_base + cbase + 0, MSGID_WRITE_WAITED);
-		mmio_wr(rsc_base + cbase + 4, addrs[i]);
-		mmio_wr(rsc_base + cbase + 8, vals[i]);
-	}
-	mmio_wr(rsc_base + RSC_TCS(tcs) + off_wait, mask);
-	mmio_wr(rsc_base + RSC_TCS(tcs) + off_en, mask);
-	uint32_t ctrl = mmio_rd(rsc_base + RSC_TCS(tcs) + off_ctrl) & ~TCS_TRIGGER;
-	mmio_wr(rsc_base + RSC_TCS(tcs) + off_ctrl, ctrl);
-	mmio_wr(rsc_base + RSC_TCS(tcs) + off_ctrl, ctrl | TCS_ACTIVE_MODE);
-	mmio_wr(rsc_base + RSC_TCS(tcs) + off_ctrl, ctrl | TCS_ACTIVE_MODE | TCS_TRIGGER);
-
-	uint64_t t0 = now_us();
-	uint32_t done = 0;
-	while (now_us() - t0 < 50000) {
-		done = mmio_rd(rsc_base + RSC_IRQ_STATUS) & (1u << tcs);
-		if (done != 0) break;
-		sleep_us(25);
-	}
-	mmio_wr(rsc_base + RSC_IRQ_CLEAR, 1u << tcs);
-	ctrl = mmio_rd(rsc_base + RSC_TCS(tcs) + off_ctrl);
-	mmio_wr(rsc_base + RSC_TCS(tcs) + off_ctrl, ctrl & ~(TCS_TRIGGER | TCS_ACTIVE_MODE));
-	mmio_wr(rsc_base + RSC_TCS(tcs) + off_en, 0);
-	lck_mtx_unlock(&aadsp_rsc_lock);
-	return done != 0;
-}
+/* ---- RPMh ARC Rail Voter (shared annibale_rpmh helper) --------------------------------------- */
 
 static bool vote_adsp_rails(uint32_t level)
 {
-	static const char *const rails[2] = { "lcx.lvl", "lmx.lvl" };
-	uint32_t addrs[2] = { 0, 0 }, vals[2] = { 0, 0 };
-
-	for (unsigned r = 0; r < 2; r++) {
-		const uint8_t *data = NULL;
-		uint32_t len = 0;
-		addrs[r] = cmd_db_find_addr(rails[r], &data, &len);
-		if (addrs[r] == 0 || data == NULL) return false;
-		if (level == 0) {
-			vals[r] = 0;
-			continue;
-		}
-		bool matched = false;
-		for (unsigned i = 0; i < len / 2u && i < 16; i++) {
-			uint32_t lv = (uint32_t)(data[2 * i] | (data[2 * i + 1] << 8));
-			if (lv >= level) {
-				vals[r] = i;
-				matched = true;
-				break;
-			}
-		}
-		if (!matched) return false;
-	}
-	return rpmh_tcs_send(addrs, vals, 2);
-}
-
-bool annibale_rpmh_regulator(const char *name, uint32_t mv, bool enable, uint32_t mode)
-{
-	uint32_t base_addr = cmd_db_find_addr(name, NULL, NULL);
-	if (base_addr == 0) return false;
-	uint32_t addrs[3], vals[3];
-	unsigned n = 0;
-	if (mv != 0) { addrs[n] = base_addr + 0x0; vals[n++] = mv; }
-	if (mode != 0) { addrs[n] = base_addr + 0x8; vals[n++] = mode; }
-	addrs[n] = base_addr + 0x4;
-	vals[n++] = enable ? 1u : 0u;
-	return rpmh_tcs_send(addrs, vals, n);
+	return annibale_rpmh_arc_vote("lcx.lvl", level) &&
+	    annibale_rpmh_arc_vote("lmx.lvl", level);
 }
 
 /* ---- AOSS QMP Mailbox ------------------------------------------------------------------------ */
@@ -1142,7 +991,7 @@ static void annibale_adsp_boot_thread(void *arg __unused, wait_result_t w __unus
 	}
 	for (;;) {
 		glink_poll_rx();
-		sleep_ms(glink_gpr_our_cid == 0 ? 5 : 20);
+		sleep_ms(annibale_audio_reach_is_active() ? 1 : (glink_gpr_our_cid == 0 ? 5 : 20));
 	}
 }
 

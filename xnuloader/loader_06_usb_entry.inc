@@ -606,9 +606,6 @@ fb_command(char *cmd)
 	int live = running_live != NULL;
 
 	host_last_cmd = READ_SYSREG(CNTVCT_EL0);
-	if (!live && !kernel_resources_held && !firmware_fault && !held_irq_masked) {
-		(void)menu_enter_fastboot();
-	}
 	{
 		if (live && download_to_inbox && starts_with(cmd, "download:")) {
 			inbox_download(cmd + 9);
@@ -1005,6 +1002,9 @@ usb_command_loop(void)
 
 		if (!usb_connected || firmware_fault || usb_out_lost || usb_in_lost) {
 			ramdisk_fail();
+		}
+		if (boot_fallback_active && (usb_out_lost || usb_in_lost)) {
+			reboot();
 		}
 		boot_fallback_check();
 		if (!usb_connected) {

@@ -168,7 +168,8 @@ class TestSourceContracts(unittest.TestCase):
         self.assertIn("boot_fallback_enter();", text)
         self.assertIn("BOOT FALLBACK - FASTBOOT MODE", (HERE / "loader_06a_screen_ui.inc").read_text())
         self.assertIn("usb_command_loop()", text)
-        self.assertIn("(void)menu_enter_fastboot();", text)
+        self.assertIn("menu_enter_fastboot();", text)
+        self.assertNotIn("(void)menu_enter_fastboot();", text)
         self.assertIn("spmi_reboot_lk_prepare();", text)
         self.assertIn("spmi_reboot_lk_prepare(void)", (HERE / "loader_06a_screen_ui.inc").read_text())
 
@@ -220,6 +221,7 @@ static int str_eq(const char *a, const char *b) { return strcmp(a, b) == 0; }
 static int starts_with(const char *s, const char *p) { return strncmp(s, p, strlen(p)) == 0; }
 static void print(const char *fmt, ...) { (void)fmt; }
 static void wdt_pet(void) {}
+static void reboot(void) {}
 static void clean_dcache(uint64_t s, uint64_t e) { (void)s; (void)e; }
 typedef struct { uint32_t media_id; uint32_t block_size; uint64_t last_block; } efi_media;
 typedef struct efi_block_io {

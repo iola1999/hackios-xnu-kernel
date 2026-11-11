@@ -1,0 +1,16 @@
+diff --git a/osfmk/arm/rtclock.c b/osfmk/arm/rtclock.c
+--- a/osfmk/arm/rtclock.c
++++ b/osfmk/arm/rtclock.c
+@@ -468,7 +468,11 @@ absolutetime_to_microtime(uint64_t       abstime,
+ 	*secs = t64 = abstime / rtclock_sec_divisor;
+ 	abstime -= (t64 * rtclock_sec_divisor);
+ 
+-	*microsecs = (uint32_t)(abstime / rtclock_usec_divisor);
++	/*
++	 * annibale: QTimer runs at 19,200,000 Hz, so integer rtclock_usec_divisor (19) overflows
++	 * microsecs past 999,999 in the final 10.42 ms of each second. Scale by USEC_PER_SEC first.
++	 */
++	*microsecs = (uint32_t)((abstime * USEC_PER_SEC) / rtclock_sec_divisor);
+ }
+ 
+ void

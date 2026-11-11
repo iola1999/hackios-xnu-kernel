@@ -512,6 +512,14 @@ ann_surface_plane(void *iosurface, unsigned long plane, const struct ann_texture
 			return -1;
 		}
 		bpp = plane == 0 ? 1 : 2;
+	} else if ((fourcc == 'x420' || fourcc == 'xf20') && planes == 2) {
+		unsigned pixel_format = plane == 0 ? 20 : 60;
+		if (want->pixel_format != pixel_format) {
+			ann_say(why, why_size, "P010 plane %lu requires Metal format %u; requested %u",
+			    plane, pixel_format, want->pixel_format);
+			return -1;
+		}
+		bpp = plane == 0 ? 2 : 4;
 	} else if (planes > 1) {
 		ann_say(why, why_size, "unsupported planar surface FourCC %#x with %zu planes", fourcc, planes);
 		return -1;

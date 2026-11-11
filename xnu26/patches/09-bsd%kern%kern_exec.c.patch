@@ -1,5 +1,5 @@
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 2467b24045cd..40afa39a3a7f 100644
+index 2467b24..96f1f5e 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -1919,6 +1919,9 @@ SYSCTL_PROC(_vm, OID_AUTO, shared_region_control,
@@ -260,7 +260,7 @@ index 2467b24045cd..40afa39a3a7f 100644
 + * from a job description, which is why the kernel adds this one. Set once by our init (from
 + * etc/inject.conf) before it hands over to launchd.
 + */
-+static char exec_inject_conf[2048];
++static char exec_inject_conf[4096];
 +SYSCTL_STRING(_kern, OID_AUTO, exec_inject, CTLFLAG_RW | CTLFLAG_LOCKED, exec_inject_conf, sizeof(exec_inject_conf),
 +    "LIBRARY NAME... [; LIBRARY NAME...]: programs started with the library inserted");
 +
@@ -318,7 +318,7 @@ index 2467b24045cd..40afa39a3a7f 100644
  static int
  exec_extract_strings(struct image_params *imgp)
  {
-+	char            inject_env[512];
++	char            inject_env[1024];
  	int error = 0;
  	int     ptr_size = (imgp->ip_flags & IMGPF_WAS_64BIT_ADDR) ? 8 : 4;
  	int new_ptr_size = (imgp->ip_flags & IMGPF_IS_64BIT_ADDR) ? 8 : 4;
