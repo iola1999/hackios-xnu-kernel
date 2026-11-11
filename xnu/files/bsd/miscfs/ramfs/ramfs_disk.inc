@@ -378,16 +378,16 @@ ramfs_disk_pack_locked(struct ramfs_mount *rm, uint64_t *payload_bytes_out, uint
 			if (target_len > 0) {
 				uint64_t alen = ANNFS_ALIGN8(target_len);
 
-				bzero(base + at, (size_t)alen);
 				memcpy(base + at, node->rn_target, target_len);
+				bzero(base + at + target_len, (size_t)(alen - target_len));
 				at += alen;
 			}
 			if (nblocks > 0) {
 				uint64_t bbytes = (uint64_t)nblocks * sizeof(uint32_t);
 				uint64_t alen = ANNFS_ALIGN8(bbytes);
 
-				bzero(base + at, (size_t)alen);
 				memcpy(base + at, node->rn_blocks, (size_t)bbytes);
+				bzero(base + at + bbytes, (size_t)(alen - bbytes));
 				at += alen;
 			}
 			TAILQ_FOREACH(xa, &node->rn_xattrs, rx_link) {
@@ -403,10 +403,13 @@ ramfs_disk_pack_locked(struct ramfs_mount *rm, uint64_t *payload_bytes_out, uint
 				}
 				memcpy(base + at, &xrec, sizeof(xrec));
 				at += sizeof(xrec);
-				bzero(base + at, (size_t)alen);
 				memcpy(base + at, xa->rx_name, xrec.namelen);
 				if (xrec.size > 0 && xa->rx_data != NULL) {
 					memcpy(base + at + xrec.namelen, xa->rx_data, xrec.size);
+					bzero(base + at + raw, (size_t)(alen - raw));
+				} else {
+					/* Preserve zero-filled values for attributes without resident data. */
+					bzero(base + at + xrec.namelen, (size_t)(alen - xrec.namelen));
 				}
 				at += alen;
 			}
@@ -428,8 +431,8 @@ ramfs_disk_pack_locked(struct ramfs_mount *rm, uint64_t *payload_bytes_out, uint
 					}
 					memcpy(base + at, &drec, sizeof(drec));
 					at += sizeof(drec);
-					bzero(base + at, (size_t)alen);
 					memcpy(base + at, de->rd_name, drec.namelen);
+					bzero(base + at + drec.namelen, (size_t)(alen - drec.namelen));
 					at += alen;
 				}
 			}
