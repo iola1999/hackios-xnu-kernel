@@ -1053,7 +1053,9 @@ iris_collect_output(struct iris_session *s, struct iris_decode_frame *req, bool 
 	for (uint32_t i = 0; i < loops; i++) {
 		int received = iris_receive(s, NULL);
 		if (received < 0) return -received;
-		int output = iris_take_output(s, req);
+		/* Ordinary submits must observe the exact input return before reusing its DMA region. */
+		int output = 0;
+		if (draining || poll || !s->input_queued) output = iris_take_output(s, req);
 		if (output < 0) return -output;
 		if (output > 0 && req != NULL) return 0;
 		if (draining && s->drain_ack && s->drain_last && !s->input_queued) {

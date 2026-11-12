@@ -223,6 +223,8 @@ def write_fixtures(directory):
         cases.append((f'stage-{width}-{height}-{stage}', default, expected))
     cases.append(('stage-wire', default, expected))
     names = ['close-success', 'tlb-failure', 'input-immutable', 'output-copy', 'decode-psc',
+             'input-order-raw-first', 'input-order-multiple-raw-first', 'input-order-missing',
+             'input-order-wrong-sid', 'input-order-wrong-index',
              'alloc-clean', 'alloc-retained', 'open-caller-retained', 'close-caller-retained',
              'device-caller-retained', 'alloc-retained-later', 'stale-wire', 'cross-session',
              'wait-cross-session', 'truncated-later', 'later-session-buffer', 'later-system-buffer',
@@ -397,6 +399,9 @@ def mutations():
                          '(hb->flags & HFI_BUF_FW_FLAG_READONLY) != 0', 'false', ['buffer-raw-readonly']),
         'input_immutable': (HFI, 'int\niris_hfi_decode_frame', 'int\niris_hfi_session_flush',
                             's->input_queued || s->draining', 's->draining', ['input-immutable']),
+        'input_return_before_output': (HFI, 'static int\niris_collect_output', 'int\niris_hfi_decode_frame',
+                                       'draining || poll || !s->input_queued', 'true',
+                                       ['input-order-raw-first', 'input-order-wrong-index']),
         'reply_packet_id': (HFI, 'static int\niris_dispatch_message', 'static int\niris_receive',
                            'pkt->packet_id == wait->packet_id && ', '', ['stop-bs-4']),
         'reply_port': (HFI, 'static int\niris_dispatch_message', 'static int\niris_receive',

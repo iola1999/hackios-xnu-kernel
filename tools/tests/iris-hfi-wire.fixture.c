@@ -530,6 +530,44 @@ static void stage_check(struct iris_session *s, const char *name)
     assert(iris_hfi_session_close(s) == 0);
 }
 
+#ifndef IRIS_LEGACY_WIRE
+static void input_return_order_check(struct iris_session *s, const char *name)
+{
+	open_output(s);
+	uint8_t input[64], later[64];
+	memset(input, 0xa5, sizeof(input)); memset(later, 0x5a, sizeof(later));
+	struct iris_decode_frame req = { .input_user_addr = (uintptr_t)input, .input_len = 64, .in_tag = 0x2345 };
+	bool missing = strstr(name, "missing") != NULL;
+	bool wrong_sid = strstr(name, "wrong-sid") != NULL;
+	bool wrong_index = strstr(name, "wrong-index") != NULL;
+	bool multiple = strstr(name, "multiple") != NULL;
+	emit_buffer(s->wire_session_id, 2, 2, 0, s->raw[0].iova, s->raw[0].size, s->raw[0].size, 0x2345, 0);
+	if (multiple) emit_buffer(s->wire_session_id, 2, 2, 1, s->raw[1].iova, s->raw[1].size, s->raw[1].size, 0x6789, 0);
+	if (!missing) emit_buffer(s->wire_session_id + wrong_sid, 1, 1, wrong_index,
+	    s->bitstream.iova, s->bitstream.size, 0, 0, 0);
+	int error = iris_hfi_decode_frame(s, &req);
+	assert(copyin_calls == 1 && s->next_input_idx == 1 && *(uint8_t *)s->bitstream.kva == 0xa5);
+	if (missing || wrong_sid || wrong_index) {
+		assert(error == (wrong_index ? EIO : ETIMEDOUT) && s->input_queued &&
+		    req.flags == 0 && s->raw_state[0] == IRIS_RAW_RETURNED && free_calls == 0);
+		struct iris_decode_frame next = { .input_user_addr = (uintptr_t)later, .input_len = 64 };
+		assert(iris_hfi_decode_frame(s, &next) == (wrong_index ? EIO : EBUSY) &&
+		    copyin_calls == 1 && *(uint8_t *)s->bitstream.kva == 0xa5);
+		return;
+	}
+	assert(error == 0 && !s->input_queued && req.flags == IRIS_FRAME_DECODED && req.out_tag == 0x2345);
+	if (multiple) {
+		assert(s->raw_state[1] == IRIS_RAW_RETURNED);
+		struct iris_decode_frame poll = { .flags = IRIS_FRAME_POLL };
+		assert(iris_hfi_decode_frame(s, &poll) == 0 && poll.flags == IRIS_FRAME_DECODED && poll.out_tag == 0x6789);
+	}
+	automatic_input = true;
+	struct iris_decode_frame next = { .input_user_addr = (uintptr_t)later, .input_len = 64, .in_tag = 0x7777 };
+	assert(iris_hfi_decode_frame(s, &next) == 0 && next.flags == IRIS_FRAME_NEED_MORE &&
+	    copyin_calls == 2 && !s->input_queued);
+}
+#endif
+
 int main(int argc, char **argv)
 {
 	assert(argc == 4); const char *name = argv[1]; psc_path = argv[2];
@@ -557,6 +595,7 @@ int main(int argc, char **argv)
 		uint8_t input[64] = {0}; struct iris_decode_frame r = { .input_user_addr = (uintptr_t)input, .input_len = 64 };
 		assert(iris_hfi_decode_frame(s, &r) == EBUSY && copyin_calls == 0 && *(uint8_t *)s->bitstream.kva == 0xa5);
 	}
+	else if (strncmp(name, "input-order-", 12) == 0) input_return_order_check(s, name);
 	else if (strcmp(name, "decode-psc") == 0) {
 		assert(iris_hfi_session_open(s) == 0); automatic_psc = automatic_input = automatic_raw = true;
 		uint8_t input[64] = {0}; struct iris_decode_frame r = { .input_user_addr = (uintptr_t)input, .input_len = 64, .in_tag = 0x2345 };
