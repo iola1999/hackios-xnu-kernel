@@ -5,6 +5,11 @@ stack (/vendor/lib64/camera/com.qti.sensormodule.<name>.bin of the phone: the ve
 fw-camera/ and never in the repository; so is what this makes of it).
 
 usage: camsensor.py MODULE.bin OUT.tab     (camsensor.py MODULE.bin -   lists the tables only)
+       camsensor.py --json MODULE.bin OUT.json  (V5.2.1 mode and register inspection)
+
+V5 JSON preserves each resolution's streams, CFA enum, timing, register operations and
+delays. It is an inspection output; the current kernel does not read this JSON. The
+RWCTAB02 output below applies to V3.0.1 modules.
 
 The module file is a "QTI Chromatix Header" / "Parameter Parser V3.0.1" file: after the header a
 table of entry points (offset, size) -- the first is a table of symbols, the second the data the
@@ -52,6 +57,22 @@ def symbols(data):
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == '--json':
+        if len(sys.argv) != 4:
+            sys.exit('usage: camsensor.py --json MODULE.bin OUT.json (use - for stdout)')
+        import json
+        from pathlib import Path
+        from camsensor_v5 import inspect
+        try:
+            result = inspect(Path(sys.argv[2]).read_bytes())
+        except (ValueError, UnicodeError, struct.error) as error:
+            sys.exit(f'camsensor.py: {error}')
+        encoded = json.dumps(result, ensure_ascii=False, indent=2) + '\n'
+        if sys.argv[3] == '-':
+            print(encoded, end='')
+        else:
+            Path(sys.argv[3]).write_text(encoded)
+        return
     if len(sys.argv) < 3:
         sys.exit(__doc__)
     data = open(sys.argv[1], 'rb').read()
