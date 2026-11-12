@@ -1114,6 +1114,8 @@ iris_hfi_session_flush(struct iris_session *s)
 	if (s->error != 0) return s->error;
 	if (s->closing) return EBUSY;
 	if ((s->started_ports & (1u << HFI_PORT_BITSTREAM)) == 0) return 0;
+	/* AVPlayer flushes before its first sample; without input PSC there is no DRAIN_LAST. */
+	if (s->next_input_idx == 0) return 0;
 	int error = iris_begin_drain(s);
 	return error != 0 ? error : iris_collect_output(s, NULL, true, false);
 }

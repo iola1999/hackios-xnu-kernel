@@ -228,7 +228,9 @@ def write_fixtures(directory):
              'wait-cross-session', 'truncated-later', 'later-session-buffer', 'later-system-buffer',
              'later-property-buffer', 'close-retry-stop', 'close-queue-failure',
              'payload-none', 'range-reject', 'drain-ack-only', 'drain-last-input-held',
-             'drain-wrong-id-last', 'drain-complete', 'buffer-input-valid', 'buffer-raw-valid']
+             'drain-wrong-id-last', 'drain-complete', 'drain-empty-first-input',
+             'drain-empty-error', 'drain-empty-closing', 'drain-flush-submitted',
+             'buffer-input-valid', 'buffer-raw-valid']
     for port in ('bs', 'raw'):
         names += [f'stop-{port}-{mode}' for mode in range(1, 8)]
     names += [f'close-error-{mode}' for mode in range(1, 8)]
@@ -479,6 +481,13 @@ def mutations():
         'stage_value': (HFI, 'static uint32_t\niris_decode_stage', 'static int\niris_copy_decoded', 'HFI_PORT_NONE, iris_decode_stage(s)', 'HFI_PORT_NONE, 1u', ['stage-wire']),
         'stage_missing': (HFI, 'static uint32_t\niris_decode_stage', 'static int\niris_copy_decoded', '\t    !pkt_add_u32(&b, HFI_PROP_STAGE, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32,\n\t    HFI_PORT_NONE, iris_decode_stage(s)) ||\n', '', ['wire-h264', 'stage-wire']),
     })
+    variants['empty_flush_drain'] = (
+        HFI, 'int\niris_hfi_session_flush', 'int\niris_hfi_session_close',
+        'if (s->next_input_idx == 0) return 0;', '', ['drain-empty-first-input'])
+    variants['submitted_flush_skipped'] = (
+        HFI, 'int\niris_hfi_session_flush', 'int\niris_hfi_session_close',
+        'if (s->next_input_idx == 0) return 0;', 'if (s->next_input_idx != 0) return 0;',
+        ['drain-flush-submitted'])
     variants.update(raw_mutations())
     return variants
 

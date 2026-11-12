@@ -315,7 +315,29 @@ static void caller_check(struct iris_session *s, const char *name)
 }
 static void drain_check(struct iris_session *s, const char *name)
 {
+	if (strncmp(name, "drain-empty-", 12) == 0) {
+		assert(iris_hfi_session_open(s) == 0);
+		size_t before = tx_size;
+		if (strstr(name, "error")) s->error = EIO;
+		if (strstr(name, "closing")) s->closing = true;
+		int expected = s->error ? EIO : s->closing ? EBUSY : 0;
+		assert(iris_hfi_session_flush(s) == expected);
+		assert(tx_size == before && !s->draining && free_calls == 0);
+		if (expected == 0) {
+			/* An empty flush must leave the first compressed input publishable. */
+			automatic_psc = automatic_input = automatic_raw = true;
+			uint8_t input[64] = {0};
+			struct iris_decode_frame r = { .input_user_addr = (uintptr_t)input, .input_len = 64, .in_tag = 0x2345 };
+			assert(iris_hfi_decode_frame(s, &r) == 0 && s->next_input_idx == 1);
+		}
+		return;
+	}
 	open_output(s); s->input_queued = true; s->next_input_idx = 1;
+	if (strcmp(name, "drain-flush-submitted") == 0) {
+		assert(iris_hfi_session_flush(s) == ETIMEDOUT && s->draining);
+		assert(count_type(0x01000007u, 1) == 1 && free_calls == 0);
+		return;
+	}
 	assert(iris_begin_drain(s) == 0);
 	reply(s->wire_session_id, 0x01000007u, s->drain_packet_id, 1, strstr(name, "wrong-id") ? 4 : 0);
 	if (strstr(name, "last") || strstr(name, "complete")) reply(s->wire_session_id, 0x06000006u, 0, 0, 0);
