@@ -328,7 +328,7 @@ ufs_part_bytes(uint32_t part)
  * The orderly end of a run, from osfmk/arm64/loader_return.c, in the thread that is about to hand
  * control back: flush any dirty metadata and blocks of /private/var to /dev/ufs_darwin_var.
  */
-extern int ramfs_disk_flush_all(void);
+extern void ramfs_disk_flush_all(void);
 
 void
 annibale_var_save_on_return(void)
@@ -336,11 +336,7 @@ annibale_var_save_on_return(void)
 	if (!ufs_ready || ufs_darwin_var_part < 0) {
 		return;
 	}
-	int error = ramfs_disk_flush_all();
-	if (error != 0) {
-		/* Shutdown must remain available after storage or pageout errors. */
-		printf("ufs: data-volume flush failed (%d); continuing shutdown; data may be unsaved\n", error);
-	}
+	ramfs_disk_flush_all();
 }
 
 /* ---- the check: the partitions there are images of, hashed as the loader hashes them ---- */

@@ -566,8 +566,7 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
  * processor side as well). Such a surface is read the way a caller's own memory is: through a
  * no-copy buffer over the surface's memory and a texture over that buffer, whose bytes are copied
  * in before each commit and written back once the GPU has written them (rwa_texture_from_buffer,
- * rwa_buffer_set_mirror). The same path serves process-owned IOSurface storage that
- * AnnibaleGPU cannot import directly, including aligned rows and offsets.
+ * rwa_buffer_set_mirror). nil leaves the surface to the import in place.
  *
  * Textures over one surface share its memory in Metal, and copies made per texture would each hold
  * bytes of their own: a draw into one would not reach a draw that samples another (backboardd made
@@ -589,6 +588,8 @@ rw_surface_through_copy(AnnibaleMetalDevice *device, MTLTextureDescriptor *d, vo
 	size_t row;
 
 	row = selected->rowBytes;
+	if (row % 64 == 0 && selected->offset % 64 == 0)
+		return nil;
 	key = [NSString stringWithFormat:@"%p %lu %lu %lux%lu", surface, (unsigned long)plane,
 	       (unsigned long)[d pixelFormat], (unsigned long)[d width], (unsigned long)[d height]];
 	pthread_mutex_lock(&shared_lock);
@@ -692,7 +693,6 @@ rw_surface_through_copy(AnnibaleMetalDevice *device, MTLTextureDescriptor *d, vo
 					   * below is the one place the two meet */
 	struct rwa_texture *texture;
 	id copy;
-	int client_memory = 0;
 	void *allocation_base = NULL;
 
 	if (_mesa == NULL) {
@@ -723,13 +723,7 @@ rw_surface_through_copy(AnnibaleMetalDevice *device, MTLTextureDescriptor *d, vo
 		return copy;
 	}
 	texture = ann_texture_for_surface(_mesa, &took, p, (const struct ann_texture_shape *)&shape,
-					 &client_memory, why, sizeof(why));
-	if (texture == NULL && client_memory) {
-		copy = rw_surface_through_copy(self, d, s, p, &took, allocation_base);
-		if (copy == nil)
-			rw_print("surface plane %lu client-memory copy allocation failed\n", (unsigned long)p);
-		return copy;
-	}
+					 why, sizeof(why));
 	if (texture == NULL) {
 		static unsigned long refusals;
 		unsigned long n = __sync_add_and_fetch(&refusals, 1);

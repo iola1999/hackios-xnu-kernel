@@ -84,11 +84,15 @@ void ann_gpu_close(io_connect_t connection);
  * one this client already has for that surface) and must be paired with kDrmGemClose on
  * `handle` when the drawable is released.
  *
- * Both fill every out field on success. describe returns 0, a kernel IOReturn, or -1 for
- * a local validation failure; take returns 0 or -1. Failures include a sentence in why.
- * AnnibaleGPU surfaceBuffer returns kIOReturnUnsupported only for IOSurfaceAddress
- * storage, including describe requests. The texture caller uses that result to select
- * its existing buffer-backed storage path.
+ * Both fill every out field of `surface` from the kernel. Both: 0, or -1 and a sentence.
+ *
+ * kIOReturnUnsupported from `take` has one named cause and it is worth telling apart from
+ * the rest: a surface built around memory the process already had (IOSurfaceAddress) is
+ * refused by the kernel, because such memory is neither whole pages nor in rows the GPU
+ * takes (AnnibaleGPU.cpp:830). Nothing on CoreAnimation's Metal path builds one -- neither
+ * CA::SurfaceUtil::CAIOSurfaceCreate nor CA::Render::create_iosurface_with_pixel_format
+ * has a parameter to pass memory in -- but a surface handed to us by an application might
+ * be, so the sentence says which it was.
  */
 int ann_surface_describe(io_connect_t connection, uint32_t surfaceID,
 			 struct ann_surface *surface, char *why, size_t why_size);
@@ -154,10 +158,9 @@ int ann_format_of_metal(unsigned metal_pixel_format, uint32_t *fourcc,
 int ann_surface_plane(void *iosurface, unsigned long plane, const struct ann_texture_shape *want,
     struct ann_surface *selected, void **allocation_base, char *why, size_t why_size);
 
-/* client_memory is set only for the kernel's process-owned-storage refusal. */
 struct rwa_texture *ann_texture_for_surface(struct rwa_device *mesa_device,
     const struct ann_surface *selected, unsigned long plane, const struct ann_texture_shape *want,
-    int *client_memory, char *why, size_t why_size);
+    char *why, size_t why_size);
 
 /*
  * There is deliberately NO release call here. The buffer a surface's memory becomes belongs

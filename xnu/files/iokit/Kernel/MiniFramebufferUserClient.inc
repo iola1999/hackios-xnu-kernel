@@ -237,11 +237,10 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		IOLockUnlock(fLock);
 		return kIOReturnSuccess;
 
-	case kFBMethodSupportedFrameInfo:               /* in: type; out: count and selected index (no modes) */
+	case kFBMethodSupportedFrameInfo:               /* in: type; out: how many, and their tags: none */
 		if (args->scalarOutputCount >= 1) {
-			/* iOS 26 reads both scalars; keep shorter caller buffers within their capacity. */
-			args->scalarOutputCount = args->scalarOutputCount >= 2 ? 2 : 1;
-			bzero(out, args->scalarOutputCount * sizeof(out[0]));
+			out[0] = 0;
+			args->scalarOutputCount = 1;
 		}
 		if (args->structureOutput != NULL) {
 			bzero(args->structureOutput, args->structureOutputSize);

@@ -186,10 +186,7 @@ rw_reflection_argument(const struct rwa_reflection_argument *arg, NSString **why
          *why = @"Metal buffer reflection size or alignment exceeds the native representation";
          return nil;
       }
-      /* GraphSPI constant inputs have an opaque pointee in native reflection. */
-      BOOL opaque = arg->type == MTLBindingTypeBuffer && arg->constant_buffer &&
-                    type->data_type == MTLDataTypeNone && type->data_size == 0;
-      id details = opaque ? nil : rw_reflection_type(type, why);
+      id details = rw_reflection_type(type, why);
       if (*why)
          return nil;
       if (arg->type == MTLBindingTypeBuffer) {

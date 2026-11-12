@@ -188,8 +188,9 @@ ann_surface_call(io_connect_t connection, struct ann_surface *surface, const cha
 		 * those two are translated. kIOReturnNotFound (0xe00002f0) is a surface ID the
 		 * kernel's table does not hold -- a surface from another process that was never
 		 * made shareable, or one already released. kIOReturnUnsupported (0xe00002c7) has
-		 * one cause in AnnibaleGPUMemory.inc surfaceBuffer: IOSurfaceAddress storage.
-		 * Its describe request is refused before geometry is returned.
+		 * exactly one cause here (AnnibaleGPU.cpp:830): the surface was built around
+		 * memory the process already had, which is neither whole pages nor in rows the
+		 * GPU takes.
 		 */
 		ann_say(why, why_size, "the kernel would not %s surface %u: %#x%s", what,
 		    surface->surface, result,
@@ -199,7 +200,7 @@ ann_surface_call(io_connect_t connection, struct ann_surface *surface, const cha
 			: result == kIOReturnNotFound
 			    ? " (no surface of that ID in the kernel's table)"
 			    : "");
-		return result;
+		return -1;
 	}
 	if (size < sizeof(reply)) {
 		ann_say(why, why_size, "the kernel answered %zu bytes about surface %u, not %zu",
@@ -377,7 +378,6 @@ struct ann_format {
 static const struct ann_format ann_formats[] = {
 	{  10, 'A008', 1, 0, "MTLPixelFormatR8Unorm" },
 	{  11, 'A008', 1, 0, "MTLPixelFormatR8Unorm_sRGB" },
-	{  25, 'L00h', 2, 0, "MTLPixelFormatR16Float" },
 	{  30, 'LA08', 2, 0, "MTLPixelFormatRG8Unorm" },
 	{  65, '2C0h', 4, 0, "MTLPixelFormatRG16Float" },
 	{  70, 'RGBA', 4, 0, "MTLPixelFormatRGBA8Unorm" },
@@ -503,7 +503,6 @@ ann_surface_plane(void *iosurface, unsigned long plane, const struct ann_texture
 		ann_say(why, why_size, "plane %lu is outside surface plane count %zu", plane, planes);
 		return -1;
 	}
-	/* CoreImage Rh uses '1C0h'; CoreVideo OneComponent16Half uses 'L00h'. */
 	uint32_t fourcc = format(iosurface), expected;
 	unsigned bpp;
 	if ((fourcc == '420v' || fourcc == '420f') && planes == 2) {
@@ -527,7 +526,7 @@ ann_surface_plane(void *iosurface, unsigned long plane, const struct ann_texture
 		return -1;
 	} else if (ann_format_of_metal(want->pixel_format, &expected, &bpp, why, why_size) != 0) {
 		return -1;
-	} else if (fourcc != expected && !(want->pixel_format == 25 && fourcc == '1C0h')) {
+	} else if (fourcc != expected) {
 		ann_say(why, why_size, "surface FourCC %#x does not match Metal format %u "
 		    "(expected %#x; plane %lu, %zux%zu, element %zu, row %zu, offset %zu, alloc %zu)",
 		    fourcc, want->pixel_format, expected, plane, width(iosurface, plane),
@@ -609,8 +608,7 @@ ann_import_available(void)
 
 struct rwa_texture *
 ann_texture_for_surface(struct rwa_device *mesa_device, const struct ann_surface *selected,
-    unsigned long plane, const struct ann_texture_shape *want, int *client_memory,
-    char *why, size_t why_size)
+    unsigned long plane, const struct ann_texture_shape *want, char *why, size_t why_size)
 {
 	struct ann_surface surface = *selected, kernel;
 	io_connect_t connection;
@@ -618,18 +616,14 @@ ann_texture_for_surface(struct rwa_device *mesa_device, const struct ann_surface
 	struct rwa_texture *texture;
 	uint32_t id = surface.surface;
 
-	*client_memory = 0;
 	connection = ann_shared_connection();
 	if (connection == 0) {
 		ann_say(why, why_size, "no connection to AnnibaleGPU: this kernel was booted "
 		    "without gpu=1, so a surface's memory cannot be given to the GPU");
 		return NULL;
 	}
-	int result = ann_surface_describe(connection, id, &kernel, why, why_size);
-	if (result != 0) {
-		*client_memory = result == (int)kIOReturnUnsupported;
+	if (ann_surface_describe(connection, id, &kernel, why, why_size) != 0)
 		return NULL;
-	}
 	if (surface.size > kernel.size || surface.pixelFormat != kernel.pixelFormat ||
 	    surface.planes != kernel.planes) {
 		ann_say(why, why_size, "surface %u geometry differs from the kernel allocation", id);

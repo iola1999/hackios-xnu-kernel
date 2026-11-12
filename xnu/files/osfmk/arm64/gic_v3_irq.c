@@ -407,17 +407,15 @@ gic_prof_sample(int cpu)
 	gic_prof_lost[cpu]++;
 }
 
-/* Starting clears the tables; stopping preserves them for reading. only_pid > 0 filters samples. */
+/* Clear the tables and start (on) or stop sampling; only_pid > 0 keeps that process's samples only. */
 void
 gic_v3_prof_control(bool on, int only_pid)
 {
 	gic_prof_on = false;
 	gic_prof_only = only_pid;
 	__builtin_arm_dmb(DMB_ISH);
-	if (on) {
-		bzero(gic_prof, sizeof(gic_prof));
-		bzero(gic_prof_lost, sizeof(gic_prof_lost));
-	}
+	bzero(gic_prof, sizeof(gic_prof));
+	bzero(gic_prof_lost, sizeof(gic_prof_lost));
 	__builtin_arm_dmb(DMB_ISH);
 	gic_prof_on = on;
 }
