@@ -206,6 +206,7 @@ extern int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t ar
 #define HFI_PROP_CODEC                  0x03000100u
 #define HFI_PROP_COLOR_FORMAT           0x03000101u
 #define HFI_PROP_BITSTREAM_RESOLUTION   0x03000103u
+#define HFI_PROP_STAGE                  0x0300010au
 #define HFI_PROP_LINEAR_STRIDE_SCANLINE 0x03000104u
 #define HFI_PROP_CROP_OFFSETS           0x03000105u
 #define HFI_PROP_PROFILE                0x03000107u

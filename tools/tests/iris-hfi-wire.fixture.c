@@ -484,11 +484,36 @@ static void raw_count_check(struct iris_session *s, const char *name)
     for (unsigned i = 0; i < IRIS_RAW_POOL_MAX; i++) assert(!s->raw[i].kva);
 }
 
+static void stage_check(struct iris_session *s, const char *name)
+{
+    unsigned expected;
+    if (strcmp(name, "stage-wire") != 0) {
+        assert(sscanf(name, "stage-%u-%u-%u", &s->width, &s->height, &expected) == 3);
+        assert(iris_decode_stage(s) == expected);
+        return;
+    }
+    s->width = 1280; s->height = 64;
+    assert(iris_hfi_session_open(s) == 0);
+    unsigned stages = 0;
+    for (size_t pos = 0; pos < tx_size; pos += get32(tx + pos)) {
+        size_t end = pos + get32(tx + pos);
+        for (size_t off = pos + 32; off < end; off += get32(tx + off)) {
+            if (get32(tx + off + 4) != 0x0300010a) continue;
+            assert(get32(tx + off) == 36 && get32(tx + off + 8) == 0);
+            assert(get32(tx + off + 12) == 1 && get32(tx + off + 16) == 0);
+            assert(get32(tx + off + 32) == 2); stages++;
+        }
+    }
+    assert(stages == 1);
+    assert(iris_hfi_session_close(s) == 0);
+}
+
 int main(int argc, char **argv)
 {
 	assert(argc == 4); const char *name = argv[1]; psc_path = argv[2];
 	struct iris_session *s = prepare(strstr(name, "hevc") ? 2 : 1);
-	if (strncmp(name, "raw-", 4) == 0) raw_count_check(s, name);
+	if (strncmp(name, "stage-", 6) == 0) stage_check(s, name);
+	else if (strncmp(name, "raw-", 4) == 0) raw_count_check(s, name);
 	else if (strncmp(name, "wire-", 5) == 0) {
 #ifndef IRIS_LEGACY_WIRE
 		if (strncmp(name, "wire-psc-", 9) == 0) output_wire_check(s, argv[3]); else
