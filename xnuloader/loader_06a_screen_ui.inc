@@ -750,9 +750,9 @@ ui_boot_menu(void)
 	UI.pct = -1;
 	UI.spin_at = ui_now();
 	UI.usb_chrome_drawn = 0;
+	usb_menu_interrupted = 0;
 	ui_fill(0, 0, (int)SCREEN.width, (int)SCREEN.height, UI_BG);
 	ui_draw_menu(choice, countdown, user_interacted);
-	usb_menu_interrupted = 0;
 
 	freq = ui_freq();
 	poll_ticks = freq / 100;
@@ -1148,6 +1148,7 @@ menu_enter_fastboot(void)
 		return "kernel resources are unavailable for recovery";
 	}
 	usb_menu_interrupted = 1;
+	boot_fallback_active = 0;
 	return NULL;
 }
 
@@ -1163,6 +1164,7 @@ boot_fallback_enter(void)
 	saved_status[i] = 0;
 	print("boot fallback: entering Fastboot debug mode (%s)\n", saved_status);
 	boot_fallback_active = 1;
+	usb_menu_interrupted = 0;
 	if (SCREEN.base != 0) UI.ready = 1;
 	host_last_cmd = READ_SYSREG(CNTVCT_EL0);
 	ui_stage("BOOT FALLBACK - FASTBOOT MODE");

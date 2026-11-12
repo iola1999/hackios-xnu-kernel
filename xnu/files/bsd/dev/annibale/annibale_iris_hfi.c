@@ -37,29 +37,87 @@ iris_qring(uint32_t off)
 	return (uint32_t *)(g_iris.uc_region.kva + off);
 }
 
+/* annibale_tl has a 320-byte line buffer; split firmware text without truncating it. */
+static void
+iris_diag_text(const char *kind, const char *text, uint32_t capacity)
+{
+	uint32_t length = (uint32_t)strnlen(text, capacity);
+	for (uint32_t off = 0; off < length; ) {
+		uint32_t count = length - off;
+		if (count > 240u) count = 240u;
+		iris_say("VPU %s +%u: %.*s\n", kind, off, (int)count, text + off);
+		off += count;
+	}
+	if (length == capacity) iris_say("VPU %s: no terminator in %u bytes\n", kind, capacity);
+}
+
+static void
+iris_dump_sfr(void)
+{
+	if (g_iris.sfr_region.kva == 0 || g_iris.sfr_region.size < 4u) return;
+	uint32_t capacity = g_iris.sfr_region.size;
+	if (capacity > IRIS_IOVA_SFR_SIZE) capacity = IRIS_IOVA_SFR_SIZE;
+	iris_cache_clean_inval((const void *)g_iris.sfr_region.kva, capacity);
+	const uint32_t *sfr = (const uint32_t *)g_iris.sfr_region.kva;
+	uint32_t size = sfr[0];
+	if (size <= 4u || size > capacity) {
+		iris_say("VPU SFR: invalid size=%u capacity=%u\n", size, capacity);
+		return;
+	}
+	iris_diag_text("SFR", (const char *)(sfr + 1), size - 4u);
+}
+
 static void
 iris_drain_dbgq(void)
 {
+	/* iris_lock serializes the scratch buffer; keep 4 KiB off nested HFI receive stacks. */
+	static uint32_t packet[1024];
+	iris_dump_sfr();
+	if (g_iris.uc_region.kva == 0 ||
+	    g_iris.uc_region.size < IRIS_HFI_DBGQ_OFF + IRIS_HFI_Q_BYTES) return;
 	struct hfi_queue_header *qh = iris_qhdr(2u);
 	uint32_t *ring = iris_qring(IRIS_HFI_DBGQ_OFF);
-
 	iris_cache_clean_inval(qh, sizeof(*qh));
-	uint32_t rd = qh->read_idx;
-	uint32_t wr = qh->write_idx;
-	if (rd == wr || rd >= IRIS_HFI_Q_DWORDS || wr >= IRIS_HFI_Q_DWORDS) {
+	uint32_t rd = qh->read_idx, wr = qh->write_idx;
+	if (rd >= IRIS_HFI_Q_DWORDS || wr >= IRIS_HFI_Q_DWORDS) {
+		iris_say("VPU debug: invalid indices rd=%u wr=%u\n", rd, wr);
 		return;
 	}
-	qh->read_idx = wr;
-	iris_cache_clean_inval(qh, sizeof(*qh));
-	(void)ring;
-
-	iris_cache_clean_inval((const void *)g_iris.sfr_region.kva, 256u);
-	const char *sfr = (const char *)(g_iris.sfr_region.kva + 4u);
-	if (sfr[0] >= 0x20 && sfr[0] < 0x7f) {
-		char msg[128];
-		strlcpy(msg, sfr, sizeof(msg));
-		iris_say("VPU SFR: %s\n", msg);
+	/* Freeze the producer limit; at most 16 complete records (under 64 KiB) per call. */
+	uint32_t avail = wr >= rd ? wr - rd : IRIS_HFI_Q_DWORDS - rd + wr;
+	for (uint32_t records = 0; avail != 0 && records < 16u; records++) {
+		iris_cache_clean_inval(&ring[rd], sizeof(uint32_t));
+		uint32_t bytes = ring[rd];
+		/* Native __flush_debug_queue accepts 16..4095 bytes; __read_queue uses words. */
+		if (bytes < 16u || bytes >= sizeof(packet) || (bytes & 3u) != 0) {
+			iris_say("VPU debug: invalid length=%u rd=%u wr=%u\n", bytes, rd, wr);
+			return;
+		}
+		uint32_t words = bytes / 4u;
+		if (words > avail) {
+			iris_say("VPU debug: incomplete length=%u available=%u rd=%u wr=%u\n",
+			    bytes, avail * 4u, rd, wr);
+			return;
+		}
+		uint32_t first = IRIS_HFI_Q_DWORDS - rd;
+		if (first > words) first = words;
+		iris_cache_clean_inval(&ring[rd], first * 4u);
+		memcpy(packet, &ring[rd], first * 4u);
+		if (words > first) {
+			iris_cache_clean_inval(ring, (words - first) * 4u);
+			memcpy((uint8_t *)packet + first * 4u, ring, (words - first) * 4u);
+		}
+		/* Firmware may reuse consumed words as soon as read_idx is published. */
+		uint32_t start = rd;
+		rd = (rd + words) % IRIS_HFI_Q_DWORDS;
+		avail -= words;
+		qh->read_idx = rd;
+		iris_cache_clean_inval(qh, sizeof(*qh));
+		iris_say("VPU debug: rd=%u bytes=%u type=0x%x\n", start, bytes, packet[1]);
+		/* Native text starts at byte 0x11, after the 16-byte header and marker. */
+		if (bytes > 17u) iris_diag_text("debug", (const char *)packet + 17u, bytes - 17u);
 	}
+	if (avail != 0) iris_say("VPU debug: deferred words=%u rd=%u wr=%u\n", avail, rd, wr);
 }
 
 /* ---- Packet Builder & Queue Ring I/O --------------------------------------------------------- */
@@ -291,6 +349,7 @@ iris_hfi_sys_init(void)
 				if ((pkt->flags & HFI_FW_FLAGS_SESSION_ERROR) != 0 ||
 				    (pkt->type > HFI_SESSION_ERROR_BEGIN && pkt->type < HFI_SESSION_ERROR_END)) {
 					iris_say("HFI INIT session error type=0x%08x flags=0x%08x\n", pkt->type, pkt->flags);
+					iris_drain_dbgq();
 					return false;
 				}
 				if (pkt->type == HFI_CMD_INIT) {
@@ -355,7 +414,7 @@ iris_free_session_buffers(struct iris_session *s)
 	for (uint32_t i = 0; i < sizeof(bufs) / sizeof(bufs[0]); i++) {
 		if (!iris_dma_free_unmap(bufs[i])) freed = false;
 	}
-	for (uint32_t i = 0; i < IRIS_RAW_POOL_COUNT; i++) {
+	for (uint32_t i = 0; i < IRIS_RAW_POOL_MAX; i++) {
 		if (iris_dma_free_unmap(&s->raw[i])) s->raw_state[i] = IRIS_RAW_HOST;
 		else freed = false;
 	}
@@ -465,6 +524,7 @@ iris_alloc_session_buffers(struct iris_session *s)
 	for (uint32_t i = 0; i < IRIS_RAW_POOL_COUNT; i++) {
 		if (!iris_dma_alloc_map(&s->raw[i], cur, s->raw_frame_size, true)) return ENOMEM;
 		cur += s->raw[i].size;
+		s->raw_count = i + 1u;
 	}
 	return 0;
 }
@@ -496,6 +556,10 @@ iris_subscribe_port(struct iris_pkt_buf *b, const struct iris_session *s, uint32
 	uint32_t flags = HFI_HOST_FLAGS_INTR_REQUIRED | HFI_HOST_FLAGS_RESPONSE_REQUIRED;
 	if (!pkt_add(b, HFI_CMD_SUBSCRIBE_MODE, flags, HFI_PAYLOAD_U32_ARRAY,
 	    port, payload, (count + 1u) * sizeof(uint32_t))) return false;
+	/* Native AVC/HEVC input subscription publishes the initial output minimum. */
+	if (port == HFI_PORT_BITSTREAM &&
+	    !pkt_add_u32(b, HFI_PROP_BUFFER_FW_MIN_OUTPUT_COUNT, HFI_HOST_FLAGS_NONE,
+	    HFI_PAYLOAD_U32, port, 4u)) return false;
 	if (port == HFI_PORT_RAW) {
 		for (uint32_t i = 0; i < count; i++) {
 			int index = iris_psc_index(props[i]);
@@ -566,10 +630,14 @@ iris_read_property(struct iris_session *s, const struct hfi_packet *pkt)
 	if (index < 0 || pkt->port != HFI_PORT_BITSTREAM ||
 	    (pkt->flags & HFI_FW_FLAGS_INFORMATION) != 0) return 0;
 	uint32_t size = index == PSC_CROP_LT ? 8u : 4u;
+	/* VPU replies use U64 crop and 32_PACKED depth, coded-frame and color fields. */
 	bool info_ok = index == PSC_RES ? (pkt->payload_info == HFI_PAYLOAD_32_PACKED ||
 	    pkt->payload_info == HFI_PAYLOAD_U32) :
-	    index == PSC_CROP_LT ? pkt->payload_info == HFI_PAYLOAD_64_PACKED :
-	    (pkt->payload_info == HFI_PAYLOAD_U32 || pkt->payload_info == HFI_PAYLOAD_U32_ENUM);
+	    index == PSC_CROP_LT ? (pkt->payload_info == HFI_PAYLOAD_U64 ||
+	    pkt->payload_info == HFI_PAYLOAD_64_PACKED) :
+	    (pkt->payload_info == HFI_PAYLOAD_U32 || pkt->payload_info == HFI_PAYLOAD_U32_ENUM ||
+	    ((index == PSC_DEPTH || index == PSC_CODED || index == PSC_COLOR) &&
+	    pkt->payload_info == HFI_PAYLOAD_32_PACKED));
 	if (!info_ok || pkt->size - sizeof(*pkt) < size) return EIO;
 	memcpy(&s->psc_values[index], (const uint8_t *)pkt + sizeof(*pkt), size);
 	s->psc_seen |= 1u << index;
@@ -591,10 +659,19 @@ iris_start_output(struct iris_session *s)
 	    s->psc_values[PSC_RES] != ((s->width << 16) | s->height) ||
 	    s->psc_values[PSC_CROP_LT] != 0 || s->psc_values[PSC_CROP_RB] != 0 ||
 	    s->psc_values[PSC_DEPTH] != 0x00080008u || count == 0 ||
-	    count > IRIS_RAW_POOL_COUNT || count > IRIS_DPB_POOL_COUNT ||
+	    count > IRIS_RAW_POOL_MAX || s->raw_frame_size == 0 ||
+	    (uint64_t)s->raw_frame_size * count > IRIS_IOVA_RAW_SESSION_STRIDE ||
 	    s->dpb_frame_size == 0 || count > s->intern_dpb.size / s->dpb_frame_size ||
 	    (s->codec_type == IRIS_CODEC_H264 && (s->psc_values[PSC_CODED] & 1u) == 0)) {
 		return EOPNOTSUPP;
+	}
+	/* Keep the initial RAW allocations and add the buffers required by input PSC. */
+	while (s->raw_count < count) {
+		uint32_t i = s->raw_count;
+		uint32_t address = IRIS_IOVA_RAW_BASE + (s->session_id - 1u) *
+		    IRIS_IOVA_RAW_SESSION_STRIDE + i * s->raw_frame_size;
+		if (!iris_dma_alloc_map(&s->raw[i], address, s->raw_frame_size, true)) return ENOMEM;
+		s->raw_count++;
 	}
 	struct iris_pkt_buf b;
 	pkt_begin(&b, s->wire_session_id);
@@ -614,13 +691,13 @@ iris_start_output(struct iris_session *s)
 		if (!iris_queue_buffer(s->wire_session_id, HFI_PORT_RAW, HFI_BUFFER_DPB, i,
 		    s->intern_dpb.iova + i * s->dpb_frame_size, s->dpb_frame_size, 0, 0)) return EIO;
 	}
-	for (uint32_t i = 0; i < IRIS_RAW_POOL_COUNT; i++) {
+	for (uint32_t i = 0; i < s->raw_count; i++) {
 		if (!iris_queue_buffer(s->wire_session_id, HFI_PORT_RAW, HFI_BUFFER_RAW, i,
 		    s->raw[i].iova, s->raw[i].size, 0, 0)) return EIO;
 		s->raw_state[i] = IRIS_RAW_QUEUED;
 	}
 	iris_say("RAW published sid=%u ports=0x%x dpb=%u frame=%u raw=%u\n",
-	    s->wire_session_id, s->started_ports, count, s->dpb_frame_size, IRIS_RAW_POOL_COUNT);
+	    s->wire_session_id, s->started_ports, count, s->dpb_frame_size, s->raw_count);
 	return 0;
 }
 
@@ -667,7 +744,7 @@ iris_return_buffer(struct iris_session *s, const struct hfi_packet *pkt)
 		return 0;
 	}
 	if (hb->type == HFI_BUFFER_RAW) {
-		if (pkt->port != HFI_PORT_RAW || hb->index >= IRIS_RAW_POOL_COUNT ||
+		if (pkt->port != HFI_PORT_RAW || hb->index >= s->raw_count ||
 		    s->raw_state[hb->index] != IRIS_RAW_QUEUED || hb->data_offset != 0 ||
 		    hb->base_address != s->raw[hb->index].iova || hb->buffer_size != s->raw[hb->index].size ||
 		    (hb->flags & HFI_BUF_FW_FLAG_READONLY) != 0) return EIO;
@@ -700,6 +777,27 @@ iris_return_buffer(struct iris_session *s, const struct hfi_packet *pkt)
 	    hb->buffer_size == buf->size ? 0 : EIO;
 }
 
+static void
+iris_trace_reply_error(struct iris_session *s, const struct hfi_header *hdr,
+    const struct hfi_packet *pkt, int error, const char *stage)
+{
+	iris_say("reply rejected stage=%s sid=%u hdr=%u type=0x%x id=%u port=%u flags=0x%x info=%u size=%u error=%d\n",
+	    stage, hdr->session_id, hdr->header_id, pkt->type, pkt->packet_id, pkt->port,
+	    pkt->flags, pkt->payload_info, pkt->size, error);
+	if (pkt->type != HFI_CMD_BUFFER || pkt->payload_info != HFI_PAYLOAD_STRUCTURE ||
+	    pkt->size - sizeof(*pkt) < sizeof(struct hfi_buffer)) return;
+	const struct hfi_buffer *hb = (const struct hfi_buffer *)((const uint8_t *)pkt + sizeof(*pkt));
+	iris_say("rejected buffer type=%u index=%u base=0x%llx addr_offset=%u size=%u data_offset=%u data_size=%u tag=%llu flags=0x%x\n",
+	    hb->type, hb->index, (unsigned long long)hb->base_address, hb->addr_offset, hb->buffer_size,
+	    hb->data_offset, hb->data_size, (unsigned long long)hb->timestamp, hb->flags);
+	iris_say("expected input queued=%u index=%u base=0x%llx size=%u raw_count=%u drain=%u ack=%u last=%u\n",
+	    s->input_queued, s->next_input_idx - 1u, (unsigned long long)s->bitstream.iova,
+	    s->bitstream.size, s->raw_count, s->draining, s->drain_ack, s->drain_last);
+	if (hb->type == HFI_BUFFER_RAW && hb->index < s->raw_count && hb->index < IRIS_RAW_POOL_MAX)
+		iris_say("expected raw index=%u base=0x%llx size=%u state=%u\n", hb->index,
+		    (unsigned long long)s->raw[hb->index].iova, s->raw[hb->index].size, s->raw_state[hb->index]);
+}
+
 static int
 iris_dispatch_message(const uint8_t *msg, uint32_t len, struct iris_session *target,
     struct iris_reply_wait *wait)
@@ -723,6 +821,7 @@ iris_dispatch_message(const uint8_t *msg, uint32_t len, struct iris_session *tar
 		if ((pkt->flags & HFI_FW_FLAGS_SESSION_ERROR) != 0 ||
 		    (pkt->type > HFI_SESSION_ERROR_BEGIN && pkt->type < HFI_SESSION_ERROR_END)) {
 			iris_say("session error sid=%u type=0x%x flags=0x%x\n", hdr->session_id, pkt->type, pkt->flags);
+			iris_drain_dbgq();
 			if (s != NULL) s->error = EIO;
 		}
 		off += pkt->size;
@@ -757,7 +856,10 @@ iris_dispatch_message(const uint8_t *msg, uint32_t len, struct iris_session *tar
 		if (pkt->type == HFI_INFO_DATA_CORRUPT || pkt->type == HFI_INFO_BUFFER_OVERFLOW) error = EIO;
 		if (pkt->type == HFI_INFO_HFI_FLAG_DRAIN_LAST && s->draining) s->drain_last = true;
 		if (pkt->type == HFI_INFO_HFI_FLAG_PSC_LAST) error = EOPNOTSUPP;
-		if (error != 0) s->error = error;
+		if (error != 0) {
+			if (s->error == 0) iris_trace_reply_error(s, hdr, pkt, error, "property");
+			s->error = error;
+		}
 		off += pkt->size;
 	}
 	/* A malformed later property must also precede BUFFER ownership changes. */
@@ -775,7 +877,10 @@ iris_dispatch_message(const uint8_t *msg, uint32_t len, struct iris_session *tar
 			if ((pkt->flags & HFI_FW_FLAGS_SUCCESS) != 0) s->drain_ack = true;
 			else s->error = EIO;
 		}
-		if (s->error != 0) break;
+		if (s->error != 0) {
+			iris_trace_reply_error(s, hdr, pkt, s->error, "buffer-or-ack");
+			break;
+		}
 		off += pkt->size;
 	}
 	if (s->error == 0 && psc) s->error = iris_start_output(s);
@@ -810,6 +915,14 @@ iris_wait_reply(struct iris_session *s, uint32_t type, uint32_t id, uint32_t por
 	return ETIMEDOUT;
 }
 
+static uint32_t
+iris_decode_stage(const struct iris_session *s)
+{
+	/* Native vpu35 OPEN defaults use coded_frames=0 and low_latency=0. */
+	uint32_t macroblocks = ((s->width + 15u) / 16u) * ((s->height + 15u) / 16u);
+	return s->width < 1280u && s->height < 1280u && macroblocks < 3600u ? 1u : 2u;
+}
+
 int
 iris_hfi_session_open(struct iris_session *s)
 {
@@ -832,11 +945,14 @@ iris_hfi_session_open(struct iris_session *s)
 	}
 	s->opened = true;
 	pkt_begin(&b, s->wire_session_id);
+	/* Decoder resolution uses U32; the encoder uses the 32_PACKED payload type. */
 	if (!pkt_add_u32(&b, HFI_PROP_CODEC, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32_ENUM, HFI_PORT_NONE, codec) ||
 	    !pkt_add_u32(&b, HFI_PROP_DEC_DEFAULT_HEADER, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32,
 	    HFI_PORT_BITSTREAM, 0u) ||
-	    !pkt_add_u32(&b, HFI_PROP_BITSTREAM_RESOLUTION, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_32_PACKED,
+	    !pkt_add_u32(&b, HFI_PROP_BITSTREAM_RESOLUTION, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32,
 	    HFI_PORT_BITSTREAM, (s->width << 16) | s->height) ||
+	    !pkt_add_u32(&b, HFI_PROP_STAGE, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32,
+	    HFI_PORT_NONE, iris_decode_stage(s)) ||
 	    !pkt_add_u32(&b, HFI_PROP_COMV_BUFFER_COUNT, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32,
 	    HFI_PORT_BITSTREAM, 8u) || !iris_cmdq_write(&b)) goto failed;
 	const struct iris_dma_buf *bufs[] = { &s->intern_persist, &s->intern_bin, &s->intern_comv,
@@ -902,7 +1018,7 @@ iris_copy_decoded_nv12(struct iris_session *s, uint32_t raw_idx, struct iris_dec
 static int
 iris_take_output(struct iris_session *s, struct iris_decode_frame *req)
 {
-	for (uint32_t i = 0; i < IRIS_RAW_POOL_COUNT; i++) {
+	for (uint32_t i = 0; i < s->raw_count; i++) {
 		if (s->raw_state[i] != IRIS_RAW_RETURNED) continue;
 		struct hfi_buffer *hb = &s->raw_done[i];
 		bool decoded = hb->data_size != 0;
@@ -944,7 +1060,7 @@ iris_finish_drain(struct iris_session *s)
 	if (!iris_send_command(s, HFI_CMD_RESUME, HFI_PORT_BITSTREAM, flags, HFI_CMD_DRAIN, NULL)) return EIO;
 	if ((s->started_ports & (1u << HFI_PORT_RAW)) != 0 &&
 	    !iris_send_command(s, HFI_CMD_RESUME, HFI_PORT_RAW, flags, HFI_CMD_DRAIN, NULL)) return EIO;
-	for (uint32_t i = 0; i < IRIS_RAW_POOL_COUNT; i++) {
+	for (uint32_t i = 0; i < s->raw_count; i++) {
 		if (s->raw_state[i] != IRIS_RAW_HOST || (s->started_ports & (1u << HFI_PORT_RAW)) == 0) continue;
 		if (!iris_queue_buffer(s->wire_session_id, HFI_PORT_RAW, HFI_BUFFER_RAW, i,
 		    s->raw[i].iova, s->raw[i].size, 0, 0)) return EIO;
@@ -964,7 +1080,9 @@ iris_collect_output(struct iris_session *s, struct iris_decode_frame *req, bool 
 	for (uint32_t i = 0; i < loops; i++) {
 		int received = iris_receive(s, NULL);
 		if (received < 0) return -received;
-		int output = iris_take_output(s, req);
+		/* Ordinary submits must observe the exact input return before reusing its DMA region. */
+		int output = 0;
+		if (draining || poll || !s->input_queued) output = iris_take_output(s, req);
 		if (output < 0) return -output;
 		if (output > 0 && req != NULL) return 0;
 		if (draining && s->drain_ack && s->drain_last && !s->input_queued) {
@@ -1025,6 +1143,8 @@ iris_hfi_session_flush(struct iris_session *s)
 	if (s->error != 0) return s->error;
 	if (s->closing) return EBUSY;
 	if ((s->started_ports & (1u << HFI_PORT_BITSTREAM)) == 0) return 0;
+	/* AVPlayer flushes before its first sample; without input PSC there is no DRAIN_LAST. */
+	if (s->next_input_idx == 0) return 0;
 	int error = iris_begin_drain(s);
 	return error != 0 ? error : iris_collect_output(s, NULL, true, false);
 }

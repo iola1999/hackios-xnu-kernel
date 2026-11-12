@@ -300,13 +300,21 @@ minisandbox_container_path(user_addr_t arg)
 /* Which request numbers have been seen: one log line each, to learn what user space asks for. */
 static uint64_t minisandbox_seen;
 
+/* libsystem_sandbox returns the request 5 output buffer on success; it must contain an extension token. */
+#define SANDBOX_SYSCALL_EXTENSION_ISSUE 5
+
 static int
 minisandbox_policy_syscall(struct proc *p, int call, user_addr_t arg)
 {
 	if (call >= 0 && call < 64 && (minisandbox_seen & (1ULL << call)) == 0) {
 		minisandbox_seen |= 1ULL << call;
 		printf("minisandbox: request %d (first seen from %s[%d]): %s\n", call, p->p_comm, proc_getpid(p),
+		    call == SANDBOX_SYSCALL_EXTENSION_ISSUE ? "unsupported" :
 		    call == SANDBOX_SYSCALL_CONTAINER_PATH ? "answered" : "allowed");
+	}
+	/* Token output is unimplemented; an error makes the native library release its unwritten buffer. */
+	if (call == SANDBOX_SYSCALL_EXTENSION_ISSUE) {
+		return ENOTSUP;
 	}
 	if (call == SANDBOX_SYSCALL_SET_CONTAINER_PATH) {
 		return minisandbox_set_container_path(p, arg);

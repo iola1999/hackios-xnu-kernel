@@ -475,21 +475,25 @@ rw_stitch_install_hooks(void)
  * node (rw_linked_fragment_functions).
  *
  * The function is a proxy over the MTLFunction of the graph's output node, which answers the
- * reflection RenderBox reads after making the library (returnType, arguments); its name, type and
+ * reflection RenderBox reads after making the library (returnType, arguments); its name, label, type and
  * graph are its own.
  */
 @interface AnnibaleMetalStitchedFunction : NSProxy {
 	id _output;
 	NSString *_name;
+	NSString *_label;
 	id _graph;
 	NSArray *_functions;
 }
+@property (nullable, copy, atomic) NSString *label;
 - (instancetype)initWithGraph:(id)graph functions:(NSArray *)functions output:(id)output;
 - (id)annibaleGraph;
 - (NSArray *)annibaleGraphFunctions;
 @end
 
 @implementation AnnibaleMetalStitchedFunction
+
+@synthesize label = _label;
 
 - (instancetype)initWithGraph:(id)graph functions:(NSArray *)functions output:(id)output
 {
@@ -506,11 +510,15 @@ rw_stitch_install_hooks(void)
 	[_functions release];
 	[_output release];
 	[_name release];
+	[_label release];
 	[super dealloc];
 }
 
 - (NSString *)name { return _name; }
-- (NSUInteger)functionType { return 5; }   /* MTLFunctionTypeVisible */
+- (NSUInteger)functionType
+{
+	return [_graph isKindOfClass:NSClassFromString(@"MTLFunctionStitchingGraphSPI")] ? 3 : 5;
+}
 - (id)annibaleGraph { return _graph; }
 - (NSArray *)annibaleGraphFunctions { return _functions; }
 - (id)forwardingTargetForSelector:(SEL)sel { (void)sel; return _output; }
@@ -521,7 +529,9 @@ rw_stitch_install_hooks(void)
 - (void)forwardInvocation:(NSInvocation *)invocation { [invocation invokeWithTarget:_output]; }
 - (BOOL)respondsToSelector:(SEL)sel
 {
-	return sel == @selector(annibaleGraph) || sel == @selector(annibaleGraphFunctions) ||
+	return sel == @selector(name) || sel == @selector(functionType) ||
+	       sel == @selector(label) || sel == @selector(setLabel:) ||
+	       sel == @selector(annibaleGraph) || sel == @selector(annibaleGraphFunctions) ||
 	       [_output respondsToSelector:sel];
 }
 - (BOOL)isKindOfClass:(Class)cls { return [_output isKindOfClass:cls]; }
@@ -634,61 +644,102 @@ rw_function_bitcode(id function, const char **module_name)
 						 : nil;
 }
 
-/* A stitched function as rwa_render_create_linked takes it: one node per function node of the
- * graph, the output node appended when the graph's list does not hold it. Input nodes become the
- * call's argument numbers. The arrays live in `scratch`. */
+/* Convert native graph references without changing their order. Special inputs
+ * belong to GraphSPI kernels; ordinary visible graphs use argumentIndex. */
 static BOOL
-rw_stitched_nodes(id function, struct rwa_linked_function *out, NSMutableData *scratch)
+rw_stitched_nodes(id function, struct rwa_linked_function *out, NSMutableData *scratch,
+                  struct rwa_stitched_kernel *kernel)
 {
 	id graph = [function annibaleGraph];
+	BOOL is_kernel = [graph isKindOfClass:NSClassFromString(@"MTLFunctionStitchingGraphSPI")];
 	NSArray *functions = [function annibaleGraphFunctions];
 	NSMutableArray *list = [NSMutableArray arrayWithArray:[graph nodes]];
+	NSMutableArray *inputs = [NSMutableArray array];
+	NSMutableData *input_data = [NSMutableData data];
 	id output = [graph outputNode];
-
-	if (output != nil && [list indexOfObjectIdenticalTo:output] == NSNotFound) {
+	if (is_kernel != (kernel != NULL) || (is_kernel && output != nil))
+		return NO;
+	if (output != nil && [list indexOfObjectIdenticalTo:output] == NSNotFound)
 		[list addObject:output];
-	}
 	NSUInteger count = [list count];
+	if (count > INT_MAX)
+		return NO;
 	struct rwa_stitch_node *nodes = calloc(count ? count : 1, sizeof(*nodes));
-	[scratch appendBytes:&nodes length:sizeof(nodes)];   /* freed by the caller */
+	if (nodes == NULL)
+		return NO;
+	[scratch appendBytes:&nodes length:sizeof(nodes)];
 
 	for (NSUInteger k = 0; k < count; k++) {
 		id node = [list objectAtIndex:k];
-		id callee = rw_stitch_function_named(functions, [node name]);
+		BOOL early = [node isKindOfClass:NSClassFromString(@"MTLFunctionStitchingEarlyReturnNode")];
+		id callee = early ? nil : rw_stitch_function_named(functions, [node name]);
 		const char *module_name = NULL;
 		NSData *air = callee != nil ? rw_function_bitcode(callee, &module_name) : nil;
-		NSArray *arguments = [node arguments];
+		id condition = early ? ((id (*)(id, SEL))objc_msgSend)(node, sel_getUid("condition")) : nil;
+		if (early && condition == nil)
+			return NO;
+		NSArray *arguments = early ? @[condition] : [node arguments];
 		NSArray *after = [node respondsToSelector:@selector(controlDependencies)]
 		    ? [node controlDependencies] : nil;
+		if ((early && !is_kernel) || (!early && [air length] == 0) ||
+		    [arguments count] > INT_MAX || [after count] > UINT_MAX)
+			return NO;
 		int *args = calloc([arguments count] + 1, sizeof(int));
 		unsigned *deps = calloc([after count] + 1, sizeof(unsigned));
-
 		[scratch appendBytes:&args length:sizeof(args)];
 		[scratch appendBytes:&deps length:sizeof(deps)];
-		if ([air length] == 0) {
-			rw_print("stitched function %s: node %s has no function with bitcode\n",
-				 [[function name] UTF8String], [[node name] UTF8String]);
+		if (args == NULL || deps == NULL)
 			return NO;
-		}
 		for (NSUInteger a = 0; a < [arguments count]; a++) {
 			id from = [arguments objectAtIndex:a];
 			NSUInteger at = [list indexOfObjectIdenticalTo:from];
-
-			if ([from respondsToSelector:@selector(argumentIndex)]) {
-				args[a] = (int)[from argumentIndex];
-			} else if (at != NSNotFound) {
+			if (at != NSNotFound) {
+				if (at >= k)
+					return NO;
 				args[a] = -1 - (int)at;
+			} else if (!is_kernel && [from respondsToSelector:@selector(argumentIndex)]) {
+				NSUInteger index = [from argumentIndex];
+				if (index > INT_MAX)
+					return NO;
+				args[a] = (int)index;
+			} else if (is_kernel && !early) {
+				NSUInteger index = [inputs indexOfObjectIdenticalTo:from];
+				if (index == NSNotFound) {
+					struct rwa_stitch_input in = { 0 };
+					if ([from isKindOfClass:NSClassFromString(@"MTLFunctionStitchingInputTexture")])
+						in.kind = RWA_STITCH_TEXTURE;
+					else if ([from isKindOfClass:NSClassFromString(@"MTLFunctionStitchingInputSampler")])
+						in.kind = RWA_STITCH_SAMPLER;
+					else if ([from isKindOfClass:NSClassFromString(@"MTLFunctionStitchingInputBufferAddress")]) {
+						in.kind = RWA_STITCH_BUFFER_ADDRESS;
+						in.byte_offset = ((NSUInteger (*)(id, SEL))objc_msgSend)(from, sel_getUid("byteOffset"));
+						in.dereference = ((BOOL (*)(id, SEL))objc_msgSend)(from, sel_getUid("dereference"));
+					} else if ([from isKindOfClass:NSClassFromString(@"MTLFunctionStitchingBuiltinThreadPositionInGrid")])
+						in.kind = RWA_STITCH_THREAD_POSITION;
+					else
+						return NO;
+					if (in.kind != RWA_STITCH_THREAD_POSITION) {
+						NSUInteger binding = ((NSUInteger (*)(id, SEL))objc_msgSend)(from, sel_getUid("bindIndex"));
+						if (binding > UINT_MAX)
+							return NO;
+						in.binding = (unsigned)binding;
+					}
+					index = [inputs count];
+					if (index > INT_MAX)
+						return NO;
+					[inputs addObject:from];
+					[input_data appendBytes:&in length:sizeof(in)];
+				}
+				args[a] = (int)index;
 			} else {
-				rw_print("stitched function %s: argument %lu of node %s is a %s\n",
-					 [[function name] UTF8String], (unsigned long)a,
-					 [[node name] UTF8String], class_getName(object_getClass(from)));
 				return NO;
 			}
 		}
 		for (NSUInteger d = 0; d < [after count]; d++) {
 			NSUInteger at = [list indexOfObjectIdenticalTo:[after objectAtIndex:d]];
-
-			deps[d] = at != NSNotFound ? (unsigned)at : (unsigned)count;
+			if (at >= k)
+				return NO;
+			deps[d] = (unsigned)at;
 		}
 		nodes[k] = (struct rwa_stitch_node){
 			.bitcode = [air bytes], .size = [air length], .function = module_name,
@@ -698,8 +749,18 @@ rw_stitched_nodes(id function, struct rwa_linked_function *out, NSMutableData *s
 	}
 	*out = (struct rwa_linked_function){
 		.name = [[function name] UTF8String], .num_nodes = (unsigned)count, .nodes = nodes,
-		.output = output != nil ? (unsigned)[list indexOfObjectIdenticalTo:output] : 0,
+		.output = output != nil ? (unsigned)[list indexOfObjectIdenticalTo:output] : UINT_MAX,
 	};
+	if (kernel != NULL) {
+		struct rwa_stitch_input *data = malloc([input_data length] ? [input_data length] : 1);
+		if (data == NULL)
+			return NO;
+		memcpy(data, [input_data bytes], [input_data length]);
+		[scratch appendBytes:&data length:sizeof(data)];
+		*kernel = (struct rwa_stitched_kernel) {
+			.graph = *out, .num_inputs = (unsigned)[inputs count], .inputs = data,
+		};
+	}
 	return YES;
 }
 
@@ -728,7 +789,7 @@ rw_linked_fragment_functions(id descriptor, struct rwa_linked_function *out, uns
 			break;
 		}
 		if ([function respondsToSelector:@selector(annibaleGraph)]) {
-			n += rw_stitched_nodes(function, &out[n], scratch) ? 1 : 0;
+			n += rw_stitched_nodes(function, &out[n], scratch, NULL) ? 1 : 0;
 			continue;
 		}
 		const char *module_name = NULL;
@@ -800,7 +861,7 @@ rw_linked_free(NSMutableData *scratch)
 	for (id graph in [descriptor functionGraphs]) {
 		id output = rw_stitch_function_named(functions, [[graph outputNode] name]);
 
-		if (output == nil) {
+		if ([graph outputNode] != nil && output == nil) {
 			NSString *why = [NSString stringWithFormat:@"stitched function %@: the output "
 					 @"node calls %@, which the descriptor's functions do not hold",
 					 [graph functionName], [[graph outputNode] name]];
@@ -814,6 +875,19 @@ rw_linked_free(NSMutableData *scratch)
 		id function = [[AnnibaleMetalStitchedFunction alloc] initWithGraph:graph
 									 functions:functions
 									    output:output];
+		struct rwa_linked_function linked = { 0 };
+		struct rwa_stitched_kernel kernel = { 0 };
+		NSMutableData *scratch = [NSMutableData data];
+		BOOL valid = rw_stitched_nodes(function, &linked, scratch,
+			[function functionType] == 3 ? &kernel : NULL);
+		rw_linked_free(scratch);
+		if (!valid) {
+			[function release];
+			if (error != NULL)
+				*error = [NSError errorWithDomain:@"AnnibaleMetal" code:2 userInfo:@{
+					NSLocalizedDescriptionKey: @"invalid stitching graph, input type, or dependency order" }];
+			return nil;
+		}
 		[made addObject:function];
 		[function release];
 	}

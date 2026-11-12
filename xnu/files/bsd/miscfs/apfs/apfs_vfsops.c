@@ -1175,9 +1175,8 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 	sp->f_bused = am->am_vol.alloc_count;
 	sp->f_files = am->am_vol.num_files + am->am_vol.num_dirs;
 	sp->f_ffree = 0;
-	/* (several volumes of one device are told apart by which container and volume) */
-	sp->f_fsid.val[0] = (int32_t)vnode_specrdev(devvp);
-	sp->f_fsid.val[1] = (int32_t)((vfs_typenum(mp) & 0xff) | (container << 8) | (am->am_vol.index << 20));
+	/* ID-based VFS lookups use fsid.val[0], so each mounted volume needs its own ID. */
+	vfs_getnewfsid(mp);
 	strlcpy(sp->f_fstypename, "apfs", sizeof(sp->f_fstypename));
 	if (container == 1) {
 		strlcpy(sp->f_mntfromname, "/dev/disk2s1", sizeof(sp->f_mntfromname));

@@ -69,10 +69,10 @@ struct annibale_camera_command {
 
 struct annibale_camera_info {
 	uint32_t        flags;          /* 0 when live sensor stream is active; bit 0 set on TPG fallback */
-	uint16_t        wide_chip_id;   /* Rear Wide OV50E chip ID (0x5650 / 0x5045) or 0 */
-	uint16_t        front_chip_id;  /* Front OV20B chip ID (0x2042 / 0x1641) or 0 */
-	uint8_t         wide_slave;     /* 7-bit I2C slave on CCI0 M1 (0x36 or 0x10) */
-	uint8_t         front_slave;    /* 7-bit I2C slave on QUPv3 SE9 I2C (0x10 or 0x36) */
+	uint16_t        wide_chip_id;   /* Rear Wide OVX8000 chip ID (0x5650) or 0 */
+	uint16_t        front_chip_id;  /* Front OV20B40 chip ID (0x2042) or 0 */
+	uint8_t         wide_slave;     /* 7-bit I2C slave on CCI0 M1 */
+	uint8_t         front_slave;    /* 7-bit I2C slave on QUPv3 SE9 I2C */
 	uint8_t         active_sensor;  /* 1 = Rear Wide, 2 = Front */
 	uint8_t         smmu_slot;      /* apps_smmu SMR slot for SID 0x1c00 (0xff if unmapped) */
 	uint32_t        csid_hw_ver;    /* CSID-lite0 HW_VERSION (0x0ad6d000) */

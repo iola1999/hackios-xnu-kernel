@@ -128,7 +128,10 @@
 #define CCI_IRQ_MASK_0                  0xc04u
 #define CCI_IRQ_CLEAR_0                 0xc08u
 #define CCI_IRQ_STATUS_0                0xc0cu
-#define CCI_IRQ_GLOBAL_CLEAR_CMD        0xc10u
+#define CCI_IRQ_GLOBAL_CLEAR_CMD        0xc00u
+#define CCI_IRQ_M1_RD_DONE                (1u << 12)
+#define CCI_IRQ_M1_Q0_REPORT              (1u << 16)
+#define CCI_IRQ_M1_ERROR                  0x60ee6000u
 
 /* CSID-lite0 / VFE-lite0 register offsets within [0x0ad6d000, 0x0ad6f800) */
 #define CSID_HW_VERSION                 0x000u
@@ -161,7 +164,7 @@
 #define CSID_TPG_DT0_CFG2               0x618u
 #define CSID_TPG_COLOR_BARS_CFG         0x640u
 #define CSID_TPG_COMMON_GEN_CFG         0x648u
-#define VFE_LITE_SUB_HW_VERSION         0x0a00u
+#define VFE_LITE_SUB_HW_VERSION         0x1000u
 
 #define RAW10_DT                        0x2bu
 
@@ -438,7 +441,7 @@ cci0_m1_init(void)
 }
 
 static bool
-cci0_m1_read8(uint8_t slave7, uint16_t reg, uint8_t *out_val)
+cci0_m1_read16(uint8_t slave7, uint16_t reg, uint16_t *out_val)
 {
 	if (!cci_ready || cci0_base == 0) {
 		return false;
@@ -446,15 +449,23 @@ cci0_m1_read8(uint8_t slave7, uint16_t reg, uint8_t *out_val)
 	reg_wr(cci0_base, CCI_IRQ_CLEAR_0, 0xffffffffu);
 	reg_wr(cci0_base, CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
 
-	uint32_t stale = reg_rd(cci0_base, CCI_I2C_M1_READ_BUF_LEVEL) & 0xffu;
-	for (uint32_t i = 0; i < stale && i < 64; i++) {
+	uint32_t stale = reg_rd(cci0_base, CCI_I2C_M1_READ_BUF_LEVEL);
+	if (stale > 64u) {
+		cci_ready = false;
+		return false;
+	}
+	for (uint32_t i = 0; i < stale; i++) {
 		(void)reg_rd(cci0_base, CCI_I2C_M1_READ_DATA);
+	}
+	if (reg_rd(cci0_base, CCI_I2C_M1_READ_BUF_LEVEL) != 0) {
+		cci_ready = false;
+		return false;
 	}
 
 	uint32_t set_param = 0x01u | ((uint32_t)(slave7 & 0x7fu) << 4) | (1u << 16);
 	uint32_t wr_addr = 0x09u | (2u << 4) | (((uint32_t)(reg >> 8) & 0xffu) << 8) |
 	    (((uint32_t)reg & 0xffu) << 16);
-	uint32_t rd_cmd = 0x0au | (1u << 4);
+	uint32_t rd_cmd = 0x0au | (2u << 4);
 	uint32_t rep_cmd = 0x108u;
 
 	reg_wr(cci0_base, CCI_I2C_M1_Q0_EXEC_WORD_CNT, 4u);
@@ -465,17 +476,32 @@ cci0_m1_read8(uint8_t slave7, uint16_t reg, uint8_t *out_val)
 	reg_wr(cci0_base, CCI_I2C_M1_Q0_CTRL, 0u);
 	reg_wr(cci0_base, CCI_QUEUE_START, (1u << 2)); /* M1_Q0 start bit */
 
+	uint32_t irq = 0, level = 0, raw = 0;
+	bool ok = false;
 	for (uint32_t i = 0; i < 250; i++) {
-		if ((reg_rd(cci0_base, CCI_I2C_M1_READ_BUF_LEVEL) & 0xffu) > 0) {
-			*out_val = (uint8_t)(reg_rd(cci0_base, CCI_I2C_M1_READ_DATA) & 0xffu);
-			return true;
+		irq = reg_rd(cci0_base, CCI_IRQ_STATUS_0);
+		if (irq & CCI_IRQ_M1_ERROR) {
+			break;
 		}
-		if (reg_rd(cci0_base, CCI_I2C_M1_Q0_CUR_WORD_CNT) == 0 && i > 15) {
+		/* The final REPORT must complete before the next probe uses this queue. */
+		if ((irq & (CCI_IRQ_M1_RD_DONE | CCI_IRQ_M1_Q0_REPORT)) ==
+		    (CCI_IRQ_M1_RD_DONE | CCI_IRQ_M1_Q0_REPORT)) {
+			level = reg_rd(cci0_base, CCI_I2C_M1_READ_BUF_LEVEL);
+			if (level == 1u) {
+				raw = reg_rd(cci0_base, CCI_I2C_M1_READ_DATA);
+				/* The FIFO holds SID, high data byte, then low data byte. */
+				*out_val = (uint16_t)((raw & 0xff00u) | ((raw >> 16) & 0xffu));
+				ok = true;
+			}
 			break;
 		}
 		delay_for_interval(10, NSEC_PER_USEC);
 	}
-	return false;
+	if (!ok) {
+		/* Recovery requires a completed master reset before another transfer. */
+		cci_ready = false;
+	}
+	return ok;
 }
 
 static bool
@@ -586,14 +612,18 @@ od_i2c_tx_byte(uint32_t sda_pin, uint32_t scl_pin, uint8_t b)
 	return ack;
 }
 
-static uint8_t
-od_i2c_rx_byte(uint32_t sda_pin, uint32_t scl_pin, bool send_ack)
+static bool
+od_i2c_rx_byte(uint32_t sda_pin, uint32_t scl_pin, bool send_ack, uint8_t *out_val)
 {
 	uint8_t val = 0;
 	od_i2c_sda(sda_pin, true);
 	for (int bit = 7; bit >= 0; bit--) {
 		delay_for_interval(3, NSEC_PER_USEC);
-		(void)od_i2c_scl_high(scl_pin);
+		if (!od_i2c_scl_high(scl_pin)) {
+			od_i2c_scl_low(scl_pin);
+			od_i2c_sda(sda_pin, true);
+			return false;
+		}
 		if (tlmm_get_in(sda_pin)) {
 			val |= (uint8_t)(1u << bit);
 		}
@@ -601,14 +631,18 @@ od_i2c_rx_byte(uint32_t sda_pin, uint32_t scl_pin, bool send_ack)
 	}
 	od_i2c_sda(sda_pin, !send_ack);
 	delay_for_interval(3, NSEC_PER_USEC);
-	(void)od_i2c_scl_high(scl_pin);
+	bool ack_clock_ok = od_i2c_scl_high(scl_pin);
 	od_i2c_scl_low(scl_pin);
 	od_i2c_sda(sda_pin, true);
-	return val;
+	if (!ack_clock_ok) {
+		return false;
+	}
+	*out_val = val;
+	return true;
 }
 
 static bool
-od_i2c_read16_reg8(uint32_t sda_pin, uint32_t scl_pin, uint8_t slave7, uint16_t reg, uint8_t *out_val)
+od_i2c_read16_reg16(uint32_t sda_pin, uint32_t scl_pin, uint8_t slave7, uint16_t reg, uint16_t *out_val)
 {
 	if (!od_i2c_start(sda_pin, scl_pin)) {
 		return false;
@@ -621,9 +655,14 @@ od_i2c_read16_reg8(uint32_t sda_pin, uint32_t scl_pin, uint8_t slave7, uint16_t 
 		od_i2c_stop(sda_pin, scl_pin);
 		return false;
 	}
-	*out_val = od_i2c_rx_byte(sda_pin, scl_pin, false);
+	uint8_t hi = 0, lo = 0;
+	bool ok = od_i2c_rx_byte(sda_pin, scl_pin, true, &hi) &&
+	    od_i2c_rx_byte(sda_pin, scl_pin, false, &lo);
 	od_i2c_stop(sda_pin, scl_pin);
-	return true;
+	if (ok) {
+		*out_val = (uint16_t)(((uint16_t)hi << 8) | lo);
+	}
+	return ok;
 }
 
 static bool
@@ -672,88 +711,74 @@ cci0_apply_exposure(uint32_t exp_lines, uint32_t gain)
 	(void)wide_bus_write(wide_slave_addr, 0x35u, 0x09u, (uint8_t)(gain & 0xffu), 3);
 }
 
-static uint16_t
-read_sensor_id_od(uint32_t sda_pin, uint32_t scl_pin, uint8_t slv)
-{
-	static const uint16_t id_regs[] = { 0x300au, 0x0000u, 0x0016u };
-	uint8_t hi = 0, lo = 0;
+/* Native modules use 16-bit register/data widths and 0x20 write addresses. */
+#define SENSOR_SLAVE7                 0x10u
+#define WIDE_SENSOR_ID_REG            0x300au
+#define WIDE_SENSOR_ID_EXPECTED       0x5650u
+#define WIDE_SENSOR_ID_MASK           0x0000ffffu
+#define FRONT_SENSOR_ID_REG           0x300bu
+#define FRONT_SENSOR_ID_EXPECTED      0x2042u
+#define FRONT_SENSOR_ID_MASK          0xffffffffu
 
-	for (size_t r = 0; r < sizeof(id_regs) / sizeof(id_regs[0]); r++) {
-		uint16_t reg = id_regs[r];
-		if (od_i2c_read16_reg8(sda_pin, scl_pin, slv, reg, &hi) &&
-		    od_i2c_read16_reg8(sda_pin, scl_pin, slv, reg + 1u, &lo)) {
-			uint16_t id = ((uint16_t)hi << 8) | lo;
-			if (id != 0x0000u && id != 0xffffu) {
-				return id;
-			}
-		}
+static bool
+sensor_id_matches(uint16_t raw, uint16_t expected, uint32_t mask)
+{
+	/* Native cam_sensor_match_id applies the low 16 mask bits, then removes trailing zero bits. */
+	uint16_t id_mask = (uint16_t)mask;
+	if (id_mask == 0) {
+		id_mask = 0xffffu;
 	}
-	return 0;
+	raw &= id_mask;
+	while ((id_mask & 1u) == 0) {
+		raw >>= 1;
+		id_mask >>= 1;
+	}
+	return raw == expected;
 }
 
 static void
 probe_sensors_all(bool can_touch_cci0)
 {
-	static const uint8_t wide_candidates[] = { 0x10u, 0x36u, 0x34u, 0x20u, 0x1au };
-	static const uint8_t front_candidates[] = { 0x10u, 0x36u, 0x30u, 0x21u };
-	uint8_t hi = 0, lo = 0, sub = 0;
+	uint16_t id = 0;
 
 	wide_chip_id = 0;
 	front_chip_id = 0;
 	wide_bus_mode = 0;
 
-	if (can_touch_cci0 && cci0_m1_init()) {
-		for (size_t i = 0; i < sizeof(wide_candidates); i++) {
-			uint8_t slv = wide_candidates[i];
-			if (cci0_m1_read8(slv, 0x300au, &hi) && cci0_m1_read8(slv, 0x300bu, &lo)) {
-				uint16_t id = ((uint16_t)hi << 8) | lo;
-				(void)cci0_m1_read8(slv, 0x300cu, &sub);
-				if (id != 0x0000u && id != 0xffffu) {
-					wide_chip_id = id;
-					wide_slave_addr = slv;
-					wide_bus_mode = 1u;
-					say("CCI0 M1 rear wide sensor answered at 0x%02x: chip_id=0x%04x rev=0x%02x\n",
-					    slv, id, sub);
-					break;
-				}
-			}
-		}
+	bool cci_initialized = can_touch_cci0 && cci0_m1_init();
+	if (cci_initialized && cci0_m1_read16(SENSOR_SLAVE7, WIDE_SENSOR_ID_REG, &id) &&
+	    sensor_id_matches(id, WIDE_SENSOR_ID_EXPECTED, WIDE_SENSOR_ID_MASK)) {
+		wide_chip_id = id;
+		wide_slave_addr = SENSOR_SLAVE7;
+		wide_bus_mode = 1u;
+		say("CCI0 M1 rear wide sensor matched at 0x%02x: chip_id=0x%04x\n", SENSOR_SLAVE7, id);
 	}
 
-	/* Fallback probe for Rear Wide on GPIO115 (SDA1) / GPIO116 (SCL1) open-drain I2C */
-	if (wide_chip_id == 0 && tlmm_base != 0) {
+	/* A failed CCI transfer requires reset before the same bus can use GPIO. */
+	if (wide_chip_id == 0 && tlmm_base != 0 && (!cci_initialized || cci_ready)) {
 		od_i2c_sda(GPIO_CCI0_M1_SDA, true);
 		(void)od_i2c_scl_high(GPIO_CCI0_M1_SCL);
 		delay_for_interval(50, NSEC_PER_USEC);
-		for (size_t i = 0; i < sizeof(wide_candidates); i++) {
-			uint8_t slv = wide_candidates[i];
-			uint16_t id = read_sensor_id_od(GPIO_CCI0_M1_SDA, GPIO_CCI0_M1_SCL, slv);
-			if (id != 0) {
-				wide_chip_id = id;
-				wide_slave_addr = slv;
-				wide_bus_mode = 2u;
-				say("GPIO115/116 I2C rear wide sensor answered at 0x%02x: chip_id=0x%04x\n",
-				    slv, id);
-				break;
-			}
+		if (od_i2c_read16_reg16(GPIO_CCI0_M1_SDA, GPIO_CCI0_M1_SCL,
+		    SENSOR_SLAVE7, WIDE_SENSOR_ID_REG, &id) &&
+		    sensor_id_matches(id, WIDE_SENSOR_ID_EXPECTED, WIDE_SENSOR_ID_MASK)) {
+			wide_chip_id = id;
+			wide_slave_addr = SENSOR_SLAVE7;
+			wide_bus_mode = 2u;
+			say("GPIO115/116 I2C rear wide sensor matched at 0x%02x: chip_id=0x%04x\n", SENSOR_SLAVE7, id);
 		}
 	}
 
-	/* Probe Front OV20B on QUPv3_2 SE9 I2C (0x00884000, GPIO4 SDA / GPIO5 SCL) */
 	if (tlmm_base != 0) {
 		od_i2c_sda(GPIO_SE9_I2C_SDA, true);
 		(void)od_i2c_scl_high(GPIO_SE9_I2C_SCL);
 		delay_for_interval(50, NSEC_PER_USEC);
-		for (size_t i = 0; i < sizeof(front_candidates); i++) {
-			uint8_t slv = front_candidates[i];
-			uint16_t id = read_sensor_id_od(GPIO_SE9_I2C_SDA, GPIO_SE9_I2C_SCL, slv);
-			if (id != 0) {
-				front_chip_id = id;
-				front_slave_addr = slv;
-				say("QUPv3 SE9 I2C front sensor answered at 0x%02x: chip_id=0x%04x\n",
-				    slv, id);
-				break;
-			}
+		if (od_i2c_read16_reg16(GPIO_SE9_I2C_SDA, GPIO_SE9_I2C_SCL,
+		    SENSOR_SLAVE7, FRONT_SENSOR_ID_REG, &id) &&
+		    sensor_id_matches(id, FRONT_SENSOR_ID_EXPECTED, FRONT_SENSOR_ID_MASK)) {
+			front_chip_id = id;
+			front_slave_addr = SENSOR_SLAVE7;
+			say("QUPv3 SE9 I2C front sensor matched at 0x%02x: chip_id=0x%04x\n", SENSOR_SLAVE7, id);
 		}
 	}
 }

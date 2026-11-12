@@ -105,7 +105,10 @@ int main(int argc, char **argv)
 	unsigned want_dbg_drain = (unsigned)strtoul(argv[13], NULL, 0);
 
 	g_iris.uc_region.kva = (uintptr_t)calloc(1, 0x300000u);
+	g_iris.uc_region.size = 0x300000u;
 	g_iris.sfr_region.kva = (uintptr_t)calloc(1, 0x1000u);
+	g_iris.sfr_region.size = 0x1000u;
+	*(uint32_t *)g_iris.sfr_region.kva = 0x1000u;
 	g_iris.mmio = (uintptr_t)calloc(1, 0xf0000u);
 	g_iris.smmu = (uintptr_t)calloc(1, 0x100000u);
 	assert(g_iris.uc_region.kva && g_iris.sfr_region.kva && g_iris.mmio && g_iris.smmu);
@@ -118,7 +121,8 @@ int main(int argc, char **argv)
 	struct hfi_queue_header *cmd = fixture_queue(0), *msg = fixture_queue(1);
 	cmd->read_idx = cmd->write_idx = cmd_index;
 	msg->read_idx = msg->write_idx = reply_index;
-	fixture_queue(2)->write_idx = 1u;
+	fixture_queue(2)->write_idx = 4u;
+	*(uint32_t *)(g_iris.uc_region.kva + 0x1901c8u) = 16u;
 	memcpy((void *)(g_iris.sfr_region.kva + 4u), "fixture debug", 14u);
 	if (publish_after == 0) {
 		publish_reply();
@@ -147,7 +151,7 @@ int main(int argc, char **argv)
 	} else {
 		CHECK(doorbell == 0 && cmd->write_idx == initial_cmd_write);
 	}
-	if (want_dbg_drain) CHECK(fixture_queue(2)->read_idx == 1u);
+	if (want_dbg_drain) CHECK(fixture_queue(2)->read_idx == 4u);
 	printf("PASS ready=%u sleeps=%u tx_bytes=%zu\n", ready, sleeps, expected_size);
 	free((void *)g_iris.uc_region.kva);
 	free((void *)g_iris.sfr_region.kva);

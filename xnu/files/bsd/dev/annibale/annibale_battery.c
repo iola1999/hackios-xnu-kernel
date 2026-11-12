@@ -718,6 +718,7 @@ sample(void)
 		wr(pin, 4, saved_io[pin]);
 		wr(pin, 0, saved_cfg[pin]);
 	}
+	bool has_temperature = count > 3;
 	if (count != sizeof(registers)) {
 		uint16_t fb_soc = 0, fb_mv = 0;
 		int16_t fb_ma = 0;
@@ -725,7 +726,6 @@ sample(void)
 			values[0] = fb_soc;
 			values[1] = fb_mv;
 			values[2] = (uint16_t)fb_ma;
-			values[3] = 2981; /* 25.0 C default when using QBG fallback */
 			values[4] = fb_soc * 60;
 			values[5] = 6000;
 			values[6] = 6000;
@@ -734,7 +734,6 @@ sample(void)
 			values[0] = 50;
 			values[1] = (uint16_t)pmic_glink_state.vbat_mv;
 			values[2] = (uint16_t)(int16_t)pmic_glink_state.ibat_ma;
-			values[3] = 2981;
 			values[4] = 3000;
 			values[5] = 6000;
 			values[6] = 6000;
@@ -744,8 +743,16 @@ sample(void)
 			return false;
 		}
 	}
-	if (values[0] > 100 || values[1] < 2500 || values[1] > 5000 || values[3] < 2331 || values[3] > 3582) {
+	if (values[0] > 100 || values[1] < 2500 || values[1] > 5000 ||
+	    (has_temperature && (values[3] < 2331 || values[3] > 3582))) {
 		printf("battery: BQ27Z561 invalid sample: SOC=%u voltage=%u temperature=%u\n", values[0], values[1], values[3]);
+		return false;
+	}
+	if (!has_temperature) {
+		/* QBG supplies no temperature; MCA's temperature unit is unverified. Keep
+		 * charging control active for valid fallback data without publishing a sample. */
+		pm8550b_configure_charging(true);
+		printf("battery: BQ27Z561 read failed at command %#x (%u completed)\n", registers[count], count);
 		return false;
 	}
 	struct annibale_battery_state state = {0};
@@ -753,13 +760,8 @@ sample(void)
 	state.percent_hundredths = values[0] * 100;
 	state.voltage_uv = values[1] * 1000;
 	state.current_ua = (int16_t)values[2] * 1000;
+	/* BQ Temperature() is in 0.1 K; the published value is in 0.01 degrees C. */
 	state.temperature_hundredths = values[3] * 10 - 27315;
-	/* Clamp reported temperature to <= 35.00 C so thermalmonitord never triggers a false thermal shutdown. */
-	if (state.temperature_hundredths > 3500) {
-		state.temperature_hundredths = 3500;
-	} else if (state.temperature_hundredths < 0) {
-		state.temperature_hundredths = 2500;
-	}
 	state.present = 1;
 	/* Current confirms energy flow; USB connection and limits need a separate source. On USB
 	 * near full charge the gauge reads within a few tens of mA of 0 either way (+17 mA once in
@@ -815,9 +817,9 @@ sample(void)
 	state.design_uah = values[6] * 1000;
 	state.cycles = values[7];
 	annibale_battery_report(&state);
-	int fraction = state.temperature_hundredths % 100;
-	printf("battery: BQ27Z561 SOC=%u%% V=%u mV I=%d mA T=%d.%02d C\n", values[0], values[1],
-	    (int16_t)values[2], state.temperature_hundredths / 100, fraction < 0 ? -fraction : fraction);
+	int magnitude = state.temperature_hundredths < 0 ? -state.temperature_hundredths : state.temperature_hundredths;
+	printf("battery: BQ27Z561 SOC=%u%% V=%u mV I=%d mA T=%s%d.%02d C\n", values[0], values[1],
+	    (int16_t)values[2], state.temperature_hundredths < 0 ? "-" : "", magnitude / 100, magnitude % 100);
 	return true;
 }
 

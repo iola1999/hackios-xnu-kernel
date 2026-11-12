@@ -759,6 +759,7 @@ reach_feeder_thread(void *arg __unused, wait_result_t w __unused)
 	uint32_t vol_below = 18 * 8;
 	bool vol_muted = false;
 	bool graphs_built_on_hw = false;
+	bool report_drain = false;
 
 	say("feeder thread running, waiting for LPASS ADSP GPR channel...\n");
 	for (unsigned wait = 0; wait < 240 && !annibale_adsp_gpr_ready(); wait++) {
@@ -791,16 +792,23 @@ reach_feeder_thread(void *arg __unused, wait_result_t w __unused)
 			annibale_audio_amp_set_volume(vol_below, vol_muted);
 		}
 
-		uint32_t backlog = 0, inflight = 0;
+		uint32_t backlog = 0, inflight = 0, sent = 0, done = 0;
 		bool slot_busy = false;
 		lck_spin_lock(audio_spin_lock);
 		backlog = ring_head - ring_tail;
 		inflight = (uint32_t)__builtin_popcount(in_flight_mask);
 		slot_busy = (in_flight_mask & (1u << (next % SLOTS))) != 0;
+		sent = reach_sent_count;
+		done = reach_done_count;
 		lck_spin_unlock(audio_spin_lock);
 
 		bool active = (backlog > 0) || (inflight > 0) || (amp_powered && quiet_count < QUIET_PERIODS);
 		__atomic_store_n(&reach_stream_active, active, __ATOMIC_RELAXED);
+		if (!active && report_drain) {
+			say("PCM drained: sent %u done %u backlog %u inflight %u completion_error %u\n",
+			    sent, done, backlog, inflight, (unsigned)__atomic_load_n(&reach_write_failed, __ATOMIC_ACQUIRE));
+			report_drain = false;
+		}
 
 		bool want_amp_on = false;
 		while (inflight < IN_FLIGHT && !slot_busy) {
@@ -827,6 +835,7 @@ reach_feeder_thread(void *arg __unused, wait_result_t w __unused)
 				thread_terminate(current_thread());
 				return;
 			}
+			report_drain = true;
 			next++;
 
 			lck_spin_lock(audio_spin_lock);

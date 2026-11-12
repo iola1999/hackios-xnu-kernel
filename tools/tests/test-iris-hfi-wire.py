@@ -45,7 +45,8 @@ def expected_open(row):
     message(0, [(0x01000003, 3, 1, 0, u32(101))])
     message(101, [(0x03000100, 0, 9, 0, u32(1 if row['codec'] == 1 else 3)),
                   (0x03000168, 0, 1, 1, u32(0)),
-                  (0x03000103, 0, 10, 1, u32(640 << 16 | 480)),
+                  (0x03000103, 0, 1, 1, u32(640 << 16 | 480)),
+                  (0x0300010a, 0, 1, 0, u32(1)),
                   (0x03000193, 0, 1, 1, u32(8))])
     addresses = []
     cursor = 0x30000000
@@ -61,14 +62,17 @@ def expected_open(row):
         change += [0x03000120, 0x03000124, 0x03000128, 0x03000107, 0x03000108, 0x03000155]
     else:
         change += [0x03000124, 0x03000107, 0x03000108, 0x03000109, 0x03000155]
+    # Native msm_vdec_set_min_output_count (0x2a168) sends U32 4 on input port 1
+    # after PSC subscription and before ordinary properties and START.
     message(101, [(0x0100000b, 3, 11, 1, struct.pack('<' + 'I' * (len(change) + 1), 1, *change)),
+                  (0x03000124, 0, 1, 1, u32(4)),
                   (0x0100000b, 3, 11, 1, struct.pack('<II', 2, 0x0300016a))])
     message(101, [(0x01000005, 3, 0, 1, b'')])
     return result
 
 
 def expected_output(row):
-    hid, pid = 1009, 2013
+    hid, pid = 1009, 2015
     result = bytearray()
 
     def message(fields):
@@ -115,7 +119,7 @@ def expected_output(row):
     return result
 
 
-def psc(codec=1, variation='valid'):
+def psc(codec=1, variation='valid', native=False, malformed=None):
     fields = [(0x03000103, 10, [640 << 16 | 480]), (0x03000105, 13, [0, 0]),
               (0x0300010f, 1, [0x00080008])]
     if codec == 1:
@@ -128,11 +132,13 @@ def psc(codec=1, variation='valid'):
         fields += [(0x03000109, 9, [0])]
     fields += [(0x03000155, 1, [0])]
     changes = {'depth': (0x0300010f, [0x000a000a]), 'zero-count': (0x03000124, [0]),
-               'capacity': (0x03000124, [5]), 'min6': (0x03000124, [6]),
                'min7': (0x03000124, [7]), 'resolution': (0x03000103, [768 << 16 | 480]),
                'crop': (0x03000105, [1, 0]), 'interlace': (0x03000120, [0])}
     packets = []
+    # Observed AVC metadata; payload values remain the supported host fixture values.
+    reply_types = {0x03000105: 3, 0x0300010f: 10, 0x03000120: 10, 0x03000155: 10}
     for kind, info, values in fields:
+        if native: info = reply_types.get(kind, info)
         if variation == 'missing' and kind == 0x03000155:
             continue
         if variation in changes and kind == changes[variation][0]:
@@ -140,9 +146,55 @@ def psc(codec=1, variation='valid'):
         if variation == 'bad-payload' and kind == 0x03000103:
             info = 13
         payload = struct.pack('<' + 'I' * len(values), *values)
-        packets.append(packet(kind, 1, info, 1, 3000 + len(packets), payload))
-    packets.append(packet(0x0100000c, 1, 0, 1, 3099))
+        flags, port = (0 if native else 1), 1
+        if malformed and kind == malformed[0]:
+            mode = malformed[1]
+            if mode in ('short', 'short-buffer'): payload = payload[:-4]
+            elif mode == 'wrong-info':
+                info = 1 if kind == 0x03000105 else 3
+                if info == 3: payload += b'\0' * 4
+            elif mode == 'wrong-port': port = 2
+            elif mode == 'information': flags = 2
+        packets.append(packet(kind, flags, info, port, 3000 + len(packets), payload))
+    packets.append(packet(0x0100000c, 0 if native else 1, 0, 1, 3099))
+    if native:
+        # cd20 AVC replies put SETTINGS_CHANGE first and use flags=0.
+        order = [0x0100000c, 0x03000103, 0x03000105, 0x03000107, 0x03000108, 0x03000109,
+                 0x0300010f, 0x03000120, 0x03000124, 0x03000128, 0x03000155]
+        packets.sort(key=lambda p: order.index(struct.unpack_from('<I', p, 4)[0]))
+    if malformed and malformed[1] == 'short-buffer':
+        payload = struct.pack('<IIQIIIIQI5I', 1, 0, 0x26000000, 0, 0x400000,
+                              0, 0, 0, 0, 0, 0, 0, 0, 0)
+        packets.insert(0, packet(0x01000009, 0, 5, 1, 5000, payload))
     return header(101, 4000, packets)
+
+
+def count_fixtures(directory, expected):
+    cases = []
+    def add(name, minimum=6, codec=1):
+        blob = bytearray(psc(codec, native=True))
+        off = 32
+        while off < len(blob):
+            if struct.unpack_from('<I', blob, off + 4)[0] == 0x03000124:
+                struct.pack_into('<I', blob, off + 32, minimum)
+            if name == 'raw-cd21-actual':
+                actual = {0x03000103: 0x014000c0, 0x03000107: 2, 0x03000108: 3, 0x03000155: 0x21202}
+                kind = struct.unpack_from('<I', blob, off + 4)[0]
+                if kind in actual: struct.pack_into('<I', blob, off + 32, actual[kind])
+            off += struct.unpack_from('<I', blob, off)[0]
+        path = directory / (name + '.bin'); path.write_bytes(blob)
+        cases.append((name, path, expected))
+    for codec in (1, 2):
+        for n in [0, 1, 2, 3, 4, 5, 6, 7, 0xffffffff]:
+            add(f'raw-negotiated-{["h264", "hevc"][codec - 1]}-{n}', n, codec)
+    for name in ['range-exact', 'range-over', 'range-wrap', 'zero-frame', 'dpb-short', 'closing',
+                 'alloc-fail-first', 'alloc-fail-second', 'alloc-fail-first-retained', 'alloc-fail-second-retained',
+                 'return-last', 'drain-last', 'repeat', 'changing', 'stop-fail-input', 'stop-fail-raw', 'slot4']:
+        add('raw-' + name)
+    add('raw-unallocated', 1)
+    add('raw-capacity-isolated', 7)
+    add('raw-cd21-actual')
+    return cases
 
 
 def write_fixtures(directory):
@@ -160,15 +212,27 @@ def write_fixtures(directory):
         output.write_bytes(expected_open(rows[codec]) + expected_output(rows[codec]))
         cases.append((f"wire-psc-{'h264' if codec == 1 else 'hevc'}", path, output))
         cases.append((f"psc-valid{'-hevc' if codec == 2 else ''}", path, wire))
+        native_path = directory / f'psc-native-{codec}.bin'
+        native_path.write_bytes(psc(codec, native=True))
+        label = 'h264' if codec == 1 else 'hevc'
+        cases.append(('psc-valid-native-' + label, native_path, wire))
+        cases.append(('wire-psc-' + label + '-native', native_path, output))
     default = directory / 'psc-1.bin'
     expected = directory / 'open-1.bin'
+    for width, height, stage in [(64, 64, 1), (320, 192, 1), (640, 480, 1), (944, 960, 1), (960, 944, 1), (960, 960, 2), (944, 944, 1), (945, 945, 2), (1264, 720, 1), (1265, 720, 2), (720, 1264, 1), (720, 1265, 2), (1279, 64, 1), (1280, 64, 2), (64, 1279, 1), (64, 1280, 2), (1280, 720, 2), (720, 1280, 2), (1920, 1080, 2), (4096, 4096, 2)]:
+        cases.append((f'stage-{width}-{height}-{stage}', default, expected))
+    cases.append(('stage-wire', default, expected))
     names = ['close-success', 'tlb-failure', 'input-immutable', 'output-copy', 'decode-psc',
+             'input-order-raw-first', 'input-order-multiple-raw-first', 'input-order-missing',
+             'input-order-wrong-sid', 'input-order-wrong-index',
              'alloc-clean', 'alloc-retained', 'open-caller-retained', 'close-caller-retained',
              'device-caller-retained', 'alloc-retained-later', 'stale-wire', 'cross-session',
              'wait-cross-session', 'truncated-later', 'later-session-buffer', 'later-system-buffer',
              'later-property-buffer', 'close-retry-stop', 'close-queue-failure',
              'payload-none', 'range-reject', 'drain-ack-only', 'drain-last-input-held',
-             'drain-wrong-id-last', 'drain-complete', 'buffer-input-valid', 'buffer-raw-valid']
+             'drain-wrong-id-last', 'drain-complete', 'drain-empty-first-input',
+             'drain-empty-error', 'drain-empty-closing', 'drain-flush-submitted',
+             'buffer-input-valid', 'buffer-raw-valid']
     for port in ('bs', 'raw'):
         names += [f'stop-{port}-{mode}' for mode in range(1, 8)]
     names += [f'close-error-{mode}' for mode in range(1, 8)]
@@ -176,11 +240,17 @@ def write_fixtures(directory):
         names += [f'buffer-{kind}-{field}' for field in ('wrong-sid', 'index', 'base', 'port', 'size', 'overflow')]
     names += ['buffer-raw-short', 'buffer-raw-readonly', 'buffer-raw-psc-last']
     cases.extend((name, default, expected) for name in names)
-    for variation in ('missing', 'depth', 'zero-count', 'capacity', 'min6', 'min7',
+    for variation in ('missing', 'depth', 'zero-count', 'min7',
                       'resolution', 'crop', 'interlace', 'bad-payload'):
         path = directory / f'psc-{variation}.bin'
         path.write_bytes(psc(variation=variation))
         cases.append(('psc-' + variation, path, expected))
+    for kind in (0x03000105, 0x0300010f, 0x03000120, 0x03000155):
+        for mode in ('short', 'wrong-info', 'wrong-port', 'information', 'short-buffer'):
+            name = f'psc-metadata-{kind:x}-{mode}'
+            path = directory / (name + '.bin')
+            path.write_bytes(psc(native=True, malformed=(kind, mode)))
+            cases.append((name, path, expected))
     for row in sizes['cases']:
         name = f"sizes-{'h264' if row['codec'] == 1 else 'hevc'}-{row['width']}x{row['height']}"
         path = directory / (name + '.bin')
@@ -188,6 +258,7 @@ def write_fixtures(directory):
                   *row['internal'], row['dpb_frame'], row['raw']]
         path.write_bytes(struct.pack('<12I', *values))
         cases.append((name, default, path))
+    cases.extend(count_fixtures(directory, expected))
     return cases
 
 
@@ -238,12 +309,82 @@ def scoped(text, start, end, old, new):
     return text[:a] + section.replace(old, new, 1) + text[b:]
 
 
+
+def raw_mutations():
+    variants = {}
+    def add(name, old, new, selected, scope=None):
+        start, end = scope if scope else ('', None)
+        variants['raw_' + name] = (HFI, start, end, old, new, selected)
+    start_output = ('static int\niris_start_output', 'struct iris_reply_wait')
+    add('fixed-four', 'count > IRIS_RAW_POOL_MAX', 'count > IRIS_RAW_POOL_COUNT', ['raw-negotiated-h264-6'])
+    add('range-check', '(uint64_t)s->raw_frame_size * count > IRIS_IOVA_RAW_SESSION_STRIDE ||', '', ['raw-range-over'])
+    add('range-overflow', '(uint64_t)s->raw_frame_size * count', 's->raw_frame_size * count', ['raw-range-wrap'])
+    add('zero-frame', 's->raw_frame_size == 0 ||', '', ['raw-zero-frame'])
+    add('dpb-byte-bound', 'count > s->intern_dpb.size / s->dpb_frame_size ||', 'false ||', ['raw-dpb-short'])
+    add('slot-address', '(s->session_id - 1u) *', '0u *', ['raw-slot4'], start_output)
+    add('buffer-address', '+ i * s->raw_frame_size;', ';', ['raw-negotiated-h264-6'], start_output)
+    add('publish-count', 'i < s->raw_count;', 'i < IRIS_RAW_POOL_COUNT;', ['raw-negotiated-h264-6'], start_output)
+    add('return-bound', 'hb->index >= s->raw_count ||', 'hb->index >= IRIS_RAW_POOL_MAX ||', ['raw-unallocated'])
+    add('take-count', 'i < s->raw_count;', 'i < IRIS_RAW_POOL_COUNT;', ['raw-return-last'],
+        ('static int\niris_take_output', 'static int\niris_begin_drain'))
+    add('drain-count', 'i < s->raw_count;', 'i < IRIS_RAW_POOL_COUNT;', ['raw-drain-last'],
+        ('static int\niris_finish_drain', 'static int\niris_collect_output'))
+    add('free-count', 'i < IRIS_RAW_POOL_MAX;', 'i < IRIS_RAW_POOL_COUNT;', ['raw-alloc-fail-second-retained'],
+        ('static bool\niris_free_session_buffers', 'static uint32_t\niris_qc08c_size'))
+    allocation = 'if (!iris_dma_alloc_map(&s->raw[i], address, s->raw_frame_size, true)) return ENOMEM;'
+    add('early-free', allocation, allocation.replace('return ENOMEM;', '{ iris_free_session_buffers(s); return ENOMEM; }'),
+        ['raw-alloc-fail-second-retained'])
+    add('allocation-failure', allocation, '(void)iris_dma_alloc_map(&s->raw[i], address, s->raw_frame_size, true);',
+        ['raw-alloc-fail-first'])
+    add('repeat-psc', 's->closing || (s->started_ports & (1u << HFI_PORT_RAW)) != 0', 's->closing', ['raw-repeat'])
+    return variants
+
+
 def mutations():
-    return {
+    initial_min = (
+        '\t/* Native AVC/HEVC input subscription publishes the initial output minimum. */\n'
+        '\tif (port == HFI_PORT_BITSTREAM &&\n'
+        '\t    !pkt_add_u32(b, HFI_PROP_BUFFER_FW_MIN_OUTPUT_COUNT, HFI_HOST_FLAGS_NONE,\n'
+        '\t    HFI_PAYLOAD_U32, port, 4u)) return false;\n')
+    psc_subscription = (
+        '\tif (!pkt_add(b, HFI_CMD_SUBSCRIBE_MODE, flags, HFI_PAYLOAD_U32_ARRAY,\n'
+        '\t    port, payload, (count + 1u) * sizeof(uint32_t))) return false;\n')
+    variants = {
+        'psc_crop_u64': (HFI, 'static int\niris_read_property', 'static int\niris_start_output',
+                         'pkt->payload_info == HFI_PAYLOAD_U64 ||', '', ['psc-valid-native-h264']),
+        'psc_depth_packed': (HFI, 'static int\niris_read_property', 'static int\niris_start_output',
+                             'index == PSC_DEPTH ||', '', ['psc-valid-native-h264']),
+        'psc_coded_packed': (HFI, 'static int\niris_read_property', 'static int\niris_start_output',
+                             'index == PSC_CODED ||', '', ['psc-valid-native-h264']),
+        'psc_color_packed': (HFI, 'static int\niris_read_property', 'static int\niris_start_output',
+                             ' || index == PSC_COLOR', '', ['psc-valid-native-h264']),
+        'initial_min_missing': (HFI, 'static bool\niris_subscribe_port', 'static bool\niris_send_command',
+                                initial_min, '', ['wire-h264', 'wire-hevc']),
+        'initial_min_property': (HFI, 'static bool\niris_subscribe_port', 'static bool\niris_send_command',
+                                 initial_min, initial_min.replace('HFI_PROP_BUFFER_FW_MIN_OUTPUT_COUNT',
+                                                                  'HFI_PROP_COMV_BUFFER_COUNT'),
+                                 ['wire-h264', 'wire-hevc']),
+        'initial_min_port': (HFI, 'static bool\niris_subscribe_port', 'static bool\niris_send_command',
+                             initial_min, initial_min.replace('HFI_PAYLOAD_U32, port,',
+                                                              'HFI_PAYLOAD_U32, HFI_PORT_RAW,'),
+                             ['wire-h264', 'wire-hevc']),
+        'initial_min_payload': (HFI, 'static bool\niris_subscribe_port', 'static bool\niris_send_command',
+                                initial_min, initial_min.replace('HFI_PAYLOAD_U32,', 'HFI_PAYLOAD_U32_ENUM,'),
+                                ['wire-h264', 'wire-hevc']),
+        'initial_min_count': (HFI, 'static bool\niris_subscribe_port', 'static bool\niris_send_command',
+                              initial_min, initial_min.replace('port, 4u', 'port, 8u'),
+                              ['wire-h264', 'wire-hevc']),
+        'initial_min_order': (HFI, 'static bool\niris_subscribe_port', 'static bool\niris_send_command',
+                              psc_subscription + initial_min, initial_min + psc_subscription,
+                              ['wire-h264', 'wire-hevc']),
         'open_core_address': (HFI, 'int\niris_hfi_session_open', 'static int\niris_copy_decoded',
                               'pkt_begin(&b, 0u);', 'pkt_begin(&b, s->wire_session_id);', ['wire-h264']),
         'hevc_codec': (PRIVATE, '#define HFI_CODEC_DECODE_HEVC', '#define HFI_COLOR_FMT_NV12',
                        '3u', '2u', ['wire-hevc']),
+        'decoder_resolution_payload': (HFI, 'int\niris_hfi_session_open', 'static int\niris_copy_decoded',
+                                       'HFI_PROP_BITSTREAM_RESOLUTION, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32,',
+                                       'HFI_PROP_BITSTREAM_RESOLUTION, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_32_PACKED,',
+                                       ['wire-h264', 'wire-hevc']),
         'nonsecure_buffer': (HFI, 'static bool\niris_queue_buffer_ts', 'static bool\niris_queue_buffer(',
                             'buf_flags | HFI_BUF_HOST_FLAGS_CB_NON_SECURE', 'buf_flags', ['wire-h264']),
         'old_bin_size': (HFI, 'static void\niris_internal_sizes', 'static int\niris_alloc_session_buffers',
@@ -258,6 +399,9 @@ def mutations():
                          '(hb->flags & HFI_BUF_FW_FLAG_READONLY) != 0', 'false', ['buffer-raw-readonly']),
         'input_immutable': (HFI, 'int\niris_hfi_decode_frame', 'int\niris_hfi_session_flush',
                             's->input_queued || s->draining', 's->draining', ['input-immutable']),
+        'input_return_before_output': (HFI, 'static int\niris_collect_output', 'int\niris_hfi_decode_frame',
+                                       'draining || poll || !s->input_queued', 'true',
+                                       ['input-order-raw-first', 'input-order-wrong-index']),
         'reply_packet_id': (HFI, 'static int\niris_dispatch_message', 'static int\niris_receive',
                            'pkt->packet_id == wait->packet_id && ', '', ['stop-bs-4']),
         'reply_port': (HFI, 'static int\niris_dispatch_message', 'static int\niris_receive',
@@ -294,7 +438,7 @@ def mutations():
         'psc_resolution': (HFI, 'static int\niris_start_output', 'struct iris_reply_wait',
                            's->psc_values[PSC_RES] != ((s->width << 16) | s->height) ||', '', ['psc-resolution']),
         'psc_capacity': (HFI, 'static int\niris_start_output', 'struct iris_reply_wait',
-                         'count > IRIS_RAW_POOL_COUNT ||', '', ['psc-capacity']),
+                         'count > IRIS_RAW_POOL_MAX ||', '', ['raw-capacity-isolated']),
         'psc_depth': (HFI, 'static int\niris_start_output', 'struct iris_reply_wait',
                       's->psc_values[PSC_DEPTH] != 0x00080008u ||', '', ['psc-depth']),
         'raw_nv12': (PRIVATE, '#define HFI_COLOR_FMT_NV12', '#define HFI_PORT_NONE',
@@ -328,6 +472,29 @@ def mutations():
                                   'if (result == 0) memset(s, 0, sizeof(*s));',
                                   'if (true) memset(s, 0, sizeof(*s));', ['device-caller-retained']),
     }
+
+    variants.update({
+        'stage_constant1': (HFI, 'static uint32_t\niris_decode_stage', 'static int\niris_copy_decoded', 'return s->width < 1280u && s->height < 1280u && macroblocks < 3600u ? 1u : 2u;', 'return macroblocks ? 1u : 1u;', ['stage-960-960-2']),
+        'stage_constant2': (HFI, 'static uint32_t\niris_decode_stage', 'static int\niris_copy_decoded', 'return s->width < 1280u && s->height < 1280u && macroblocks < 3600u ? 1u : 2u;', 'return macroblocks ? 2u : 2u;', ['stage-320-192-1']),
+        'stage_width_round': (HFI, 'static uint32_t\niris_decode_stage', 'static int\niris_copy_decoded', 's->width + 15u', 's->width', ['stage-1265-720-2']),
+        'stage_height_round': (HFI, 'static uint32_t\niris_decode_stage', 'static int\niris_copy_decoded', 's->height + 15u', 's->height', ['stage-720-1265-2']),
+        'stage_width_bound': (HFI, 'static uint32_t\niris_decode_stage', 'static int\niris_copy_decoded', 's->width < 1280u', 's->width <= 1280u', ['stage-1280-64-2']),
+        'stage_height_bound': (HFI, 'static uint32_t\niris_decode_stage', 'static int\niris_copy_decoded', 's->height < 1280u', 's->height <= 1280u', ['stage-64-1280-2']),
+        'stage_macroblock_bound': (HFI, 'static uint32_t\niris_decode_stage', 'static int\niris_copy_decoded', 'macroblocks < 3600u', 'macroblocks <= 3600u', ['stage-960-960-2']),
+        'stage_payload': (HFI, 'static uint32_t\niris_decode_stage', 'static int\niris_copy_decoded', 'HFI_PROP_STAGE, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32,', 'HFI_PROP_STAGE, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32_ENUM,', ['wire-h264', 'stage-wire']),
+        'stage_port': (HFI, 'static uint32_t\niris_decode_stage', 'static int\niris_copy_decoded', 'HFI_PORT_NONE, iris_decode_stage(s)', 'HFI_PORT_BITSTREAM, iris_decode_stage(s)', ['wire-h264', 'stage-wire']),
+        'stage_value': (HFI, 'static uint32_t\niris_decode_stage', 'static int\niris_copy_decoded', 'HFI_PORT_NONE, iris_decode_stage(s)', 'HFI_PORT_NONE, 1u', ['stage-wire']),
+        'stage_missing': (HFI, 'static uint32_t\niris_decode_stage', 'static int\niris_copy_decoded', '\t    !pkt_add_u32(&b, HFI_PROP_STAGE, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32,\n\t    HFI_PORT_NONE, iris_decode_stage(s)) ||\n', '', ['wire-h264', 'stage-wire']),
+    })
+    variants['empty_flush_drain'] = (
+        HFI, 'int\niris_hfi_session_flush', 'int\niris_hfi_session_close',
+        'if (s->next_input_idx == 0) return 0;', '', ['drain-empty-first-input'])
+    variants['submitted_flush_skipped'] = (
+        HFI, 'int\niris_hfi_session_flush', 'int\niris_hfi_session_close',
+        'if (s->next_input_idx == 0) return 0;', 'if (s->next_input_idx != 0) return 0;',
+        ['drain-flush-submitted'])
+    variants.update(raw_mutations())
+    return variants
 
 
 def verify(args, directory):

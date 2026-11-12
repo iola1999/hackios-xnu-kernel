@@ -31,6 +31,7 @@ static struct {
 	struct rwa_compute *(*compute_create)(struct rwa_device *, const void *, size_t,
 					      const char *, struct rwa_compute_info *, char *,
 					      size_t);
+	__typeof__(&rwa_compute_create_stitched) compute_create_stitched;
 	void (*compute_destroy)(struct rwa_compute *);
 	__typeof__(&rwa_compute_get_reflection) compute_get_reflection;
 	struct rwa_texture *(*texture_create)(struct rwa_device *,
@@ -133,6 +134,7 @@ mesa_available(void)
 	*(void **)&mesa.buffer_size = dlsym(mesa.handle, "rwa_buffer_size");
 	*(void **)&mesa.buffer_destroy = dlsym(mesa.handle, "rwa_buffer_destroy");
 	*(void **)&mesa.compute_create = dlsym(mesa.handle, "rwa_compute_create");
+	*(void **)&mesa.compute_create_stitched = dlsym(mesa.handle, "rwa_compute_create_stitched");
 	*(void **)&mesa.compute_destroy = dlsym(mesa.handle, "rwa_compute_destroy");
 	*(void **)&mesa.compute_get_reflection = dlsym(mesa.handle, "rwa_compute_get_reflection");
 	*(void **)&mesa.texture_create = dlsym(mesa.handle, "rwa_texture_create");

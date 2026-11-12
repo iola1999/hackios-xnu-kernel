@@ -103,6 +103,13 @@ static MTLSizeAndAlign rw_heap_buffer_size(NSUInteger length)
 - (instancetype)initWithAnnibaleDevice:(AnnibaleMetalDevice *)device descriptor:(MTLHeapDescriptor *)descriptor
 {
 	if ((self = [super init]) == nil) return nil;
+	SEL protection = sel_getUid("protectionOptions");
+	if ([descriptor respondsToSelector:protection] &&
+	    ((NSUInteger (*)(id, SEL))objc_msgSend)(descriptor, protection) != 0) {
+		rw_print("heap: protected allocations are unavailable\n");
+		[self release];
+		return nil;
+	}
 	_owner = [device retain];
 	_size = [descriptor size];
 	_storageMode = [descriptor storageMode];
@@ -143,6 +150,8 @@ static MTLSizeAndAlign rw_heap_buffer_size(NSUInteger length)
 - (NSUInteger)cpuCacheMode           { return _cpuCacheMode; }
 - (NSUInteger)hazardTrackingMode     { return _hazardTrackingMode; }
 - (NSUInteger)type                   { return _type; }
+/* Resources use ordinary allocations; construction rejects protected descriptors. */
+- (NSUInteger)protectionOptions      { return 0; }
 - (NSUInteger)resourceOptions
 {
 	return (_cpuCacheMode << MTLResourceCPUCacheModeShift) |
