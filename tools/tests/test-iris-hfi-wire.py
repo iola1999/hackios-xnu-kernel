@@ -235,6 +235,7 @@ def write_fixtures(directory):
              'drain-wrong-id-last', 'drain-complete', 'drain-empty-first-input',
              'drain-empty-error', 'drain-empty-closing', 'drain-flush-submitted',
              'buffer-input-valid', 'buffer-raw-valid']
+    names += ['last-' + mode for mode in ('short', 'full', 'short-readonly', 'full-readonly')]
     for port in ('bs', 'raw'):
         names += [f'stop-{port}-{mode}' for mode in range(1, 8)]
     names += [f'close-error-{mode}' for mode in range(1, 8)]
@@ -392,8 +393,8 @@ def mutations():
                                 'data_corrupt ? IRIS_RAW_RETURNED_CORRUPT : IRIS_RAW_RETURNED',
                                 'IRIS_RAW_RETURNED', ['corrupt-empty']),
         'corrupt_short_frame': (BUFFERS, 'static int\niris_return_buffer', None,
-                               '!data_corrupt && hb->data_size != 0',
-                               'hb->data_size != 0', ['corrupt-short']),
+                               '!data_corrupt && returned.data_size != 0',
+                               'returned.data_size != 0', ['corrupt-short']),
         'corrupt_dma_base': (BUFFERS, 'static int\niris_return_buffer', None,
                             'hb->base_address != s->raw[hb->index].iova',
                             '(!data_corrupt && hb->base_address != s->raw[hb->index].iova)', ['corrupt-reject-base']),
@@ -449,7 +450,11 @@ def mutations():
         'buffer_input_size': (BUFFERS, 'static int\niris_return_buffer', None,
                               'hb->buffer_size != s->bitstream.size', 'false', ['buffer-input-size']),
         'raw_readonly': (BUFFERS, 'static int\niris_return_buffer', None,
-                         '(hb->flags & HFI_BUF_FW_FLAG_READONLY) != 0', 'false', ['buffer-raw-readonly']),
+                         '(returned.flags & HFI_BUF_FW_FLAG_READONLY) != 0', 'false', ['buffer-raw-readonly']),
+        'last_length': (BUFFERS, 'static int\niris_return_buffer', None,
+                        'returned.data_size = 0;', '', ['last-short']),
+        'last_readonly': (BUFFERS, 'static int\niris_return_buffer', None,
+                          'returned.flags &= ~HFI_BUF_FW_FLAG_READONLY;', '', ['last-full-readonly']),
         'input_immutable': (HFI, 'int\niris_hfi_decode_frame', 'int\niris_hfi_session_flush',
                             's->input_queued || s->draining', 's->draining', ['input-immutable']),
         'input_return_before_output': (HFI, 'static int\niris_collect_output', 'int\niris_hfi_decode_frame',

@@ -19,16 +19,22 @@ iris_return_buffer(struct iris_session *s, const struct hfi_packet *pkt, bool da
 	if (hb->type == HFI_BUFFER_RAW) {
 		if (pkt->port != HFI_PORT_RAW || hb->index >= s->raw_count ||
 		    s->raw_state[hb->index] != IRIS_RAW_QUEUED || hb->data_offset != 0 ||
-		    hb->base_address != s->raw[hb->index].iova || hb->buffer_size != s->raw[hb->index].size ||
-		    (hb->flags & HFI_BUF_FW_FLAG_READONLY) != 0) return EIO;
+		    hb->base_address != s->raw[hb->index].iova || hb->buffer_size != s->raw[hb->index].size) return EIO;
+		struct hfi_buffer returned = *hb;
+		/* Native LAST/PSC_LAST handling precedes the internal-DPB READONLY check. */
+		if ((returned.flags & (HFI_BUF_FW_FLAG_LAST | HFI_BUF_FW_FLAG_PSC_LAST)) != 0) {
+			returned.data_size = 0;
+			returned.flags &= ~HFI_BUF_FW_FLAG_READONLY;
+		}
+		if ((returned.flags & HFI_BUF_FW_FLAG_READONLY) != 0) return EIO;
 		uint32_t needed = s->y_stride * s->y_scanlines +
 		    s->uv_stride * (s->height / 2u - 1u) + s->width;
 		/* Damaged frames can be empty or short; their bytes are never copied to userland. */
-		if (!data_corrupt && hb->data_size != 0 && hb->data_size < needed) return EIO;
-		if ((hb->flags & HFI_BUF_FW_FLAG_PSC_LAST) != 0) return EOPNOTSUPP;
-		s->raw_done[hb->index] = *hb;
+		if (!data_corrupt && returned.data_size != 0 && returned.data_size < needed) return EIO;
+		if ((returned.flags & HFI_BUF_FW_FLAG_PSC_LAST) != 0) return EOPNOTSUPP;
+		s->raw_done[hb->index] = returned;
 		s->raw_state[hb->index] = data_corrupt ? IRIS_RAW_RETURNED_CORRUPT : IRIS_RAW_RETURNED;
-		if ((hb->flags & HFI_BUF_FW_FLAG_LAST) != 0 && s->draining) s->drain_last = true;
+		if ((returned.flags & HFI_BUF_FW_FLAG_LAST) != 0 && s->draining) s->drain_last = true;
 		return 0;
 	}
 	const struct iris_dma_buf *buf = NULL;

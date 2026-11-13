@@ -358,6 +358,38 @@ static void drain_check(struct iris_session *s, const char *name)
 	}
 	assert(free_calls == 0);
 }
+static void last_buffer_check(struct iris_session *s, const char *name)
+{
+	open_output(s);
+	const struct iris_dma_buf dpb = s->intern_dpb;
+	s->next_input_idx = 1; s->input_queued = true;
+	unsigned resume_bs = count_type(HFI_CMD_RESUME, HFI_PORT_BITSTREAM);
+	unsigned resume_raw = count_type(HFI_CMD_RESUME, HFI_PORT_RAW);
+	assert(iris_begin_drain(s) == 0);
+	uint32_t flags = HFI_BUF_FW_FLAG_LAST;
+	if (strstr(name, "readonly")) flags |= HFI_BUF_FW_FLAG_READONLY;
+	uint32_t bytes = strstr(name, "short") ? 1 : s->raw[0].size;
+	emit_buffer(s->wire_session_id, HFI_PORT_RAW, HFI_BUFFER_RAW, 0,
+	    s->raw[0].iova, s->raw[0].size, bytes, 0x2345, flags);
+	assert(iris_receive(s, NULL) == 1 && s->drain_last);
+	assert(s->raw_done[0].data_size == 0 && !(s->raw_done[0].flags & HFI_BUF_FW_FLAG_READONLY));
+	struct iris_decode_frame req = { .flags = 0x80, .out_tag = 0x8888 };
+	assert(iris_take_output(s, &req) == 0 && copyout_calls == 0);
+	assert(req.flags == 0x80 && req.out_tag == 0x8888 && s->raw_state[0] == IRIS_RAW_HOST);
+	assert(iris_finish_drain(s) == EBUSY && free_calls == 0);
+	reply(s->wire_session_id, HFI_CMD_DRAIN, s->drain_packet_id, HFI_PORT_BITSTREAM, 0);
+	assert(iris_receive(s, NULL) == 1 && s->drain_ack && s->input_queued);
+	assert(iris_finish_drain(s) == EBUSY && free_calls == 0);
+	emit_buffer(s->wire_session_id, HFI_PORT_BITSTREAM, HFI_BUFFER_BITSTREAM, 0,
+	    s->bitstream.iova, s->bitstream.size, 0, 0, 0);
+	assert(iris_receive(s, NULL) == 1 && !s->input_queued);
+	assert(iris_finish_drain(s) == 0 && !s->draining);
+	assert(count_type(HFI_CMD_RESUME, HFI_PORT_BITSTREAM) == resume_bs + 1);
+	assert(count_type(HFI_CMD_RESUME, HFI_PORT_RAW) == resume_raw + 1);
+	assert(s->raw_state[0] == IRIS_RAW_QUEUED && free_calls == 0);
+	assert(memcmp(&s->intern_dpb, &dpb, sizeof(dpb)) == 0);
+	assert(iris_hfi_session_close(s) == 0 && free_calls == 11);
+}
 static void output_copy_check(struct iris_session *s)
 {
 	open_output(s);
@@ -692,6 +724,7 @@ int main(int argc, char **argv)
 	}
 	else if (strstr(name, "caller") || strncmp(name, "alloc-", 6) == 0) caller_check(s, name);
 	else if (strncmp(name, "drain-", 6) == 0) drain_check(s, name);
+	else if (strncmp(name, "last-", 5) == 0) last_buffer_check(s, name);
 	else if (strcmp(name, "output-copy") == 0) output_copy_check(s);
 	else if (strncmp(name, "later-", 6) == 0) later_error_check(s, name);
 	else if (strncmp(name, "corrupt-", 8) == 0) corrupt_check(s, name);
