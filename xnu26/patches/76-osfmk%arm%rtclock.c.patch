@@ -1,15 +1,39 @@
 diff --git a/osfmk/arm/rtclock.c b/osfmk/arm/rtclock.c
+index 58ad17ee8784..898cc716fe4c 100644
 --- a/osfmk/arm/rtclock.c
 +++ b/osfmk/arm/rtclock.c
-@@ -468,7 +468,11 @@ absolutetime_to_microtime(uint64_t       abstime,
+@@ -58,6 +58,7 @@
+ #error Unsupported arch
+ #endif
+ #include <arm/rtclock.h>
++#include <arm/annibale_mach_timebase.h>
+ 
+ #include <IOKit/IOPlatformExpert.h>
+ #include <libkern/OSAtomic.h>
+@@ -400,7 +401,7 @@ setPop(uint64_t time)
+ 	delay_time = deadline_to_decrementer(time, current_time);
+ 	cdp->rtcPop = delay_time + current_time;
+ 
+-	ml_set_decrementer((uint32_t) delay_time);
++	ml_set_decrementer(annibale_mach_interval_to_hw((uint32_t) delay_time));
+ 
+ 	return delay_time;
+ }
+@@ -428,7 +429,7 @@ SetIdlePop(void)
+ 
+ 	delay_time = deadline_to_decrementer(time, current_time);
+ 	cdp->cpu_idle_pop = delay_time + current_time;
+-	ml_set_decrementer((uint32_t) delay_time);
++	ml_set_decrementer(annibale_mach_interval_to_hw((uint32_t) delay_time));
+ 
+ 	return TRUE;
+ }
+@@ -468,7 +469,8 @@ absolutetime_to_microtime(uint64_t       abstime,
  	*secs = t64 = abstime / rtclock_sec_divisor;
  	abstime -= (t64 * rtclock_sec_divisor);
  
 -	*microsecs = (uint32_t)(abstime / rtclock_usec_divisor);
-+	/*
-+	 * annibale: QTimer runs at 19,200,000 Hz, so integer rtclock_usec_divisor (19) overflows
-+	 * microsecs past 999,999 in the final 10.42 ms of each second. Scale by USEC_PER_SEC first.
-+	 */
++	/* Scale the remainder before division to keep microseconds below USEC_PER_SEC. */
 +	*microsecs = (uint32_t)((abstime * USEC_PER_SEC) / rtclock_sec_divisor);
  }
  

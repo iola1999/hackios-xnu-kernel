@@ -1,0 +1,24 @@
+diff --git a/pexpert/arm/pe_identify_machine.c b/pexpert/arm/pe_identify_machine.c
+index 937ce42df60f..9b7abbd44cdb 100644
+--- a/pexpert/arm/pe_identify_machine.c
++++ b/pexpert/arm/pe_identify_machine.c
+@@ -3,6 +3,7 @@
+  * Copyright (c) 2000-2006 Apple Computer, Inc. All rights reserved.
+  */
+ #include <pexpert/pexpert.h>
++#include <arm/annibale_mach_timebase.h>
+ #include <pexpert/boot.h>
+ #include <pexpert/protos.h>
+ #include <pexpert/device_tree.h>
+@@ -80,6 +81,11 @@ pe_identify_machine(boot_args * bootArgs)
+ 			}
+ 		}
+ 		gPEClockFrequencyInfo.dec_clock_rate_hz = gPEClockFrequencyInfo.timebase_frequency_hz;
++#if defined(ANNIBALE_ARM64E_USERLAND)
++		if (gPEClockFrequencyInfo.dec_clock_rate_hz == ANNIBALE_HW_TIMEBASE_HZ) {
++			gPEClockFrequencyInfo.timebase_frequency_hz = ANNIBALE_MACH_TIMEBASE_HZ;
++		}
++#endif
+ 
+ 		/* Find the bus frequency next. */
+ 		if (SecureDTGetProperty(cpu, "bus-frequency", &value, &size) == kSuccess) {

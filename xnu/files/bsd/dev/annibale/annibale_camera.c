@@ -10,8 +10,8 @@
  *   - CCI0 master 1 (0x0ac7b000) / GPIO115-116 I2C (Rear Wide OV50E, VAF actuator DAC 0x0c)
  *   - QUPv3_2 SE9 I2C: 0x00884000 / GPIO4-5 (Front OV20B at 0x10, reset GPIO7, MCLK4 GPIO93)
  *   - CSID-lite0 / VFE-lite0 (0x0ad6d000) + 8 MB kernel frame buffer
- *   - Exports /dev/annibale-camera conforming to struct annibale_camera_frame (RAW10 1920x1080@30fps),
- *     CAMIOC_G_INFO, struct annibale_camera_command, and ASCII control writes.
+ *   - /dev/annibale-camera installs a checked front profile and captures RAW10 through CSID/VFE.
+ *     cam_hw=0 selects the existing software diagnostic frames.
  */
 
 #include <kern/clock.h>
@@ -19,6 +19,7 @@
 #include <kern/locks.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
+#include <libkern/crypto/sha2.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
 #include <miscfs/devfs/devfs.h>
@@ -47,6 +48,8 @@ extern kern_return_t thread_terminate(thread_t thread);
 #define CAM_FRAME_BYTES         (CAM_STRIDE * CAM_HEIGHT)   /* 2,592,000 bytes */
 #define CAM_FPS                 30u
 
+static struct annibale_camera_capture cam_capture;
+
 #include "annibale_camera_hw.inc"
 
 static lck_grp_t *cam_lock_grp;
@@ -59,6 +62,10 @@ static uint32_t current_focus = 512;
 static uint32_t current_sensor = 1;     /* 1 = Rear Wide (OV50E), 2 = Front (OV20B) */
 static uint32_t boot_cam_level = 0;
 static uint32_t cam_hw_mmio = 1;
+
+#include "annibale_camera_profile.inc"
+
+static bool cam_native_idle(void);
 
 /*
  * Render MIPI RAW10 RGGB test pattern into camera_region, modulated by exposure, gain,
@@ -169,8 +176,9 @@ render_dynamic_tpg_frame(uint8_t *dest, uint64_t seq, uint32_t exp_lines, uint32
 static bool
 cam_hardware_power_up(void)
 {
-	if (cam_region_vbase == 0 && kmem_alloc(kernel_map, &cam_region_vbase,
-	    CAMERA_REGION_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+	if (cam_region_vbase == 0 && kmem_alloc_contig(kernel_map, &cam_region_vbase,
+	    CAMERA_REGION_SIZE, PAGE_MASK, (ppnum_t)((1ULL << (36 - PAGE_SHIFT)) - 1u), 0,
+	    KMA_KOBJECT | KMA_ZERO | KMA_DATA,
 	    VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
 		cam_region_vbase = 0;
 	}
@@ -195,10 +203,23 @@ cam_hardware_power_up(void)
 		csid_lite_base = ml_io_map(CSID_LITE0_PHYS, CSID_LITE0_SIZE);
 		tlmm_base = ml_io_map(TLMM_PHYS, TLMM_SIZE);
 	}
+	if (gcc_base == 0 || mclkcc_base == 0 || cpas_base == 0 || camcc_base == 0 ||
+	    cci0_base == 0 || csid_lite_base == 0 || tlmm_base == 0) {
+		return false;
+	}
+	uint32_t gdsc = reg_rd(camcc_base, CAMCC_TITAN_TOP_GDSC);
+	uint32_t gdsc_config = reg_rd(camcc_base, CAMCC_TITAN_TOP_CFG_GDSCR);
+	if (gdsc == UINT32_MAX || gdsc_config == UINT32_MAX) {
+		return false;
+	}
+	/* A running inherited pipeline must be checked before its rates or supplies change. */
+	if ((gdsc & GDSC_PWR_ON) != 0 || (gdsc_config & CFG_GDSCR_PWR_ON) != 0) {
+		if (reg_rd(csid_lite_base, 0) != 0x30000004u ||
+		    reg_rd(csid_lite_base, VFE_LITE_SUB_HW_VERSION) != 0x20050000u || !cam_native_idle()) {
+			return false;
+		}
+	}
 
-	/* Seed dynamic frame upfront so user reads succeed even if a sub-block times out */
-	render_dynamic_tpg_frame((uint8_t *)cam_region_vbase, 0, current_exposure,
-	    current_gain, current_focus, current_sensor);
 	__builtin_arm_dsb(0xf);
 
 	/* 1. Vote RPMh MMCX/MXC nominal rails and all 7 camera VRM regulators */
@@ -226,9 +247,6 @@ cam_hardware_power_up(void)
 	} else {
 		say("gcc mapping failed\n");
 	}
-
-	/* 3. Idempotent apps_smmu SID 0x1c00 Stage-1 bypass */
-	(void)cam_smmu_configure_bypass();
 
 	/* 4. Enable sun-camcc AO branches, Titan Top GDSC, and camera clocks */
 	bool titan_top_on = false;
@@ -340,7 +358,14 @@ cam_hardware_power_up(void)
 static void
 cam_hardware_power_down(void)
 {
+	if (cam_capture_resources_held()) {
+		return;
+	}
 	if (cam_hw_mmio == 0) {
+		return;
+	}
+	if (!cam_native_idle()) {
+		say("camera paths are busy or unreadable; power state retained\n");
 		return;
 	}
 	csid_lite_hardware_stop();
@@ -366,20 +391,28 @@ cam_hardware_power_down(void)
 	say("camera pipeline powered down\n");
 }
 
+#include "annibale_camera_native.inc"
+
 /* Character Device Operations for /dev/annibale-camera */
 
 static int
 annibale_cam_open(dev_t dev __unused, int flags __unused, int devtype __unused, struct proc *p __unused)
 {
 	lck_mtx_lock(cam_lock);
-	if (!cam_is_open) {
-		if (!cam_hardware_power_up()) {
-			lck_mtx_unlock(cam_lock);
-			return EIO;
-		}
-		cam_is_open = true;
-		cam_frame_seq = 0;
+	if (cam_is_open || cam_capture_resources_held()) {
+		lck_mtx_unlock(cam_lock);
+		return EBUSY;
 	}
+	if (!cam_hardware_power_up()) {
+		if (cam_region_vbase != 0) {
+			kmem_free(kernel_map, cam_region_vbase, CAMERA_REGION_SIZE);
+			cam_region_vbase = 0;
+		}
+		lck_mtx_unlock(cam_lock);
+		return EIO;
+	}
+	cam_is_open = true;
+	cam_frame_seq = 0;
 	lck_mtx_unlock(cam_lock);
 	return 0;
 }
@@ -390,7 +423,24 @@ annibale_cam_close(dev_t dev __unused, int flags __unused, int devtype __unused,
 	lck_mtx_lock(cam_lock);
 	if (cam_is_open) {
 		cam_is_open = false;
-		cam_hardware_power_down();
+		if (!cam_capture_resources_held()) {
+			if (!cam_native_release()) {
+				cam_capture.state = ANNIBALE_CAM_CAPTURE_HELD;
+				cam_capture.error = EIO;
+			} else {
+				cam_hardware_power_down();
+				if (cam_profile != NULL) {
+					kfree_data(cam_profile, CAM_NATIVE_PROFILE_BYTES);
+					cam_profile = NULL;
+				}
+				if (cam_region_vbase != 0) {
+					kmem_free(kernel_map, cam_region_vbase, CAMERA_REGION_SIZE);
+					cam_region_vbase = 0;
+				}
+				bzero(&cam_capture, sizeof(cam_capture));
+				cam_hw_dma_verified = false;
+			}
+		}
 	}
 	lck_mtx_unlock(cam_lock);
 	return 0;
@@ -412,6 +462,15 @@ annibale_cam_read(dev_t dev __unused, struct uio *uio, int ioflag __unused)
 		lck_mtx_unlock(cam_lock);
 		return EIO;
 	}
+	if (cam_profile != NULL) {
+		error = cam_native_read(uio);
+		lck_mtx_unlock(cam_lock);
+		return error;
+	}
+	if (cam_hw_mmio != 0) {
+		lck_mtx_unlock(cam_lock);
+		return ENXIO;
+	}
 
 	cam_frame_seq++;
 	seq = cam_frame_seq;
@@ -428,6 +487,12 @@ annibale_cam_read(dev_t dev __unused, struct uio *uio, int ioflag __unused)
 	resid = uio_resid(uio);
 	if (resid < (user_ssize_t)sizeof(frame)) {
 		return EINVAL;
+	}
+	lck_mtx_lock(cam_lock);
+	if (!cam_is_open || cam_profile != NULL) {
+		error = cam_is_open ? cam_native_read(uio) : EIO;
+		lck_mtx_unlock(cam_lock);
+		return error;
 	}
 	if (!live_sensor && resid > (user_ssize_t)sizeof(frame) && payload_vbase != 0) {
 		render_dynamic_tpg_frame((uint8_t *)payload_vbase, seq, exp, gain, focus, sensor);
@@ -458,6 +523,7 @@ annibale_cam_read(dev_t dev __unused, struct uio *uio, int ioflag __unused)
 
 	error = uiomove((caddr_t)&frame, sizeof(frame), uio);
 	if (error != 0) {
+		lck_mtx_unlock(cam_lock);
 		return error;
 	}
 
@@ -466,6 +532,7 @@ annibale_cam_read(dev_t dev __unused, struct uio *uio, int ioflag __unused)
 		error = uiomove((caddr_t)payload_vbase, (int)copy_bytes, uio);
 	}
 
+	lck_mtx_unlock(cam_lock);
 	return error;
 }
 
@@ -477,14 +544,55 @@ annibale_cam_write(dev_t dev __unused, struct uio *uio, int ioflag __unused)
 		return EINVAL;
 	}
 
-	if (resid == (user_ssize_t)sizeof(struct annibale_camera_command)) {
-		struct annibale_camera_command cmd;
-		int error = uiomove((caddr_t)&cmd, sizeof(cmd), uio);
-		if (error != 0) {
+	char buf[64];
+	struct annibale_camera_command cmd = {0};
+	size_t prefix_bytes = (size_t)MIN(resid, (user_ssize_t)sizeof(cmd));
+	int error = uiomove((caddr_t)&cmd, (int)prefix_bytes, uio);
+	if (error != 0) {
+		return error;
+	}
+	if (cmd.command >= ANNIBALE_CAMERA_EXPOSURE && cmd.command <= ANNIBALE_CAMERA_PROFILE) {
+		if (prefix_bytes != sizeof(cmd)) {
+			return EINVAL;
+		}
+		if (cmd.command == ANNIBALE_CAMERA_PROFILE) {
+			if (cmd.bytes != CAM_NATIVE_PROFILE_BYTES || cmd.a || cmd.b || cmd.c || cmd.d ||
+			    uio_resid(uio) != (user_ssize_t)cmd.bytes) {
+				return EINVAL;
+			}
+			struct annibale_camera_profile *profile = kalloc_data(cmd.bytes, Z_WAITOK);
+			if (profile == NULL) {
+				return ENOMEM;
+			}
+			error = uiomove((caddr_t)profile, (int)cmd.bytes, uio);
+			if (error == 0) {
+				error = cam_profile_validate(profile, cmd.bytes);
+			}
+			lck_mtx_lock(cam_lock);
+			if (error == 0) {
+				if (!cam_is_open || cam_capture_resources_held()) {
+					error = EBUSY;
+				} else {
+					cam_profile_install(profile);
+					profile = NULL;
+				}
+			}
+			lck_mtx_unlock(cam_lock);
+			if (profile != NULL) {
+				kfree_data(profile, cmd.bytes);
+			}
 			return error;
+		}
+		if (cmd.bytes != 0 || uio_resid(uio) != 0) {
+			return EINVAL;
 		}
 
 		lck_mtx_lock(cam_lock);
+		if (cam_profile != NULL || cam_hw_mmio != 0) {
+			error = cam_capture_resources_held() ? EBUSY : ENOTSUP;
+			lck_mtx_unlock(cam_lock);
+			return error;
+		}
 		switch (cmd.command) {
 		case ANNIBALE_CAMERA_EXPOSURE:
 			current_exposure = cmd.a > 0 ? cmd.a : 1000;
@@ -507,21 +615,30 @@ annibale_cam_write(dev_t dev __unused, struct uio *uio, int ioflag __unused)
 			}
 			break;
 		default:
+			error = ENOTSUP;
 			break;
 		}
 		lck_mtx_unlock(cam_lock);
-		return 0;
+		return error;
 	}
 
-	char buf[64];
-	size_t n = (size_t)MIN(resid, (user_ssize_t)(sizeof(buf) - 1));
-	int error = uiomove(buf, (int)n, uio);
+	if (((const uint8_t *)&cmd)[0] < 0x20u || ((const uint8_t *)&cmd)[0] > 0x7eu) {
+		return EINVAL;
+	}
+	memcpy(buf, &cmd, prefix_bytes);
+	size_t tail = (size_t)MIN(uio_resid(uio), (user_ssize_t)(sizeof(buf) - 1u - prefix_bytes));
+	error = uiomove(buf + prefix_bytes, (int)tail, uio);
 	if (error != 0) {
 		return error;
 	}
-	buf[n] = '\0';
+	buf[prefix_bytes + tail] = '\0';
 
 	lck_mtx_lock(cam_lock);
+	if (cam_profile != NULL || cam_hw_mmio != 0) {
+		error = cam_capture_resources_held() ? EBUSY : ENOTSUP;
+		lck_mtx_unlock(cam_lock);
+		return error;
+	}
 	if (strncmp(buf, "front", 5) == 0) {
 		current_sensor = 2u;
 		if (!cam_sensor_streaming && cam_region_vbase != 0) {
@@ -558,6 +675,15 @@ static int
 annibale_cam_ioctl(dev_t dev __unused, u_long cmd, caddr_t data, int flags __unused, struct proc *p __unused)
 {
 	switch (cmd) {
+	case CAMIOC_CAPTURE:
+		if (data == NULL) {
+			return EINVAL;
+		}
+		lck_mtx_lock(cam_lock);
+		cam_native_capture();
+		memcpy(data, &cam_capture, sizeof(cam_capture));
+		lck_mtx_unlock(cam_lock);
+		return 0;
 	case CAMIOC_G_INFO: {
 		struct annibale_camera_info *info = (struct annibale_camera_info *)data;
 		if (info == NULL) {
@@ -565,8 +691,13 @@ annibale_cam_ioctl(dev_t dev __unused, u_long cmd, caddr_t data, int flags __unu
 		}
 		lck_mtx_lock(cam_lock);
 		bzero(info, sizeof(*info));
-		/* Bit 0 == 0 when live sensor CSI stream is active; set when using TPG fallback */
-		uint32_t fl = cam_sensor_streaming ? 0u : ANNIBALE_CAM_INFO_FLAG_TPG_FALLBACK;
+		uint32_t fl = cam_hw_mmio == 0 ? ANNIBALE_CAM_INFO_FLAG_TPG_FALLBACK : 0;
+		if (cam_profile != NULL) {
+			fl |= ANNIBALE_CAM_INFO_FLAG_NATIVE_PROFILE;
+		}
+		if (cam_native_front_mode4()) {
+			fl |= ANNIBALE_CAM_INFO_FLAG_FRONT_MODE4;
+		}
 		if (cam_smmu_ready) {
 			fl |= ANNIBALE_CAM_INFO_FLAG_SMMU_BYPASS;
 		}
@@ -592,21 +723,8 @@ annibale_cam_ioctl(dev_t dev __unused, u_long cmd, caddr_t data, int flags __unu
 		return 0;
 	}
 	default:
-		return 0;
+		return ENOTTY;
 	}
-}
-
-static int
-annibale_cam_mmap(dev_t dev __unused, vm_map_offset_t off, int prot __unused)
-{
-	if (cam_region_vbase == 0 || off >= CAMERA_REGION_SIZE) {
-		return -1;
-	}
-	uint64_t pa = kvtophys(cam_region_vbase + (vm_offset_t)(off & ~(vm_map_offset_t)PAGE_MASK));
-	if (pa == 0) {
-		return -1;
-	}
-	return (int)(pa >> PAGE_SHIFT);
 }
 
 static const struct cdevsw annibale_cam_cdevsw = {
@@ -618,7 +736,7 @@ static const struct cdevsw annibale_cam_cdevsw = {
 	.d_stop = eno_stop,
 	.d_reset = eno_reset,
 	.d_select = eno_select,
-	.d_mmap = (mmap_fcn_t *)&annibale_cam_mmap,
+	.d_mmap = eno_mmap,
 	.d_strategy = eno_strat,
 	.d_type = 0
 };

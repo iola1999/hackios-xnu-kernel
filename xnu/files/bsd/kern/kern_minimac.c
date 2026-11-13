@@ -17,8 +17,8 @@
  *
  *   Sandbox  Every query (may this process look up that service?) is
  *            answered "allowed", and every request to apply a profile
- *            succeeds without applying anything. The one question with
- *            an answer of its own is which container a process is in.
+ *            succeeds without applying anything. Container queries and
+ *            file extension lifetimes retain their own checked objects.
  */
 
 #include <sys/param.h>
@@ -28,13 +28,16 @@
 #include <sys/errno.h>
 #include <sys/kpi_socket.h>
 #include <sys/priv.h>
+#include <sys/kauth.h>
 #include <sys/proc_internal.h>
+#include <sys/random.h>
 #include <sys/ubc_internal.h>
 #include <sys/vnode_internal.h>
 #include <libkern/libkern.h>
 #include <kern/startup.h>
 #include <kern/task.h>
 #include <kern/kalloc.h>
+#include <kern/locks.h>
 #include <os/refcnt.h>
 #include <mach/vm_param.h>
 #include <vm/vm_kern.h>
@@ -205,6 +208,7 @@ SECURITY_READ_ONLY_LATE(static mac_policy_handle_t) miniamfi_handle;
 extern kern_return_t miniamfi_entitlement_boolean(struct proc *proc, const char *name);
 
 #include "kern_minisandbox_container.inc"
+#include "kern_minisandbox_extension.inc"
 
 /* Query the credential's container, then the exec environment for older launchers. */
 #define SANDBOX_SYSCALL_CONTAINER_PATH  4
@@ -300,20 +304,24 @@ minisandbox_container_path(user_addr_t arg)
 /* Which request numbers have been seen: one log line each, to learn what user space asks for. */
 static uint64_t minisandbox_seen;
 
-/* libsystem_sandbox returns the request 5 output buffer on success; it must contain an extension token. */
-#define SANDBOX_SYSCALL_EXTENSION_ISSUE 5
-
 static int
 minisandbox_policy_syscall(struct proc *p, int call, user_addr_t arg)
 {
 	if (call >= 0 && call < 64 && (minisandbox_seen & (1ULL << call)) == 0) {
 		minisandbox_seen |= 1ULL << call;
 		printf("minisandbox: request %d (first seen from %s[%d]): %s\n", call, p->p_comm, proc_getpid(p),
-		    call == SANDBOX_SYSCALL_EXTENSION_ISSUE ? "unsupported" :
-		    call == SANDBOX_SYSCALL_CONTAINER_PATH ? "answered" : "allowed");
+		    call >= SANDBOX_SYSCALL_CONTAINER_PATH && call <= SANDBOX_SYSCALL_EXTENSION_RELEASE ? "answered" : "allowed");
 	}
-	/* Token output is unimplemented; an error makes the native library release its unwritten buffer. */
 	if (call == SANDBOX_SYSCALL_EXTENSION_ISSUE) {
+		return minisandbox_extension_issue(p, arg);
+	}
+	if (call == SANDBOX_SYSCALL_EXTENSION_CONSUME) {
+		return minisandbox_extension_consume(p, arg);
+	}
+	if (call == SANDBOX_SYSCALL_EXTENSION_RELEASE) {
+		return minisandbox_extension_release(p, arg);
+	}
+	if (call == SANDBOX_SYSCALL_EXTENSION_RELEASE_DETECT) {
 		return ENOTSUP;
 	}
 	if (call == SANDBOX_SYSCALL_SET_CONTAINER_PATH) {
@@ -436,8 +444,11 @@ static const struct mac_policy_ops minisandbox_ops = {
 	.mpo_priv_grant = minisandbox_priv_grant,
 	.mpo_cred_label_destroy = minisandbox_label_destroy,
 	.mpo_cred_label_associate = minisandbox_label_associate,
+	.mpo_cred_label_associate_fork = minisandbox_extension_fork,
 	.mpo_cred_check_label_update_execve = minisandbox_check_exec,
 	.mpo_cred_label_update_execve = minisandbox_update_exec,
+	.mpo_proc_notify_exec_complete = minisandbox_extension_exec_complete,
+	.mpo_proc_notify_exit = minisandbox_extension_exit,
 };
 
 SECURITY_READ_ONLY_LATE(static struct mac_policy_conf) minisandbox_conf = {

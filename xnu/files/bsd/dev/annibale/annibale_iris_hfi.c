@@ -726,77 +726,7 @@ iris_protocol_fault(void)
 	iris_drain_dbgq();
 }
 
-static int
-iris_return_buffer(struct iris_session *s, const struct hfi_packet *pkt)
-{
-	/* Gen2 BUFFER replies without a payload do not return DMA ownership. */
-	if (pkt->payload_info == HFI_PAYLOAD_NONE) return 0;
-	if (pkt->payload_info != HFI_PAYLOAD_STRUCTURE ||
-	    pkt->size - sizeof(*pkt) < sizeof(struct hfi_buffer)) return EIO;
-	const struct hfi_buffer *hb = (const struct hfi_buffer *)((const uint8_t *)pkt + sizeof(*pkt));
-	if (hb->addr_offset != 0 || hb->data_offset > hb->buffer_size ||
-	    hb->data_size > hb->buffer_size - hb->data_offset) return EIO;
-	if (hb->type == HFI_BUFFER_BITSTREAM) {
-		if (pkt->port != HFI_PORT_BITSTREAM || !s->input_queued ||
-		    hb->index != s->next_input_idx - 1u || hb->base_address != s->bitstream.iova ||
-		    hb->data_offset != 0 || hb->buffer_size != s->bitstream.size) return EIO;
-		s->input_queued = false;
-		return 0;
-	}
-	if (hb->type == HFI_BUFFER_RAW) {
-		if (pkt->port != HFI_PORT_RAW || hb->index >= s->raw_count ||
-		    s->raw_state[hb->index] != IRIS_RAW_QUEUED || hb->data_offset != 0 ||
-		    hb->base_address != s->raw[hb->index].iova || hb->buffer_size != s->raw[hb->index].size ||
-		    (hb->flags & HFI_BUF_FW_FLAG_READONLY) != 0) return EIO;
-		uint32_t needed = s->y_stride * s->y_scanlines +
-		    s->uv_stride * (s->height / 2u - 1u) + s->width;
-		if (hb->data_size != 0 && hb->data_size < needed) return EIO;
-		if ((hb->flags & HFI_BUF_FW_FLAG_PSC_LAST) != 0) return EOPNOTSUPP;
-		s->raw_done[hb->index] = *hb;
-		s->raw_state[hb->index] = IRIS_RAW_RETURNED;
-		if ((hb->flags & HFI_BUF_FW_FLAG_LAST) != 0 && s->draining) s->drain_last = true;
-		return 0;
-	}
-	const struct iris_dma_buf *buf = NULL;
-	uint32_t port = HFI_PORT_BITSTREAM, index = 0;
-	switch (hb->type) {
-	case HFI_BUFFER_BIN: buf = &s->intern_bin; break;
-	case HFI_BUFFER_COMV: buf = &s->intern_comv; break;
-	case HFI_BUFFER_NON_COMV: buf = &s->intern_non_comv; break;
-	case HFI_BUFFER_LINE: buf = &s->intern_line; break;
-	case HFI_BUFFER_PERSIST: buf = &s->intern_persist; port = HFI_PORT_NONE; break;
-	case HFI_BUFFER_DPB:
-		port = HFI_PORT_RAW;
-		if (hb->index >= s->dpb_count || hb->base_address !=
-		    (uint64_t)s->intern_dpb.iova + hb->index * s->dpb_frame_size ||
-		    hb->buffer_size != s->dpb_frame_size) return EIO;
-		return pkt->port == port ? 0 : EIO;
-	default: return EIO;
-	}
-	return pkt->port == port && hb->index == index && hb->base_address == buf->iova &&
-	    hb->buffer_size == buf->size ? 0 : EIO;
-}
-
-static void
-iris_trace_reply_error(struct iris_session *s, const struct hfi_header *hdr,
-    const struct hfi_packet *pkt, int error, const char *stage)
-{
-	iris_say("reply rejected stage=%s sid=%u hdr=%u type=0x%x id=%u port=%u flags=0x%x info=%u size=%u error=%d\n",
-	    stage, hdr->session_id, hdr->header_id, pkt->type, pkt->packet_id, pkt->port,
-	    pkt->flags, pkt->payload_info, pkt->size, error);
-	if (pkt->type != HFI_CMD_BUFFER || pkt->payload_info != HFI_PAYLOAD_STRUCTURE ||
-	    pkt->size - sizeof(*pkt) < sizeof(struct hfi_buffer)) return;
-	const struct hfi_buffer *hb = (const struct hfi_buffer *)((const uint8_t *)pkt + sizeof(*pkt));
-	iris_say("rejected buffer type=%u index=%u base=0x%llx addr_offset=%u size=%u data_offset=%u data_size=%u tag=%llu flags=0x%x\n",
-	    hb->type, hb->index, (unsigned long long)hb->base_address, hb->addr_offset, hb->buffer_size,
-	    hb->data_offset, hb->data_size, (unsigned long long)hb->timestamp, hb->flags);
-	iris_say("expected input queued=%u index=%u base=0x%llx size=%u raw_count=%u drain=%u ack=%u last=%u\n",
-	    s->input_queued, s->next_input_idx - 1u, (unsigned long long)s->bitstream.iova,
-	    s->bitstream.size, s->raw_count, s->draining, s->drain_ack, s->drain_last);
-	if (hb->type == HFI_BUFFER_RAW && hb->index < s->raw_count && hb->index < IRIS_RAW_POOL_MAX)
-		iris_say("expected raw index=%u base=0x%llx size=%u state=%u\n", hb->index,
-		    (unsigned long long)s->raw[hb->index].iova, s->raw[hb->index].size, s->raw_state[hb->index]);
-}
+#include "annibale_iris_buffers.inc"
 
 static int
 iris_dispatch_message(const uint8_t *msg, uint32_t len, struct iris_session *target,
@@ -828,10 +758,12 @@ iris_dispatch_message(const uint8_t *msg, uint32_t len, struct iris_session *tar
 	}
 	if (s == NULL) return 0;
 	if (s->error != 0) return s == target ? s->error : 0;
-	bool psc = false;
+	/* Native Gen2 clears DATA_CORRUPT before each message, then processes info before BUFFER. */
+	bool psc = false, data_corrupt = false;
 	for (uint32_t off = sizeof(*hdr); off < len; ) {
 		const struct hfi_packet *pkt = (const struct hfi_packet *)(msg + off);
 		psc |= pkt->type == HFI_CMD_SETTINGS_CHANGE && pkt->port == HFI_PORT_BITSTREAM;
+		data_corrupt |= pkt->type == HFI_INFO_DATA_CORRUPT;
 		off += pkt->size;
 	}
 	if (psc) {
@@ -853,7 +785,12 @@ iris_dispatch_message(const uint8_t *msg, uint32_t len, struct iris_session *tar
 			s->response_logs++;
 		}
 		int error = iris_read_property(s, pkt);
-		if (pkt->type == HFI_INFO_DATA_CORRUPT || pkt->type == HFI_INFO_BUFFER_OVERFLOW) error = EIO;
+#if ANNIBALE_IRIS_BUFFER_DIAGNOSTICS
+		if (pkt->type == HFI_INFO_DATA_CORRUPT)
+			iris_say("data corrupt sid=%u hdr=%u port=%u flags=0x%x\n",
+			    hdr->session_id, hdr->header_id, pkt->port, pkt->flags);
+#endif
+		if (pkt->type == HFI_INFO_BUFFER_OVERFLOW) error = EIO;
 		if (pkt->type == HFI_INFO_HFI_FLAG_DRAIN_LAST && s->draining) s->drain_last = true;
 		if (pkt->type == HFI_INFO_HFI_FLAG_PSC_LAST) error = EOPNOTSUPP;
 		if (error != 0) {
@@ -862,11 +799,20 @@ iris_dispatch_message(const uint8_t *msg, uint32_t len, struct iris_session *tar
 		}
 		off += pkt->size;
 	}
+#if ANNIBALE_IRIS_BUFFER_DIAGNOSTICS
+	if (data_corrupt) {
+		for (uint32_t off = sizeof(*hdr); off < len; ) {
+			const struct hfi_packet *pkt = (const struct hfi_packet *)(msg + off);
+			iris_trace_buffer_identity(s, hdr, pkt);
+			off += pkt->size;
+		}
+	}
+#endif
 	/* A malformed later property must also precede BUFFER ownership changes. */
 	if (s->error != 0) return s == target ? s->error : 0;
 	for (uint32_t off = sizeof(*hdr); off < len; ) {
 		const struct hfi_packet *pkt = (const struct hfi_packet *)(msg + off);
-		if (pkt->type == HFI_CMD_BUFFER) s->error = iris_return_buffer(s, pkt);
+		if (pkt->type == HFI_CMD_BUFFER) s->error = iris_return_buffer(s, pkt, data_corrupt);
 		if (wait != NULL && hdr->session_id == wait->session_id && pkt->type == wait->type &&
 		    pkt->packet_id == wait->packet_id && pkt->port == wait->port) {
 			if ((pkt->flags & HFI_FW_FLAGS_SUCCESS) != 0) wait->done = true;
@@ -951,6 +897,8 @@ iris_hfi_session_open(struct iris_session *s)
 	    HFI_PORT_BITSTREAM, 0u) ||
 	    !pkt_add_u32(&b, HFI_PROP_BITSTREAM_RESOLUTION, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32,
 	    HFI_PORT_BITSTREAM, (s->width << 16) | s->height) ||
+	    !pkt_add_u32(&b, HFI_PROP_DECODE_ORDER_OUTPUT, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32,
+	    HFI_PORT_BITSTREAM, 1u) ||
 	    !pkt_add_u32(&b, HFI_PROP_STAGE, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32,
 	    HFI_PORT_NONE, iris_decode_stage(s)) ||
 	    !pkt_add_u32(&b, HFI_PROP_COMV_BUFFER_COUNT, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32,
@@ -1019,9 +967,14 @@ static int
 iris_take_output(struct iris_session *s, struct iris_decode_frame *req)
 {
 	for (uint32_t i = 0; i < s->raw_count; i++) {
-		if (s->raw_state[i] != IRIS_RAW_RETURNED) continue;
+		bool corrupt = s->raw_state[i] == IRIS_RAW_RETURNED_CORRUPT;
+		if (s->raw_state[i] != IRIS_RAW_RETURNED && !corrupt) continue;
 		struct hfi_buffer *hb = &s->raw_done[i];
-		bool decoded = hb->data_size != 0;
+		bool decoded = !corrupt && hb->data_size != 0;
+		if (corrupt && req != NULL) {
+			req->flags = IRIS_FRAME_CORRUPT;
+			req->out_tag = hb->timestamp;
+		}
 		if (decoded && req != NULL) {
 			int error = iris_copy_decoded_nv12(s, i, req);
 			if (error != 0) return -error;
@@ -1033,7 +986,7 @@ iris_take_output(struct iris_session *s, struct iris_decode_frame *req)
 			    s->raw[i].iova, s->raw[i].size, 0, 0)) return -EIO;
 			s->raw_state[i] = IRIS_RAW_QUEUED;
 		}
-		if (decoded && req != NULL) return 1;
+		if ((decoded || corrupt) && req != NULL) return 1;
 	}
 	return 0;
 }

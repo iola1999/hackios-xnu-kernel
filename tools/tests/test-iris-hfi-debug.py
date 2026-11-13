@@ -24,6 +24,7 @@ def packet(text=b'fatal fixture', size=None):
 def compile_harness(directory, source):
     directory.mkdir(parents=True, exist_ok=True)
     (directory / 'annibale_iris_private.h').write_text((ROOT / HFI.with_name('annibale_iris_private.h')).read_text())
+    (directory / 'annibale_iris_buffers.inc').write_text((ROOT / HFI.with_name('annibale_iris_buffers.inc')).read_text())
     body = re.sub(r'__asm__ volatile\("dsb (?:ld|sy)" ::: "memory"\);', '(void)0;', source)
     path = directory / 'test.c'
     path.write_text(FIXTURE.read_text().replace('__HFI_SOURCE__', body))

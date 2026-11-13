@@ -1,8 +1,26 @@
 diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
-index 07143d539042..966e8ef38d3a 100644
+index 07143d539042..9d466639daba 100644
 --- a/osfmk/arm64/machine_routines.c
 +++ b/osfmk/arm64/machine_routines.c
-@@ -907,17 +907,31 @@ ml_get_machine_mem(void)
+@@ -38,6 +38,7 @@
+ #include <arm/machdep_call.h>
+ #include <arm/machine_routines.h>
+ #include <arm/rtclock.h>
++#include <arm/annibale_mach_timebase.h>
+ #include <arm/cpuid_internal.h>
+ #include <arm/cpu_capabilities.h>
+ #include <console/serial_protos.h>
+@@ -499,6 +500,9 @@ user_cont_hwclock_allowed(void)
+ uint8_t
+ user_timebase_type(void)
+ {
++	if (annibale_mach_timebase_scaled()) {
++		return USER_TIMEBASE_NONE;
++	}
+ #if HAS_ACNTVCT
+ 	return USER_TIMEBASE_NOSPEC_APPLE;
+ #elif HAS_APPLE_GENERIC_TIMER
+@@ -907,10 +911,21 @@ ml_get_machine_mem(void)
  	return machine_info.memory_size;
  }
  
@@ -24,7 +42,7 @@ index 07143d539042..966e8ef38d3a 100644
  	if (reboot) {
  		printf("MACH Reboot\n");
  		PEHaltRestart(kPERestartCPU);
- 	} else {
+@@ -918,6 +933,9 @@ halt_all_cpus(boolean_t reboot)
  		printf("CPU halted\n");
  		PEHaltRestart(kPEHaltCPU);
  	}
@@ -34,7 +52,7 @@ index 07143d539042..966e8ef38d3a 100644
  	while (1) {
  		;
  	}
-@@ -1140,6 +1156,21 @@ ml_read_chip_revision(unsigned int *rev __unused)
+@@ -1140,6 +1158,21 @@ ml_read_chip_revision(unsigned int *rev __unused)
  #endif
  }
  
@@ -56,7 +74,7 @@ index 07143d539042..966e8ef38d3a 100644
  void
  ml_parse_cpu_topology(void)
  {
-@@ -1414,7 +1445,11 @@ ml_get_boot_cluster_type(void)
+@@ -1414,7 +1447,11 @@ ml_get_boot_cluster_type(void)
  int
  ml_get_cpu_number(uint32_t phys_id)
  {
@@ -68,7 +86,42 @@ index 07143d539042..966e8ef38d3a 100644
  
  	for (unsigned i = 0; i < topology_info.num_cpus; i++) {
  		if (topology_info.cpus[i].phys_id == phys_id) {
-@@ -2708,8 +2743,16 @@ _enable_virtual_timer(void)
+@@ -2517,14 +2554,14 @@ uint64_t
+ ml_get_hwclock()
+ {
+ 	uint64_t timebase = nonspeculative_timebase();
+-	return timebase;
++	return annibale_hw_ticks_to_mach(timebase);
+ }
+ 
+ uint64_t
+ ml_get_hwclock_speculative()
+ {
+ 	uint64_t timebase = speculative_timebase();
+-	return timebase;
++	return annibale_hw_ticks_to_mach(timebase);
+ }
+ 
+ uint64_t
+@@ -2587,7 +2624,7 @@ ml_get_speculative_timebase(void)
+ 	do {
+ 		timebase = getCpuDatap()->cpu_base_timebase;
+ 		os_compiler_barrier();
+-		clock = speculative_timebase();
++		clock = ml_get_hwclock_speculative();
+ 
+ 		os_compiler_barrier();
+ 	} while (getCpuDatap()->cpu_base_timebase != timebase);
+@@ -2687,6 +2724,8 @@ _enable_timebase_event_stream(uint32_t bit_index)
+ 	 */
+ 	if (user_timebase_type() != USER_TIMEBASE_NONE) {
+ 		cntkctl |= (CNTKCTL_EL1_PL0PCTEN | CNTKCTL_EL1_PL0VCTEN);
++	} else {
++		cntkctl &= ~(CNTKCTL_EL1_PL0PCTEN | CNTKCTL_EL1_PL0VCTEN);
+ 	}
+ 
+ 	__builtin_arm_wsr64(KERNEL_CNTKCTL_EL1, cntkctl);
+@@ -2708,8 +2747,16 @@ _enable_virtual_timer(void)
  	uint64_t cntvctl = CNTV_CTL_EL0_ENABLE; /* One wants to use 32 bits, but "mrs" prefers it this way */
  
  	__builtin_arm_wsr64(KERNEL_CNTV_CTL_EL0, cntvctl);
@@ -85,7 +138,16 @@ index 07143d539042..966e8ef38d3a 100644
  #if HAS_APPLE_GENERIC_TIMER
  	__builtin_arm_wsr64("S3_1_C15_C13_4", CNTP_CTL_EL0_IMASKED);
  #endif
-@@ -3395,6 +3438,13 @@ ml_unsafe_kernel_text_init(void)
+@@ -2761,7 +2808,7 @@ wfe_timeout_configure(void)
+ 	} else {
+ 		events_per_sec = USEC_PER_SEC;
+ 	}
+-	ticks_per_sec = gPEClockFrequencyInfo.timebase_frequency_hz;
++	ticks_per_sec = gPEClockFrequencyInfo.dec_clock_rate_hz;
+ 	ticks_per_event = ticks_per_sec / events_per_sec;
+ 
+ 	/* Bit index of next power of two greater than ticks_per_event */
+@@ -3395,6 +3442,13 @@ ml_unsafe_kernel_text_init(void)
  		_unsafe_kernel_text_initialized = true;
  		_unsafe_kernel_text = (0 == *(const int *)value);
  	}

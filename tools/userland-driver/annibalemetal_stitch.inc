@@ -346,6 +346,9 @@ rw_air_cache_store(NSString *key, NSData *bitcode)
 	[rw_air_memcache setObject:bitcode forKey:key];
 
 	NSString *path = [NSString stringWithFormat:@"%s/%@.air", RW_AIR_CACHE_DIR, key];
+	NSData *persisted = [NSData dataWithContentsOfFile:path options:0 error:nil];
+	if ([persisted isEqualToData:bitcode])
+		return;
 	mkdir(RW_AIR_CACHE_DIR, 0777);
 	NSError *err = nil;
 	[bitcode writeToFile:path options:NSDataWritingAtomic error:&err];

@@ -1,5 +1,5 @@
 /*
- * Hardware power, RPMh VRM, GCC/CAMCC/CPAS clocks, apps_smmu SID 0x1c00 bypass,
+ * Hardware power, RPMh VRM, GCC/CAMCC/CPAS clocks, apps_smmu SID 0x1c00 S1 bypass,
  * CCI0 Master 1 / GPIO115-116 I2C (Rear Wide OV50E), QUPv3 SE9 I2C (Front OV20B),
  * and CSID-lite0 / IFE-lite0 version & DMA helpers for annibale_camera.c.
  */
@@ -15,8 +15,8 @@
 #define CCI0_SIZE               0x00001000UL
 #define CSID_LITE0_PHYS         0x0ad6d000UL    /* csid-lite980 (0xa00) + vfe-lite980 (0x2800) */
 #define CSID_LITE0_SIZE         0x00002800UL
-#define CSIPHY3_PHYS            0x0adaf000UL
-#define CSIPHY3_SIZE            0x00002000UL
+#define CSIPHY4_PHYS            0x0adb1000UL
+#define CSIPHY4_SIZE            0x00002000UL
 #define CAMCC_PHYS              0x0ade0000UL
 #define CAMCC_SIZE              0x00020000UL
 #define TLMM_PHYS               0x0f100000UL
@@ -87,17 +87,6 @@
 #define GDSC_SW_COLLAPSE                (1u << 0)
 #define GDSC_PWR_ON                     (1u << 31)
 #define CFG_GDSCR_PWR_ON                (1u << 16)
-
-/* apps_smmu registers (base: 0x15000000) */
-#define CAM_SMMU_IDR0                   0x020u
-#define CAM_SMMU_IDR1                   0x024u
-#define CAM_SMMU_SMR(n)                 (0x800u + 4u * (n))
-#define CAM_SMMU_S2CR(n)                (0xc00u + 4u * (n))
-#define CAM_SMMU_GR1_CBAR(n)            (0x000u + 4u * (n))
-#define CAM_SMMU_GR1_CBA2R(n)           (0x800u + 4u * (n))
-#define CAM_SMMU_SMR_VALID              (1u << 31)
-#define CAM_SMMU_SID_IFE                0x1c00u
-#define CAM_SMMU_SID_IFE_MASK           0x0000u
 
 /* TLMM GPIO numbers on annibale (verified against pinctrl-sun.ko & annibale.dts) */
 #define GPIO_SE9_I2C_SDA                4u      /* qupv3_se9_i2c: Front OV20B SDA */
@@ -175,7 +164,6 @@ static vm_offset_t camcc_base;
 static vm_offset_t cci0_base;
 static vm_offset_t csid_lite_base;
 static vm_offset_t tlmm_base;
-static vm_offset_t cam_smmu_base;
 static vm_offset_t cam_region_vbase;
 
 static uint16_t wide_chip_id = 0;
@@ -183,13 +171,11 @@ static uint16_t front_chip_id = 0;
 static uint8_t wide_slave_addr = 0x36u;
 static uint8_t front_slave_addr = 0x10u;
 static uint8_t wide_bus_mode = 0;       /* 0 = none, 1 = CCI0 M1, 2 = GPIO 115/116 OD I2C */
-static uint8_t cam_smmu_slot = 0xffu;
 static uint32_t cached_cpas_ver = 0;
 static uint32_t cached_cpas_cap = 0;
 static uint32_t cached_csid_ver = 0;
 static uint32_t cached_ife_ver = 0;
 static bool cci_ready = false;
-static bool cam_smmu_ready = false;
 static bool cam_ife_lite_clks_on = false;
 static bool cam_hw_dma_verified = false;
 static bool cam_sensor_streaming = false;
@@ -236,6 +222,18 @@ csid_wr(uint32_t offset, uint32_t val)
 {
 	reg_wr(csid_lite_base, offset, val);
 }
+
+static inline void
+reg_wr64(vm_offset_t base, uint32_t offset, uint64_t val)
+{
+	if (base != 0) {
+		__builtin_arm_dsb(0xf);
+		*(volatile uint64_t *)(base + offset) = val;
+		__builtin_arm_dsb(0xf);
+	}
+}
+
+#include "annibale_camera_smmu.inc"
 
 /* TLMM GPIO helper with SM8750 eGPIO override (bit 11 -> set bit 12 to claim AP ownership) */
 static void
@@ -317,81 +315,6 @@ rcgr_enable_xo(vm_offset_t base, uint32_t cmd_off, uint32_t cfg_off)
 		}
 		delay_for_interval(10, NSEC_PER_USEC);
 	}
-}
-
-/*
- * Idempotent apps_smmu (0x15000000) Stage-1 bypass for cam_hf_qtb (SID 0x1c00).
- * Shares the dedicated non-translating context bank (banks - 1) used by audio and PCIe,
- * reusing any pre-existing SMR entry for 0x1c00 across repeated open/close cycles.
- */
-static bool
-cam_smmu_configure_bypass(void)
-{
-	if (cam_smmu_base == 0) {
-		cam_smmu_base = ml_io_map(APPS_SMMU_PHYS, APPS_SMMU_SIZE);
-	}
-	if (cam_smmu_base == 0) {
-		say("failed to map apps_smmu (0x15000000)\n");
-		return false;
-	}
-
-	uint32_t idr0 = reg_rd(cam_smmu_base, CAM_SMMU_IDR0);
-	uint32_t idr1 = reg_rd(cam_smmu_base, CAM_SMMU_IDR1);
-	uint32_t streams = MIN(idr0 & 0xffu, 128u);
-	uint32_t banks = idr1 & 0xffu;
-	uint32_t pg_size = (idr1 & (1u << 31)) ? 0x10000u : 0x1000u;
-	uint32_t pages = 1u << (((idr1 >> 28) & 7u) + 1u);
-
-	if (banks < 2 || streams == 0 || (pages + banks) * pg_size > APPS_SMMU_SIZE) {
-		say("unexpected apps_smmu layout IDR0=0x%08x IDR1=0x%08x\n", idr0, idr1);
-		return false;
-	}
-
-	uint32_t bank = banks - 1u;
-	uint32_t gr1_off = pg_size;
-	uint32_t cb_off = (pages + bank) * pg_size;
-	uint32_t free_slot = UINT32_MAX;
-
-	for (uint32_t i = 0; i < streams; i++) {
-		uint32_t smr = reg_rd(cam_smmu_base, CAM_SMMU_SMR(i));
-		if ((smr & CAM_SMMU_SMR_VALID) == 0) {
-			if (free_slot == UINT32_MAX) {
-				free_slot = i;
-			}
-			continue;
-		}
-		uint32_t mask = (smr >> 16) & 0x7fffu;
-		if (((smr ^ CAM_SMMU_SID_IFE) & 0x7fffu & ~mask) == 0) {
-			cam_smmu_slot = (uint8_t)i;
-			cam_smmu_ready = true;
-			return true;
-		}
-	}
-
-	if (free_slot == UINT32_MAX || (reg_rd(cam_smmu_base, cb_off) & 1u) != 0) {
-		say("no free apps_smmu SMR slot or bypass bank %u busy\n", bank);
-		return false;
-	}
-
-	if (reg_rd(cam_smmu_base, gr1_off + CAM_SMMU_GR1_CBAR(bank)) != 0x10000u ||
-	    reg_rd(cam_smmu_base, gr1_off + CAM_SMMU_GR1_CBA2R(bank)) != 1u) {
-		reg_wr(cam_smmu_base, cb_off, 0);
-		reg_wr(cam_smmu_base, gr1_off + CAM_SMMU_GR1_CBA2R(bank), 1u);
-		reg_wr(cam_smmu_base, gr1_off + CAM_SMMU_GR1_CBAR(bank), 0x10000u);
-	}
-	uint32_t smr_val = CAM_SMMU_SMR_VALID | (CAM_SMMU_SID_IFE_MASK << 16) | CAM_SMMU_SID_IFE;
-	reg_wr(cam_smmu_base, CAM_SMMU_S2CR(free_slot), bank);
-	reg_wr(cam_smmu_base, CAM_SMMU_SMR(free_slot), smr_val);
-	if (reg_rd(cam_smmu_base, CAM_SMMU_SMR(free_slot)) != smr_val) {
-		say("apps_smmu SMR[%u] rejected SID 0x%04x\n", free_slot, CAM_SMMU_SID_IFE);
-		return false;
-	}
-
-	cam_smmu_slot = (uint8_t)free_slot;
-	cam_smmu_ready = true;
-	say("apps_smmu SID 0x%04x bypass configured at SMR[%u] -> CB[%u]\n",
-	    CAM_SMMU_SID_IFE, free_slot, bank);
-	return true;
 }
 
 static void

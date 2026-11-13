@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 
 HFI = Path('xnu/files/bsd/dev/annibale/annibale_iris_hfi.c')
+BUFFERS = HFI.with_name('annibale_iris_buffers.inc')
 PRIVATE = HFI.with_name('annibale_iris_private.h')
 SESSION = HFI.with_name('annibale_iris.c')
 PUBLIC = Path('xnu/files/bsd/sys/annibale_iris.h')
@@ -46,6 +47,7 @@ def expected_open(row):
     message(101, [(0x03000100, 0, 9, 0, u32(1 if row['codec'] == 1 else 3)),
                   (0x03000168, 0, 1, 1, u32(0)),
                   (0x03000103, 0, 1, 1, u32(640 << 16 | 480)),
+                  (0x0300015b, 0, 1, 1, u32(1)),
                   (0x0300010a, 0, 1, 0, u32(1)),
                   (0x03000193, 0, 1, 1, u32(8))])
     addresses = []
@@ -72,7 +74,7 @@ def expected_open(row):
 
 
 def expected_output(row):
-    hid, pid = 1009, 2015
+    hid, pid = 1009, 2016
     result = bytearray()
 
     def message(fields):
@@ -239,6 +241,12 @@ def write_fixtures(directory):
     for kind in ('input', 'raw'):
         names += [f'buffer-{kind}-{field}' for field in ('wrong-sid', 'index', 'base', 'port', 'size', 'overflow')]
     names += ['buffer-raw-short', 'buffer-raw-readonly', 'buffer-raw-psc-last']
+    names += ['corrupt-' + mode for mode in (
+        'full', 'short', 'empty', 'multiple', 'zero-tag', 'input-held', 'drain',
+        'no-buffer', 'bitstream-only', 'close', 'close-stop', 'close-tlb',
+        'later-property', 'later-session', 'later-system',
+        'reject-index', 'reject-base', 'reject-port', 'reject-size',
+        'reject-overflow', 'reject-offset', 'reject-readonly', 'reject-psc')]
     cases.extend((name, default, expected) for name in names)
     for variation in ('missing', 'depth', 'zero-count', 'min7',
                       'resolution', 'crop', 'interlace', 'bad-payload'):
@@ -262,10 +270,12 @@ def write_fixtures(directory):
     return cases
 
 
-def compile_variant(root, directory, sources=None, legacy=False):
+def compile_variant(root, directory, sources=None, legacy=False, buffer_diagnostics=False):
     directory.mkdir(parents=True, exist_ok=True)
-    sources = sources or {path: (root / path).read_text() for path in (HFI, PRIVATE, SESSION, PUBLIC)}
+    sources = sources or {path: (root / path).read_text() for path in (HFI, BUFFERS, PRIVATE, SESSION, PUBLIC)
+                          if (root / path).exists()}
     (directory / 'annibale_iris_private.h').write_text(sources[PRIVATE])
+    (directory / BUFFERS.name).write_text(sources.get(BUFFERS, ''))
     (directory / 'sys').mkdir(exist_ok=True)
     (directory / 'sys/annibale_iris.h').write_text(sources[PUBLIC])
     (directory / 'sys/ioccom.h').write_text(
@@ -280,6 +290,8 @@ def compile_variant(root, directory, sources=None, legacy=False):
            '-I', str(directory), str(directory / 'test.c'), '-o', str(binary)]
     if legacy:
         cmd.insert(1, '-DIRIS_LEGACY_WIRE=1')
+    if buffer_diagnostics:
+        cmd.insert(1, '-DANNIBALE_IRIS_BUFFER_DIAGNOSTICS=1')
     run = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     (directory / 'compile.log').write_text(run.stdout + run.stderr)
     if run.returncode:
@@ -324,7 +336,8 @@ def raw_mutations():
     add('slot-address', '(s->session_id - 1u) *', '0u *', ['raw-slot4'], start_output)
     add('buffer-address', '+ i * s->raw_frame_size;', ';', ['raw-negotiated-h264-6'], start_output)
     add('publish-count', 'i < s->raw_count;', 'i < IRIS_RAW_POOL_COUNT;', ['raw-negotiated-h264-6'], start_output)
-    add('return-bound', 'hb->index >= s->raw_count ||', 'hb->index >= IRIS_RAW_POOL_MAX ||', ['raw-unallocated'])
+    variants['raw_return-bound'] = (BUFFERS, 'static int\niris_return_buffer', None,
+                                    'hb->index >= s->raw_count ||', 'hb->index >= IRIS_RAW_POOL_MAX ||', ['raw-unallocated'])
     add('take-count', 'i < s->raw_count;', 'i < IRIS_RAW_POOL_COUNT;', ['raw-return-last'],
         ('static int\niris_take_output', 'static int\niris_begin_drain'))
     add('drain-count', 'i < s->raw_count;', 'i < IRIS_RAW_POOL_COUNT;', ['raw-drain-last'],
@@ -349,7 +362,47 @@ def mutations():
     psc_subscription = (
         '\tif (!pkt_add(b, HFI_CMD_SUBSCRIBE_MODE, flags, HFI_PAYLOAD_U32_ARRAY,\n'
         '\t    port, payload, (count + 1u) * sizeof(uint32_t))) return false;\n')
+    decode_order = (
+        '\t    !pkt_add_u32(&b, HFI_PROP_DECODE_ORDER_OUTPUT, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32,\n'
+        '\t    HFI_PORT_BITSTREAM, 1u) ||\n')
     variants = {
+        'decode_order_property': (PRIVATE, '#define HFI_PROP_DECODE_ORDER_OUTPUT',
+                                  '#define HFI_PROP_PICTURE_TYPE', '0x0300015bu', '0x0300015cu',
+                                  ['wire-h264', 'wire-hevc']),
+        'decode_order_payload': (HFI, 'int\niris_hfi_session_open', 'static int\niris_copy_decoded',
+                                decode_order, decode_order.replace('HFI_PAYLOAD_U32,', 'HFI_PAYLOAD_U32_ENUM,'),
+                                ['wire-h264', 'wire-hevc']),
+        'decode_order_port': (HFI, 'int\niris_hfi_session_open', 'static int\niris_copy_decoded',
+                             decode_order, decode_order.replace('HFI_PORT_BITSTREAM,', 'HFI_PORT_RAW,'),
+                             ['wire-h264', 'wire-hevc']),
+        'decode_order_value': (HFI, 'int\niris_hfi_session_open', 'static int\niris_copy_decoded',
+                              decode_order, decode_order.replace('1u)', '0u)'), ['wire-h264', 'wire-hevc']),
+        'decode_order_missing': (HFI, 'int\niris_hfi_session_open', 'static int\niris_copy_decoded',
+                                decode_order, '', ['wire-h264', 'wire-hevc']),
+        'corrupt_info_ignored': (HFI, 'static int\niris_dispatch_message', 'static int\niris_receive',
+                                'data_corrupt |= pkt->type == HFI_INFO_DATA_CORRUPT;',
+                                'data_corrupt |= false;', ['corrupt-full']),
+        'corrupt_session_error': (HFI, 'static int\niris_dispatch_message', 'static int\niris_receive',
+                                 'if (pkt->type == HFI_INFO_BUFFER_OVERFLOW) error = EIO;',
+                                 'if (pkt->type == HFI_INFO_BUFFER_OVERFLOW || data_corrupt) error = EIO;', ['corrupt-full']),
+        'corrupt_next_message': (HFI, 'static int\niris_dispatch_message', 'static int\niris_receive',
+                                'bool psc = false, data_corrupt = false;',
+                                'bool psc = false; static bool data_corrupt;', ['corrupt-no-buffer']),
+        'corrupt_return_state': (BUFFERS, 'static int\niris_return_buffer', None,
+                                'data_corrupt ? IRIS_RAW_RETURNED_CORRUPT : IRIS_RAW_RETURNED',
+                                'IRIS_RAW_RETURNED', ['corrupt-empty']),
+        'corrupt_short_frame': (BUFFERS, 'static int\niris_return_buffer', None,
+                               '!data_corrupt && hb->data_size != 0',
+                               'hb->data_size != 0', ['corrupt-short']),
+        'corrupt_dma_base': (BUFFERS, 'static int\niris_return_buffer', None,
+                            'hb->base_address != s->raw[hb->index].iova',
+                            '(!data_corrupt && hb->base_address != s->raw[hb->index].iova)', ['corrupt-reject-base']),
+        'corrupt_image_copy': (HFI, 'static int\niris_take_output', 'static int\niris_begin_drain',
+                              '!corrupt && hb->data_size != 0', 'hb->data_size != 0', ['corrupt-full']),
+        'corrupt_empty_output': (HFI, 'static int\niris_take_output', 'static int\niris_begin_drain',
+                                '(decoded || corrupt) && req != NULL', 'decoded && req != NULL', ['corrupt-empty']),
+        'corrupt_output_tag': (HFI, 'static int\niris_take_output', 'static int\niris_begin_drain',
+                              'req->out_tag = hb->timestamp;', 'req->out_tag = req->in_tag;', ['corrupt-full']),
         'psc_crop_u64': (HFI, 'static int\niris_read_property', 'static int\niris_start_output',
                          'pkt->payload_info == HFI_PAYLOAD_U64 ||', '', ['psc-valid-native-h264']),
         'psc_depth_packed': (HFI, 'static int\niris_read_property', 'static int\niris_start_output',
@@ -389,13 +442,13 @@ def mutations():
                             'buf_flags | HFI_BUF_HOST_FLAGS_CB_NON_SECURE', 'buf_flags', ['wire-h264']),
         'old_bin_size': (HFI, 'static void\niris_internal_sizes', 'static int\niris_alloc_session_buffers',
                         '* 4u;', '* 2u;', ['wire-h264']),
-        'buffer_input_index': (HFI, 'static int\niris_return_buffer', 'static int\niris_dispatch_message',
+        'buffer_input_index': (BUFFERS, 'static int\niris_return_buffer', None,
                                'hb->index != s->next_input_idx - 1u ||', '', ['buffer-input-index']),
-        'buffer_input_base': (HFI, 'static int\niris_return_buffer', 'static int\niris_dispatch_message',
+        'buffer_input_base': (BUFFERS, 'static int\niris_return_buffer', None,
                               'hb->base_address != s->bitstream.iova ||', '', ['buffer-input-base']),
-        'buffer_input_size': (HFI, 'static int\niris_return_buffer', 'static int\niris_dispatch_message',
+        'buffer_input_size': (BUFFERS, 'static int\niris_return_buffer', None,
                               'hb->buffer_size != s->bitstream.size', 'false', ['buffer-input-size']),
-        'raw_readonly': (HFI, 'static int\niris_return_buffer', 'static int\niris_dispatch_message',
+        'raw_readonly': (BUFFERS, 'static int\niris_return_buffer', None,
                          '(hb->flags & HFI_BUF_FW_FLAG_READONLY) != 0', 'false', ['buffer-raw-readonly']),
         'input_immutable': (HFI, 'int\niris_hfi_decode_frame', 'int\niris_hfi_session_flush',
                             's->input_queued || s->draining', 's->draining', ['input-immutable']),
@@ -499,13 +552,29 @@ def mutations():
 
 def verify(args, directory):
     cases = write_fixtures(directory / 'fixtures')
-    source = {path: (args.source_root / path).read_text() for path in (HFI, PRIVATE, SESSION, PUBLIC)}
+    source = {path: (args.source_root / path).read_text() for path in (HFI, BUFFERS, PRIVATE, SESSION, PUBLIC)}
     report = {'source_manifest': {str(p): hashlib.sha256(v.encode()).hexdigest() for p, v in source.items()},
               'native_commit': json.loads(NATIVE_SIZES.read_text())['commit'], 'variants': {}}
     binary = compile_variant(args.source_root, directory / 'candidate', source)
     result = run_cases(binary, cases, directory / 'candidate')
     report['variants']['candidate'] = result
     failures = [v['name'] for v in result if not v['passed']]
+    details = (b'buffer identity sid=', b'expected input queued=', b'expected raw index=', b'data corrupt sid=')
+    default_has_no_details = all(text not in binary.read_bytes() for text in details)
+    diagnostic_dir = directory / 'buffer-diagnostics'
+    diagnostic = compile_variant(args.source_root, diagnostic_dir, source, buffer_diagnostics=True)
+    diagnostic_cases = [case for case in cases if case[0].startswith('corrupt-') or case[0] == 'buffer-raw-valid']
+    diagnostic_results = run_cases(diagnostic, diagnostic_cases, diagnostic_dir)
+    report['variants']['buffer-diagnostics'] = diagnostic_results
+    checks = {
+        'default_has_no_buffer_details': default_has_no_details,
+        'diagnostic_contains_buffer_details': all(text in diagnostic.read_bytes() for text in details),
+        'diagnostic_same_frame_contract': all(row['passed'] for row in diagnostic_results),
+        'corrupt_message_records_buffer_identity': 'buffer identity sid=' in (diagnostic_dir / 'corrupt-full.log').read_text(),
+        'normal_buffer_has_no_added_log': 'buffer identity sid=' not in (diagnostic_dir / 'buffer-raw-valid.log').read_text(),
+    }
+    report['buffer_diagnostics'] = checks
+    failures.extend(name for name, passed in checks.items() if not passed)
     if args.baseline_root:
         binary = compile_variant(args.baseline_root, directory / 'baseline', legacy=True)
         result = run_cases(binary, [c for c in cases if c[0].startswith('wire-')], directory / 'baseline')
@@ -525,6 +594,7 @@ def verify(args, directory):
     if failures:
         raise AssertionError('HFI wire regression failed: ' + ', '.join(failures))
     print(f'PASS: {len(cases)} actual HFI/session cases')
+    print(f'PASS: default diagnostics absent; {len(diagnostic_cases)} diagnostic HFI/session cases')
     if args.baseline_root:
         print('PASS: actual unfixed baseline rejected by native OPEN/codec/buffer wire fixtures')
     if args.mutations:

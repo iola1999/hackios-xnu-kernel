@@ -7,6 +7,11 @@
 
 #include <sys/annibale_iris.h>
 
+/* Same-message BUFFER details are enabled only in private diagnostic builds. */
+#ifndef ANNIBALE_IRIS_BUFFER_DIAGNOSTICS
+#define ANNIBALE_IRIS_BUFFER_DIAGNOSTICS 0
+#endif
+
 #ifndef ANNIBALE_IRIS_HOST_TEST
 #include <kern/clock.h>
 #include <kern/kalloc.h>
@@ -218,6 +223,7 @@ extern int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t ar
 #define HFI_PROP_BUFFER_FW_MIN_OUTPUT_COUNT 0x03000124u
 #define HFI_PROP_PIC_ORDER_CNT_TYPE      0x03000128u
 #define HFI_PROP_SIGNAL_COLOR_INFO       0x03000155u
+#define HFI_PROP_DECODE_ORDER_OUTPUT     0x0300015bu
 #define HFI_PROP_PICTURE_TYPE            0x03000162u
 #define HFI_PROP_DEC_DEFAULT_HEADER      0x03000168u
 #define HFI_PROP_NO_OUTPUT               0x0300016au
@@ -263,6 +269,7 @@ extern int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t ar
 #define IRIS_RAW_HOST                    0u
 #define IRIS_RAW_QUEUED                  1u
 #define IRIS_RAW_RETURNED                2u
+#define IRIS_RAW_RETURNED_CORRUPT        3u
 
 #define IRIS_MAX_SESSIONS               4u
 #define IRIS_RAW_POOL_COUNT             4u

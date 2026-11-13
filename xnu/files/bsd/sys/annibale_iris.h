@@ -20,6 +20,7 @@
 #define IRIS_INFO_HW_READY      0x04u
 
 #define IRIS_FRAME_DECODED      0x01u
+#define IRIS_FRAME_CORRUPT      0x02u    /* Damaged returned out_tag; output planes are untouched. */
 #define IRIS_FRAME_NEED_MORE    0x04u
 #define IRIS_FRAME_DRAIN        0x08u
 #define IRIS_FRAME_POLL         0x10u
@@ -49,7 +50,7 @@ struct iris_decode_frame {
 	uint64_t out_user_y;    /* Userland CVPixelBuffer plane 0 (Y) */
 	uint64_t out_user_uv;   /* Userland CVPixelBuffer plane 1 (UV) */
 	uint32_t out_stride;    /* In: userland destination bytesPerRow; Out: active row stride */
-	uint32_t flags;         /* In: IRIS_FRAME_DRAIN / POLL; Out: IRIS_FRAME_DECODED / NEED_MORE */
+	uint32_t flags;         /* In: DRAIN / POLL; Out: DECODED / CORRUPT / NEED_MORE (mutually exclusive). */
 };
 
 #define IRIS_IOC_OPEN_SESSION   _IOWR('V', 1, struct iris_session_params)

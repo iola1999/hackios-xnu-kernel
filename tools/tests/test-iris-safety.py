@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Compile and test SM8750 Iris VPU (/dev/annibale-iris) and VideoToolbox plugin safety."""
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 
@@ -433,6 +434,7 @@ static OSStatus sim_emit_status;
 static VTDecodeFrameRef emitted_frames[64];
 static OSStatus emitted_statuses[64];
 static VTDecodeInfoFlags emitted_flags[64];
+static bool emitted_images[64];
 static OSStatus VTDecoderSessionEmitDecodedFrame(VTDecoderSessionRef s, VTDecodeFrameRef fr,
     OSStatus st, VTDecodeInfoFlags fl, CVImageBufferRef img) {
 	assert(s == borrowed_session && fr != NULL);
@@ -445,6 +447,7 @@ static OSStatus VTDecoderSessionEmitDecodedFrame(VTDecoderSessionRef s, VTDecode
 	emitted_frames[emit_calls] = fr;
 	emitted_statuses[emit_calls] = st;
 	emitted_flags[emit_calls] = fl;
+	emitted_images[emit_calls] = img != NULL;
 	emit_calls++;
 	return sim_emit_status;
 }
@@ -452,7 +455,10 @@ static OSStatus VTDecoderSessionEmitDecodedFrame(VTDecoderSessionRef s, VTDecode
 static bool sim_dev_exists;
 static uint32_t sim_info_flags;
 static int sim_delay_mode;
-static bool sim_fail_decode, sim_fail_poll;
+static bool sim_fail_decode, sim_fail_poll, sim_fail_flush, sim_fail_drain;
+static uint32_t sim_output_flags, sim_poll_flags, sim_drain_flags;
+static uint64_t sim_output_tag;
+static unsigned sim_decode_calls, sim_flush_calls;
 static uint64_t delayed_tag;
 static uint8_t last_submitted_bs[256];
 static uint32_t last_submitted_len;
@@ -482,18 +488,24 @@ static int iris_sys_ioctl(int fd, unsigned long cmd, void *arg) {
 		return 0;
 	}
 	if (cmd == IRIS_IOC_DECODE_FRAME) {
+		sim_decode_calls++;
 		struct iris_decode_frame *req = arg;
 		if (sim_fail_decode) { errno = EIO; return -1; }
 		if ((req->flags & IRIS_FRAME_POLL) != 0) {
 			if (sim_fail_poll) return -1;
-			req->flags = 0;
+			req->flags = sim_poll_flags;
+			sim_poll_flags = 0;
+			req->out_tag = delayed_tag;
+			if (req->flags != 0) delayed_tag = 0;
 			return 0;
 		}
 		if ((req->flags & IRIS_FRAME_DRAIN) != 0) {
+			if (sim_fail_drain) { errno = EIO; return -1; }
 			if (delayed_tag != 0) {
 				req->out_tag = delayed_tag;
 				delayed_tag = 0;
-				req->flags = IRIS_FRAME_DECODED;
+				req->flags = sim_drain_flags ? sim_drain_flags : IRIS_FRAME_DECODED;
+				sim_drain_flags = 0;
 			} else {
 				req->flags = 0;
 			}
@@ -502,6 +514,12 @@ static int iris_sys_ioctl(int fd, unsigned long cmd, void *arg) {
 		assert(req->input_len <= sizeof(last_submitted_bs));
 		memcpy(last_submitted_bs, (const void *)(uintptr_t)req->input_user_addr, req->input_len);
 		last_submitted_len = req->input_len;
+		if (sim_output_flags != 0) {
+			req->flags = sim_output_flags;
+			req->out_tag = sim_output_tag;
+			sim_output_flags = 0;
+			return 0;
+		}
 		memset((void *)(uintptr_t)req->out_user_y, 0x5a, 128);
 		if (sim_delay_mode == 1) {
 			delayed_tag = req->in_tag;
@@ -514,6 +532,10 @@ static int iris_sys_ioctl(int fd, unsigned long cmd, void *arg) {
 		return 0;
 	}
 	if (cmd == IRIS_IOC_FLUSH_SESSION || cmd == IRIS_IOC_CLOSE_SESSION) {
+		if (cmd == IRIS_IOC_FLUSH_SESSION) {
+			sim_flush_calls++;
+			if (sim_fail_flush) { errno = EIO; return -1; }
+		}
 		return 0;
 	}
 	return -1;
@@ -530,11 +552,11 @@ static void test_pending_tokens(void) {
 	assert(!iris_pending_push(&dec, 999, (VTDecodeFrameRef)(uintptr_t)999));
 	assert(iris_pending_pop(&dec, 999) == NULL);
 	assert(iris_pending_pop(&dec, 103) == (VTDecodeFrameRef)(uintptr_t)4);
-	assert(iris_pending_pop(&dec, 0) == (VTDecodeFrameRef)(uintptr_t)1);
+	assert(iris_pending_pop(&dec, 0) == NULL);
 	iris_pending_abort_all(&dec, kVTVideoDecoderMalfunctionErr);
-	assert(emit_calls == (int)IRIS_VT_PENDING_MAX - 2);
+	assert(emit_calls == (int)IRIS_VT_PENDING_MAX - 1);
 	int emitted = 0;
-	for (uint32_t token = 2; token <= IRIS_VT_PENDING_MAX; token++) {
+	for (uint32_t token = 1; token <= IRIS_VT_PENDING_MAX; token++) {
 		if (token == 4) continue;
 		assert(emitted_frames[emitted] == (VTDecodeFrameRef)(uintptr_t)token);
 		assert(emitted_statuses[emitted] == kVTVideoDecoderMalfunctionErr);
@@ -543,6 +565,94 @@ static void test_pending_tokens(void) {
 	for (uint32_t i = 0; i < IRIS_VT_PENDING_MAX; i++) assert(!dec.pending[i].in_use);
 	iris_pending_abort_all(&dec, kVTVideoDecoderMalfunctionErr);
 	assert(emit_calls == emitted && cf_live_objects == live_before);
+}
+
+static unsigned pending_count(const struct iris_vt_decoder *dec) {
+	unsigned count = 0;
+	for (uint32_t i = 0; i < IRIS_VT_PENDING_MAX; i++) count += dec->pending[i].in_use;
+	return count;
+}
+
+static void test_corrupt_outputs(CFTypeRef obj) {
+	struct iris_vt_decoder *dec = CMBaseObjectGetDerivedStorage(obj);
+	const uint8_t nal[] = {0, 0, 0, 2, 1, 0x9a};
+	struct fake_sample sample = {nal, sizeof(nal), true};
+	const int live_before = cf_live_objects;
+	sim_delay_mode = 1;
+	assert(iris_vt_decode_frame(obj, (void *)(uintptr_t)101, &sample, 0, NULL) == noErr);
+	uint64_t older = dec->next_tag;
+	sim_output_flags = 2; sim_output_tag = older;
+	assert(iris_vt_decode_frame(obj, (void *)(uintptr_t)102, &sample, 0, NULL) == noErr);
+	assert(emit_calls == 1 && emitted_frames[0] == (void *)(uintptr_t)101);
+	assert(emitted_statuses[0] == kVTVideoDecoderBadDataErr && emitted_flags[0] == kVTDecodeInfo_FrameDropped);
+	assert(!emitted_images[0] && pending_count(dec) == 1 && cf_live_objects == live_before);
+	delayed_tag = dec->next_tag; sim_poll_flags = 1;
+	assert(iris_vt_decode_frame(obj, (void *)(uintptr_t)103, &sample, 0, NULL) == noErr);
+	assert(emit_calls == 3 && emitted_frames[1] == (void *)(uintptr_t)103 && emitted_frames[2] == (void *)(uintptr_t)102);
+	assert(emitted_statuses[1] == noErr && emitted_statuses[2] == noErr && emitted_images[1] && emitted_images[2]);
+	assert(pending_count(dec) == 0);
+
+	/* A damaged submit output and a damaged POLL output each complete their exact token. */
+	sim_delay_mode = 1;
+	assert(iris_vt_decode_frame(obj, (void *)(uintptr_t)104, &sample, 0, NULL) == noErr);
+	sim_output_flags = 2; sim_output_tag = dec->next_tag;
+	delayed_tag = dec->next_tag + 1; sim_poll_flags = 2;
+	assert(iris_vt_decode_frame(obj, (void *)(uintptr_t)105, &sample, 0, NULL) == noErr);
+	assert(emit_calls == 5 && emitted_frames[3] == (void *)(uintptr_t)104 && emitted_frames[4] == (void *)(uintptr_t)105);
+	for (unsigned i = 3; i < 5; i++)
+		assert(emitted_statuses[i] == kVTVideoDecoderBadDataErr && emitted_flags[i] == kVTDecodeInfo_FrameDropped && !emitted_images[i]);
+	assert(pending_count(dec) == 0);
+
+	assert(iris_pending_push(dec, 0xf01, (void *)(uintptr_t)201));
+	assert(iris_pending_push(dec, 0xf02, (void *)(uintptr_t)202));
+	const uint64_t unknown_tags[] = {0, 0xfff, older};
+	pthread_mutex_lock(&dec->lock);
+	for (unsigned i = 0; i < 3; i++) {
+		bool emitted = true;
+		delayed_tag = unknown_tags[i]; sim_poll_flags = 2;
+		assert(iris_run_decode_step_Locked(dec, NULL, NULL, 0, 0, IRIS_FRAME_POLL, &emitted) == kVTVideoDecoderMalfunctionErr);
+		assert(!emitted && emit_calls == 5 && pending_count(dec) == 2 && cf_live_objects == live_before);
+	}
+	bool emitted = true;
+	delayed_tag = 0xf01; sim_poll_flags = 3;
+	assert(iris_run_decode_step_Locked(dec, NULL, NULL, 0, 0, IRIS_FRAME_POLL, &emitted) == kVTVideoDecoderMalfunctionErr);
+	assert(!emitted && emit_calls == 5 && pending_count(dec) == 2);
+	delayed_tag = 0xf01; sim_poll_flags = 2;
+	assert(iris_run_decode_step_Locked(dec, NULL, NULL, 0, 0, IRIS_FRAME_POLL, &emitted) == noErr && emitted);
+	delayed_tag = 0xf02; sim_poll_flags = 1;
+	assert(iris_run_decode_step_Locked(dec, NULL, NULL, 0, 0, IRIS_FRAME_POLL, &emitted) == noErr && emitted);
+	pthread_mutex_unlock(&dec->lock);
+	assert(emit_calls == 7 && emitted_frames[5] == (void *)(uintptr_t)201 && emitted_frames[6] == (void *)(uintptr_t)202);
+	assert(emitted_statuses[5] == kVTVideoDecoderBadDataErr && !emitted_images[5] && emitted_statuses[6] == noErr && emitted_images[6]);
+	assert(pending_count(dec) == 0);
+
+	sim_delay_mode = 1;
+	assert(iris_vt_decode_frame(obj, (void *)(uintptr_t)106, &sample, 0, NULL) == noErr);
+	sim_drain_flags = 2;
+	unsigned flush_before = sim_flush_calls;
+	assert(iris_vt_finish_delayed_frames(obj) == noErr && sim_flush_calls == flush_before + 1);
+	assert(emit_calls == 8 && emitted_frames[7] == (void *)(uintptr_t)106 && emitted_statuses[7] == kVTVideoDecoderBadDataErr && !emitted_images[7]);
+	assert(pending_count(dec) == 0);
+	unsigned calls_before = sim_decode_calls;
+	assert(iris_vt_finish_delayed_frames(obj) == noErr && sim_decode_calls == calls_before && sim_flush_calls == flush_before + 1);
+	assert(iris_vt_decode_frame(obj, (void *)(uintptr_t)107, &sample, 0, NULL) == noErr);
+	assert(emit_calls == 9 && emitted_statuses[8] == noErr && emitted_images[8]);
+
+	sim_delay_mode = 1;
+	assert(iris_vt_decode_frame(obj, (void *)(uintptr_t)108, &sample, 0, NULL) == noErr);
+	sim_fail_flush = true;
+	assert(iris_vt_finish_delayed_frames(obj) == kVTVideoDecoderMalfunctionErr);
+	sim_fail_flush = false;
+	assert(emit_calls == 10 && emitted_frames[9] == (void *)(uintptr_t)108 && pending_count(dec) == 0);
+
+	sim_delay_mode = 1;
+	assert(iris_vt_decode_frame(obj, (void *)(uintptr_t)109, &sample, 0, NULL) == noErr);
+	sim_fail_drain = true;
+	assert(iris_vt_finish_delayed_frames(obj) == kVTVideoDecoderBadDataErr);
+	sim_fail_drain = false; delayed_tag = 0;
+	assert(emit_calls == 11 && emitted_frames[10] == (void *)(uintptr_t)109 && emitted_statuses[10] == kVTVideoDecoderBadDataErr && !emitted_images[10]);
+	assert(pending_count(dec) == 0 && cf_live_objects == live_before);
+	assert(iris_vt_finish_delayed_frames(obj) == noErr && emit_calls == 11);
 }
 
 int main(int argc, char **argv) {
@@ -591,6 +701,19 @@ int main(int argc, char **argv) {
 	assert(pb_attr_calls == 1);
 	assert(cf_live_objects == 1 && memcmp(session_words, original_words, sizeof(session_words)) == 0);
 	assert(vt->derived_class->can_accept_format(dec_obj, &fmt));
+	for (unsigned repeat = 0; repeat < 3; repeat++) {
+		assert(vt->derived_class->finish_delayed_frames(dec_obj) == noErr);
+	}
+	assert(sim_decode_calls == 0 && sim_flush_calls == 0);
+	if (argc == 2 && strcmp(argv[1], "corrupt") == 0) {
+		test_corrupt_outputs(dec_obj);
+		assert(vt->base_class->invalidate(dec_obj) == noErr && emit_calls == 11);
+		vt->base_class->finalize(dec_obj);
+		CFRelease(dec_obj);
+		assert(cf_live_objects == 0);
+		puts("PASS: exact damaged output tokens, NULL images, continued decode, drain errors, and cleanup");
+		return 0;
+	}
 
 	/* 5. Corrupt zero-length NALU is rejected with BadDataErr (-12909) */
 	static const uint8_t bad_nal[] = { 0x00, 0x00, 0x00, 0x00 };
@@ -627,6 +750,12 @@ int main(int argc, char **argv) {
 	assert(vt->derived_class->finish_delayed_frames(dec_obj) == noErr);
 	assert(emit_calls == 2 && emitted_frames[1] == fref1 && emitted_statuses[1] == noErr);
 	assert(cf_live_objects == 1 && pixbuf_allocations > 0);
+	assert(sim_flush_calls == 1);
+	unsigned decode_calls = sim_decode_calls, flush_calls = sim_flush_calls;
+	for (unsigned repeat = 0; repeat < 3; repeat++) {
+		assert(vt->derived_class->finish_delayed_frames(dec_obj) == noErr);
+	}
+	assert(sim_decode_calls == decode_calls && sim_flush_calls == flush_calls);
 
 	/* The native wrapper consumes the return code; the frame still needs completion. */
 	sim_fail_decode = true;
@@ -751,6 +880,32 @@ with tempfile.TemporaryDirectory(prefix='iris-safety-') as tmp:
     assert len(failures) == 1, failures
     assert 'sid=1 mode=0x0 tag=3 bytes=6 errno=5' in failures[0], failures
     print(vt_res.stdout.strip())
+
+    vt_code = VT_SRC.read_text()
+    public_code = (ROOT / 'xnu/files/bsd/sys/annibale_iris.h').read_text()
+    for name in ('DECODED', 'CORRUPT', 'NEED_MORE', 'DRAIN', 'POLL'):
+        definition = rf'^#define IRIS_FRAME_{name}\s+(0x[0-9a-f]+u)'
+        assert re.search(definition, vt_code, re.M).group(1) == re.search(definition, public_code, re.M).group(1)
+    corrupt_res = run_vt(directory, args=('corrupt',), label='vt_corrupt')
+    assert corrupt_res.returncode == 0, corrupt_res.stderr
+    print(corrupt_res.stdout.strip())
+    vt_mutations = {
+        'corrupt_ignored': ('bool corrupt = (req.flags & IRIS_FRAME_CORRUPT) != 0;', 'bool corrupt = false;'),
+        'corrupt_success': ('corrupt ? kVTVideoDecoderBadDataErr : noErr,', 'noErr,'),
+        'corrupt_image': ('corrupt ? NULL : pixbuf', 'pixbuf'),
+        'corrupt_current_tag': ('iris_pending_pop(dec, req.out_tag)', 'iris_pending_pop(dec, in_tag)'),
+        'zero_oldest_tag': ('if (tag == 0) return NULL;', 'if (tag == 0) return iris_pending_pop(dec, dec->pending[0].tag);'),
+        'corrupt_step_error': ('*out_emitted = true;', '*out_emitted = true; if (corrupt) status = kVTVideoDecoderBadDataErr;'),
+        'flush_error_ignored': ('if (iris_sys_ioctl(dec->fd, IRIS_IOC_FLUSH_SESSION, &sid) != 0 && status == noErr)\n\t\t\tstatus = kVTVideoDecoderMalfunctionErr;',
+                                '(void)iris_sys_ioctl(dec->fd, IRIS_IOC_FLUSH_SESSION, &sid);'),
+        'drain_error_ignored': ('status = iris_run_decode_step_Locked(dec, NULL, NULL, 0, 0, IRIS_FRAME_DRAIN, &emitted);',
+                                '(void)iris_run_decode_step_Locked(dec, NULL, NULL, 0, 0, IRIS_FRAME_DRAIN, &emitted);'),
+    }
+    for label, (old, new) in vt_mutations.items():
+        assert old in vt_code, label
+        result = run_vt(directory, vt_code.replace(old, new, 1), args=('corrupt',), label=label)
+        assert result.returncode != 0, label
+    print(f'PASS: {len(vt_mutations)} compiled per-frame error regressions are rejected')
 
 assert 'videotoolbox_iris.c' in PACKAGE
 assert 'libannibale-vt.dylib' in PACKAGE

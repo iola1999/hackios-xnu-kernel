@@ -91,15 +91,20 @@ static void reply(uint32_t sid, uint32_t type, uint32_t id, uint32_t port, unsig
 	if (mode == 7) { put32(msg + 64, 32); put32(msg + 68, 0x05000002u); put32(msg + 72, 8); }
 	push_message(msg, mode == 7 ? 96 : 64);
 }
+static void buffer_packet(uint8_t *p, uint32_t port, uint32_t type, uint32_t index,
+    uint64_t address, uint32_t size, uint32_t data_size, uint64_t timestamp, uint32_t flags)
+{
+	put32(p, 96); put32(p + 4, 0x01000009u); put32(p + 8, 1);
+	put32(p + 12, 5); put32(p + 16, port); put32(p + 32, type);
+	put32(p + 36, index); put64(p + 40, address); put32(p + 52, size);
+	put32(p + 60, data_size); put64(p + 64, timestamp); put32(p + 72, flags);
+}
 static void emit_buffer(uint32_t sid, uint32_t port, uint32_t type, uint32_t index,
     uint64_t address, uint32_t size, uint32_t data_size, uint64_t timestamp, uint32_t flags)
 {
 	uint8_t msg[128] = {0};
 	put32(msg, 128); put32(msg + 4, sid); put32(msg + 28, 1);
-	put32(msg + 32, 96); put32(msg + 36, 0x01000009u); put32(msg + 40, 1);
-	put32(msg + 44, 5); put32(msg + 48, port); put32(msg + 64, type);
-	put32(msg + 68, index); put64(msg + 72, address); put32(msg + 84, size);
-	put32(msg + 92, data_size); put64(msg + 96, timestamp); put32(msg + 104, flags);
+	buffer_packet(msg + 32, port, type, index, address, size, data_size, timestamp, flags);
 	push_message(msg, sizeof(msg));
 }
 static void push_psc(uint32_t sid)
@@ -384,6 +389,106 @@ static void later_error_check(struct iris_session *s, const char *name)
 	assert(iris_receive(s, NULL) == -EIO && s->input_queued && s->error == EIO && free_calls == 0);
 	assert(g_iris.hw_ready != system);
 }
+
+static void corrupt_check(struct iris_session *s, const char *name)
+{
+	open_output(s);
+	s->next_input_idx = 1; s->input_queued = true;
+	uint8_t msg[400] = {0};
+	uint32_t off = 32, packets = 0, index = 0, flags = 0;
+	uint32_t bytes = strstr(name, "empty") || strstr(name, "drain") ? 0 :
+	    strstr(name, "short") ? 1 : s->raw[0].size;
+	uint64_t tag = strstr(name, "zero-tag") ? 0 : 0x2345;
+	bool raw = !strstr(name, "no-buffer") && !strstr(name, "bitstream-only");
+	bool held = strstr(name, "input-held") != NULL;
+	bool closing = strstr(name, "close") != NULL;
+	bool draining = strstr(name, "drain") != NULL;
+	bool invalid = strstr(name, "reject-") != NULL;
+	bool later = strstr(name, "later-") != NULL;
+	if (draining) flags = 0x10000000u;
+	if (strstr(name, "reject-index")) index = s->raw_count;
+	if (strstr(name, "reject-readonly")) flags = 0x10;
+	if (strstr(name, "reject-psc")) flags = 0x20000000u;
+	if (raw) {
+		buffer_packet(msg + off, strstr(name, "reject-port") ? 1 : 2, 2, index,
+		    s->raw[0].iova + (strstr(name, "reject-base") ? 4096 : 0),
+		    s->raw[0].size - (strstr(name, "reject-size") ? 1 : 0), bytes, tag, flags);
+		if (strstr(name, "reject-overflow")) put32(msg + off + 60, s->raw[0].size + 1);
+		if (strstr(name, "reject-offset")) put32(msg + off + 48, 1);
+		off += 96; packets++;
+	}
+	if (strstr(name, "multiple")) {
+		buffer_packet(msg + off, 2, 2, 1, s->raw[1].iova, s->raw[1].size, 0, 0x6789, 0);
+		off += 96; packets++;
+	}
+	if (!held && !strstr(name, "no-buffer")) {
+		buffer_packet(msg + off, 1, 1, 0, s->bitstream.iova, s->bitstream.size, 0, 0, 0);
+		off += 96; packets++;
+	}
+	/* Put INFO after BUFFER to verify native info-before-command handling. */
+	put32(msg + off, 32); put32(msg + off + 4, 0x06000002u);
+	put32(msg + off + 8, 2); put32(msg + off + 16, 2); off += 32; packets++;
+	if (later) {
+		bool property = strstr(name, "property") != NULL, system = strstr(name, "system") != NULL;
+		put32(msg + off, property ? 36 : 32);
+		put32(msg + off + 4, property ? 0x03000103u : system ? 0x05000002u : 0x04000005u);
+		put32(msg + off + 8, property ? 1 : system ? 8 : 4);
+		if (property) { put32(msg + off + 12, 9); put32(msg + off + 16, 1); }
+		off += property ? 36 : 32; packets++;
+	}
+	put32(msg, off); put32(msg + 4, s->wire_session_id); put32(msg + 8, 29);
+	put32(msg + 28, packets);
+	push_message(msg, off);
+	if (closing) {
+		if (strstr(name, "stop")) { stop_port = 2; stop_mode = 6; }
+		if (strstr(name, "tlb")) free_fail = true;
+		int error = iris_hfi_session_close(s);
+		assert(s->error == 0 && !s->input_queued);
+		assert(error == (stop_mode ? ETIMEDOUT : free_fail ? EIO : 0));
+		assert(free_calls == (error ? 0 : 11));
+		if (stop_mode) assert(s->opened && s->raw[0].kva && s->started_ports == 4);
+		if (free_fail) assert(!s->opened && s->raw[0].kva);
+		return;
+	}
+	if (draining) {
+		assert(iris_begin_drain(s) == 0);
+		reply(s->wire_session_id, 0x01000007u, s->drain_packet_id, 1, 0);
+	}
+	uint8_t y[640 * 480], uv[640 * 240];
+	memset(y, 0xa5, sizeof(y)); memset(uv, 0x5a, sizeof(uv));
+	struct iris_decode_frame req = { .out_user_y = (uintptr_t)y, .out_user_uv = (uintptr_t)uv };
+	int received = iris_receive(s, NULL);
+	if (invalid || later) {
+		int expected = strstr(name, "reject-psc") ? EOPNOTSUPP : EIO;
+		assert(received == -expected && s->error == expected && s->input_queued);
+		assert(s->raw_state[0] == IRIS_RAW_QUEUED && free_calls == 0 && copyout_calls == 0);
+		assert(iris_hfi_session_close(s) == expected && free_calls == 0);
+		return;
+	}
+	assert(received == 1 && s->error == 0);
+	if (raw) {
+		assert(s->raw_state[0] == IRIS_RAW_RETURNED_CORRUPT && s->input_queued == held);
+		assert(iris_take_output(s, &req) == 1 && req.flags == 2 && req.out_tag == tag);
+		assert(copyout_calls == 0 && y[0] == 0xa5 && uv[0] == 0x5a);
+		assert(s->raw_state[0] == (draining ? IRIS_RAW_HOST : IRIS_RAW_QUEUED));
+	}
+	if (strstr(name, "multiple")) {
+		assert(s->raw_state[1] == IRIS_RAW_RETURNED_CORRUPT);
+		assert(iris_take_output(s, &req) == 1 && req.flags == 2 && req.out_tag == 0x6789 && copyout_calls == 0);
+		assert(iris_take_output(s, &req) == 0);
+	}
+	if (draining) {
+		struct iris_decode_frame drain = { .flags = IRIS_FRAME_DRAIN };
+		assert(iris_hfi_decode_frame(s, &drain) == 0 && drain.flags == 0 && !s->draining);
+		assert(count_type(0x01000007u, 1) == 1 && count_type(0x01000008u, 1) == 2 && count_type(0x01000008u, 2) == 1);
+	}
+	/* The next message must return a normal image, including after INFO without RAW. */
+	emit_buffer(s->wire_session_id, 2, 2, 0, s->raw[0].iova, s->raw[0].size, s->raw[0].size, 0x9999, 0);
+	assert(iris_receive(s, NULL) == 1 && s->raw_state[0] == IRIS_RAW_RETURNED);
+	assert(iris_take_output(s, &req) == 1 && req.flags == 1 && req.out_tag == 0x9999);
+	assert(copyout_calls == s->height * 3 / 2);
+	assert(iris_hfi_session_close(s) == 0 && free_calls == 11);
+}
 #endif
 
 static unsigned buffer_count(uint32_t type)
@@ -589,6 +694,7 @@ int main(int argc, char **argv)
 	else if (strncmp(name, "drain-", 6) == 0) drain_check(s, name);
 	else if (strcmp(name, "output-copy") == 0) output_copy_check(s);
 	else if (strncmp(name, "later-", 6) == 0) later_error_check(s, name);
+	else if (strncmp(name, "corrupt-", 8) == 0) corrupt_check(s, name);
 	else if (strcmp(name, "input-immutable") == 0) {
 		assert(iris_hfi_session_open(s) == 0); memset((void *)s->bitstream.kva, 0xa5, 64);
 		s->input_queued = true;

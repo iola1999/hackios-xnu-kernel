@@ -1,14 +1,12 @@
 /*
- * /dev/annibale-camera: the phone's wide camera for iOS (boot-arg cam=5; bsd/dev/annibale/annibale_camera.c).
- *
- *   open()   the first one powers the sensor up and starts its frames (the sensor's mode: boot-arg
- *            cam_mode, else the module file's 4000x3000 one); the last close puts everything down
- *            again, and so does a second without a read.
- *   read()   waits (at most a second) for the newest frame not read yet: a struct
- *            annibale_camera_frame, then as many of the frame's bytes as the buffer has room for.
- *            A buffer of the header's size learns the frame's size and nothing else is copied.
- *            EIO when the camera has had a fault: it stays off for the rest of the run.
- *   write()  commands: a struct annibale_camera_command, then what it says follows.
+ * /dev/annibale-camera accepts annibale_camera_command followed by cmd.bytes.
+ * ANNIBALE_CAMERA_PROFILE installs one checked native sensor mode. CAMIOC_CAPTURE
+ * acquires one frame and returns its completion/stop status. read() copies a frame
+ * header and up to stride * height bytes only after that capture has stopped.
+ * A header-sized read returns geometry without copying pixels. Unknown native
+ * exposure/gain/black-level fields are zero. Native capture failures retain any
+ * resources whose DMA ownership has not ended; close() cannot release them.
+ * cam_hw=0 selects the existing software diagnostic path without a profile.
  */
 #ifndef _SYS_ANNIBALE_CAMERA_H_
 #define _SYS_ANNIBALE_CAMERA_H_
@@ -53,6 +51,7 @@ enum {
 	ANNIBALE_CAMERA_SENSOR = 3,      /* another sensor: a which (as in the frames' header), b its mode (~0: the usual one);
 	                                 * the frames stop, everything goes down, and the next read starts the other one */
 	ANNIBALE_CAMERA_FOCUS = 4,       /* the lens to a: 0 (the furthest) to 1023, from the next frame or so */
+	ANNIBALE_CAMERA_PROFILE = 5,     /* bytes: one RWCTAB03 profile; a/b/c/d must be zero */
 };
 
 struct annibale_camera_command {
@@ -66,9 +65,11 @@ struct annibale_camera_command {
 #define ANNIBALE_CAM_INFO_FLAG_WIDE_DETECTED    (1u << 2)
 #define ANNIBALE_CAM_INFO_FLAG_FRONT_DETECTED   (1u << 3)
 #define ANNIBALE_CAM_INFO_FLAG_HW_DMA_VERIFIED  (1u << 4)
+#define ANNIBALE_CAM_INFO_FLAG_NATIVE_PROFILE   (1u << 5)
+#define ANNIBALE_CAM_INFO_FLAG_FRONT_MODE4      (1u << 6)
 
 struct annibale_camera_info {
-	uint32_t        flags;          /* 0 when live sensor stream is active; bit 0 set on TPG fallback */
+	uint32_t        flags;          /* ANNIBALE_CAM_INFO_FLAG_*; native completion is reported separately */
 	uint16_t        wide_chip_id;   /* Rear Wide OVX8000 chip ID (0x5650) or 0 */
 	uint16_t        front_chip_id;  /* Front OV20B40 chip ID (0x2042) or 0 */
 	uint8_t         wide_slave;     /* 7-bit I2C slave on CCI0 M1 */
@@ -80,5 +81,57 @@ struct annibale_camera_info {
 };
 
 #define CAMIOC_G_INFO           _IOR('C', 1, struct annibale_camera_info)
+
+/* Little-endian profile: header, up/down power entries, then init/mode/on/off registers. */
+#define ANNIBALE_CAMERA_PROFILE_MAGIC "RWCTAB03"
+struct annibale_camera_profile {
+	char magic[8];
+	uint32_t bytes, sensor, mode;
+	uint32_t width, height, stride, bayer;
+	uint32_t lane_assign, lane_count, settle_count, virtual_channel, data_type;
+	uint32_t output_pixel_clock, line_length, frame_length, fps_milli;
+	uint32_t init_count, mode_count, on_count, off_count, up_count, down_count;
+	uint8_t source_sha256[32];
+};
+
+struct annibale_camera_power {
+	uint32_t type, value, delay_ms;
+};
+
+struct annibale_camera_register {
+	uint16_t address, value;
+	uint8_t address_bytes, data_bytes, operation, reserved;
+	uint32_t delay_us;
+};
+
+enum {
+	ANNIBALE_CAM_CAPTURE_NO_PROFILE = 0,
+	ANNIBALE_CAM_CAPTURE_READY,
+	ANNIBALE_CAM_CAPTURE_RUNNING,
+	ANNIBALE_CAM_CAPTURE_STOPPED,
+	ANNIBALE_CAM_CAPTURE_FAILED,
+	ANNIBALE_CAM_CAPTURE_HELD,
+};
+
+#define ANNIBALE_CAM_CAPTURE_BUF_DONE   (1u << 0)
+#define ANNIBALE_CAM_CAPTURE_ADDR_MATCH (1u << 1)
+#define ANNIBALE_CAM_CAPTURE_FIFO_EMPTY (1u << 2)
+#define ANNIBALE_CAM_CAPTURE_HALTED     (1u << 3)
+#define ANNIBALE_CAM_CAPTURE_DMA_STOPPED (1u << 4)
+#define ANNIBALE_CAM_CAPTURE_SMMU_SYNC  (1u << 5)
+#define ANNIBALE_CAM_CAPTURE_COMPLETE  (ANNIBALE_CAM_CAPTURE_BUF_DONE | ANNIBALE_CAM_CAPTURE_ADDR_MATCH | \
+    ANNIBALE_CAM_CAPTURE_FIFO_EMPTY | ANNIBALE_CAM_CAPTURE_HALTED | ANNIBALE_CAM_CAPTURE_DMA_STOPPED | \
+    ANNIBALE_CAM_CAPTURE_SMMU_SYNC)
+
+/* CAMIOC_CAPTURE has no input. error is a positive errno; the ioctl copies status on failure too. */
+struct annibale_camera_capture {
+	uint32_t state, error, flags;
+	uint32_t buf_done, top_irq, rx_irq, path_irq;
+	uint32_t consumed_addr, fifo_count, reset_status, wm_cfg;
+	uint32_t width, height, stride, bytes;
+	uint64_t dma_address, sequence, time;
+};
+
+#define CAMIOC_CAPTURE          _IOR('C', 2, struct annibale_camera_capture)
 
 #endif /* _SYS_ANNIBALE_CAMERA_H_ */

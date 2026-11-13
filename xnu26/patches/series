@@ -76,3 +76,5 @@
 74-osfmk%vm%vm_memory_entry.c.patch
 75-osfmk%vm%vm_map_store.c.patch
 76-osfmk%arm%rtclock.c.patch
+77-osfmk%arm%Makefile.patch
+78-pexpert%arm%pe_identify_machine.c.patch
