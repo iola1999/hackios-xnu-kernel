@@ -285,7 +285,7 @@ ramfs_disk_dirty_locked(struct ramfs_mount *rm)
 	if (rm == NULL || !rm->rm_disk_backed || rm->rm_disk_loading) {
 		return;
 	}
-	rm->rm_meta_dirty = true;
+	rm->rm_meta_state = RAMFS_META_DIRTY;
 	if (ramfs_var_seed_done == 0 || !rm->rm_seed_done) {
 		return;
 	}
@@ -456,13 +456,18 @@ ramfs_disk_sync_impl(struct ramfs_mount *rm)
 		return 0;
 	}
 	lck_mtx_lock(&rm->rm_lock);
-	if (rm->rm_meta_gen == 0) {
-		rm->rm_meta_dirty = true;
-	}
 	while (rm->rm_meta_syncing) {
 		msleep(&rm->rm_meta_syncing, &rm->rm_lock, PRIBIO, "annfssync", NULL);
 	}
-	if (!rm->rm_meta_dirty) {
+	if (rm->rm_meta_gen == 0 && rm->rm_meta_state == RAMFS_META_CLEAN) {
+		rm->rm_meta_state = RAMFS_META_DIRTY;
+	}
+	/* A mutation resets SLOT_FULL in ramfs_disk_dirty_locked(); unchanged input still cannot fit. */
+	if (rm->rm_meta_state == RAMFS_META_SLOT_FULL) {
+		lck_mtx_unlock(&rm->rm_lock);
+		return ENOSPC;
+	}
+	if (rm->rm_meta_state == RAMFS_META_CLEAN) {
 		lck_mtx_unlock(&rm->rm_lock);
 		return 0;
 	}
@@ -474,6 +479,7 @@ ramfs_disk_sync_impl(struct ramfs_mount *rm)
 
 		if (new_cap > ANNFS_SLOT_MAX) {
 			if (old_cap >= ANNFS_SLOT_MAX) {
+				rm->rm_meta_state = RAMFS_META_SLOT_FULL;
 				lck_mtx_unlock(&rm->rm_lock);
 				return ENOSPC;
 			}
@@ -498,7 +504,7 @@ ramfs_disk_sync_impl(struct ramfs_mount *rm)
 		}
 	}
 
-	rm->rm_meta_dirty = false;
+	rm->rm_meta_state = RAMFS_META_CLEAN;
 	rm->rm_meta_syncing = true;
 	gen = rm->rm_meta_gen + 1;
 	write_bytes = ANNFS_ALIGN4K(ANNFS_SUPER_BYTES + payload_bytes);
@@ -549,11 +555,11 @@ ramfs_disk_sync_impl(struct ramfs_mount *rm)
 		rm->rm_meta_gen = gen;
 		rm->rm_meta_slot = slot_off == ANNFS_SLOT0_OFFSET ? 0 : 1;
 	} else {
-		rm->rm_meta_dirty = true;
+		rm->rm_meta_state = RAMFS_META_DIRTY;
 	}
 	if (error != 0) {
 		printf("ramfs: metadata write failed (%d)\n", error);
-	} else if (rm->rm_meta_dirty && rm->rm_seed_done && ramfs_var_seed_done != 0 &&
+	} else if (rm->rm_meta_state != RAMFS_META_CLEAN && rm->rm_seed_done && ramfs_var_seed_done != 0 &&
 	    rm->rm_meta_call != NULL) {
 		uint64_t deadline;
 
@@ -726,6 +732,45 @@ ramfs_disk_find_child(struct ramfs_node *dir, const char *name, size_t len)
 }
 
 static void
+ramfs_disk_prune_bloated_aircache(struct ramfs_mount *rm)
+{
+	struct ramfs_node *db_node, *cache_node;
+	struct ramfs_dirent *de, *tmp;
+	uint32_t removed = 0;
+
+	lck_mtx_lock(&rm->rm_lock);
+	db_node = ramfs_disk_find_child(rm->rm_root, "db", 2);
+	cache_node = ramfs_disk_find_child(db_node, "annibale-aircache", 17);
+	if (cache_node == NULL || cache_node->rn_type != VDIR || cache_node->rn_nentries <= 4096) {
+		lck_mtx_unlock(&rm->rm_lock);
+		return;
+	}
+	TAILQ_FOREACH_SAFE(de, &cache_node->rn_entries, rd_link, tmp) {
+		struct ramfs_node *child = de->rd_node;
+
+		if (child == NULL || child->rn_type != VREG || child->rn_vp != NULLVP) {
+			continue;
+		}
+		TAILQ_REMOVE(&cache_node->rn_entries, de, rd_link);
+		cache_node->rn_nentries--;
+		ramfs_dirent_free(de);
+		if (--child->rn_nlink == 0) {
+			ramfs_node_free(child);
+		}
+		removed++;
+	}
+	if (cache_node->rn_dir_hash != NULL) {
+		kfree_type(struct ramfs_dirent *, RAMFS_DIR_HASH_SIZE, cache_node->rn_dir_hash);
+		cache_node->rn_dir_hash = NULL;
+	}
+	ramfs_disk_dirty_locked(rm);
+	lck_mtx_unlock(&rm->rm_lock);
+	(void)ramfs_disk_sync(rm);
+	printf("ramfs: pruned %u legacy entries from /private/var/db/annibale-aircache (%llu nodes remain)\n",
+	    removed, rm->rm_nodes);
+}
+
+static void
 ramfs_disk_restore_panic_log(struct ramfs_mount *rm)
 {
 	uint8_t *head_buf;
@@ -741,6 +786,7 @@ ramfs_disk_restore_panic_log(struct ramfs_mount *rm)
 	if (rm == NULL || !rm->rm_disk_backed || rm->rm_root == NULL) {
 		return;
 	}
+	ramfs_disk_prune_bloated_aircache(rm);
 
 	head_buf = (uint8_t *)ramfs_vm_alloc(PAGE_SIZE);
 	if (head_buf == NULL) {

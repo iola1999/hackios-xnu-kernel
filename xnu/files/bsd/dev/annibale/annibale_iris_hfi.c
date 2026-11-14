@@ -861,14 +861,6 @@ iris_wait_reply(struct iris_session *s, uint32_t type, uint32_t id, uint32_t por
 	return ETIMEDOUT;
 }
 
-static uint32_t
-iris_decode_stage(const struct iris_session *s)
-{
-	/* Native vpu35 OPEN defaults use coded_frames=0 and low_latency=0. */
-	uint32_t macroblocks = ((s->width + 15u) / 16u) * ((s->height + 15u) / 16u);
-	return s->width < 1280u && s->height < 1280u && macroblocks < 3600u ? 1u : 2u;
-}
-
 int
 iris_hfi_session_open(struct iris_session *s)
 {
@@ -892,6 +884,7 @@ iris_hfi_session_open(struct iris_session *s)
 	s->opened = true;
 	pkt_begin(&b, s->wire_session_id);
 	/* Decoder resolution uses U32; the encoder uses the 32_PACKED payload type. */
+	/* The synchronous single-input interface uses native vpu35's low-latency STAGE=1. */
 	if (!pkt_add_u32(&b, HFI_PROP_CODEC, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32_ENUM, HFI_PORT_NONE, codec) ||
 	    !pkt_add_u32(&b, HFI_PROP_DEC_DEFAULT_HEADER, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32,
 	    HFI_PORT_BITSTREAM, 0u) ||
@@ -900,7 +893,7 @@ iris_hfi_session_open(struct iris_session *s)
 	    !pkt_add_u32(&b, HFI_PROP_DECODE_ORDER_OUTPUT, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32,
 	    HFI_PORT_BITSTREAM, 1u) ||
 	    !pkt_add_u32(&b, HFI_PROP_STAGE, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32,
-	    HFI_PORT_NONE, iris_decode_stage(s)) ||
+	    HFI_PORT_NONE, 1u) ||
 	    !pkt_add_u32(&b, HFI_PROP_COMV_BUFFER_COUNT, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32,
 	    HFI_PORT_BITSTREAM, 8u) || !iris_cmdq_write(&b)) goto failed;
 	const struct iris_dma_buf *bufs[] = { &s->intern_persist, &s->intern_bin, &s->intern_comv,
@@ -1010,15 +1003,16 @@ iris_finish_drain(struct iris_session *s)
 {
 	if (!s->draining || !s->drain_ack || !s->drain_last || s->input_queued) return EBUSY;
 	uint32_t flags = HFI_HOST_FLAGS_INTR_REQUIRED | HFI_HOST_FLAGS_RESPONSE_REQUIRED;
-	if (!iris_send_command(s, HFI_CMD_RESUME, HFI_PORT_BITSTREAM, flags, HFI_CMD_DRAIN, NULL)) return EIO;
-	if ((s->started_ports & (1u << HFI_PORT_RAW)) != 0 &&
-	    !iris_send_command(s, HFI_CMD_RESUME, HFI_PORT_RAW, flags, HFI_CMD_DRAIN, NULL)) return EIO;
+	/* Publish host-owned output buffers before firmware resumes decoding. */
 	for (uint32_t i = 0; i < s->raw_count; i++) {
 		if (s->raw_state[i] != IRIS_RAW_HOST || (s->started_ports & (1u << HFI_PORT_RAW)) == 0) continue;
 		if (!iris_queue_buffer(s->wire_session_id, HFI_PORT_RAW, HFI_BUFFER_RAW, i,
 		    s->raw[i].iova, s->raw[i].size, 0, 0)) return EIO;
 		s->raw_state[i] = IRIS_RAW_QUEUED;
 	}
+	if (!iris_send_command(s, HFI_CMD_RESUME, HFI_PORT_BITSTREAM, flags, HFI_CMD_DRAIN, NULL)) return EIO;
+	if ((s->started_ports & (1u << HFI_PORT_RAW)) != 0 &&
+	    !iris_send_command(s, HFI_CMD_RESUME, HFI_PORT_RAW, flags, HFI_CMD_DRAIN, NULL)) return EIO;
 	s->draining = false;
 	s->drain_ack = false;
 	s->drain_last = false;

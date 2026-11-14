@@ -221,8 +221,9 @@ def write_fixtures(directory):
         cases.append(('wire-psc-' + label + '-native', native_path, output))
     default = directory / 'psc-1.bin'
     expected = directory / 'open-1.bin'
-    for width, height, stage in [(64, 64, 1), (320, 192, 1), (640, 480, 1), (944, 960, 1), (960, 944, 1), (960, 960, 2), (944, 944, 1), (945, 945, 2), (1264, 720, 1), (1265, 720, 2), (720, 1264, 1), (720, 1265, 2), (1279, 64, 1), (1280, 64, 2), (64, 1279, 1), (64, 1280, 2), (1280, 720, 2), (720, 1280, 2), (1920, 1080, 2), (4096, 4096, 2)]:
-        cases.append((f'stage-{width}-{height}-{stage}', default, expected))
+    for codec, width, height in [('h264', 320, 192), ('h264', 1280, 720),
+                                 ('hevc', 1280, 720), ('hevc', 1920, 1080)]:
+        cases.append((f'stage-{codec}-{width}-{height}', default, expected))
     cases.append(('stage-wire', default, expected))
     names = ['close-success', 'tlb-failure', 'input-immutable', 'output-copy', 'decode-psc',
              'input-order-raw-first', 'input-order-multiple-raw-first', 'input-order-missing',
@@ -532,18 +533,26 @@ def mutations():
     }
 
     variants.update({
-        'stage_constant1': (HFI, 'static uint32_t\niris_decode_stage', 'static int\niris_copy_decoded', 'return s->width < 1280u && s->height < 1280u && macroblocks < 3600u ? 1u : 2u;', 'return macroblocks ? 1u : 1u;', ['stage-960-960-2']),
-        'stage_constant2': (HFI, 'static uint32_t\niris_decode_stage', 'static int\niris_copy_decoded', 'return s->width < 1280u && s->height < 1280u && macroblocks < 3600u ? 1u : 2u;', 'return macroblocks ? 2u : 2u;', ['stage-320-192-1']),
-        'stage_width_round': (HFI, 'static uint32_t\niris_decode_stage', 'static int\niris_copy_decoded', 's->width + 15u', 's->width', ['stage-1265-720-2']),
-        'stage_height_round': (HFI, 'static uint32_t\niris_decode_stage', 'static int\niris_copy_decoded', 's->height + 15u', 's->height', ['stage-720-1265-2']),
-        'stage_width_bound': (HFI, 'static uint32_t\niris_decode_stage', 'static int\niris_copy_decoded', 's->width < 1280u', 's->width <= 1280u', ['stage-1280-64-2']),
-        'stage_height_bound': (HFI, 'static uint32_t\niris_decode_stage', 'static int\niris_copy_decoded', 's->height < 1280u', 's->height <= 1280u', ['stage-64-1280-2']),
-        'stage_macroblock_bound': (HFI, 'static uint32_t\niris_decode_stage', 'static int\niris_copy_decoded', 'macroblocks < 3600u', 'macroblocks <= 3600u', ['stage-960-960-2']),
-        'stage_payload': (HFI, 'static uint32_t\niris_decode_stage', 'static int\niris_copy_decoded', 'HFI_PROP_STAGE, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32,', 'HFI_PROP_STAGE, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32_ENUM,', ['wire-h264', 'stage-wire']),
-        'stage_port': (HFI, 'static uint32_t\niris_decode_stage', 'static int\niris_copy_decoded', 'HFI_PORT_NONE, iris_decode_stage(s)', 'HFI_PORT_BITSTREAM, iris_decode_stage(s)', ['wire-h264', 'stage-wire']),
-        'stage_value': (HFI, 'static uint32_t\niris_decode_stage', 'static int\niris_copy_decoded', 'HFI_PORT_NONE, iris_decode_stage(s)', 'HFI_PORT_NONE, 1u', ['stage-wire']),
-        'stage_missing': (HFI, 'static uint32_t\niris_decode_stage', 'static int\niris_copy_decoded', '\t    !pkt_add_u32(&b, HFI_PROP_STAGE, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32,\n\t    HFI_PORT_NONE, iris_decode_stage(s)) ||\n', '', ['wire-h264', 'stage-wire']),
+        'stage_payload': (HFI, 'int\niris_hfi_session_open', 'static int\niris_copy_decoded', 'HFI_PROP_STAGE, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32,', 'HFI_PROP_STAGE, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32_ENUM,', ['wire-h264', 'stage-wire']),
+        'stage_port': (HFI, 'int\niris_hfi_session_open', 'static int\niris_copy_decoded', 'HFI_PORT_NONE, 1u', 'HFI_PORT_BITSTREAM, 1u', ['wire-h264', 'stage-wire']),
+        'stage_value': (HFI, 'int\niris_hfi_session_open', 'static int\niris_copy_decoded', 'HFI_PORT_NONE, 1u', 'HFI_PORT_NONE, 2u', ['stage-h264-320-192', 'stage-hevc-1920-1080']),
+        'stage_missing': (HFI, 'int\niris_hfi_session_open', 'static int\niris_copy_decoded', '\t    !pkt_add_u32(&b, HFI_PROP_STAGE, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32,\n\t    HFI_PORT_NONE, 1u) ||\n', '', ['wire-h264', 'stage-wire']),
     })
+    resume = (
+        '\tif (!iris_send_command(s, HFI_CMD_RESUME, HFI_PORT_BITSTREAM, flags, HFI_CMD_DRAIN, NULL)) return EIO;\n'
+        '\tif ((s->started_ports & (1u << HFI_PORT_RAW)) != 0 &&\n'
+        '\t    !iris_send_command(s, HFI_CMD_RESUME, HFI_PORT_RAW, flags, HFI_CMD_DRAIN, NULL)) return EIO;\n')
+    requeue = (
+        '\t/* Publish host-owned output buffers before firmware resumes decoding. */\n'
+        '\tfor (uint32_t i = 0; i < s->raw_count; i++) {\n'
+        '\t\tif (s->raw_state[i] != IRIS_RAW_HOST || (s->started_ports & (1u << HFI_PORT_RAW)) == 0) continue;\n'
+        '\t\tif (!iris_queue_buffer(s->wire_session_id, HFI_PORT_RAW, HFI_BUFFER_RAW, i,\n'
+        '\t\t    s->raw[i].iova, s->raw[i].size, 0, 0)) return EIO;\n'
+        '\t\ts->raw_state[i] = IRIS_RAW_QUEUED;\n'
+        '\t}\n')
+    variants['drain_resume_before_raw'] = (
+        HFI, 'static int\niris_finish_drain', 'static int\niris_collect_output',
+        requeue + resume, resume + requeue, ['last-full', 'last-short-readonly'])
     variants['empty_flush_drain'] = (
         HFI, 'int\niris_hfi_session_flush', 'int\niris_hfi_session_close',
         'if (s->next_input_idx == 0) return 0;', '', ['drain-empty-first-input'])

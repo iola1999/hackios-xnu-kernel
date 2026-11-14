@@ -12,6 +12,9 @@ structs = main[main.index('struct ramfs_mount;'):main.index('/* file pages in us
 format_defs = disk[disk.index('#define ANNFS_MAGIC_STR'):disk.index('static void ramfs_disk_dirty_locked')]
 find_ino = disk[disk.index('static struct ramfs_node *\nramfs_disk_find_ino'):disk.index('#include "ramfs_disk_restore.inc"')]
 pack_sync = disk[disk.index('static void\nramfs_disk_dirty_locked'):disk.index('int ramfs_disk_flush_all(void);')]
+# Count calls without changing the extracted serialization or sync logic.
+pack_sync = pack_sync.replace('uint8_t *base = (uint8_t *)rm->rm_meta_buf + ANNFS_SUPER_BYTES;',
+                              'pack_calls++;\n\tuint8_t *base = (uint8_t *)rm->rm_meta_buf + ANNFS_SUPER_BYTES;', 1)
 source = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -57,7 +60,13 @@ typedef struct test_call *thread_call_t;
 typedef void *thread_call_param_t;
 enum vtype { VNON, VREG, VDIR, VBLK, VCHR, VLNK, VSOCK, VFIFO, VBAD };
 static size_t allocations, alloc_call, fail_alloc;
+static void (*allocation_hook)(void);
+static unsigned pack_calls, sync_waits;
 static void *allocate(size_t n) {
+    if (allocation_hook != NULL) {
+        void (*hook)(void) = allocation_hook;
+        allocation_hook = NULL; hook();
+    }
     if (++alloc_call == fail_alloc) return NULL;
     void *p = calloc(1, n); assert(p); allocations++; return p;
 }
@@ -84,7 +93,8 @@ static void wait_cond(pthread_cond_t *cv, pthread_mutex_t *lock) {
     deadline.tv_sec += 5;
     assert(pthread_cond_timedwait(cv, lock, &deadline) == 0);
 }
-#define msleep(p, lock, ...) wait_cond(&sync_cv, lock)
+static void sync_wait(pthread_mutex_t *lock);
+#define msleep(p, lock, ...) sync_wait(lock)
 #define wakeup(p) assert(pthread_cond_broadcast(&sync_cv) == 0)
 #define clock_interval_to_deadline(a,b,p) (*(p) = 1)
 #define THREAD_CALL_PRIORITY_HIGH 0
@@ -125,9 +135,15 @@ static pthread_cond_t event_cv = PTHREAD_COND_INITIALIZER;
 static bool pause_callback, callback_entered, release_callback;
 static bool pause_io, io_entered, release_io, cancel_entered, unmount_done;
 static uint64_t ramfs_var_used_pages;
+static void nanotime(struct timespec *now) { assert(clock_gettime(CLOCK_REALTIME, now) == 0); }
 '''
 source += structs + format_defs
 source += r'''
+static void sync_wait(pthread_mutex_t *lock) {
+    lck_mtx_lock(&event_lock); sync_waits++;
+    pthread_cond_broadcast(&event_cv); lck_mtx_unlock(&event_lock);
+    wait_cond(&sync_cv, lock);
+}
 /* Match XNU's cancellation contract; production ONCE selection must wait for both states. */
 static bool thread_call_cancel_wait(thread_call_t call) {
     struct ramfs_mount *rm = call->arg;
@@ -228,6 +244,8 @@ static void ramfs_disk_restore_panic_log(struct ramfs_mount *rm) { (void)rm; pan
 '''
 source += '#define ramfs_disk_sync(rm) ramfs_disk_sync_impl(rm)\n'
 source += find_ino + (SRC / 'ramfs_disk_restore.inc').read_text() + pack_sync
+touch_at = main.index('static void\nramfs_touch(')
+source += main[touch_at:main.index('\n}\n', touch_at) + 3]
 source += (SRC / 'ramfs_disk_mount.inc').read_text()
 source += r'''
 struct vfsstatfs { char f_mntonname[64]; };
@@ -333,7 +351,7 @@ static void unmount_retry_tests(void) {
         partial_write = fault == 0 ? 128 : 0;
         assert(ramfs_unmount(&mp, 0, NULL) == EIO);
         assert(mp.private == rm && ramfs_disk_rm == rm && ramfs_disk_claimed);
-        assert(rm->rm_disk_backed && rm->rm_meta_dirty && rm->rm_meta_gen == 4);
+        assert(rm->rm_disk_backed && rm->rm_meta_state == RAMFS_META_DIRTY && rm->rm_meta_gen == 4);
         assert(rm->rm_meta_call == call && rm->rm_meta_buf == meta && rm->rm_io_page == io_page);
         assert(rm->rm_bmap == bmap && rm->rm_root == root && !call->pending && !call->running);
         assert(memcmp(committed, device + ANNFS_SLOT1_OFFSET, sizeof(committed)) == 0);
@@ -344,7 +362,7 @@ static void unmount_retry_tests(void) {
             pthread_t worker;
             assert(pthread_create(&worker, NULL, run_call, call) == 0);
             assert(pthread_join(worker, NULL) == 0);
-            assert(!rm->rm_meta_dirty && rm->rm_meta_gen == 5);
+            assert(rm->rm_meta_state == RAMFS_META_CLEAN && rm->rm_meta_gen == 5);
         }
         assert(ramfs_unmount(&mp, 0, NULL) == 0);
         assert_released(&mp);
@@ -401,10 +419,10 @@ static void callout_tests(void) {
             assert(pthread_join(unmount_worker, NULL) == 0 && unmount_result == 0);
         } else {
             /* A checkpoint changed during I/O must still schedule its next commit. */
-            assert(call->pending && rm->rm_meta_dirty && rm->rm_meta_gen == 5);
+            assert(call->pending && rm->rm_meta_state == RAMFS_META_DIRTY && rm->rm_meta_gen == 5);
             assert(pthread_create(&worker, NULL, run_call, call) == 0);
             assert(pthread_join(worker, NULL) == 0);
-            assert(!call->pending && !rm->rm_meta_dirty && rm->rm_meta_gen == 6);
+            assert(!call->pending && rm->rm_meta_state == RAMFS_META_CLEAN && rm->rm_meta_gen == 6);
             assert(ramfs_unmount(&mp, 0, NULL) == 0);
         }
         assert_released(&mp);
@@ -412,6 +430,120 @@ static void callout_tests(void) {
         struct annfs_inode_rec *root = (void *)(device + slot * ANNFS_SLOT_MAX + ANNFS_SUPER_BYTES);
         assert(root->mode == 0600);
     }
+}
+static struct ramfs_xattr *add_large_attribute(struct ramfs_mount *rm, const char *name) {
+    struct ramfs_xattr *xa = allocate(sizeof(*xa));
+    xa->rx_name = allocate(5); memcpy(xa->rx_name, name, 4); xa->rx_namelen = 4;
+    xa->rx_data = allocate(RAMFS_MAX_XATTR); xa->rx_size = RAMFS_MAX_XATTR;
+    TAILQ_INSERT_TAIL(&rm->rm_root->rn_xattrs, xa, rx_link);
+    ramfs_touch(rm->rm_root, false); return xa;
+}
+static void remove_large_attribute(struct ramfs_mount *rm, struct ramfs_xattr *xa) {
+    TAILQ_REMOVE(&rm->rm_root->rn_xattrs, xa, rx_link);
+    release(xa->rx_name); release(xa->rx_data); release(xa);
+    ramfs_touch(rm->rm_root, false);
+}
+static void *repeat_full_sync(void *arg) {
+    for (unsigned i = 0; i < 25; i++) assert(ramfs_disk_sync_impl(arg) == ENOSPC);
+    return NULL;
+}
+static void slot_full_tests(void) {
+    struct test_mount mp; struct ramfs_mount *rm = mounted_checkpoint(&mp);
+    thread_call_t call = rm->rm_meta_call;
+    uint8_t committed[8192];
+    memcpy(committed, device + ANNFS_SLOT1_OFFSET, sizeof(committed));
+    lck_mtx_lock(&rm->rm_lock);
+    struct ramfs_xattr *a = add_large_attribute(rm, "bigA");
+    struct ramfs_xattr *b = add_large_attribute(rm, "bigB");
+    lck_mtx_unlock(&rm->rm_lock);
+    pack_calls = 0;
+    assert(ramfs_disk_sync_impl(rm) == ENOSPC);
+    unsigned first = pack_calls;
+    assert(rm->rm_meta_state == RAMFS_META_SLOT_FULL && rm->rm_meta_gen == 4);
+    pthread_t workers[8];
+    for (unsigned i = 0; i < 8; i++) assert(pthread_create(&workers[i], NULL, repeat_full_sync, rm) == 0);
+    for (unsigned i = 0; i < 8; i++) assert(pthread_join(workers[i], NULL) == 0);
+    assert(pack_calls == first && writes == 0 && rm->rm_meta_slot == 1);
+    assert(memcmp(committed, device + ANNFS_SLOT1_OFFSET, sizeof(committed)) == 0);
+    assert(ramfs_unmount(&mp, 0, NULL) == ENOSPC && mp.private == rm);
+    assert(rm->rm_meta_call == call && rm->rm_disk_backed && pack_calls == first);
+    lck_mtx_lock(&rm->rm_lock);
+    rm->rm_root->rn_mode = 0600; ramfs_touch(rm->rm_root, false);
+    lck_mtx_unlock(&rm->rm_lock);
+    assert(rm->rm_meta_state == RAMFS_META_DIRTY);
+    assert(ramfs_disk_sync_impl(rm) == ENOSPC && pack_calls == first + 1 && writes == 0);
+    lck_mtx_lock(&rm->rm_lock); remove_large_attribute(rm, b); lck_mtx_unlock(&rm->rm_lock);
+    assert(ramfs_disk_sync_impl(rm) == 0 && pack_calls == first + 2 && writes == 2);
+    assert(rm->rm_meta_gen == 5 && rm->rm_meta_state == RAMFS_META_CLEAN);
+    assert(ramfs_disk_sync_impl(rm) == 0 && pack_calls == first + 2);
+    lck_mtx_lock(&rm->rm_lock); remove_large_attribute(rm, a); lck_mtx_unlock(&rm->rm_lock);
+    assert(ramfs_unmount(&mp, 0, NULL) == 0); assert_released(&mp);
+    puts("slot-full: 200 unchanged sync requests preserve ENOSPC without repacking; mutation retries passed");
+}
+static void initial_slot_full_tests(void) {
+    struct ramfs_mount rm; setup(&rm); assert(ramfs_disk_mount(&rm) == 0);
+    rm.rm_seed_done = true; ramfs_var_seed_done = 1;
+    lck_mtx_lock(&rm.rm_lock);
+    struct ramfs_xattr *a = add_large_attribute(&rm, "bigA");
+    struct ramfs_xattr *b = add_large_attribute(&rm, "bigB");
+    lck_mtx_unlock(&rm.rm_lock);
+    assert(ramfs_disk_sync_impl(&rm) == ENOSPC);
+    unsigned first = pack_calls;
+    assert(ramfs_disk_sync_impl(&rm) == ENOSPC && pack_calls == first);
+    assert(rm.rm_meta_gen == 0 && writes == 0 && rm.rm_meta_state == RAMFS_META_SLOT_FULL);
+    rm.rm_disk_loading = true;
+    assert(ramfs_disk_sync_impl(&rm) == 0 && pack_calls == first);
+    rm.rm_disk_loading = false; rm.rm_seed_done = false;
+    assert(ramfs_disk_sync_impl(&rm) == 0 && pack_calls == first);
+    rm.rm_seed_done = true; ramfs_var_seed_done = 0;
+    assert(ramfs_disk_sync_impl(&rm) == 0 && pack_calls == first);
+    ramfs_var_seed_done = 1;
+    lck_mtx_lock(&rm.rm_lock); remove_large_attribute(&rm, b); lck_mtx_unlock(&rm.rm_lock);
+    assert(ramfs_disk_sync_impl(&rm) == 0 && rm.rm_meta_gen == 1);
+    lck_mtx_lock(&rm.rm_lock); remove_large_attribute(&rm, a); lck_mtx_unlock(&rm.rm_lock);
+    assert(ramfs_disk_unmount(&rm) == 0); cleanup(&rm);
+}
+static struct ramfs_mount *sync_worker_rm;
+static int sync_worker_results[2];
+static void *sync_once(void *arg) {
+    sync_worker_results[(uintptr_t)arg] = ramfs_disk_sync_impl(sync_worker_rm); return NULL;
+}
+static void initial_concurrent_sync_test(void) {
+    struct ramfs_mount rm; setup(&rm); assert(ramfs_disk_mount(&rm) == 0);
+    rm.rm_seed_done = true; ramfs_var_seed_done = 1;
+    pack_calls = sync_waits = 0; pause_io = true; io_entered = release_io = false;
+    sync_worker_rm = &rm;
+    pthread_t a, b;
+    assert(pthread_create(&a, NULL, sync_once, (void *)0) == 0);
+    wait_event(&io_entered);
+    assert(pthread_create(&b, NULL, sync_once, (void *)1) == 0);
+    lck_mtx_lock(&event_lock);
+    while (!sync_waits) wait_cond(&event_cv, &event_lock);
+    release_io = true; pthread_cond_broadcast(&event_cv); lck_mtx_unlock(&event_lock);
+    assert(pthread_join(a, NULL) == 0 && pthread_join(b, NULL) == 0);
+    assert(sync_worker_results[0] == 0 && sync_worker_results[1] == 0);
+    assert(pack_calls == 1 && rm.rm_meta_gen == 1 && rm.rm_meta_state == RAMFS_META_CLEAN);
+    assert(ramfs_disk_unmount(&rm) == 0); cleanup(&rm);
+}
+static struct ramfs_mount *allocation_rm;
+static void change_during_allocation(void) { dirty_mode(allocation_rm, 0640); }
+static void allocation_retry_tests(void) {
+    struct test_mount mp; struct ramfs_mount *rm = mounted_checkpoint(&mp);
+    lck_mtx_lock(&rm->rm_lock);
+    struct ramfs_xattr *a = add_large_attribute(rm, "bigA");
+    lck_mtx_unlock(&rm->rm_lock);
+    size_t original_cap = rm->rm_meta_cap;
+    fail_alloc = alloc_call + 1;
+    assert(ramfs_disk_sync_impl(rm) == ENOMEM && writes == 0);
+    assert(rm->rm_meta_state == RAMFS_META_DIRTY && rm->rm_meta_cap == original_cap);
+    assert(!rm->rm_meta_syncing && rm->rm_meta_gen == 4);
+    fail_alloc = 0; allocation_rm = rm; allocation_hook = change_during_allocation;
+    assert(ramfs_disk_sync_impl(rm) == 0 && allocation_hook == NULL);
+    assert(rm->rm_meta_state == RAMFS_META_CLEAN && rm->rm_meta_gen == 5);
+    struct annfs_inode_rec *root = (void *)(device + ANNFS_SUPER_BYTES);
+    assert(root->mode == 0640);
+    lck_mtx_lock(&rm->rm_lock); remove_large_attribute(rm, a); lck_mtx_unlock(&rm->rm_lock);
+    assert(ramfs_unmount(&mp, 0, NULL) == 0); assert_released(&mp);
 }
 int main(void) {
     device = calloc(1, 64ULL << 20); assert(device);
@@ -436,7 +568,7 @@ int main(void) {
     setup(&rm); checkpoint(0, 5, true); checkpoint(1, 3, false);
     assert(ramfs_disk_mount(&rm) == 0 && rm.rm_nodes == 1 && rm.rm_pages == 0);
     assert(rm.rm_meta_slot == 1 && rm.rm_meta_gen == 3 && ramfs_var_used_pages == 0 && writes == 0);
-    rm.rm_meta_dirty = true;
+    rm.rm_meta_state = RAMFS_META_DIRTY;
     assert(ramfs_disk_sync_impl(&rm) == 0 && last_write == ANNFS_SLOT0_OFFSET && rm.rm_meta_gen == 4);
     cleanup(&rm);
     /* A failed target-slot write must preserve the last committed checkpoint. */
@@ -445,10 +577,10 @@ int main(void) {
         assert(ramfs_disk_mount(&rm) == 0 && rm.rm_meta_slot == 1);
         uint8_t committed[8192];
         memcpy(committed, device + ANNFS_SLOT1_OFFSET, sizeof(committed));
-        rm.rm_root->rn_mode = 0700; rm.rm_meta_dirty = true;
+        rm.rm_root->rn_mode = 0700; rm.rm_meta_state = RAMFS_META_DIRTY;
         io_fail = stop == 0 ? ANNFS_SUPER_BYTES : ANNFS_SLOT0_OFFSET;
         partial_write = stop == 0 ? 128 : 0;
-        assert(ramfs_disk_sync_impl(&rm) == EIO && rm.rm_meta_dirty);
+        assert(ramfs_disk_sync_impl(&rm) == EIO && rm.rm_meta_state == RAMFS_META_DIRTY);
         assert(rm.rm_meta_gen == 4 && rm.rm_meta_slot == 1);
         assert(memcmp(committed, device + ANNFS_SLOT1_OFFSET, sizeof(committed)) == 0);
         io_fail = -1; partial_write = 0;
@@ -464,7 +596,7 @@ int main(void) {
         io_fail = -1; partial_write = 0;
         assert(ramfs_disk_mount(&rm) == 0 && rm.rm_meta_gen == 4 && rm.rm_meta_slot == 1);
         assert(rm.rm_root->rn_mode == 0);
-        rm.rm_root->rn_mode = 0600; rm.rm_meta_dirty = true;
+        rm.rm_root->rn_mode = 0600; rm.rm_meta_state = RAMFS_META_DIRTY;
         assert(ramfs_disk_sync_impl(&rm) == 0 && rm.rm_meta_gen == 5 && rm.rm_meta_slot == 0);
         assert(ramfs_disk_read_slot(&rm, ANNFS_SLOT0_OFFSET, (void *)device) == 0);
         cleanup(&rm);
@@ -473,9 +605,9 @@ int main(void) {
     assert(ramfs_disk_mount(&rm) == ENOMEM && writes == 0 && ramfs_var_used_pages == 0); cleanup(&rm);
     setup(&rm); checkpoint(1, 3, false);
     assert(ramfs_disk_mount(&rm) == 0 && rm.rm_meta_slot == 1);
-    rm.rm_meta_dirty = true; io_fail = ANNFS_SUPER_BYTES;
+    rm.rm_meta_state = RAMFS_META_DIRTY; io_fail = ANNFS_SUPER_BYTES;
     assert(ramfs_disk_sync_impl(&rm) == EIO && rm.rm_meta_gen == 3 && rm.rm_meta_slot == 1);
-    assert(rm.rm_meta_dirty && writes == 0);
+    assert(rm.rm_meta_state == RAMFS_META_DIRTY && writes == 0);
     io_fail = -1;
     assert(ramfs_disk_sync_impl(&rm) == 0 && rm.rm_meta_gen == 4 && last_write == ANNFS_SLOT0_OFFSET);
     cleanup(&rm);
@@ -500,6 +632,7 @@ int main(void) {
         assert(allocations == 0);
     }
     unmount_retry_tests(); callout_tests();
+    slot_full_tests(); initial_slot_full_tests(); initial_concurrent_sync_test(); allocation_retry_tests();
     free(device); puts("ramfs recovery: recovery faults, unmount retries and callout lifetime passed");
 }
 '''

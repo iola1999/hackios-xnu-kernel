@@ -383,10 +383,20 @@ static void last_buffer_check(struct iris_session *s, const char *name)
 	emit_buffer(s->wire_session_id, HFI_PORT_BITSTREAM, HFI_BUFFER_BITSTREAM, 0,
 	    s->bitstream.iova, s->bitstream.size, 0, 0, 0);
 	assert(iris_receive(s, NULL) == 1 && !s->input_queued);
+	size_t drained = tx_size;
 	assert(iris_finish_drain(s) == 0 && !s->draining);
 	assert(count_type(HFI_CMD_RESUME, HFI_PORT_BITSTREAM) == resume_bs + 1);
 	assert(count_type(HFI_CMD_RESUME, HFI_PORT_RAW) == resume_raw + 1);
 	assert(s->raw_state[0] == IRIS_RAW_QUEUED && free_calls == 0);
+	size_t requeued = SIZE_MAX, resumed = SIZE_MAX;
+	for (size_t pos = drained; pos < tx_size; pos += get32(tx + pos)) {
+		for (size_t off = pos + 32; off < pos + get32(tx + pos); off += get32(tx + off)) {
+			if (get32(tx + off + 4) == 0x01000009u && get32(tx + off + 16) == 2 &&
+			    get32(tx + off + 32) == 2 && get32(tx + off + 36) == 0) requeued = off;
+			if (get32(tx + off + 4) == 0x01000008u && resumed == SIZE_MAX) resumed = off;
+		}
+	}
+	assert(requeued < resumed && resumed < tx_size);
 	assert(memcmp(&s->intern_dpb, &dpb, sizeof(dpb)) == 0);
 	assert(iris_hfi_session_close(s) == 0 && free_calls == 11);
 }
@@ -645,13 +655,9 @@ static void raw_count_check(struct iris_session *s, const char *name)
 
 static void stage_check(struct iris_session *s, const char *name)
 {
-    unsigned expected;
     if (strcmp(name, "stage-wire") != 0) {
-        assert(sscanf(name, "stage-%u-%u-%u", &s->width, &s->height, &expected) == 3);
-        assert(iris_decode_stage(s) == expected);
-        return;
-    }
-    s->width = 1280; s->height = 64;
+        assert(sscanf(name, "stage-%*[^-]-%u-%u", &s->width, &s->height) == 2);
+    } else { s->width = 1280; s->height = 64; }
     assert(iris_hfi_session_open(s) == 0);
     unsigned stages = 0;
     for (size_t pos = 0; pos < tx_size; pos += get32(tx + pos)) {
@@ -660,7 +666,7 @@ static void stage_check(struct iris_session *s, const char *name)
             if (get32(tx + off + 4) != 0x0300010a) continue;
             assert(get32(tx + off) == 36 && get32(tx + off + 8) == 0);
             assert(get32(tx + off + 12) == 1 && get32(tx + off + 16) == 0);
-            assert(get32(tx + off + 32) == 2); stages++;
+            assert(get32(tx + off + 32) == 1); stages++;
         }
     }
     assert(stages == 1);

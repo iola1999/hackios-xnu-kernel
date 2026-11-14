@@ -60,9 +60,11 @@
 struct ramfs_mount;
 struct ramfs_dirent {
 	TAILQ_ENTRY(ramfs_dirent) rd_link;
+	struct ramfs_dirent *rd_hnext;
 	struct ramfs_node *rd_node;
 	char              *rd_name;             /* rd_namelen bytes and a terminator */
 	uint32_t           rd_namelen;
+	uint32_t           rd_hash;
 };
 
 /* An extended attribute: iOS keeps container metadata, ACLs and much else in them. */
@@ -89,6 +91,7 @@ struct ramfs_node {
 	/* directory */
 	struct ramfs_node  *rn_parent;          /* NULL once the directory has been removed */
 	TAILQ_HEAD(, ramfs_dirent) rn_entries;
+	struct ramfs_dirent **rn_dir_hash;      /* lazily allocated name buckets for large directories */
 	/* regular file */
 	void              **rn_pages;           /* rn_nslots slots; NULL is a hole that reads as zeros */
 	uint32_t           *rn_blocks;          /* rn_nslots disk block numbers on darwin_var (0 = hole) */
@@ -103,6 +106,12 @@ struct ramfs_node {
 #define RAMFS_N_CREATING        0x1         /* a thread is in vnode_create() for this node */
 #define RAMFS_N_WANTED          0x2         /* somebody sleeps on the node */
 
+enum ramfs_meta_state {
+	RAMFS_META_CLEAN,
+	RAMFS_META_DIRTY,
+	RAMFS_META_SLOT_FULL,
+};
+
 struct ramfs_mount {
 	mount_t             rm_mp;
 	lck_mtx_t           rm_lock, rm_rename_lock;
@@ -110,7 +119,8 @@ struct ramfs_mount {
 	uint64_t            rm_next_ino, rm_nodes, rm_pages, rm_max_pages; /* rm_pages: file pages in use */
 	uint32_t            rm_next_docid;
 	struct ramfs_node **rm_hash;            /* every node by its number, for vfs_vget */
-	bool                rm_disk_backed, rm_disk_loading, rm_meta_dirty, rm_meta_syncing, rm_seed_done;
+	bool                rm_disk_backed, rm_disk_loading, rm_meta_syncing, rm_seed_done;
+	enum ramfs_meta_state rm_meta_state;
 	uint32_t            rm_bmap_words, rm_bmap_max, rm_bmap_next;
 	uint32_t           *rm_bmap;
 	void               *rm_io_page, *rm_meta_buf, *rm_meta_call;
@@ -120,6 +130,8 @@ struct ramfs_mount {
 };
 
 #define RAMFS_HASH_SIZE         4096u       /* chains, a power of two */
+#define RAMFS_DIR_HASH_SIZE     1024u       /* per-directory name chains, a power of two */
+#define RAMFS_DIR_HASH_MIN      32u         /* allocate rn_dir_hash once a directory reaches this size */
 
 /* file pages in use on all the mounts together (each mount has its own lock): for the kernel's memory report */
 _Atomic uint64_t ramfs_pages_in_use;
@@ -352,6 +364,10 @@ ramfs_node_free(struct ramfs_node *node)
 	}
 
 	assert(TAILQ_EMPTY(&node->rn_entries));
+	if (node->rn_dir_hash != NULL) {
+		kfree_type(struct ramfs_dirent *, RAMFS_DIR_HASH_SIZE, node->rn_dir_hash);
+		node->rn_dir_hash = NULL;
+	}
 	while ((xa = TAILQ_FIRST(&node->rn_xattrs)) != NULL) {
 		TAILQ_REMOVE(&node->rn_xattrs, xa, rx_link);
 		ramfs_xattr_free(xa);
@@ -401,6 +417,18 @@ ramfs_track(struct ramfs_node *node)
 	}
 }
 
+static uint32_t
+ramfs_name_hash(const char *name, size_t len)
+{
+	uint32_t h = 2166136261u;
+
+	for (size_t i = 0; i < len; i++) {
+		h ^= (uint8_t)name[i];
+		h *= 16777619u;
+	}
+	return h ? h : 1u;
+}
+
 static struct ramfs_dirent *
 ramfs_dirent_alloc(const char *name, size_t len)
 {
@@ -410,6 +438,7 @@ ramfs_dirent_alloc(const char *name, size_t len)
 	memcpy(de->rd_name, name, len);
 	de->rd_name[len] = '\0';
 	de->rd_namelen = (uint32_t)len;
+	de->rd_hash = ramfs_name_hash(name, len);
 	return de;
 }
 
@@ -424,9 +453,28 @@ static struct ramfs_dirent *
 ramfs_dir_find(struct ramfs_node *dir, const char *name, size_t len)
 {
 	struct ramfs_dirent *de;
+	uint32_t h = ramfs_name_hash(name, len);
 
+	if (dir->rn_dir_hash == NULL && dir->rn_nentries >= RAMFS_DIR_HASH_MIN) {
+		dir->rn_dir_hash = kalloc_type(struct ramfs_dirent *, RAMFS_DIR_HASH_SIZE, Z_NOWAIT | Z_ZERO);
+		if (dir->rn_dir_hash != NULL) {
+			TAILQ_FOREACH(de, &dir->rn_entries, rd_link) {
+				uint32_t b = de->rd_hash & (RAMFS_DIR_HASH_SIZE - 1);
+				de->rd_hnext = dir->rn_dir_hash[b];
+				dir->rn_dir_hash[b] = de;
+			}
+		}
+	}
+	if (dir->rn_dir_hash != NULL) {
+		for (de = dir->rn_dir_hash[h & (RAMFS_DIR_HASH_SIZE - 1)]; de != NULL; de = de->rd_hnext) {
+			if (de->rd_hash == h && de->rd_namelen == len && memcmp(de->rd_name, name, len) == 0) {
+				return de;
+			}
+		}
+		return NULL;
+	}
 	TAILQ_FOREACH(de, &dir->rn_entries, rd_link) {
-		if (de->rd_namelen == len && memcmp(de->rd_name, name, len) == 0) {
+		if (de->rd_hash == h && de->rd_namelen == len && memcmp(de->rd_name, name, len) == 0) {
 			return de;
 		}
 	}
@@ -438,6 +486,11 @@ ramfs_dir_add(struct ramfs_node *dir, struct ramfs_dirent *de, struct ramfs_node
 {
 	de->rd_node = node;
 	TAILQ_INSERT_TAIL(&dir->rn_entries, de, rd_link);
+	if (dir->rn_dir_hash != NULL) {
+		uint32_t b = de->rd_hash & (RAMFS_DIR_HASH_SIZE - 1);
+		de->rd_hnext = dir->rn_dir_hash[b];
+		dir->rn_dir_hash[b] = de;
+	}
 	dir->rn_nentries++;
 	ramfs_touch(dir, true);
 }
@@ -445,6 +498,16 @@ ramfs_dir_add(struct ramfs_node *dir, struct ramfs_dirent *de, struct ramfs_node
 static void
 ramfs_dir_remove(struct ramfs_node *dir, struct ramfs_dirent *de)
 {
+	if (dir->rn_dir_hash != NULL) {
+		struct ramfs_dirent **link = &dir->rn_dir_hash[de->rd_hash & (RAMFS_DIR_HASH_SIZE - 1)];
+		while (*link != NULL && *link != de) {
+			link = &(*link)->rd_hnext;
+		}
+		if (*link == de) {
+			*link = de->rd_hnext;
+		}
+		de->rd_hnext = NULL;
+	}
 	TAILQ_REMOVE(&dir->rn_entries, de, rd_link);
 	dir->rn_nentries--;
 	ramfs_touch(dir, true);
