@@ -38,7 +38,7 @@ extern bool annibale_adsp_gpr_send(const void *pkt, uint32_t len, uint32_t wait_
     uint32_t *rsp_opcode, uint32_t *rsp_words, uint32_t max_words);
 extern void annibale_adsp_set_gpr_event(annibale_gpr_event_fn handler);
 extern bool annibale_audio_amp_probe(void);
-extern void annibale_audio_amp_power(bool on);
+extern bool annibale_audio_amp_power(bool on);
 extern void annibale_audio_amp_set_volume(uint32_t below_eighths_db, bool muted);
 extern void annibale_audio_amp_status(const char *when);
 
@@ -72,6 +72,9 @@ extern void annibale_audio_amp_status(const char *when);
 #define APM_CMD_GET_SPF_STATE   0x01001021u
 #define APM_CMD_RSP_GET_SPF_STATE 0x02001007u
 #define GPR_BASIC_RSP_RESULT    0x02001005u
+#define AR_ENOTEXIST            19u
+#define APM_SPF_STATE_NOT_READY 0u
+#define APM_SPF_STATE_READY     1u
 #define OP_GRAPH_OPEN           0x01001000u
 #define OP_GRAPH_PREPARE        0x01001001u
 #define OP_GRAPH_START          0x01001002u
@@ -492,6 +495,52 @@ annibale_audio_reach_dma_info(volatile uint8_t **va_out, uint64_t *pa_out,
 	return true;
 }
 
+/* GPR channel publication can precede APM port registration. Graph setup requires SPF Ready. */
+static bool
+wait_for_spf_ready(struct gpr_pkt *p)
+{
+	uint64_t deadline = 0;
+	clock_interval_to_deadline(8000u, NSEC_PER_MSEC, &deadline);
+	for (;;) {
+		uint64_t now = 0, remaining_ns = 0;
+		clock_get_uptime(&now);
+		if (now >= deadline) return false;
+		absolutetime_to_nanoseconds(deadline - now, &remaining_ns);
+		uint32_t wait_ms = (uint32_t)(remaining_ns / NSEC_PER_MSEC);
+		if (wait_ms == 0) return false;
+		/* Cap each in-band query so a packet dropped before APM registers its port retries promptly. */
+		uint32_t attempt_ms = wait_ms > 200u ? 200u : wait_ms;
+
+		gpr_begin(p, OUR_PORT, APM_IID, APM_CMD_GET_SPF_STATE);
+		gpr_finish(p);
+		uint32_t rop = 0, rwords[2] = { ~0u, ~0u };
+		/* The 24-byte query is in-band and does not refer to the shared OOB buffer. */
+		bool ok = annibale_adsp_gpr_send(p->buf, p->len, attempt_ms, &rop, rwords, 2);
+		uint32_t tok = 0;
+		memcpy(&tok, p->buf + 16, sizeof(tok));
+		say("APM command '%s' (len %u, token %u) -> ok %u rsp %#x first %#x second %#x\n",
+		    "GET_SPF_STATE", p->len, tok, ok, rop, rwords[0], rwords[1]);
+		clock_get_uptime(&now);
+		if (now >= deadline) return false;
+
+		if (ok && rop == APM_CMD_RSP_GET_SPF_STATE) {
+			if (rwords[0] == APM_SPF_STATE_READY) return true;
+			if (rwords[0] != APM_SPF_STATE_NOT_READY) return false;
+		} else if (!ok && rop == 0) {
+			/* No reply arrived within attempt_ms; resend after the retry interval. */
+		} else if (rop != GPR_BASIC_RSP_RESULT || rwords[0] != APM_CMD_GET_SPF_STATE ||
+		    rwords[1] != AR_ENOTEXIST) {
+			return false;
+		}
+
+		uint64_t retry_deadline = 0;
+		clock_interval_to_deadline(50u, NSEC_PER_MSEC, &retry_deadline);
+		if (retry_deadline > deadline) retry_deadline = deadline;
+		assert_wait_deadline((event_t)&gpr_token, THREAD_UNINT, retry_deadline);
+		thread_block(THREAD_CONTINUE_NULL);
+	}
+}
+
 /* Build AudioReach APM Playback Graphs */
 static bool
 build_audioreach_graphs(void)
@@ -515,10 +564,7 @@ build_audioreach_graphs(void)
 	uint32_t rwords[4] = { 0 };
 
 	/* 0. Query SPF state */
-	gpr_begin(&p, OUR_PORT, APM_IID, APM_CMD_GET_SPF_STATE);
-	gpr_finish(&p);
-	if (!annibale_audio_reach_send_cmd(p.buf, p.len, "GET_SPF_STATE", &rop, rwords, 4) ||
-	    rop != APM_CMD_RSP_GET_SPF_STATE || rwords[0] != 1) return false;
+	if (!wait_for_spf_ready(&p)) return false;
 
 	/* 1. Map contiguous 64 KiB buffer [0xcf66f000, 0xcf67f000) to ADSP */
 	gpr_begin(&p, OUR_PORT, APM_IID, OP_MEM_MAP);
@@ -541,14 +587,17 @@ build_audioreach_graphs(void)
 	gpr_graph_open(&p, SG_SPEAKER, 1, speaker_mods, 1, NULL, 0);
 	if (!gpr_send_command(&p, "OPEN SG_SPEAKER (0x4005)")) return false;
 
-	/* 3. Configure I2S sink (secondary MI2S, 48 kHz 16-bit stereo) */
+	/* 3. Configure I2S sink (secondary MI2S, 48 kHz 32-bit stereo) */
 	gpr_begin(&p, OUR_PORT, APM_IID, OP_SET_CFG);
 	uint32_t cmd = gpr_cmd_begin(&p);
 	uint32_t at = gpr_param_begin(&p, IID_SPEAKER_I2S, 0x08001019);
 	gpr_put32(&p, 0); gpr_put32(&p, 1); gpr_put16(&p, 2); gpr_put16(&p, 1);
 	gpr_param_end(&p, at);
+	at = gpr_param_begin(&p, IID_SPEAKER_I2S, 0x08001018);
+	gpr_put32(&p, 1);
+	gpr_param_end(&p, at);
 	at = gpr_param_begin(&p, IID_SPEAKER_I2S, 0x08001017);
-	gpr_put32(&p, RATE); gpr_put16(&p, 16); gpr_put16(&p, CHANNELS); gpr_put32(&p, 1);
+	gpr_put32(&p, RATE); gpr_put16(&p, 32); gpr_put16(&p, CHANNELS); gpr_put32(&p, 1);
 	gpr_param_end(&p, at);
 	gpr_cmd_end(&p, cmd);
 	gpr_finish(&p);
@@ -572,15 +621,17 @@ build_audioreach_graphs(void)
 	gpr_finish(&p);
 	if (!gpr_send_command(&p, "SET_CFG WR_SHMEM PCM input")) return false;
 
-	/* Media payload sizes exclude alignment padding. */
+	/* CNV expands Q15 input to Q31 for the 32-bit I2S slots. Payload sizes exclude padding. */
 	gpr_begin(&p, OUR_PORT, APM_IID, OP_SET_CFG);
 	cmd = gpr_cmd_begin(&p);
 	const uint32_t pcm_iids[] = { IID_PLAY_DEC, IID_PLAY_CNV };
 	for (unsigned i = 0; i < 2; i++) {
+		const uint16_t width = pcm_iids[i] == IID_PLAY_CNV ? 32u : 16u;
+		const uint16_t interleaved = pcm_iids[i] == IID_PLAY_CNV ? 3u : 1u;
 		at = gpr_param_begin(&p, pcm_iids[i], 0x08001008);
 		gpr_put32(&p, 1); gpr_put32(&p, 0x09001000); gpr_put32(&p, 18);
-		gpr_put16(&p, 16); gpr_put16(&p, 1); gpr_put16(&p, 16); gpr_put16(&p, 15);
-		gpr_put16(&p, 1); gpr_put16(&p, 1); gpr_put16(&p, 0); gpr_put16(&p, CHANNELS);
+		gpr_put16(&p, width); gpr_put16(&p, 1); gpr_put16(&p, width); gpr_put16(&p, width - 1u);
+		gpr_put16(&p, 1); gpr_put16(&p, interleaved); gpr_put16(&p, 0); gpr_put16(&p, CHANNELS);
 		gpr_put8(&p, 1); gpr_put8(&p, 2);
 		gpr_param_end(&p, at);
 	}
@@ -593,6 +644,10 @@ build_audioreach_graphs(void)
 	if (!gpr_graph_cmd(OP_GRAPH_START, SG_SPEAKER, "START SG_SPEAKER")) return false;
 	if (!gpr_graph_cmd(OP_GRAPH_PREPARE, SG_PLAY, "PREPARE SG_PLAY")) return false;
 	if (!gpr_graph_cmd(OP_GRAPH_START, SG_PLAY, "START SG_PLAY")) return false;
+
+	/* Prime smart amplifiers with cold calibration while BCLK is active, then hold in low-power standby */
+	(void)annibale_audio_amp_power(true);
+	(void)annibale_audio_amp_power(false);
 
 	say("AudioReach graphs SG_PLAY (0x4001) & SG_SPEAKER (0x4005) initialized and started\n");
 	return true;
@@ -736,14 +791,15 @@ fill_period_slot(uint32_t slot, bool muted)
 	}
 	lck_spin_unlock(audio_spin_lock);
 
-	/* Run speaker protection (200 Hz 4th-order HPF + thermal/excursion limiter) */
+	/* Run speaker protection (200 Hz second-order HPF + thermal/excursion limiter) */
 	annibale_guard_process(local, PERIOD_FRAMES);
-	if (annibale_audio_recording_fed()) {
-		annibale_audio_record_fed(local, PERIOD_FRAMES);
-	}
 
 	for (uint32_t s = 0; s < PERIOD_FRAMES * CHANNELS; s++) {
 		out[s] = local[s];
+	}
+	if (annibale_audio_recording_fed()) {
+		__builtin_arm_dsb(0xf);
+		annibale_audio_record_fed(__DEVOLATILE(const int16_t *, out), PERIOD_FRAMES);
 	}
 	return has_audio;
 }
@@ -769,6 +825,8 @@ reach_feeder_thread(void *arg __unused, wait_result_t w __unused)
 		graphs_built_on_hw = build_audioreach_graphs();
 	}
 	if (!graphs_built_on_hw) {
+		__atomic_store_n(&reach_write_failed, true, __ATOMIC_RELEASE);
+		__atomic_store_n(&reach_stream_active, false, __ATOMIC_RELAXED);
 		say("AudioReach graph setup failed; playback stopped\n");
 		thread_terminate(current_thread());
 		return;
@@ -776,7 +834,7 @@ reach_feeder_thread(void *arg __unused, wait_result_t w __unused)
 	for (;;) {
 		if (__atomic_load_n(&reach_write_failed, __ATOMIC_ACQUIRE)) {
 			__atomic_store_n(&reach_stream_active, false, __ATOMIC_RELAXED);
-			annibale_audio_amp_power(false);
+			(void)annibale_audio_amp_power(false);
 			say("PCM completion failed; playback stopped\n");
 			thread_terminate(current_thread());
 			return;
@@ -829,8 +887,9 @@ reach_feeder_thread(void *arg __unused, wait_result_t w __unused)
 			bool ok = reach_sync_mode != 0 ?
 			    send_audio_period(slot) : queue_audio_period_async(slot);
 			if (!ok) {
+				__atomic_store_n(&reach_write_failed, true, __ATOMIC_RELEASE);
 				__atomic_store_n(&reach_stream_active, false, __ATOMIC_RELAXED);
-				annibale_audio_amp_power(false);
+				(void)annibale_audio_amp_power(false);
 				say("PCM submission failed; playback stopped\n");
 				thread_terminate(current_thread());
 				return;
@@ -849,11 +908,23 @@ reach_feeder_thread(void *arg __unused, wait_result_t w __unused)
 		}
 
 		if (want_amp_on && !amp_powered) {
-			annibale_audio_amp_power(true);
+			if (!annibale_audio_amp_power(true)) {
+				__atomic_store_n(&reach_write_failed, true, __ATOMIC_RELEASE);
+				__atomic_store_n(&reach_stream_active, false, __ATOMIC_RELAXED);
+				say("amplifier startup failed; playback stopped\n");
+				thread_terminate(current_thread());
+				return;
+			}
 			amp_powered = true;
 		}
 		if (amp_powered && quiet_count >= QUIET_PERIODS && inflight == 0 && backlog == 0) {
-			annibale_audio_amp_power(false);
+			if (!annibale_audio_amp_power(false)) {
+				__atomic_store_n(&reach_write_failed, true, __ATOMIC_RELEASE);
+				__atomic_store_n(&reach_stream_active, false, __ATOMIC_RELAXED);
+				say("amplifier powerdown failed; playback stopped\n");
+				thread_terminate(current_thread());
+				return;
+			}
 			amp_powered = false;
 			__atomic_store_n(&reach_stream_active, false, __ATOMIC_RELAXED);
 		}
@@ -884,15 +955,13 @@ static uint32_t
 reach_audio_sink(const int16_t *frames, uint32_t count)
 {
 	uint32_t taken = 0;
+	if (__atomic_load_n(&reach_write_failed, __ATOMIC_ACQUIRE)) {
+		return 0;
+	}
 	if (ring_storage == NULL) {
 		return count;
 	}
 	lck_spin_lock(audio_spin_lock);
-	/* If the ring buffer is nearly full, advance tail to make room so the real-time writer never drops */
-	uint32_t avail = RING_FRAMES - (ring_head - ring_tail);
-	if (avail < count && count <= RING_FRAMES) {
-		ring_tail += (count - avail);
-	}
 	while (taken < count && (ring_head - ring_tail) < RING_FRAMES) {
 		uint32_t at = ring_head & RING_MASK;
 		ring_storage[2 * at] = frames[2 * taken];
@@ -915,13 +984,19 @@ configure_i2s_pins(void)
 	if (tlmm == 0) {
 		return;
 	}
-	static const unsigned i2s_pins[] = { 121, 122, 123, 124 };
+	static const struct {
+		unsigned pin;
+		uint32_t cfg;
+	} i2s_pins[] = {
+		{ 121, (1u << 2) | (3u << 6) | 0u }, /* SCK: func 1, 8 mA, no-pull */
+		{ 122, (1u << 2) | (3u << 6) | 0u }, /* DATA0: func 1, 8 mA, no-pull */
+		{ 123, (1u << 2) | (2u << 6) | 0u }, /* WS: func 1, 6 mA, no-pull */
+		{ 124, (1u << 2) | (3u << 6) | 1u }, /* DATA1: func 1, 8 mA, pull-down */
+	};
 	for (unsigned i = 0; i < sizeof(i2s_pins) / sizeof(i2s_pins[0]); i++) {
-		unsigned pin = i2s_pins[i];
-		vm_offset_t reg = tlmm + 0x1000UL * pin;
+		vm_offset_t reg = tlmm + 0x1000UL * i2s_pins[i].pin;
 		uint32_t val = *(volatile uint32_t *)reg;
-		/* Function 1 (i2s1_*), 8 mA drive, pull-down */
-		val = (val & ~(0x3ffu)) | (1u << 2) | (3u << 6) | 1u;
+		val = (val & ~(0x3ffu)) | i2s_pins[i].cfg;
 		if (val & (1u << 11)) {
 			val |= (1u << 12); /* Hand to AP */
 		}
@@ -981,7 +1056,7 @@ annibale_audio_reach_init(void)
 	if (ring_storage == NULL) {
 		ring_storage = kalloc_data(RING_FRAMES * CHANNELS * sizeof(int16_t), Z_WAITOK | Z_ZERO);
 	}
-	annibale_guard_configure(true, 6 * 8);
+	annibale_guard_configure(true, 18 * 8);
 	annibale_guard_attenuation(18 * 8);
 
 	/* 5. Configure secondary MI2S TLMM pins */

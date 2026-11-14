@@ -215,21 +215,28 @@ ufs_strategy(buf_t bp)
 	if (offset + len > size) {
 		len = size - offset;
 	}
-	if (!(buf_flags(bp) & B_READ)) {
-		if (ufs_darwin_var_part >= 0 && part == (uint32_t)ufs_darwin_var_part) {
-			error = ufs_write(part, offset, (const uint8_t *)buf_dataptr(bp), len);
-			buf_setresid(bp, (uint32_t)(buf_count(bp) - (error ? 0 : len)));
-			if (error) {
-				buf_seterror(bp, error);
-			}
-			buf_biodone(bp);
-			return;
-		}
+
+	bool is_read = (buf_flags(bp) & B_READ) != 0;
+
+	if (!is_read && (ufs_darwin_var_part < 0 || part != (uint32_t)ufs_darwin_var_part)) {
 		buf_seterror(bp, EROFS);         /* this device never writes */
 		buf_biodone(bp);
 		return;
 	}
-	error = ufs_read(part, offset, (uint8_t *)buf_dataptr(bp), len);
+
+	if (ufs_native_on && ufs_lun[part] != 0xff) {
+		int err = ufshc_strategy_async(bp, ufs_lun[part], ufs_lun_offset[part] + offset, !is_read);
+		if (err == 0) {
+			return; /* Completed asynchronously via GICv3 SPI 297 interrupt and buf_biodone(bp) */
+		}
+	}
+
+	/* Synchronous fallback */
+	if (!is_read) {
+		error = ufs_write(part, offset, (const uint8_t *)buf_dataptr(bp), len);
+	} else {
+		error = ufs_read(part, offset, (uint8_t *)buf_dataptr(bp), len);
+	}
 	buf_setresid(bp, (uint32_t)(buf_count(bp) - (error ? 0 : len)));
 	if (error) {
 		buf_seterror(bp, error);
@@ -278,6 +285,48 @@ ufs_ioctl(dev_t dev, u_long cmd, caddr_t data, __unused int fflag, __unused proc
 	case DKIOCGETMAXBLOCKCOUNTREAD:
 		*(uint64_t *)data = ufs_buffer_size / ufs_bsize[part];
 		return 0;
+	case DKIOCSYNCHRONIZECACHE:
+		if (ufs_darwin_var_part < 0 || part != (uint32_t)ufs_darwin_var_part) {
+			return EROFS;
+		}
+		if (ufs_native_on && ufs_lun[part] != 0xff) {
+			return ufshc_sync_cache(ufs_lun[part]);
+		}
+		return 0;
+	case DKIOCUNMAP: {
+		dk_unmap_t *unmap = (dk_unmap_t *)data;
+		if (ufs_darwin_var_part < 0 || part != (uint32_t)ufs_darwin_var_part) {
+			return EROFS;
+		}
+		if (unmap == NULL || unmap->extents == NULL || unmap->extentsCount == 0) {
+			return 0;
+		}
+		if (ufs_native_on && ufs_lun[part] != 0xff) {
+			for (uint32_t i = 0; i < unmap->extentsCount; i++) {
+				uint64_t off = unmap->extents[i].offset;
+				uint64_t elen = unmap->extents[i].length;
+				if (off % BLOCK != 0 || elen % BLOCK != 0) {
+					return EINVAL;
+				}
+				uint64_t lba = (ufs_lun_offset[part] + off) / BLOCK;
+				uint32_t blocks = (uint32_t)(elen / BLOCK);
+				int err = ufshc_unmap(ufs_lun[part], lba, blocks);
+				if (err != 0) {
+					return err;
+				}
+			}
+			return 0;
+		}
+		return 0;
+	}
+	case DKIOCGETFEATURES: {
+		uint32_t features = 0;
+		if (ufs_darwin_var_part >= 0 && part == (uint32_t)ufs_darwin_var_part) {
+			features |= DK_FEATURE_FORCE_UNIT_ACCESS | DK_FEATURE_UNMAP | DK_FEATURE_BARRIER;
+		}
+		*(uint32_t *)data = features;
+		return 0;
+	}
 	default:
 		return ENOTTY;
 	}
@@ -496,7 +545,7 @@ annibale_ufs_fat16_fw_read(const char *name, uint64_t *size_out, volatile void *
 	char target11[11], image11[11] = { 'I','M','A','G','E',' ',' ',' ',' ',' ',' ' };
 	bool has_83 = ufs_fat83_name(name, target11);
 
-	uint8_t *sec = kalloc_data(4096, Z_WAITOK);
+	uint8_t *sec = kalloc_data(8192, Z_WAITOK);
 	if (sec == NULL) return false;
 
 	for (unsigned p = 0; p < 2; p++) {
@@ -565,29 +614,48 @@ annibale_ufs_fat16_fw_read(const char *name, uint64_t *size_out, volatile void *
 		if (file_clus < 2 || file_sz == 0) continue;
 		if (size_out != NULL) *size_out = file_sz;
 		if (dst_buf == NULL) {
-			kfree_data(sec, 4096);
+			kfree_data(sec, 8192);
 			return true;
 		}
 		if (file_sz > dst_cap) break;
 
 		uint32_t rem = file_sz, written = 0;
+		uint32_t io_cap = 262144u;
+		uint8_t *io_buf = kalloc_data(io_cap, Z_WAITOK);
+		if (io_buf == NULL) {
+			io_buf = sec;
+			io_cap = 4096u;
+		}
+		uint8_t *fat_sec = sec + 4096;
+		uint32_t fat_sec_base = UINT32_MAX;
 		cur = file_clus;
 		volatile uint8_t *out = (volatile uint8_t *)dst_buf;
 		for (unsigned hop = 0; hop < 8192 && rem > 0 && cur >= 2 && cur < 0xfff8; hop++) {
 			uint32_t run = 1;
 			uint16_t nxt = cur;
-			while (rem > run * csize && run < 64) {
-				uint8_t fe[2];
-				if (annibale_ufs_part_read(parts[p], fat_off + (uint32_t)nxt * 2u, fe, 2) != 0) break;
-				uint16_t c2 = (uint16_t)(fe[0] | (fe[1] << 8));
+			while (rem > run * csize && run < 256) {
+				uint32_t ent_off = fat_off + (uint32_t)nxt * 2u;
+				uint32_t aligned = ent_off & ~4095u;
+				if (aligned != fat_sec_base) {
+					if (annibale_ufs_part_read(parts[p], aligned, fat_sec, 4096) != 0) break;
+					fat_sec_base = aligned;
+				}
+				uint32_t idx = ent_off - aligned;
+				uint16_t c2 = (uint16_t)(fat_sec[idx] | (fat_sec[idx + 1] << 8));
 				if (c2 != nxt + 1) { nxt = c2; break; }
 				nxt = c2;
 				run++;
 			}
 			if (run == 1 || nxt == cur + run - 1) {
-				uint8_t fe[2];
-				if (annibale_ufs_part_read(parts[p], fat_off + (uint32_t)nxt * 2u, fe, 2) == 0) {
-					nxt = (uint16_t)(fe[0] | (fe[1] << 8));
+				uint32_t ent_off = fat_off + (uint32_t)nxt * 2u;
+				uint32_t aligned = ent_off & ~4095u;
+				if (aligned != fat_sec_base &&
+				    annibale_ufs_part_read(parts[p], aligned, fat_sec, 4096) == 0) {
+					fat_sec_base = aligned;
+				}
+				if (aligned == fat_sec_base) {
+					uint32_t idx = ent_off - aligned;
+					nxt = (uint16_t)(fat_sec[idx] | (fat_sec[idx + 1] << 8));
 				} else {
 					nxt = 0xffff;
 				}
@@ -595,22 +663,44 @@ annibale_ufs_fat16_fw_read(const char *name, uint64_t *size_out, volatile void *
 			uint32_t chunk = run * csize;
 			if (chunk > rem) chunk = rem;
 			uint64_t disk_off = data_off + (uint64_t)(cur - 2u) * csize;
-			for (uint32_t off = 0; off < chunk; off += 4096) {
-				uint32_t ask = chunk - off > 4096 ? 4096 : chunk - off;
-				if (annibale_ufs_part_read(parts[p], disk_off + off, sec, ask) != 0) { rem = 1; cur = 0xffff; break; }
-				for (uint32_t b = 0; b < ask; b++) out[written + off + b] = sec[b];
+			for (uint32_t off = 0; off < chunk; off += io_cap) {
+				uint32_t ask = chunk - off > io_cap ? io_cap : chunk - off;
+				if (annibale_ufs_part_read(parts[p], disk_off + off, io_buf, ask) != 0) {
+					rem = 1;
+					cur = 0xffff;
+					break;
+				}
+				volatile uint8_t *dst_p = out + written + off;
+				uint32_t b = 0;
+				while (b < ask && (((uintptr_t)(dst_p + b)) & 7UL) != 0) {
+					dst_p[b] = io_buf[b];
+					b++;
+				}
+				while (b + 8u <= ask) {
+					uint64_t w;
+					memcpy(&w, io_buf + b, sizeof(w));
+					*(volatile uint64_t *)(dst_p + b) = w;
+					b += 8u;
+				}
+				while (b < ask) {
+					dst_p[b] = io_buf[b];
+					b++;
+				}
 			}
 			if (cur == 0xffff) break;
 			written += chunk;
 			rem -= chunk;
 			cur = nxt;
 		}
+		if (io_buf != sec) {
+			kfree_data(io_buf, io_cap);
+		}
 		if (rem == 0) {
-			kfree_data(sec, 4096);
+			kfree_data(sec, 8192);
 			return true;
 		}
 	}
-	kfree_data(sec, 4096);
+	kfree_data(sec, 8192);
 	return false;
 }
 

@@ -189,7 +189,21 @@ static bool pas_stage_and_setup(const char *stem, uint32_t pas_id, uint32_t regi
 		uint32_t at = fw->segment[s].at, fsz = fw->segment[s].file_size, msz = fw->segment[s].memory_size;
 		const uint8_t *src = fw->segment[s].file;
 		if (src != NULL) {
-			for (uint32_t i = 0; i < fsz; i++) carveout[at + i] = src[i];
+			uint32_t i = 0;
+			while (i < fsz && (((uintptr_t)(carveout + at + i)) & 7UL) != 0) {
+				carveout[at + i] = src[i];
+				i++;
+			}
+			while (i + 8u <= fsz) {
+				uint64_t w;
+				memcpy(&w, src + i, sizeof(w));
+				*(volatile uint64_t *)(carveout + at + i) = w;
+				i += 8u;
+			}
+			while (i < fsz) {
+				carveout[at + i] = src[i];
+				i++;
+			}
 		} else if (fsz != 0) {
 			char bname[32];
 			uint64_t bsz = 0;
@@ -199,7 +213,17 @@ static bool pas_stage_and_setup(const char *stem, uint32_t pas_id, uint32_t regi
 				return false;
 			}
 		}
-		for (uint32_t i = fsz; i < msz; i++) carveout[at + i] = 0;
+		uint32_t cur = at + fsz, end = at + msz;
+		while (cur < end && (((uintptr_t)(carveout + cur)) & 7UL) != 0) {
+			carveout[cur++] = 0;
+		}
+		while (cur + 8u <= end) {
+			*(volatile uint64_t *)(carveout + cur) = 0ULL;
+			cur += 8u;
+		}
+		while (cur < end) {
+			carveout[cur++] = 0;
+		}
 	}
 	__builtin_arm_dsb(0xf);
 	ml_io_unmap((vm_offset_t)carveout, region_size);

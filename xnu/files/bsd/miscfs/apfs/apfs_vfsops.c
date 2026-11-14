@@ -79,7 +79,7 @@ apfs_dev_read(void *ctx, uint64_t off, void *buf, size_t len)
 	}
 	return 0;
 }
-
+#include "apfs_vfsops_write.inc"
 /*
  * A file's contents, straight into the caller's memory: one buffer header of our own and
  * one VNOP_STRATEGY a request, past the buffer cache.  apfs_lib calls this without the
@@ -88,8 +88,6 @@ apfs_dev_read(void *ctx, uint64_t off, void *buf, size_t len)
  * with the lock held, it was slower there; here it is the device reads coming out from
  * under the lock, on a device where one costs a memory copy -- see apfs_lib.c.)
  */
-#define APFS_DATA_MAX (128 * 1024)
-
 static int
 apfs_dev_read_data(void *ctx, uint64_t off, void *buf, size_t len)
 {
@@ -1080,6 +1078,7 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 	dev.size = nx_size;
 	dev.read = apfs_dev_read;
 	dev.read_data = apfs_dev_read_data;
+	apfs_mount_check_rw(mp, &dev);
 
 	error = apfs_nx_open(&am->am_nx, &dev);
 	if (error) {
@@ -1165,7 +1164,7 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 	am->am_root_id = APFS_ROOT_DIR_INO_NUM;
 
 	vfs_setfsprivate(mp, am);
-	vfs_setflags(mp, MNT_RDONLY | MNT_LOCAL);
+	apfs_mount_set_rw_flags(mp, am);
 	vfs_setlocklocal(mp);
 
 	sp = vfs_statfs(mp);

@@ -16,6 +16,7 @@
 #include <kern/clock.h>
 #include <kern/kalloc.h>
 #include <kern/locks.h>
+#include <kern/sched_prim.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -553,8 +554,14 @@ mic_capture_thread(void *arg __unused, wait_result_t w __unused)
 				say("capture DMA completion failed; capture stopped\n");
 			}
 			slot++;
+		} else {
+			assert_wait_timeout((event_t)&mic_open_clients, THREAD_INTERRUPTIBLE, 250, NSEC_PER_MSEC);
+			if ((mic_open_clients > 0) || annibale_audio_recording_mic()) {
+				clear_wait(current_thread(), THREAD_AWAKENED);
+			} else {
+				thread_block(THREAD_CONTINUE_NULL);
+			}
 		}
-		delay_for_interval(20, NSEC_PER_MSEC);
 	}
 }
 
@@ -641,6 +648,7 @@ mic_cdev_open(__unused dev_t dev, __unused int flags, __unused int devtype, __un
 	}
 	mic_open_clients++;
 	lck_mtx_unlock(&amic_lock);
+	thread_wakeup((event_t)&mic_open_clients);
 	return 0;
 }
 

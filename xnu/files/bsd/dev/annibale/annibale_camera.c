@@ -430,8 +430,9 @@ annibale_cam_close(dev_t dev __unused, int flags __unused, int devtype __unused,
 			} else {
 				cam_hardware_power_down();
 				if (cam_profile != NULL) {
-					kfree_data(cam_profile, CAM_NATIVE_PROFILE_BYTES);
+					kfree_data(cam_profile, cam_profile->bytes ? cam_profile->bytes : CAM_NATIVE_PROFILE_BYTES);
 					cam_profile = NULL;
+					cam_native_exposure_reset();
 				}
 				if (cam_region_vbase != 0) {
 					kmem_free(kernel_map, cam_region_vbase, CAMERA_REGION_SIZE);
@@ -556,7 +557,8 @@ annibale_cam_write(dev_t dev __unused, struct uio *uio, int ioflag __unused)
 			return EINVAL;
 		}
 		if (cmd.command == ANNIBALE_CAMERA_PROFILE) {
-			if (cmd.bytes != CAM_NATIVE_PROFILE_BYTES || cmd.a || cmd.b || cmd.c || cmd.d ||
+			if ((cmd.bytes != CAM_NATIVE_PROFILE_BYTES && cmd.bytes != CAM_BACK_PROFILE_BYTES) ||
+			    cmd.a || cmd.b || cmd.c || cmd.d ||
 			    uio_resid(uio) != (user_ssize_t)cmd.bytes) {
 				return EINVAL;
 			}
@@ -572,6 +574,10 @@ annibale_cam_write(dev_t dev __unused, struct uio *uio, int ioflag __unused)
 			if (error == 0) {
 				if (!cam_is_open || cam_capture_resources_held()) {
 					error = EBUSY;
+				} else if (cam_profile != NULL && !cam_native_release()) {
+					cam_capture.state = ANNIBALE_CAM_CAPTURE_HELD;
+					cam_capture.error = EIO;
+					error = EIO;
 				} else {
 					cam_profile_install(profile);
 					profile = NULL;
@@ -588,6 +594,15 @@ annibale_cam_write(dev_t dev __unused, struct uio *uio, int ioflag __unused)
 		}
 
 		lck_mtx_lock(cam_lock);
+		if (cam_profile != NULL && cmd.command == ANNIBALE_CAMERA_EXPOSURE) {
+			if (cam_capture_resources_held()) {
+				error = EBUSY;
+			} else if (!cam_native_exposure_set(cam_profile, cmd.a, cmd.b, cmd.c)) {
+				error = EINVAL;
+			}
+			lck_mtx_unlock(cam_lock);
+			return error;
+		}
 		if (cam_profile != NULL || cam_hw_mmio != 0) {
 			error = cam_capture_resources_held() ? EBUSY : ENOTSUP;
 			lck_mtx_unlock(cam_lock);
@@ -697,6 +712,9 @@ annibale_cam_ioctl(dev_t dev __unused, u_long cmd, caddr_t data, int flags __unu
 		}
 		if (cam_native_front_mode4()) {
 			fl |= ANNIBALE_CAM_INFO_FLAG_FRONT_MODE4;
+		}
+		if (cam_native_back_mode24()) {
+			fl |= ANNIBALE_CAM_INFO_FLAG_BACK_MODE24;
 		}
 		if (cam_smmu_ready) {
 			fl |= ANNIBALE_CAM_INFO_FLAG_SMMU_BYPASS;

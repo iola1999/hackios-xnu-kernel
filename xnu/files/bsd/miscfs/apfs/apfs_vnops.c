@@ -332,7 +332,7 @@ apfs_vnop_lookup(struct vnop_lookup_args *ap)
 	 */
 	if (error == ENOENT && (cnp->cn_flags & ISLASTCN) &&
 	    (cnp->cn_nameiop == CREATE || cnp->cn_nameiop == RENAME)) {
-		return EROFS;
+		return (vfs_flags(vnode_mount(dvp)) & MNT_RDONLY) ? EROFS : ENOENT;
 	}
 	/*
 	 * A name that is not there stays not there (the volume cannot change; a synthetic
@@ -1103,7 +1103,8 @@ apfs_vnop_listxattr(struct vnop_listxattr_args *ap)
 static int
 apfs_vnop_open(struct vnop_open_args *ap)
 {
-	if (ap->a_mode & (FWRITE | O_TRUNC | O_CREAT)) {
+	if ((vfs_flags(vnode_mount(ap->a_vp)) & MNT_RDONLY) &&
+	    (ap->a_mode & (FWRITE | O_TRUNC | O_CREAT))) {
 		return EROFS;
 	}
 	return 0;
@@ -1191,45 +1192,7 @@ apfs_vnop_reclaim(struct vnop_reclaim_args *ap)
  * does not have that"; the default, ENOTSUP, is not -- the iOS dyld, probing the root
  * volume for APFS features, gives up on it.
  */
-static int
-apfs_vnop_ioctl(__unused struct vnop_ioctl_args *ap)
-{
-	return ENOTTY;
-}
-
-static int
-apfs_vnop_pathconf(struct vnop_pathconf_args *ap)
-{
-	switch (ap->a_name) {
-	case _PC_LINK_MAX:
-		*ap->a_retval = 32767;
-		return 0;
-	case _PC_NAME_MAX:
-		*ap->a_retval = 255;
-		return 0;
-	case _PC_PATH_MAX:
-		*ap->a_retval = PATH_MAX;
-		return 0;
-	case _PC_CHOWN_RESTRICTED:
-		*ap->a_retval = 1;
-		return 0;
-	case _PC_NO_TRUNC:
-		*ap->a_retval = 1;
-		return 0;
-	case _PC_CASE_SENSITIVE:
-		*ap->a_retval = (APFS_VP_MOUNT(ap->a_vp)->am_vol.incompat &
-		    APFS_INCOMPAT_CASE_INSENSITIVE) ? 0 : 1;
-		return 0;
-	case _PC_CASE_PRESERVING:
-		*ap->a_retval = 1;
-		return 0;
-	case _PC_XATTR_SIZE_BITS:
-		*ap->a_retval = 32;
-		return 0;
-	default:
-		return EINVAL;
-	}
-}
+#include "apfs_vnops_write.inc"
 
 #define VOPFUNC int (*)(void *)
 
@@ -1238,10 +1201,14 @@ const struct vnodeopv_entry_desc apfs_vnodeop_entries[] = {
 	{ .opve_op = &vnop_default_desc, .opve_impl = (VOPFUNC)vn_default_error },
 	{ .opve_op = &vnop_ioctl_desc, .opve_impl = (VOPFUNC)apfs_vnop_ioctl },
 	{ .opve_op = &vnop_lookup_desc, .opve_impl = (VOPFUNC)apfs_vnop_lookup },
+	{ .opve_op = &vnop_create_desc, .opve_impl = (VOPFUNC)apfs_vnop_create },
+	{ .opve_op = &vnop_remove_desc, .opve_impl = (VOPFUNC)apfs_vnop_remove },
 	{ .opve_op = &vnop_open_desc, .opve_impl = (VOPFUNC)apfs_vnop_open },
 	{ .opve_op = &vnop_close_desc, .opve_impl = (VOPFUNC)apfs_vnop_close },
 	{ .opve_op = &vnop_getattr_desc, .opve_impl = (VOPFUNC)apfs_vnop_getattr },
+	{ .opve_op = &vnop_setattr_desc, .opve_impl = (VOPFUNC)apfs_vnop_setattr },
 	{ .opve_op = &vnop_read_desc, .opve_impl = (VOPFUNC)apfs_vnop_read },
+	{ .opve_op = &vnop_write_desc, .opve_impl = (VOPFUNC)apfs_vnop_write },
 	{ .opve_op = &vnop_getxattr_desc, .opve_impl = (VOPFUNC)apfs_vnop_getxattr },
 	{ .opve_op = &vnop_listxattr_desc, .opve_impl = (VOPFUNC)apfs_vnop_listxattr },
 	{ .opve_op = &vnop_fsync_desc, .opve_impl = (VOPFUNC)nop_fsync },

@@ -67,6 +67,7 @@ struct annibale_camera_command {
 #define ANNIBALE_CAM_INFO_FLAG_HW_DMA_VERIFIED  (1u << 4)
 #define ANNIBALE_CAM_INFO_FLAG_NATIVE_PROFILE   (1u << 5)
 #define ANNIBALE_CAM_INFO_FLAG_FRONT_MODE4      (1u << 6)
+#define ANNIBALE_CAM_INFO_FLAG_BACK_MODE24      (1u << 7)
 
 struct annibale_camera_info {
 	uint32_t        flags;          /* ANNIBALE_CAM_INFO_FLAG_*; native completion is reported separately */
@@ -84,6 +85,8 @@ struct annibale_camera_info {
 
 /* Little-endian profile: header, up/down power entries, then init/mode/on/off registers. */
 #define ANNIBALE_CAMERA_PROFILE_MAGIC "RWCTAB03"
+#define ANNIBALE_CAMERA_FRONT_PROFILE_BYTES 6440u
+#define ANNIBALE_CAMERA_BACK_PROFILE_BYTES 16136u
 struct annibale_camera_profile {
 	char magic[8];
 	uint32_t bytes, sensor, mode;

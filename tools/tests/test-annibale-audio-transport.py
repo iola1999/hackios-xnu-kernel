@@ -182,6 +182,7 @@ GRAPH_HEADER = r'''
 #include <string.h>
 #include <stdio.h>
 #define say(...) ((void)0)
+static bool annibale_audio_amp_power(bool on) { (void)on; return true; }
 struct gpr_pkt { uint8_t buf[1024]; uint32_t len; };
 struct reach_module { uint32_t module, iid, inputs, outputs; };
 struct reach_link { uint32_t from, to; };
@@ -217,7 +218,10 @@ static bool annibale_audio_reach_send_cmd(const void *raw, uint32_t len, const c
             } else if(param[1]==0x08001008) {
                 assert(p[3]==APM_IID && (param[0]==IID_PLAY_DEC || param[0]==IID_PLAY_CNV));
                 assert(param[2]==32 && param[4]==1 && param[5]==0x09001000 && param[6]==18);
-                assert(param[7]==0x10010 && param[8]==0xf0010 && param[9]==0x10001);
+                uint32_t w7 = param[0]==IID_PLAY_CNV ? 0x10020u : 0x10010u;
+                uint32_t w8 = param[0]==IID_PLAY_CNV ? 0x1f0020u : 0xf0010u;
+                uint32_t w9 = param[0]==IID_PLAY_CNV ? 0x30001u : 0x10001u;
+                assert(param[7]==w7 && param[8]==w8 && param[9]==w9);
                 assert(param[10]==0x20000 && param[11]==0x201);
                 output_formats++;
             }
@@ -228,6 +232,15 @@ static bool annibale_audio_reach_send_cmd(const void *raw, uint32_t len, const c
     }
     if(bad_opcode && commands==3) *op=OP_WRITE_DONE;
     return true;
+}
+static void gpr_begin(struct gpr_pkt *p, uint32_t src, uint32_t dst, uint32_t opcode);
+static uint32_t gpr_finish(struct gpr_pkt *p);
+static bool wait_for_spf_ready(struct gpr_pkt *p) {
+    gpr_begin(p, OUR_PORT, APM_IID, APM_CMD_GET_SPF_STATE);
+    gpr_finish(p);
+    uint32_t rop = 0, rwords[2] = { ~0u, ~0u };
+    return annibale_audio_reach_send_cmd(p->buf, p->len, "GET_SPF_STATE", &rop, rwords, 2) &&
+        rop == APM_CMD_RSP_GET_SPF_STATE && rwords[0] == APM_SPF_STATE_READY;
 }
 '''
 GRAPH_MAIN = r'''

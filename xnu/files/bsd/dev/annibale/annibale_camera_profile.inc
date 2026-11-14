@@ -1,7 +1,10 @@
-/* RWCTAB03 layout and the complete front mode 4 exported by tools/camsensor_profile.py. */
-#define CAM_NATIVE_PROFILE_BYTES 6440u
+/* RWCTAB03 layout for the complete front mode 4 and back mode 24 profiles. */
+#define CAM_NATIVE_PROFILE_BYTES ANNIBALE_CAMERA_FRONT_PROFILE_BYTES
+#define CAM_BACK_PROFILE_BYTES ANNIBALE_CAMERA_BACK_PROFILE_BYTES
 
 static struct annibale_camera_profile *cam_profile;
+
+#include "annibale_camera_exposure.inc"
 
 _Static_assert(sizeof(struct annibale_camera_profile) == 128, "RWCTAB03 header");
 _Static_assert(sizeof(struct annibale_camera_power) == 12, "RWCTAB03 power entry");
@@ -16,11 +19,18 @@ cam_profile_validate(const void *data, size_t bytes)
 		0x15, 0x67, 0xfd, 0xc9, 0x45, 0xc6, 0x40, 0x91,
 		0xbd, 0x44, 0x3b, 0x0a, 0x52, 0x21, 0xe4, 0x5e,
 	};
+	static const uint8_t expected_back[SHA256_DIGEST_LENGTH] = {
+		0x83, 0x27, 0x35, 0x46, 0x2b, 0xe3, 0xfe, 0x12,
+		0x26, 0xa2, 0x36, 0x01, 0xb4, 0x1c, 0xe7, 0xdd,
+		0x53, 0x25, 0x27, 0x49, 0x62, 0xff, 0x9b, 0x17,
+		0xe6, 0x90, 0xc3, 0x9f, 0xa3, 0xd4, 0xaf, 0x9e,
+	};
 	const struct annibale_camera_profile *profile = data;
 	uint8_t digest[SHA256_DIGEST_LENGTH];
 	SHA256_CTX context;
 
-	if (data == NULL || bytes != CAM_NATIVE_PROFILE_BYTES || profile->bytes != bytes ||
+	if (data == NULL || (bytes != CAM_NATIVE_PROFILE_BYTES && bytes != CAM_BACK_PROFILE_BYTES) ||
+	    profile->bytes != bytes ||
 	    memcmp(profile->magic, ANNIBALE_CAMERA_PROFILE_MAGIC, sizeof(profile->magic)) != 0) {
 		return EINVAL;
 	}
@@ -28,7 +38,8 @@ cam_profile_validate(const void *data, size_t bytes)
 	SHA256_Init(&context);
 	SHA256_Update(&context, data, bytes);
 	SHA256_Final(digest, &context);
-	return memcmp(digest, expected, sizeof(digest)) == 0 ? 0 : EINVAL;
+	const uint8_t *selected = profile->sensor == 1u ? expected_back : expected;
+	return memcmp(digest, selected, sizeof(digest)) == 0 ? 0 : EINVAL;
 }
 
 static const struct annibale_camera_power *
@@ -67,9 +78,10 @@ static void
 cam_profile_install(struct annibale_camera_profile *profile)
 {
 	if (cam_profile != NULL) {
-		kfree_data(cam_profile, CAM_NATIVE_PROFILE_BYTES);
+		kfree_data(cam_profile, cam_profile->bytes);
 	}
 	cam_profile = profile;
+	cam_native_exposure_defaults(profile);
 	current_sensor = profile->sensor;
 	cam_hw_dma_verified = false;
 	bzero(&cam_capture, sizeof(cam_capture));
@@ -104,6 +116,7 @@ cam_native_read(struct uio *uio)
 	frame.frame_lines = cam_profile->frame_length;
 	frame.sensor = cam_profile->sensor;
 	frame.focus = ANNIBALE_CAMERA_NO_FOCUS;
+	cam_native_frame_exposure(cam_profile, &frame);
 	int error = uiomove((caddr_t)&frame, sizeof(frame), uio);
 	user_ssize_t bytes = MIN(uio_resid(uio), (user_ssize_t)cam_capture.bytes);
 	if (error == 0 && bytes > 0) {

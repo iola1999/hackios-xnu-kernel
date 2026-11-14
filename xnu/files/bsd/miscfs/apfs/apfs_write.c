@@ -105,7 +105,13 @@
 
 #include "apfs_write.h"
 
-/* ------------------------------------------------------------------ little-endian reads */
+/* ------------------------------------------------------------------ little-endian helpers */
+
+static inline uint16_t
+w_le16(const uint8_t *p)
+{
+	return (uint16_t)p[0] | (uint16_t)p[1] << 8;
+}
 
 static inline uint32_t
 w_le32(const uint8_t *p)
@@ -119,6 +125,47 @@ w_le64(const uint8_t *p)
 	return (uint64_t)w_le32(p) | (uint64_t)w_le32(p + 4) << 32;
 }
 
+static inline void
+w_put_le16(uint8_t *p, uint16_t v)
+{
+	p[0] = (uint8_t)v;
+	p[1] = (uint8_t)(v >> 8);
+}
+
+static inline void
+w_put_le32(uint8_t *p, uint32_t v)
+{
+	p[0] = (uint8_t)v;
+	p[1] = (uint8_t)(v >> 8);
+	p[2] = (uint8_t)(v >> 16);
+	p[3] = (uint8_t)(v >> 24);
+}
+
+static inline void
+w_put_le64(uint8_t *p, uint64_t v)
+{
+	w_put_le32(p, (uint32_t)v);
+	w_put_le32(p + 4, (uint32_t)(v >> 32));
+}
+
+static inline void
+w_seal_obj(uint8_t *blk, uint32_t bs, uint64_t oid, uint64_t xid, uint32_t otype, uint32_t subtype)
+{
+	w_put_le64(blk + 8, oid);
+	w_put_le64(blk + 16, xid);
+	w_put_le32(blk + 24, otype);
+	w_put_le32(blk + 28, subtype);
+	uint64_t cksum = apfs_fletcher64(blk + 8, bs - 8);
+	w_put_le64(blk, cksum);
+}
+
+static inline void
+w_make_jkey(uint8_t *dst, uint64_t oid, uint8_t type)
+{
+	uint64_t val = (oid & APFS_OBJ_ID_MASK) | ((uint64_t)type << APFS_OBJ_TYPE_SHIFT);
+	w_put_le64(dst, val);
+}
+
 /* ------------------------------------------------------------------ the volume */
 
 int
@@ -126,7 +173,9 @@ apfs_write_volume_ok(struct apfs_vol *vol, const char **why)
 {
 	const char *reason = NULL;
 
-	if (vol->nx->dev.write == NULL) {
+	if (vol == NULL || vol->nx == NULL) {
+		reason = "invalid volume";
+	} else if (vol->nx->dev.write == NULL) {
 		reason = "the device does not take writes";
 	} else if (vol->nx->block_size < APFS_NX_MINIMUM_BLOCK_SIZE) {
 		reason = "the container's block size makes no sense";
@@ -165,7 +214,7 @@ blocks_are_free_ground(struct apfs_nx *nx, uint64_t start, uint64_t count)
 {
 	uint64_t end;
 
-	if (count == 0 || start == 0 || start >= nx->block_count) {
+	if (nx == NULL || count == 0 || start == 0 || start >= nx->block_count) {
 		return false;
 	}
 	if (count > nx->block_count - start) {
@@ -198,6 +247,9 @@ static int
 extent_is_ours(struct apfs_btree *er, uint64_t stream_id, uint64_t phys, uint64_t blocks,
     const char **why)
 {
+	if (er == NULL || why == NULL) {
+		return EINVAL;
+	}
 	struct apfs_cursor cur;
 	struct apfs_rec rec;
 	uint64_t len, owner;
@@ -247,6 +299,9 @@ extent_is_ours(struct apfs_btree *er, uint64_t stream_id, uint64_t phys, uint64_
 static int
 block_out(struct apfs_nx *nx, uint64_t block, const uint8_t *data, uint8_t *scratch)
 {
+	if (nx == NULL || data == NULL || scratch == NULL) {
+		return EINVAL;
+	}
 	uint64_t at = block * (uint64_t)nx->block_size;
 	int error;
 
@@ -272,6 +327,21 @@ int
 apfs_write_in_place(struct apfs_vol *vol, uint64_t obj_id, uint64_t off, const void *buf,
     size_t len, struct apfs_write_report *rep)
 {
+	struct apfs_write_report unused_report;
+
+	if (rep == NULL) rep = &unused_report;
+	memset(rep, 0, sizeof(*rep));
+	rep->bytes = len;
+
+	if (vol == NULL || vol->nx == NULL) {
+		return EINVAL;
+	}
+	if (buf == NULL && len > 0) {
+		return EINVAL;
+	}
+	if (off + len < off) {
+		return EINVAL;
+	}
 	struct apfs_nx *nx = vol->nx;
 	struct apfs_inode ino;
 	struct apfs_xattr xa;
@@ -282,9 +352,6 @@ apfs_write_in_place(struct apfs_vol *vol, uint64_t obj_id, uint64_t off, const v
 	uint64_t at = off, left = len;
 	const char *why = NULL;
 	int error;
-
-	memset(rep, 0, sizeof(*rep));
-	rep->bytes = len;
 
 	error = apfs_write_volume_ok(vol, &why);
 	if (error) {
@@ -439,3 +506,9 @@ out:
 	}
 	return error;
 }
+
+
+#include "apfs_txn.inc"
+#include "apfs_write_ops.inc"
+#include "apfs_write_ops_dir.inc"
+#include "apfs_write_ops_xattr.inc"

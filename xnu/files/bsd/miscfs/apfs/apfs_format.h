@@ -64,7 +64,10 @@ struct apfs_obj_phys {
 #define APFS_OBJECT_TYPE_BTREE          0x00000002  /* a tree's root node */
 #define APFS_OBJECT_TYPE_BTREE_NODE     0x00000003  /* any other node */
 #define APFS_OBJECT_TYPE_SPACEMAN       0x00000005
+#define APFS_OBJECT_TYPE_CAB            0x00000006
+#define APFS_OBJECT_TYPE_CIB            0x00000007
 #define APFS_OBJECT_TYPE_SPACEMAN_BITMAP 0x00000008
+#define APFS_OBJECT_TYPE_FREE_QUEUE     0x00000009
 #define APFS_OBJECT_TYPE_OMAP           0x0000000b
 #define APFS_OBJECT_TYPE_CHECKPOINT_MAP 0x0000000c
 #define APFS_OBJECT_TYPE_FS             0x0000000d  /* a volume superblock */
@@ -181,6 +184,57 @@ struct apfs_checkpoint_map_phys {
 	uint32_t             cpm_flags;
 	uint32_t             cpm_count;
 	struct apfs_checkpoint_mapping cpm_map[];
+};
+
+/*
+ * Space manager
+ */
+struct apfs_chunk_info {
+	uint64_t     ci_xid;
+	uint64_t     ci_addr;
+	uint32_t     ci_block_count;
+	uint32_t     ci_free_count;
+	apfs_paddr_t ci_bitmap_addr;
+};
+
+struct apfs_chunk_info_block {
+	struct apfs_obj_phys cib_o;
+	uint32_t             cib_index;
+	uint32_t             cib_chunk_info_count;
+	struct apfs_chunk_info cib_chunk_info[];
+};
+
+struct apfs_spaceman_phys {
+	struct apfs_obj_phys sm_o;
+	uint32_t     sm_block_size;
+	uint32_t     sm_blocks_per_chunk;
+	uint32_t     sm_chunks_per_cib;
+	uint32_t     sm_cibs_per_cab;
+	uint64_t     sm_block_count;
+	uint64_t     sm_chunk_count;
+	uint32_t     sm_cib_count;
+	uint32_t     sm_cab_count;
+	uint64_t     sm_free_count;
+	uint32_t     sm_addr_offset;
+	uint32_t     sm_reserved;
+	uint64_t     sm_reserved2;
+	uint8_t      sm_pad1[48];
+	uint32_t     sm_flags;
+	uint32_t     sm_ip_bm_tx_multiplier;
+	uint64_t     sm_ip_block_count;
+	uint32_t     sm_ip_bm_size_in_blocks;
+	uint32_t     sm_ip_bm_block_count;
+	uint64_t     sm_ip_bm_base;
+	uint64_t     sm_ip_base;
+	uint64_t     sm_fs_reserve_alloc_count;
+	uint64_t     sm_fs_reserve_total_count;
+	uint8_t      sm_pad2[120];
+	uint16_t     sm_ip_bm_free_head;
+	uint16_t     sm_ip_bm_free_tail;
+	uint32_t     sm_ip_bm_xid_offset;
+	uint32_t     sm_ip_bitmap_offset;
+	uint32_t     sm_ip_bm_free_next_offset;
+	uint8_t      sm_data[];
 };
 
 /*

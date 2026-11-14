@@ -56,6 +56,7 @@
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
+#include <kern/sched_prim.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -805,10 +806,12 @@ torch_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 		/* 32-bit binary level 0..1000 has high 16 bits == 0 and value <= 1000 */
 		if (val <= 1000) {
 			wanted = val;
+			thread_wakeup((event_t)&wanted);
 			return 0;
 		}
 		memcpy(raw, &val, sizeof(val));
 		wanted = parse_torch_ascii((const char *)raw, sizeof(val));
+		thread_wakeup((event_t)&wanted);
 		return 0;
 	}
 	if (resid > (user_ssize_t)(sizeof(raw) - 1)) {
@@ -818,6 +821,7 @@ torch_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 		return error;
 	}
 	wanted = parse_torch_ascii((const char *)raw, (size_t)resid);
+	thread_wakeup((event_t)&wanted);
 	return 0;
 }
 
@@ -892,8 +896,19 @@ serve_thread(__unused void *parameter, __unused wait_result_t result)
 			shown = 0;
 			cut = true;
 		}
+		bool is_lit = lit;
 		lck_mtx_unlock(&torch_hv_lck);
-		wait_ms(100);
+		if (is_lit) {
+			wait_ms(100);
+		} else {
+			assert_wait((event_t)&wanted, THREAD_INTERRUPTIBLE);
+			uint32_t next_want = (cut && wanted != 0) ? 0 : wanted;
+			if (next_want != shown) {
+				clear_wait(current_thread(), THREAD_AWAKENED);
+			} else {
+				thread_block(THREAD_CONTINUE_NULL);
+			}
+		}
 	}
 done:
 	thread_terminate(current_thread());

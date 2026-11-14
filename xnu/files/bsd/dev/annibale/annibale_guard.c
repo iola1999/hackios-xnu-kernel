@@ -1,47 +1,16 @@
 /*
- * The speakers' guard: what the samples go through on their way to the phone's two amplifiers
- * (bsd/dev/annibale_sound.c's feeder), in place of the protection Android has in the audio DSP.
+ * Stereo PCM protection for the speaker feeder. A second-order Butterworth high-pass filter
+ * at 200 Hz precedes three power estimates (0.2, 3 and 60 seconds) and the peak limiter.
+ * The monitor can request an additional reduction. Configurable gain is limited to 12 dB.
  *
- * Under Android the DSP runs Awinic's algorithm (SKTune, "aw882xx_rx_switch") with each
- * speaker's calibration: it keeps the cone's excursion and the voice coil's temperature in
- * bounds, measuring both through the amplifiers' current and voltage feedback. None of that runs
- * here, and nothing here knows the speakers' parameters (Android's files that can be read have
- * none: the amplifiers' register profile, the battery tables of its "monitor", and in the device
- * tree a range of 4 to 9 ohms for the calibrated resistance). So the guard holds what reaches the
- * speakers to levels that are safe for small phone speakers whatever they are exactly, measured
- * the only way there is without feedback -- from the samples and the amplifiers' level -- and
- * kept well under what the speakers can take at Android's level:
+ * Limits use a full-scale signal at the configured amplifier gain as their reference. TFA986x
+ * user volume is applied to PCM before the filter and power estimates; its hardware gain stays
+ * at the vendor profile. The other amplifier path retains its hardware attenuation model. The
+ * reference has no measured conversion to acoustic output or watts. Arithmetic uses Q30
+ * fractions unless stated otherwise.
  *
- *   high-pass  a second-order Butterworth filter at 200 Hz: a phone's speaker gives out next to
- *              nothing below its resonance (several hundred Hz), and what it is given there only
- *              moves the cone further and heats the coil
- *   power      the power that would reach a speaker, averaged three ways -- over 0.2 s (the
- *              cone and coil at once), 3 s (the voice coil's warming) and 60 s (the magnet and
- *              the frame) -- and the level turned down so that none of the three averages goes
- *              over its limit: 3, 6 and 9 dB under the power of a full-scale sine at Android's
- *              level. Sound of ordinary loudness never comes near them; a sustained full-scale
- *              tone is turned down at once to the first, after seconds to the second and over a
- *              minute to the third, and the level comes back up as the averages fall, as a
- *              speaker cools. The averages go on falling while the amplifiers are off.
- *   peaks      no sample above 3 dB under full scale at Android's level: a limiter that turns
- *              the level down at the sample that would go over (so none does) and lets it come
- *              back with a time constant of 43 ms
- *   monitor    a further reduction that the amplifiers' watch asks for (annibale_speaker.c:
- *              Android's table for a cold amplifier, and a low battery)
- *
- * Before all that, a gain (sound_gain, at most 12 dB): iOS's own processing for the iPhone X's
- * speaker keeps even a full-scale tone at its top volume 12.6 to 14.3 dB under full scale, so
- * without it iOS at the top would stay that much under Android at the top. What it lifts over
- * full scale is held to full scale by the peak limiter (or to its lower limit), never clipped.
- *
- * All the limits are in terms of the speakers: a signal at full scale with the amplifiers at
- * Android's level (the loudest they are ever set to) is 0 dB. With the amplifiers turned down
- * (sound_below) the same samples are that much quieter at the speakers, and the guard holds them
- * back only that much later. Everything is integer arithmetic (the kernel's threads do no
- * floating point); fractions are in Q30 unless said otherwise.
- *
- * One caller at a time (the feeder); annibale_guard_attenuation() and annibale_guard_monitor() may
- * be called from another thread.
+ * The feeder is the sole sample-processing caller. Volume and monitor updates can come from
+ * another thread. The amplifier selects PCM volume before the feeder starts.
  */
 #include <stdbool.h>
 #include <stdint.h>
@@ -50,7 +19,7 @@
 #define ONE                     (1ll << 30)
 #define FULL_SCALE              32768
 
-/* The limits, in eighths of a dB under full scale at Android's level (powers: under a full-scale square wave's) */
+/* The limits, in eighths of a dB under full scale at the configured amplifier gain (powers: under a full-scale square wave's) */
 #define PEAK_LIMIT              (3 * 8)
 #define RMS_LIMIT               (6 * 8)         /* a full-scale sine is 3 dB under a square wave: these are 3, 6, 9 dB under it */
 #define FAST_LIMIT              (9 * 8)
@@ -78,11 +47,12 @@ static const int64_t hpf_a1 = -2107733822, hpf_a2 = 1034714513;
 
 static struct {
 	bool hpf;
+	bool pcm_volume;                       /* selected before the feeder starts for TFA986x */
 	uint64_t gain;                          /* the gain before everything, Q30 (1 to 4) */
-	volatile uint32_t attenuation;          /* the amplifiers' level under Android's, eighths of a dB; ANNIBALE_GUARD_SILENT: off */
+	volatile uint32_t attenuation;          /* requested volume, eighths of a dB; ANNIBALE_GUARD_SILENT: off */
 	volatile uint32_t monitor;              /* the monitor's reduction, eighths of a dB */
 	int64_t x1[2], x2[2], y1[2], y2[2];     /* the filter's past, in 1/256 of a sample */
-	uint64_t rms[2], fast[2], slow[2];      /* average powers at each speaker, Q30 of a full-scale square wave at Android's level */
+	uint64_t rms[2], fast[2], slow[2];      /* average powers at each speaker, Q30 of a full-scale square wave at the configured amplifier gain */
 	uint64_t level;                         /* the power guard's and the monitor's gain at the end of the last block */
 	uint64_t envelope;                      /* the peak limiter's, 1/65536 of a sample */
 	struct annibale_guard_report report;
@@ -141,6 +111,12 @@ annibale_guard_configure(bool hpf, uint32_t gain)
 }
 
 void
+annibale_guard_pcm_volume(void)
+{
+	guard.pcm_volume = true;
+}
+
+void
 annibale_guard_attenuation(uint32_t below)
 {
 	guard.attenuation = below;
@@ -156,15 +132,21 @@ static void
 block(int16_t *frames, uint32_t count)
 {
 	uint32_t attenuation = guard.attenuation;
+	uint32_t hardware_attenuation = guard.pcm_volume ? 0 : attenuation;
+	bool pcm_muted = guard.pcm_volume && attenuation == ANNIBALE_GUARD_SILENT;
+	uint64_t input_gain = guard.gain;
+	if (guard.pcm_volume) {
+		input_gain = pcm_muted ? 0 : input_gain * amplitude(attenuation) >> 30;
+	}
 	struct annibale_guard_report *r = &guard.report;
-	uint64_t to_speaker = attenuation == ANNIBALE_GUARD_SILENT ? 0 : amplitude(2 * attenuation);
+	uint64_t to_speaker = hardware_attenuation == ANNIBALE_GUARD_SILENT ? 0 : amplitude(2 * hardware_attenuation);
 	uint64_t sum[2] = { 0, 0 }, g2 = ONE, g, start = guard.level, ceiling;
 	uint32_t binding = 0;
 
 	/* the high-pass filter, and what comes out of it: its power, per channel */
 	for (uint32_t i = 0; i < 2 * count; i++) {
 		unsigned c = i & 1;
-		int64_t x = (int64_t)frames[i] * (int64_t)guard.gain >> 22, y;    /* (the gain, and 1/256 of a sample) */
+		int64_t x = (int64_t)frames[i] * (int64_t)input_gain >> 22, y;    /* (the gain, and 1/256 of a sample) */
 		uint32_t level = frames[i] < 0 ? (uint32_t)-frames[i] : (uint32_t)frames[i];
 
 		if (level > r->peak_in) {
@@ -222,8 +204,8 @@ block(int16_t *frames, uint32_t count)
 
 	/* the peaks: no sample over the limit at the speaker (and none over full scale) */
 	ceiling = FULL_SCALE - 1;
-	if (attenuation != ANNIBALE_GUARD_SILENT && attenuation < PEAK_LIMIT) {
-		ceiling = (uint64_t)FULL_SCALE * amplitude(PEAK_LIMIT - attenuation) >> 30;
+	if (hardware_attenuation != ANNIBALE_GUARD_SILENT && hardware_attenuation < PEAK_LIMIT) {
+		ceiling = (uint64_t)FULL_SCALE * amplitude(PEAK_LIMIT - hardware_attenuation) >> 30;
 	}
 	for (uint32_t f = 0; f < count; f++) {
 		/* (the power guard's gain moves from the last block's to this one's across the block) */
@@ -250,7 +232,7 @@ block(int16_t *frames, uint32_t count)
 			}
 		}
 		for (unsigned c = 0; c < 2; c++) {
-			int64_t out = y[c] * (int64_t)peak_gain >> 16;
+			int64_t out = pcm_muted ? 0 : y[c] * (int64_t)peak_gain >> 16;
 			uint32_t magnitude;
 
 			out = out > FULL_SCALE - 1 ? FULL_SCALE - 1 : out < -FULL_SCALE ? -FULL_SCALE : out;

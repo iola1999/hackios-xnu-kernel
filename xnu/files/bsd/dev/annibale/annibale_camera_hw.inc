@@ -15,6 +15,8 @@
 #define CCI0_SIZE               0x00001000UL
 #define CSID_LITE0_PHYS         0x0ad6d000UL    /* csid-lite980 (0xa00) + vfe-lite980 (0x2800) */
 #define CSID_LITE0_SIZE         0x00002800UL
+#define CSIPHY3_PHYS            0x0adaf000UL
+#define CSIPHY3_SIZE            0x00002000UL
 #define CSIPHY4_PHYS            0x0adb1000UL
 #define CSIPHY4_SIZE            0x00002000UL
 #define CAMCC_PHYS              0x0ade0000UL
@@ -449,11 +451,17 @@ cci0_m1_write_bytes(uint8_t slave7, uint8_t b0, uint8_t b1, uint8_t b2, uint32_t
 	reg_wr(cci0_base, CCI_QUEUE_START, (1u << 2));
 
 	for (uint32_t i = 0; i < 250; i++) {
-		if (reg_rd(cci0_base, CCI_I2C_M1_Q0_CUR_WORD_CNT) == 0) {
+		uint32_t irq = reg_rd(cci0_base, CCI_IRQ_STATUS_0);
+		if (irq == UINT32_MAX || (irq & CCI_IRQ_M1_ERROR) != 0) {
+			break;
+		}
+		if ((irq & CCI_IRQ_M1_Q0_REPORT) != 0) {
 			return true;
 		}
 		delay_for_interval(10, NSEC_PER_USEC);
 	}
+	/* A pending or failed transfer requires a completed master reset. */
+	cci_ready = false;
 	return false;
 }
 

@@ -38,4 +38,59 @@ int apfs_write_volume_ok(struct apfs_vol *vol, const char **why);
 int apfs_write_in_place(struct apfs_vol *vol, uint64_t obj_id, uint64_t off,
     const void *buf, size_t len, struct apfs_write_report *rep);
 
+/*
+ * Full transactional write: write `len` bytes at offset `off` of file `obj_id`.
+ * If `off + len` exceeds existing file size, allocates new blocks via Space Manager,
+ * updates B-tree extents, updates inode size/mtime, and commits a new transaction.
+ */
+int apfs_write_file(struct apfs_vol *vol, uint64_t obj_id, uint64_t off,
+    const void *buf, size_t len, struct apfs_write_report *rep);
+
+/*
+ * Create a new regular file with name `name` under parent directory `parent_id`.
+ * Commits a new transaction and returns the assigned object identifier in `out_id`.
+ */
+int apfs_create_file(struct apfs_vol *vol, uint64_t parent_id, const char *name,
+    uint16_t mode, uint32_t uid, uint32_t gid, uint64_t *out_id);
+
+/*
+ * Remove an existing file with name `name` under parent directory `parent_id`.
+ * Frees its allocated data blocks via Space Manager and commits a new transaction.
+ */
+int apfs_remove_file(struct apfs_vol *vol, uint64_t parent_id, const char *name);
+
+/*
+ * Set the size (truncate / extend) of file `obj_id` to `new_size`.
+ * Frees or allocates data blocks accordingly and commits a new transaction.
+ */
+int apfs_set_file_size(struct apfs_vol *vol, uint64_t obj_id, uint64_t new_size);
+
+/*
+ * Update attributes (mode, uid, gid, mtime_ns) for file `obj_id`.
+ * Commits a new transaction.
+ */
+int apfs_set_file_attrs(struct apfs_vol *vol, uint64_t obj_id, uint16_t mode,
+    uint32_t uid, uint32_t gid, uint64_t mtime_ns);
+
+/*
+ * Directory, Symlink, Link, Mknod and Rename operations.
+ */
+int apfs_create_dir(struct apfs_vol *vol, uint64_t parent_id, const char *name,
+    uint16_t mode, uint32_t uid, uint32_t gid, uint64_t *out_id);
+int apfs_remove_dir(struct apfs_vol *vol, uint64_t parent_id, const char *name);
+int apfs_create_symlink(struct apfs_vol *vol, uint64_t parent_id, const char *name,
+    const char *target, uint32_t uid, uint32_t gid, uint64_t *out_id);
+int apfs_create_link(struct apfs_vol *vol, uint64_t target_id, uint64_t parent_id, const char *name);
+int apfs_create_mknod(struct apfs_vol *vol, uint64_t parent_id, const char *name,
+    uint16_t mode, uint32_t rdev, uint32_t uid, uint32_t gid, uint64_t *out_id);
+int apfs_rename_file(struct apfs_vol *vol, uint64_t from_parent, const char *from_name,
+    uint64_t to_parent, const char *to_name);
+
+/*
+ * Extended Attribute operations.
+ */
+int apfs_set_xattr(struct apfs_vol *vol, uint64_t obj_id, const char *name,
+    const void *data, size_t size);
+int apfs_remove_xattr(struct apfs_vol *vol, uint64_t obj_id, const char *name);
+
 #endif /* _MISCFS_APFS_APFS_WRITE_H_ */

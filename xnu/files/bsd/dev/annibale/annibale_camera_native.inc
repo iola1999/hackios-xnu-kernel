@@ -61,6 +61,13 @@ cam_native_front_mode4(void)
 }
 
 static bool
+cam_native_back_mode24(void)
+{
+	return cam_hw_mmio != 0 && wide_chip_id == WIDE_SENSOR_ID_EXPECTED &&
+	       cached_csid_ver == 0x30000004u && cached_ife_ver == 0x20050000u;
+}
+
+static bool
 cam_native_reset(bool global)
 {
 	if (cam_native_reset_failed) {
@@ -117,13 +124,13 @@ cam_native_idle(void)
 static bool
 cam_native_buffer(void)
 {
-	cam_native_dma_bytes = (cam_capture.bytes + 255u) & ~255u;
+	cam_native_dma_bytes = (cam_capture.bytes + 511u) & ~511u;
 	if (cam_region_vbase == 0 || cam_native_dma_bytes == 0 ||
 	    cam_native_dma_bytes > CAMERA_REGION_SIZE) {
 		return false;
 	}
 	uint64_t first = kvtophys(cam_region_vbase);
-	if (first == 0 || (first & 255u) != 0 ||
+	if (first == 0 || (first & 511u) != 0 ||
 	    first >= (1ULL << 36) || cam_native_dma_bytes > (1ULL << 36) - first) {
 		return false;
 	}
@@ -175,7 +182,8 @@ cam_native_release(void)
 static int
 cam_native_prepare(void)
 {
-	if (!cam_native_front_mode4()) {
+	bool back = cam_profile->sensor == 1u;
+	if (back ? !cam_native_back_mode24() : !cam_native_front_mode4()) {
 		return ENXIO;
 	}
 	if (!cam_native_buffer()) {
@@ -197,8 +205,13 @@ cam_native_prepare(void)
 		return EIO;
 	}
 	uint16_t id = 0;
-	if (!od_i2c_read16_reg16(GPIO_SE9_I2C_SDA, GPIO_SE9_I2C_SCL,
-	    front_slave_addr, FRONT_SENSOR_ID_REG, &id) || id != FRONT_SENSOR_ID_EXPECTED) {
+	bool identified = back ?
+	    (wide_bus_mode == 1u ? cci0_m1_read16(wide_slave_addr, WIDE_SENSOR_ID_REG, &id) :
+	    (wide_bus_mode == 2u && od_i2c_read16_reg16(GPIO_CCI0_M1_SDA, GPIO_CCI0_M1_SCL,
+	    wide_slave_addr, WIDE_SENSOR_ID_REG, &id))) :
+	    od_i2c_read16_reg16(GPIO_SE9_I2C_SDA, GPIO_SE9_I2C_SCL,
+	    front_slave_addr, FRONT_SENSOR_ID_REG, &id);
+	if (!identified || id != (back ? WIDE_SENSOR_ID_EXPECTED : FRONT_SENSOR_ID_EXPECTED)) {
 		return ENXIO;
 	}
 	if (!cam_native_register_table(0u, cam_profile->init_count) ||
@@ -234,8 +247,9 @@ cam_native_configure(void)
 	csid_wr(0x1218u, 0);
 	csid_wr(0x1220u, UINT32_MAX);
 	csid_wr(0x1230u, 1u);
+	bool back = cam_profile->sensor == 1u;
 	uint32_t receive = (cam_profile->lane_count - 1u) | (cam_profile->lane_assign << 4) |
-	    (5u << 20);
+	    ((back ? 4u : 5u) << 20) | (back ? 1u << 24 : 0);
 	csid_wr(CAM980_RX_CFG0, receive);
 	csid_wr(CAM980_RX_CFG1, (1u << 6) | 1u);
 	/* Native RAW10 -> MIPI RAW10: decode 2, packing 1; timestamp strobe 2. */
@@ -265,7 +279,7 @@ cam_native_configure(void)
 	csid_wr(CAM980_WM_IRQ_PATTERN, 1u);
 	csid_wr(CAM980_WM_PREFETCH, 0);
 	csid_wr(CAM980_WM_CACHE, 0);
-	csid_wr(CAM980_WM_ADDR_CONFIG, 0);
+	csid_wr(CAM980_WM_ADDR_CONFIG, (uint32_t)(cam_capture.dma_address & 0xffu));
 	return reg_rd(csid_lite_base, CAM980_PATH_CFG0) == (path | (1u << 31)) &&
 	       reg_rd(csid_lite_base, CAM980_WM_IMAGE_CFG0) ==
 	       ((cam_profile->height << 16) | (cam_profile->stride / 16u)) &&
@@ -298,10 +312,7 @@ cam_native_wait_frame(void)
 			return (cam_capture.rx_irq & CAM980_RX_FATAL) != 0 ||
 			       (cam_capture.path_irq & CAM980_PATH_FATAL) != 0 ? EIO : 0;
 		}
-		if ((cam_capture.rx_irq & CAM980_RX_FATAL) != 0 ||
-		    (cam_capture.path_irq & CAM980_PATH_FATAL) != 0) {
-			return EIO;
-		}
+		/* Wait for WM0's RDI0_DONE output fence so transient C-PHY errors retire DMA cleanly instead of entering HELD. */
 		delay_for_interval(1000, NSEC_PER_USEC);
 	}
 	return ETIMEDOUT;
@@ -313,6 +324,7 @@ cam_native_finish(void)
 	bool sensor_off = cam_native_register_table(3u, cam_profile->off_count);
 	if (sensor_off) {
 		cam_sensor_streaming = false;
+		delay_for_interval(2000, NSEC_PER_USEC);
 	}
 	if (!cam_native_reset(false)) {
 		return false;

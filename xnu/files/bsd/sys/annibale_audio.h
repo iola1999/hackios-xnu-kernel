@@ -78,12 +78,14 @@ struct annibale_guard_report {
 	uint32_t peak_in, peak_out;     /* the largest sample that came in and that went out */
 	uint32_t least_peak_gain;       /* the peak limiter's least gain, in 1/65536 */
 	uint64_t least_gain, gain;      /* the power guard's (with the monitor's) least gain and the latest, Q30 */
-	uint64_t rms, fast, slow;       /* the averages now, the louder speaker's: Q30 of a full-scale square wave at Android's level */
+	uint64_t rms, fast, slow;       /* the averages now, the louder speaker's: Q30 of a full-scale square wave at the configured amplifier gain */
 };
 #define ANNIBALE_GUARD_MAX_GAIN  (12 * 8)        /* the most gain before the guard: 12 dB */
 void annibale_guard_configure(bool hpf, uint32_t gain);         /* the high-pass filter; `gain' before everything */
-void annibale_guard_attenuation(uint32_t below);                 /* the amplifiers' level under Android's (or ANNIBALE_GUARD_SILENT):
-                                                                 * what the limits are reckoned from */
+/* Select PCM volume for a fixed amplifier profile before starting the feeder. */
+void annibale_guard_pcm_volume(void);
+/* Requested attenuation in eighths of a dB, or ANNIBALE_GUARD_SILENT. */
+void annibale_guard_attenuation(uint32_t below);
 void annibale_guard_process(int16_t *frames, uint32_t count);    /* stereo frames, in place */
 void annibale_guard_monitor(uint32_t below);                     /* a further reduction, for the amplifiers' own protection */
 void annibale_guard_take_report(struct annibale_guard_report *report);   /* what happened since the last call */

@@ -164,7 +164,6 @@ apfs_nx_reclaim(struct apfs_nx *nx, uint64_t oldest)
 	}
 }
 
-#ifndef KERNEL
 void
 apfs_nx_cache_flush(struct apfs_nx *nx)
 {
@@ -188,7 +187,6 @@ apfs_nx_cache_flush(struct apfs_nx *nx)
 		memset(nx->omap_cache, 0, APFS_OMAP_CACHE * sizeof(*nx->omap_cache));
 	}
 }
-#endif
 
 /* A free slot, or the first the clock hand finds neither used since it last passed nor recent. */
 static struct apfs_buf *
@@ -858,6 +856,7 @@ omap_open(struct apfs_nx *nx, uint64_t omap_addr, struct apfs_omap *omap)
 	int error;
 
 	memset(omap, 0, sizeof(*omap));
+	omap->omap_paddr = omap_addr;
 	error = nx_block(nx, omap_addr, &blk, true);
 	if (error) {
 		return error;
@@ -1106,10 +1105,18 @@ apfs_nx_open(struct apfs_nx *nx, const struct apfs_dev *dev)
 	nx->xid = obj_xid(blk);
 	nx->block_count = le64(blk + 40);
 	memcpy(nx->uuid, blk + 72, sizeof(nx->uuid));
+	nx->next_oid = le64(blk + 88);
+	if (nx->next_oid < 1024) nx->next_oid = 1024;
 	nx->xp_desc_blocks = le32(blk + 104);
 	nx->xp_data_blocks = le32(blk + 108);
 	nx->xp_desc_base = le64(blk + 112);
 	nx->xp_data_base = le64(blk + 120);
+	nx->xp_desc_next = le32(blk + 128);
+	nx->xp_data_next = le32(blk + 132);
+	nx->xp_desc_index = le32(blk + 136);
+	nx->xp_desc_len = le32(blk + 140);
+	nx->xp_data_index = le32(blk + 144);
+	nx->xp_data_len = le32(blk + 148);
 	nx->omap_addr = le64(blk + 160);
 	{
 		uint32_t maxfs = le32(blk + 180);
@@ -1203,6 +1210,7 @@ apfs_vol_open(struct apfs_nx *nx, uint32_t index, struct apfs_vol *vol)
 	}
 	vol->incompat = le64(blk + 56);
 	vol->alloc_count = le64(blk + 88);
+	vol->next_obj_id = le64(blk + 176);
 	er_type = le32(blk + 120);
 	omap_oid = le64(blk + 128);
 	root_oid = le64(blk + 136);
@@ -1489,47 +1497,7 @@ apfs_cursor_next(struct apfs_cursor *cur, struct apfs_rec *rec)
 
 /* ------------------------------------------------------------------ inodes */
 
-/*
- * Walk the extended fields at the tail of an inode record.  The blob is a count and a
- * used-byte total, then that many descriptors, then the values, each padded out to a
- * multiple of eight bytes.
- */
-static int
-xfields_find(const uint8_t *buf, uint16_t len, uint8_t want, const uint8_t **out,
-    uint16_t *out_len)
-{
-	uint16_t num, i, off;
-
-	*out = NULL;
-	*out_len = 0;
-	if (len < 4) {
-		return ENOENT;
-	}
-	num = le16(buf);
-	if ((uint32_t)4 + 4 * (uint32_t)num > len) {
-		return EIO;
-	}
-	off = (uint16_t)(4 + 4 * num);
-	for (i = 0; i < num; i++) {
-		uint8_t xtype = buf[4 + 4 * i];
-		uint16_t xsize = le16(buf + 4 + 4 * i + 2);
-		uint32_t pad = ((uint32_t)xsize + 7u) & ~7u;
-
-		if ((uint32_t)off + xsize > len) {
-			return EIO;
-		}
-		if (xtype == want) {
-			*out = buf + off;
-			*out_len = xsize;
-			return 0;
-		}
-		if ((uint32_t)off + pad > len) {
-			return ENOENT;  /* the last field, padding cut short */
-		}
-		off = (uint16_t)(off + pad);
-	}
-	return ENOENT;
-}
+#include "apfs_lib_write.inc"
 
 int
 apfs_inode_get(struct apfs_vol *vol, uint64_t obj_id, struct apfs_inode *ino)
@@ -1573,7 +1541,7 @@ apfs_inode_get(struct apfs_vol *vol, uint64_t obj_id, struct apfs_inode *ino)
 	/* the size of the contents is in an extended field, not in the fixed part */
 	xf = rec.val + 92;
 	xf_len = (uint16_t)(rec.val_len - 92);
-	if (xfields_find(xf, xf_len, APFS_INO_EXT_TYPE_DSTREAM, &xf, &xf_len) == 0 &&
+	if (apfs_xfields_find(xf, xf_len, APFS_INO_EXT_TYPE_DSTREAM, &xf, &xf_len) == 0 &&
 	    xf_len >= 16) {
 		ino->size = le64(xf);
 		ino->alloced_size = le64(xf + 8);
@@ -1581,7 +1549,7 @@ apfs_inode_get(struct apfs_vol *vol, uint64_t obj_id, struct apfs_inode *ino)
 	}
 	xf = rec.val + 92;
 	xf_len = (uint16_t)(rec.val_len - 92);
-	if (xfields_find(xf, xf_len, APFS_INO_EXT_TYPE_RDEV, &xf, &xf_len) == 0 &&
+	if (apfs_xfields_find(xf, xf_len, APFS_INO_EXT_TYPE_RDEV, &xf, &xf_len) == 0 &&
 	    xf_len >= 4) {
 		ino->rdev = le32(xf);
 	}

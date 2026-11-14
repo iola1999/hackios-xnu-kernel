@@ -157,6 +157,7 @@ struct apfs_btree {
 /* An object map: it turns an object identifier into a block address. */
 struct apfs_omap {
 	struct apfs_btree tree;
+	uint64_t          omap_paddr;
 	bool              ready;
 };
 
@@ -184,6 +185,7 @@ struct apfs_nx {
 	uint64_t          block_count;
 	apfs_xid_t        xid;          /* the checkpoint we are reading */
 	uint64_t          omap_addr;
+	uint64_t          next_oid;
 	apfs_oid_t        fs_oid[APFS_NX_MAX_FILE_SYSTEMS];
 	uint32_t          fs_count;
 	uint8_t           uuid[16];
@@ -196,6 +198,9 @@ struct apfs_nx {
 	 */
 	uint64_t          xp_desc_base, xp_data_base;
 	uint32_t          xp_desc_blocks, xp_data_blocks;
+	uint32_t          xp_desc_next, xp_data_next;
+	uint32_t          xp_desc_index, xp_desc_len;
+	uint32_t          xp_data_index, xp_data_len;
 	/*
 	 * The caller's lock round this container, which apfs_lib may let go of while it
 	 * does work that touches nothing shared -- reading a file's contents off the device
@@ -324,6 +329,7 @@ struct apfs_vol {
 	uint64_t          num_dirs;
 	uint64_t          num_symlinks;
 	uint64_t          alloc_count;
+	uint64_t          next_obj_id;
 	char              name[APFS_VOLNAME_LEN];
 	struct apfs_omap  omap;         /* resolves the nodes of the tree below */
 	struct apfs_btree tree;         /* the file-system tree */
@@ -460,9 +466,9 @@ void apfs_nx_close(struct apfs_nx *nx);
 bool apfs_name_hash(const char *name, size_t name_len, bool fold, uint32_t *hash);
 /* Free the retired blocks' memory no operation that began at `oldest` or later can see (lock held) */
 void apfs_nx_reclaim(struct apfs_nx *nx, uint64_t oldest);
-#ifndef KERNEL
-/* For tests on the build machine: every cached block out (retired, with a caller's lock), so all is read again */
+/* Flush every cached block out (retired, with a caller's lock), so all is read again */
 void apfs_nx_cache_flush(struct apfs_nx *nx);
+#ifndef KERNEL
 /* Every directory record of the volume, with the hash stored in its key (hashed keys only) */
 int apfs_dirrec_walk(struct apfs_vol *vol, int (*cb)(void *ctx, uint64_t dir_id, const char *name,
     size_t name_len, uint32_t stored_hash, uint64_t file_id), void *ctx);
@@ -490,6 +496,10 @@ int apfs_cursor_next(struct apfs_cursor *cur, struct apfs_rec *rec);
  * apfs_inode_size() where the size reported to a caller has to be right.
  */
 int apfs_inode_get(struct apfs_vol *vol, uint64_t obj_id, struct apfs_inode *ino);
+
+int apfs_omap_lookup(struct apfs_omap *omap, uint64_t oid, apfs_xid_t want_xid, uint64_t *addr);
+int apfs_xfields_find(const uint8_t *buf, uint16_t len, uint8_t want, const uint8_t **out,
+        uint16_t *out_len);
 
 /*
  * The logical size of a file: the uncompressed size for a compressed one, the length of

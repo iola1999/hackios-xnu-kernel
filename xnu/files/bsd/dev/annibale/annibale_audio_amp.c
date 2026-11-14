@@ -18,6 +18,7 @@
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
+#include <sys/annibale_audio.h>
 #include <sys/annibale_rpmh.h>
 #include <sys/systm.h>
 
@@ -60,7 +61,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 #define TFA6X_REG_STATUS_FLAGS0 0x10u
 #define TFA6X_REG_STATUS_FLAGS1 0x11u
 #define TFA6X_REG_SYS_STATUS0   0x12u
-#define TFA6X_REG_VOL_CTRL      0x51u
+#define TFA6X_REG_AUDIO_CTRL      0x51u
 #define TFA6X_REG_MTP_KEY2_A0   0xa0u
 #define TFA6X_REG_MTP_KEY2_A1   0xa1u
 #define TFA6X_REG_SWPROFIL      0xe0u
@@ -78,7 +79,6 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 #define TFA6X_BF_REV_HI2        0x0687u /* reg 0x06[15:8]: extended silicon revision bits */
 #define TFA6X_BF_CLKS           0x1100u /* reg 0x11[0]: PLL & clocks stable on BCLK */
 #define TFA6X_BF_MANSTATE       0x1203u /* reg 0x12[3:0]: manager state (0=pwdn, 1=wait_cfg, 6=mute, 9=op) */
-#define TFA6X_BF_VOL            0x5187u /* reg 0x51[15:8]: 0.5 dB/step attenuation (0xff = mute) */
 #define TFA6X_BF_INIT_DONE      0x9000u /* reg 0x90[0]: post-I2CR init latch */
 #define TFA6X_BF_SWPROFIL       0xe00fu /* reg 0xe0[15:0]: software profile marker */
 #define TFA6X_BF_SWVSTEP        0xe10fu /* reg 0xe1[15:0]: software vstep marker */
@@ -104,14 +104,19 @@ struct tfa_bf_val {
 
 static vm_offset_t tlmm_base;
 static enum amp_type detected_amp = AMP_TYPE_UNKNOWN;
-static bool amp_is_powered = false;
+enum amp_power_state {
+	AMP_POWER_OFF,
+	AMP_POWER_ON,
+	AMP_POWER_UNKNOWN,
+};
+static enum amp_power_state power_state = AMP_POWER_UNKNOWN;
 static bool amp_bus_online = false;
 static bool amp_ldo_voted = false;
 static bool tfa_rst_deassert_high = true;
 static uint32_t tfa_ext_rev[2];
 static uint8_t addr_top = TFA_ADDR_TOP;
 static uint8_t addr_bot = TFA_ADDR_BOT;
-static uint32_t current_below_eighths = 18 * 8; /* -18 dB default level */
+static uint32_t current_below_eighths = 18 * 8; /* -18 dB default safe level */
 static bool current_muted = false;
 
 static lck_grp_t *amp_lock_grp;
@@ -120,7 +125,7 @@ static lck_mtx_t *amp_lock;
 bool annibale_i2c_xfer(uint8_t addr, const uint8_t *wbuf, size_t wlen, uint8_t *rbuf, size_t rlen);
 void annibale_audio_amp_set_volume(uint32_t below_eighths_db, bool muted);
 bool annibale_audio_amp_probe(void);
-void annibale_audio_amp_power(bool enable);
+bool annibale_audio_amp_power(bool enable);
 void annibale_audio_amp_status(const char *when);
 
 /* ---- Silicon errata tables from tfa986x_specific & tfa9865_specific -------------------------- */
@@ -364,14 +369,15 @@ i2c_start(void)
 	return true;
 }
 
-static void
+static bool
 i2c_stop(void)
 {
 	i2c_sda_set(false);
 	i2c_delay();
-	(void)i2c_scl_high();
+	bool clocked = i2c_scl_high();
 	i2c_sda_set(true);
 	i2c_delay();
+	return clocked;
 }
 
 static bool
@@ -397,14 +403,17 @@ i2c_write_byte(uint8_t byte)
 	return ack;
 }
 
-static uint8_t
-i2c_read_byte(bool send_ack)
+static bool
+i2c_read_byte(bool send_ack, uint8_t *value)
 {
 	uint8_t byte = 0;
 	i2c_sda_set(true);
 	for (int bit = 7; bit >= 0; bit--) {
 		i2c_delay();
-		(void)i2c_scl_high();
+		if (!i2c_scl_high()) {
+			i2c_scl_low();
+			return false;
+		}
 		if (gpio_in(PIN_SDA)) {
 			byte |= (uint8_t)(1u << bit);
 		}
@@ -412,10 +421,14 @@ i2c_read_byte(bool send_ack)
 	}
 	i2c_sda_set(!send_ack);
 	i2c_delay();
-	(void)i2c_scl_high();
+	bool clocked = i2c_scl_high();
 	i2c_scl_low();
 	i2c_sda_set(true);
-	return byte;
+	if (!clocked) {
+		return false;
+	}
+	*value = byte;
+	return true;
 }
 
 bool
@@ -441,10 +454,11 @@ annibale_i2c_xfer(uint8_t addr, const uint8_t *wbuf, size_t wlen, uint8_t *rbuf,
 	if (ok && rlen > 0) {
 		ok = i2c_write_byte((uint8_t)((addr << 1) | 1u));
 		for (size_t i = 0; ok && i < rlen; i++) {
-			rbuf[i] = i2c_read_byte(i + 1 < rlen);
+			ok = i2c_read_byte(i + 1 < rlen, &rbuf[i]);
 		}
 	}
-	i2c_stop();
+	bool stopped = i2c_stop();
+	ok = ok && stopped;
 out:
 	lck_mtx_unlock(amp_lock);
 	return ok;
@@ -483,18 +497,35 @@ amp_reg_write16(uint8_t addr, uint8_t reg, uint16_t val)
 
 /* ---- TFA9865 / TFA9866 Bitfield & Startup Engine --------------------------------------------- */
 
-static uint16_t
-tfa_get_bf(uint8_t addr, uint16_t bf)
+static bool
+tfa_get_bf(uint8_t addr, uint16_t bf, uint16_t *value)
 {
 	uint8_t reg = (uint8_t)(bf >> 8);
 	unsigned pos = (bf >> 4) & 0x0fu;
 	unsigned width = (bf & 0x0fu) + 1u;
 	uint16_t raw = 0;
 	if (!amp_reg_read16(addr, reg, &raw)) {
-		return 0;
+		return false;
 	}
 	uint32_t field_mask = (width >= 16u) ? 0xffffu : ((1u << width) - 1u);
-	return (uint16_t)((raw >> pos) & field_mask);
+	*value = (uint16_t)((raw >> pos) & field_mask);
+	return true;
+}
+
+static bool
+tfa_wait_manstate(uint8_t addr, uint16_t minimum)
+{
+	for (unsigned i = 0; i < 50; i++) {
+		uint16_t state = 0;
+		if (!tfa_get_bf(addr, TFA6X_BF_MANSTATE, &state)) {
+			return false;
+		}
+		if (minimum == 0 ? state == 0 : state >= minimum) {
+			return true;
+		}
+		delay_for_interval(1, NSEC_PER_MSEC);
+	}
+	return false;
 }
 
 static bool
@@ -517,79 +548,74 @@ tfa_set_bf(uint8_t addr, uint16_t bf, uint16_t val)
 	return amp_reg_write16(addr, reg, next);
 }
 
-static void
+static bool
 tfa_write_reg_table(uint8_t addr, const struct tfa_reg_val *tbl, size_t count)
 {
 	for (size_t i = 0; i < count; i++) {
-		(void)amp_reg_write16(addr, tbl[i].reg, tbl[i].val);
+		if (!amp_reg_write16(addr, tbl[i].reg, tbl[i].val)) {
+			return false;
+		}
 	}
+	return true;
 }
 
-static void
+static bool
 tfa_write_bf_table(uint8_t addr, const struct tfa_bf_val *tbl, size_t count)
 {
 	for (size_t i = 0; i < count; i++) {
-		(void)tfa_set_bf(addr, tbl[i].bf, tbl[i].val);
+		if (!tfa_set_bf(addr, tbl[i].bf, tbl[i].val)) {
+			return false;
+		}
 	}
+	return true;
 }
 
-static uint8_t
-eighths_db_to_tfa_atten(uint32_t below_eighths)
-{
-	/*
-	 * TFA9865/TFA9866 reg 0x51[15:8] (bf 0x5187) attenuates in 0.5 dB steps
-	 * (4 eighths of a dB per LSB; 0x00 = 0 dB, 0xff = mute).
-	 */
-	uint32_t half_db = (below_eighths + 2u) / 4u;
-	if (half_db > 0xffu) {
-		half_db = 0xffu;
-	}
-	return (uint8_t)half_db;
-}
-
-static void
+static bool
 tfa_unlock_keys(uint8_t addr)
 {
 	uint16_t fb = 0;
-	(void)amp_reg_write16(addr, TFA6X_REG_HIDDEN_KEY, 0x5a6bu);
-	(void)amp_reg_read16(addr, TFA6X_REG_KEY1_CHALLENGE, &fb);
-	(void)amp_reg_write16(addr, TFA6X_REG_MTP_KEY2_A0, (uint16_t)(fb ^ 0x005au));
-	(void)amp_reg_write16(addr, TFA6X_REG_HIDDEN_KEY, 0x5a6bu);
-	(void)amp_reg_write16(addr, TFA6X_REG_MTP_KEY2_A1, 0x005au);
+	return amp_reg_write16(addr, TFA6X_REG_HIDDEN_KEY, 0x5a6bu) &&
+	       amp_reg_read16(addr, TFA6X_REG_KEY1_CHALLENGE, &fb) &&
+	       amp_reg_write16(addr, TFA6X_REG_MTP_KEY2_A0, (uint16_t)(fb ^ 0x005au)) &&
+	       amp_reg_write16(addr, TFA6X_REG_HIDDEN_KEY, 0x5a6bu) &&
+	       amp_reg_write16(addr, TFA6X_REG_MTP_KEY2_A1, 0x005au);
 }
 
-static uint32_t
-tfa986x_apply_specific(uint8_t addr, uint16_t rev_reg, uint16_t base_rev)
+static bool
+tfa986x_apply_specific(uint8_t addr, uint16_t rev_reg, uint16_t base_rev, uint32_t *revision)
 {
-	(void)tfa_set_bf(addr, TFA6X_BF_PWDN, 0);
-	(void)tfa_set_bf(addr, TFA6X_BF_OPEN_PROTECT, 0);
-	for (unsigned i = 0; i < 50; i++) {
-		if (tfa_get_bf(addr, TFA6X_BF_MANSTATE) >= 1u) {
-			break;
-		}
-		delay_for_interval(1, NSEC_PER_MSEC);
+	if (!tfa_set_bf(addr, TFA6X_BF_PWDN, 0) ||
+	    !tfa_set_bf(addr, TFA6X_BF_OPEN_PROTECT, 0) || !tfa_wait_manstate(addr, 1)) {
+		return false;
 	}
-
 	uint32_t ext_rev = base_rev;
+	bool applied = false;
 	if ((rev_reg & 0xffu) == 0x65u) {
-		tfa_unlock_keys(addr);
+		if (!tfa_unlock_keys(addr)) {
+			return false;
+		}
 		if (base_rev == 0x0a65u || base_rev == 0x2a65u) {
-			tfa_write_reg_table(addr, tfa65_errata_0a, sizeof(tfa65_errata_0a) / sizeof(tfa65_errata_0a[0]));
+			applied = tfa_write_reg_table(addr, tfa65_errata_0a, sizeof(tfa65_errata_0a) / sizeof(tfa65_errata_0a[0]));
 		} else if (base_rev == 0x0c65u) {
-			tfa_write_reg_table(addr, tfa65_errata_0c, sizeof(tfa65_errata_0c) / sizeof(tfa65_errata_0c[0]));
+			applied = tfa_write_reg_table(addr, tfa65_errata_0c, sizeof(tfa65_errata_0c) / sizeof(tfa65_errata_0c[0]));
 		} else {
-			tfa_write_reg_table(addr, tfa65_errata_3c, sizeof(tfa65_errata_3c) / sizeof(tfa65_errata_3c[0]));
-			if (base_rev == 0x4c65u) {
-				(void)amp_reg_write16(addr, 0x00u, 0x8041u);
-				(void)amp_reg_write16(addr, 0x62u, 0x05c6u);
+			applied = tfa_write_reg_table(addr, tfa65_errata_3c, sizeof(tfa65_errata_3c) / sizeof(tfa65_errata_3c[0]));
+			if (applied && base_rev == 0x4c65u) {
+				applied = amp_reg_write16(addr, 0x00u, 0x8041u) && amp_reg_write16(addr, 0x62u, 0x05c6u);
 			}
 		}
-		(void)amp_reg_write16(addr, TFA6X_REG_HIDDEN_KEY, 0x0000u);
 	} else {
-		if ((ext_rev & 0xffu) == 0x66u && tfa_get_bf(addr, TFA6X_BF_OTP_F3_11) != 0) {
+		uint16_t f3 = 0;
+		if ((ext_rev & 0xffu) == 0x66u && !tfa_get_bf(addr, TFA6X_BF_OTP_F3_11, &f3)) {
+			return false;
+		}
+		if ((ext_rev & 0xffu) == 0x66u && f3 != 0) {
+			uint16_t f4 = 0, f0 = 0;
+			if (!tfa_get_bf(addr, TFA6X_BF_OTP_F4_15, &f4) || !tfa_get_bf(addr, TFA6X_BF_OTP_F0_9, &f0)) {
+				return false;
+			}
 			ext_rev -= 1u;
-			uint16_t f4 = tfa_get_bf(addr, TFA6X_BF_OTP_F4_15);
-			if (tfa_get_bf(addr, TFA6X_BF_OTP_F0_9) == 0) {
+			if (f0 == 0) {
 				ext_rev |= 0x10000u;
 			} else if (f4 == 0) {
 				ext_rev |= 0x100000u;
@@ -599,54 +625,58 @@ tfa986x_apply_specific(uint8_t addr, uint16_t rev_reg, uint16_t base_rev)
 			}
 		}
 		if ((ext_rev & 0xffu) == 0x66u) {
-			ext_rev += (uint32_t)(tfa_get_bf(addr, TFA6X_BF_REV_HI2) & 3u) * 0x100000u;
+			uint16_t high = 0;
+			if (!tfa_get_bf(addr, TFA6X_BF_REV_HI2, &high)) {
+				return false;
+			}
+			ext_rev += (uint32_t)(high & 3u) * 0x100000u;
 		}
 		if ((ext_rev & 0xfffeu) == 0x3a64u) {
 			ext_rev = 0x10000u | (ext_rev & 0xffffu);
 		}
-
-		tfa_unlock_keys(addr);
+		if (!tfa_unlock_keys(addr)) {
+			return false;
+		}
 		switch (ext_rev) {
 		case 0x1a64u:
 		case 0x11a64u:
-			tfa_write_reg_table(addr, tfa6x_errata_a, sizeof(tfa6x_errata_a) / sizeof(tfa6x_errata_a[0]));
+			applied = tfa_write_reg_table(addr, tfa6x_errata_a, sizeof(tfa6x_errata_a) / sizeof(tfa6x_errata_a[0]));
 			break;
 		case 0x13a65u:
 		case 0x103a65u:
-			tfa_write_reg_table(addr, tfa6x_errata_b, sizeof(tfa6x_errata_b) / sizeof(tfa6x_errata_b[0]));
+			applied = tfa_write_reg_table(addr, tfa6x_errata_b, sizeof(tfa6x_errata_b) / sizeof(tfa6x_errata_b[0]));
 			break;
 		case 0x11a65u:
 		case 0x101a65u:
-			tfa_write_reg_table(addr, tfa6x_errata_d, sizeof(tfa6x_errata_d) / sizeof(tfa6x_errata_d[0]));
+			applied = tfa_write_reg_table(addr, tfa6x_errata_d, sizeof(tfa6x_errata_d) / sizeof(tfa6x_errata_d[0]));
 			break;
 		case 0x3a64u:
 		case 0x13a64u:
-			tfa_write_reg_table(addr, tfa6x_errata_e, sizeof(tfa6x_errata_e) / sizeof(tfa6x_errata_e[0]));
+			applied = tfa_write_reg_table(addr, tfa6x_errata_e, sizeof(tfa6x_errata_e) / sizeof(tfa6x_errata_e[0]));
 			break;
 		default:
-			tfa_write_reg_table(addr, tfa6x_errata_c, sizeof(tfa6x_errata_c) / sizeof(tfa6x_errata_c[0]));
+			applied = tfa_write_reg_table(addr, tfa6x_errata_c, sizeof(tfa6x_errata_c) / sizeof(tfa6x_errata_c[0]));
 			break;
 		}
-		(void)amp_reg_write16(addr, TFA6X_REG_HIDDEN_KEY, 0x0000u);
 	}
-
-	(void)tfa_set_bf(addr, TFA6X_BF_PWDN, 1);
-	for (unsigned i = 0; i < 50; i++) {
-		if (tfa_get_bf(addr, TFA6X_BF_MANSTATE) == 0) {
-			break;
-		}
-		delay_for_interval(1, NSEC_PER_MSEC);
+	bool closed = amp_reg_write16(addr, TFA6X_REG_HIDDEN_KEY, 0x0000u);
+	if (!applied || !closed || !tfa_set_bf(addr, TFA6X_BF_PWDN, 1) ||
+	    !tfa_wait_manstate(addr, 0) || !tfa_set_bf(addr, TFA6X_BF_OPEN_PROTECT, 1)) {
+		return false;
 	}
-	(void)tfa_set_bf(addr, TFA6X_BF_OPEN_PROTECT, 1);
-	return ext_rev;
+	*revision = ext_rev;
+	return true;
 }
 
-static void
+static bool
 tfa986x_cold_startup_one(uint8_t addr, unsigned ch, uint32_t cal_mohm)
 {
+	tfa_ext_rev[ch & 1u] = 0;
 	uint16_t rev_reg = 0, r6 = 0;
-	(void)amp_reg_read16(addr, TFA6X_REG_REV, &rev_reg);
-	(void)amp_reg_read16(addr, TFA6X_REG_TYPE_BITS, &r6);
+	if (!amp_reg_read16(addr, TFA6X_REG_REV, &rev_reg) ||
+	    !amp_reg_read16(addr, TFA6X_REG_TYPE_BITS, &r6)) {
+		return false;
+	}
 
 	uint16_t base_rev;
 	if ((rev_reg & 0xffu) == 0x65u) {
@@ -655,101 +685,188 @@ tfa986x_cold_startup_one(uint8_t addr, unsigned ch, uint32_t cal_mohm)
 		base_rev = (uint16_t)((((r6 & 0xf000u) | ((r6 >> 2) & 0x0300u) | (rev_reg & 0xffu)) + 0x0a00u) & 0xffffu);
 	}
 
-	uint16_t audfs = tfa_get_bf(addr, TFA6X_BF_AUDFS);
-	uint16_t cskip = tfa_get_bf(addr, TFA6X_BF_CSKIP_SAVE);
+	uint16_t audfs = 0, cskip = 0;
+	if (!tfa_get_bf(addr, TFA6X_BF_AUDFS, &audfs) || !tfa_get_bf(addr, TFA6X_BF_CSKIP_SAVE, &cskip)) {
+		return false;
+	}
 
-	/* Soft reset I2C registers and run silicon-specific OTP & errata init */
-	(void)amp_reg_write16(addr, TFA6X_REG_SYS_CONTROL0, 0x0002u);
-	(void)tfa_set_bf(addr, TFA6X_BF_INIT_DONE, 1);
-	tfa_ext_rev[ch & 1u] = tfa986x_apply_specific(addr, rev_reg, base_rev);
+	/* I2CR is auto-clearing; check it before the silicon-specific initialization. */
+	uint16_t reset_control = 0;
+	if (!amp_reg_write16(addr, TFA6X_REG_SYS_CONTROL0, 0x0002u) ||
+	    !amp_reg_read16(addr, TFA6X_REG_SYS_CONTROL0, &reset_control) ||
+	    (reset_control & 0x0002u) != 0 ||
+	    !tfa_set_bf(addr, TFA6X_BF_INIT_DONE, 1)) {
+		return false;
+	}
+	uint32_t ext_rev = 0;
+	if (!tfa986x_apply_specific(addr, rev_reg, base_rev, &ext_rev)) {
+		return false;
+	}
+	/* The device/profile tables leave audio_delay unchanged after silicon initialization. */
+	uint16_t configured_audio = 0;
+	if (!amp_reg_read16(addr, TFA6X_REG_AUDIO_CTRL, &configured_audio)) {
+		return false;
+	}
 
-	(void)tfa_set_bf(addr, TFA6X_BF_AUDFS, audfs);
-	(void)tfa_set_bf(addr, TFA6X_BF_CSKIP_SAVE, cskip);
+	if (!tfa_set_bf(addr, TFA6X_BF_AUDFS, audfs) || !tfa_set_bf(addr, TFA6X_BF_CSKIP_SAVE, cskip)) {
+		return false;
+	}
 
 	/* Apply K90 tfa98xx.cnt device bitfields + channel TDM slot routing */
-	tfa_write_bf_table(addr, tfa_cnt_dev_pre, sizeof(tfa_cnt_dev_pre) / sizeof(tfa_cnt_dev_pre[0]));
+	if (!tfa_write_bf_table(addr, tfa_cnt_dev_pre, sizeof(tfa_cnt_dev_pre) / sizeof(tfa_cnt_dev_pre[0]))) {
+		return false;
+	}
 	if (ch == 0) {
 		/* Top 'RCV' (0x36): sink slot 0 */
-		(void)tfa_set_bf(addr, 0x2183u, 0);
-		(void)tfa_set_bf(addr, 0x2130u, 1);
-		(void)tfa_set_bf(addr, 0x21c3u, 1);
-		(void)tfa_set_bf(addr, 0x2203u, 0);
+		if (!tfa_set_bf(addr, 0x2183u, 0) ||
+		    !tfa_set_bf(addr, 0x2130u, 1) ||
+		    !tfa_set_bf(addr, 0x21c3u, 1) ||
+		    !tfa_set_bf(addr, 0x2203u, 0)) {
+			return false;
+		}
 	} else {
 		/* Bottom 'SPK' (0x34): sink slot 1 */
-		(void)tfa_set_bf(addr, 0x2183u, 1);
-		(void)tfa_set_bf(addr, 0x2130u, 1);
-		(void)tfa_set_bf(addr, 0x21c3u, 0);
-		(void)tfa_set_bf(addr, 0x2203u, 1);
+		if (!tfa_set_bf(addr, 0x2183u, 1) ||
+		    !tfa_set_bf(addr, 0x2130u, 1) ||
+		    !tfa_set_bf(addr, 0x21c3u, 0) ||
+		    !tfa_set_bf(addr, 0x2203u, 1)) {
+			return false;
+		}
 	}
-	tfa_write_bf_table(addr, tfa_cnt_dev_post, sizeof(tfa_cnt_dev_post) / sizeof(tfa_cnt_dev_post[0]));
+	if (!tfa_write_bf_table(addr, tfa_cnt_dev_post, sizeof(tfa_cnt_dev_post) / sizeof(tfa_cnt_dev_post[0]))) {
+		return false;
+	}
 
 	/* Apply 'stereo' profile init bitfields */
-	tfa_write_bf_table(addr, tfa_cnt_prof_stereo, sizeof(tfa_cnt_prof_stereo) / sizeof(tfa_cnt_prof_stereo[0]));
-	(void)tfa_set_bf(addr, TFA6X_BF_SWPROFIL, 1);
-	(void)tfa_set_bf(addr, TFA6X_BF_SWVSTEP, 1);
+	if (!tfa_write_bf_table(addr, tfa_cnt_prof_stereo, sizeof(tfa_cnt_prof_stereo) / sizeof(tfa_cnt_prof_stereo[0]))) {
+		return false;
+	}
+	uint16_t profile_audio = 0, profile_lnm = 0;
+	if (!tfa_set_bf(addr, TFA6X_BF_SWPROFIL, 1) ||
+	    !tfa_set_bf(addr, TFA6X_BF_SWVSTEP, 1) ||
+	    !amp_reg_read16(addr, TFA6X_REG_AUDIO_CTRL, &profile_audio) ||
+	    profile_audio != configured_audio ||
+	    !amp_reg_read16(addr, 0x7cu, &profile_lnm) ||
+	    ((profile_lnm >> 14) & 3u) != 1u) {
+		return false;
+	}
+	tfa_ext_rev[ch & 1u] = ext_rev;
 
 	say("TFA986x ch%u (%#x) cold init: rev=%#x r6=%#x ext_rev=%#x cal=%u mOhm\n",
 	    ch, addr, rev_reg, r6, tfa_ext_rev[ch & 1u], cal_mohm);
+	return true;
 }
 
+/* Sample the existing input, gain and PWM controls after manager startup. */
 static void
+tfa986x_output_readback(uint8_t addr, unsigned ch)
+{
+	static const uint8_t regs[] = { 0x20, 0x21, 0x52, 0x58, 0x5f };
+	uint16_t values[5] = { 0 };
+	uint32_t valid = 0;
+	for (unsigned i = 0; i < 5; i++) {
+		if (amp_reg_read16(addr, regs[i], &values[i])) {
+			valid |= 1u << i;
+		}
+	}
+	say("TFA986x ch%u (%#x) output controls: valid=%#x r20=%#06x r21=%#06x r52=%#06x r58=%#06x r5f=%#06x\n",
+	    ch, addr, valid, values[0], values[1], values[2], values[3], values[4]);
+}
+
+static bool
 tfa986x_start_operating_one(uint8_t addr, unsigned ch, uint32_t cal_mohm)
 {
 	uint16_t swprof = 0;
-	if (!amp_reg_read16(addr, TFA6X_REG_SWPROFIL, &swprof) || swprof != 1u) {
-		tfa986x_cold_startup_one(addr, ch, cal_mohm);
+	if (!amp_reg_read16(addr, TFA6X_REG_SWPROFIL, &swprof)) {
+		return false;
 	}
-
-	uint8_t atten = current_muted ? 0xffu : eighths_db_to_tfa_atten(current_below_eighths);
-	(void)tfa_set_bf(addr, TFA6X_BF_VOL, atten);
-	(void)tfa_set_bf(addr, TFA6X_BF_PWDN, 0);
-	(void)tfa_set_bf(addr, TFA6X_BF_MANSCONF, 1);
-	(void)tfa_set_bf(addr, TFA6X_BF_AMPE, current_muted ? 0 : 1);
-
-	if ((tfa_ext_rev[ch & 1u] & 0xfffeu) == 0x3a64u) {
-		uint16_t f0 = 0;
-		if (amp_reg_read16(addr, TFA6X_REG_MTP0, &f0)) {
-			(void)amp_reg_write16(addr, TFA6X_REG_MTP0, (uint16_t)(f0 & ~(1u << 9)));
+	if (tfa_ext_rev[ch & 1u] == 0 || swprof != 1u) {
+		if (!tfa986x_cold_startup_one(addr, ch, cal_mohm)) {
+			say("TFA986x ch%u (%#x) cold init failed\n", ch, addr);
+			return false;
 		}
 	}
-
+	if (!tfa_set_bf(addr, TFA6X_BF_PWDN, 0) ||
+	    !tfa_set_bf(addr, TFA6X_BF_MANSCONF, 1) ||
+	    !tfa_set_bf(addr, TFA6X_BF_AMPE, current_muted ? 0 : 1)) {
+		return false;
+	}
+	if ((tfa_ext_rev[ch & 1u] & 0xfffeu) == 0x3a64u) {
+		uint16_t f0 = 0;
+		if (!amp_reg_read16(addr, TFA6X_REG_MTP0, &f0) ||
+		    !amp_reg_write16(addr, TFA6X_REG_MTP0, (uint16_t)(f0 & ~(1u << 9)))) {
+			return false;
+		}
+	}
+	uint16_t r0 = 0, r1 = 0, r10 = 0, r11 = 0, r12 = 0, r51 = 0;
+	bool ready = false;
 	for (unsigned i = 0; i < 25; i++) {
-		if (tfa_get_bf(addr, TFA6X_BF_CLKS) == 1u &&
-		    tfa_get_bf(addr, TFA6X_BF_MANSTATE) >= (current_muted ? 6u : 9u)) {
+		if (!amp_reg_read16(addr, TFA6X_REG_STATUS_FLAGS1, &r11) ||
+		    !amp_reg_read16(addr, TFA6X_REG_SYS_STATUS0, &r12)) {
+			return false;
+		}
+		bool amps_ready = current_muted || ((r11 & (1u << 9)) != 0 && (r11 & (1u << 10)) != 0);
+		if ((r11 & 1u) != 0 && (r11 & (1u << 2)) == 0 && amps_ready &&
+		    (r12 & 0x0fu) >= (current_muted ? 6u : 9u) &&
+		    (r12 & (1u << 13)) == 0) {
+			ready = true;
 			break;
 		}
 		delay_for_interval(1, NSEC_PER_MSEC);
 	}
-
-	uint16_t r0 = 0, r1 = 0, r10 = 0, r11 = 0, r12 = 0, r51 = 0;
-	(void)amp_reg_read16(addr, TFA6X_REG_SYS_CONTROL0, &r0);
-	(void)amp_reg_read16(addr, TFA6X_REG_SYS_CONTROL1, &r1);
-	(void)amp_reg_read16(addr, TFA6X_REG_STATUS_FLAGS0, &r10);
-	(void)amp_reg_read16(addr, TFA6X_REG_STATUS_FLAGS1, &r11);
-	(void)amp_reg_read16(addr, TFA6X_REG_SYS_STATUS0, &r12);
-	(void)amp_reg_read16(addr, TFA6X_REG_VOL_CTRL, &r51);
-	say("TFA986x ch%u (%#x) operating: r00=%#06x r01=%#06x flg0=%#06x flg1=%#06x st0=%#06x vol=%#06x\n",
+	if (!ready) {
+		say("TFA986x ch%u (%#x) startup timed out: flg1=%#06x st0=%#06x\n", ch, addr, r11, r12);
+		return false;
+	}
+	if (!amp_reg_read16(addr, TFA6X_REG_SYS_CONTROL0, &r0) ||
+	    !amp_reg_read16(addr, TFA6X_REG_SYS_CONTROL1, &r1) ||
+	    !amp_reg_read16(addr, TFA6X_REG_STATUS_FLAGS0, &r10) ||
+	    !amp_reg_read16(addr, TFA6X_REG_AUDIO_CTRL, &r51)) {
+		return false;
+	}
+	say("TFA986x ch%u (%#x) operating: r00=%#06x r01=%#06x flg0=%#06x flg1=%#06x st0=%#06x r51=%#06x\n",
 	    ch, addr, r0, r1, r10, r11, r12, r51);
+	tfa986x_output_readback(addr, ch);
+	return true;
 }
 
-static void
+static bool
 tfa986x_powerdown_one(uint8_t addr)
 {
-	(void)tfa_set_bf(addr, TFA6X_BF_AMPE, 0);
-	(void)tfa_set_bf(addr, TFA6X_BF_VOL, 0xffu);
+	/* Attempt every cleanup operation even if an earlier transaction failed. */
+	bool disabled = tfa_set_bf(addr, TFA6X_BF_AMPE, 0);
 	delay_for_interval(1, NSEC_PER_MSEC);
-	(void)tfa_set_bf(addr, TFA6X_BF_PWDN, 1);
+	bool down = tfa_set_bf(addr, TFA6X_BF_PWDN, 1);
+	bool stopped = tfa_wait_manstate(addr, 0);
+	bool gated = stopped && tfa_set_bf(addr, TFA6X_BF_OPEN_PROTECT, 1);
+	bool closed = amp_reg_write16(addr, TFA6X_REG_HIDDEN_KEY, 0x0000u);
+	uint16_t control = 0;
+	bool read = amp_reg_read16(addr, TFA6X_REG_SYS_CONTROL0, &control);
+	return disabled && down && stopped && gated && closed && read && (control & 9u) == 1u;
 }
 
-static void
+static bool
+tfa986x_powerdown_both(void)
+{
+	bool top = amp_bus_online && tfa986x_powerdown_one(addr_top);
+	bool bottom = amp_bus_online && tfa986x_powerdown_one(addr_bot);
+	power_state = top && bottom ? AMP_POWER_OFF : AMP_POWER_UNKNOWN;
+	if (!top || !bottom) {
+		say("smart amplifier powerdown failed (top=%d bottom=%d)\n", top, bottom);
+	}
+	return top && bottom;
+}
+
+static bool
 sia9197x_init_one(uint8_t addr, unsigned ch)
 {
 	uint8_t id = 0;
-	if (amp_reg_read8(addr, 0x00, &id)) {
-		say("SIA9197x ch%u at %#x: chip_id=%#x\n", ch, addr, id);
+	if (!amp_reg_read8(addr, 0x00, &id)) {
+		return false;
 	}
-	(void)amp_reg_write8(addr, 0x05, current_muted ? 0x3fu : 0x18u);
-	(void)amp_reg_write8(addr, 0x06, 0x02u);
+	say("SIA9197x ch%u at %#x: chip_id=%#x\n", ch, addr, id);
+	return amp_reg_write8(addr, 0x05, current_muted ? 0x3fu : 0x18u) &&
+	       amp_reg_write8(addr, 0x06, 0x02u);
 }
 
 void
@@ -759,13 +876,10 @@ annibale_audio_amp_set_volume(uint32_t below_eighths_db, bool muted)
 	current_below_eighths = below_eighths_db;
 	current_muted = muted;
 
-	if (!amp_is_powered || !amp_bus_online) {
+	if (power_state != AMP_POWER_ON || !amp_bus_online) {
 		return;
 	}
 	if (detected_amp == AMP_TYPE_TFA986X) {
-		uint8_t atten = muted ? 0xffu : eighths_db_to_tfa_atten(below_eighths_db);
-		(void)tfa_set_bf(addr_top, TFA6X_BF_VOL, atten);
-		(void)tfa_set_bf(addr_bot, TFA6X_BF_VOL, atten);
 		(void)tfa_set_bf(addr_top, TFA6X_BF_AMPE, muted ? 0 : 1);
 		(void)tfa_set_bf(addr_bot, TFA6X_BF_AMPE, muted ? 0 : 1);
 	} else if (detected_amp == AMP_TYPE_SIA9197X) {
@@ -825,11 +939,11 @@ annibale_audio_amp_probe(void)
 			(void)amp_reg_read16(TFA_ADDR_TOP, TFA6X_REG_REV, &rev_top);
 			(void)amp_reg_read16(TFA_ADDR_BOT, TFA6X_REG_REV, &rev_bot);
 			detected_amp = AMP_TYPE_TFA986X;
+			annibale_guard_pcm_volume();
 			addr_top = TFA_ADDR_TOP;
 			addr_bot = TFA_ADDR_BOT;
 			/* Leave both amps in PWDN=1 until ADSP I2S1 BCLK is active */
-			tfa986x_powerdown_one(addr_top);
-			tfa986x_powerdown_one(addr_bot);
+			(void)tfa986x_powerdown_both();
 			say("detected dual NXP TFA986x amplifiers: top %#x (rev=%#x, %u mOhm), bot %#x (rev=%#x, %u mOhm)\n",
 			    addr_top, rev_top, TFA_CAL_TOP_MOHM, addr_bot, rev_bot, TFA_CAL_BOT_MOHM);
 			return true;
@@ -846,6 +960,7 @@ annibale_audio_amp_probe(void)
 	}
 
 	detected_amp = AMP_TYPE_TFA986X;
+	annibale_guard_pcm_volume();
 	addr_top = TFA_ADDR_TOP;
 	addr_bot = TFA_ADDR_BOT;
 	say("configured default TFA986x profile (top %#x [%u mOhm], bottom %#x [%u mOhm])\n",
@@ -853,48 +968,77 @@ annibale_audio_amp_probe(void)
 	return false;
 }
 
-void
+/* TFA checks manager completion; SIA checks only its existing configuration transactions. */
+bool
 annibale_audio_amp_power(bool on)
 {
 	gpio_init_once();
-	if (amp_is_powered == on) {
-		return;
+	if (power_state == (on ? AMP_POWER_ON : AMP_POWER_OFF)) {
+		return true;
 	}
-	amp_is_powered = on;
 	if (on) {
 		amp_ensure_ldo();
+		if (!amp_ldo_voted) {
+			return false;
+		}
 		gpio_push_pull(PIN_SPK_SW, false);
 		gpio_push_pull(PIN_RST_TOP, tfa_rst_deassert_high);
 		gpio_push_pull(PIN_RST_BOT, tfa_rst_deassert_high);
 		if (!amp_bus_online) {
 			amp_bus_online = i2c_bus_recover_and_check();
 		}
-		if (amp_bus_online) {
-			if (detected_amp == AMP_TYPE_TFA986X) {
-				tfa986x_start_operating_one(addr_top, 0, TFA_CAL_TOP_MOHM);
-				tfa986x_start_operating_one(addr_bot, 1, TFA_CAL_BOT_MOHM);
-			} else if (detected_amp == AMP_TYPE_SIA9197X) {
-				sia9197x_init_one(addr_top, 0);
-				sia9197x_init_one(addr_bot, 1);
-			}
+		if (!amp_bus_online) {
+			return false;
 		}
+		if (detected_amp == AMP_TYPE_TFA986X) {
+			if (power_state == AMP_POWER_UNKNOWN && !tfa986x_powerdown_both()) {
+				return false;
+			}
+			bool top = tfa986x_start_operating_one(addr_top, 0, TFA_CAL_TOP_MOHM);
+			bool bottom = top && tfa986x_start_operating_one(addr_bot, 1, TFA_CAL_BOT_MOHM);
+			if (!top || !bottom) {
+				bool down = tfa986x_powerdown_both();
+				say("smart amplifier startup failed (top=%d bottom=%d down=%d)\n", top, bottom, down);
+				return false;
+			}
+		} else if (detected_amp == AMP_TYPE_SIA9197X) {
+			bool top = sia9197x_init_one(addr_top, 0);
+			bool bottom = top && sia9197x_init_one(addr_bot, 1);
+			if (!top || !bottom) {
+				power_state = AMP_POWER_UNKNOWN;
+				say("SIA9197x configuration failed (top=%d bottom=%d)\n", top, bottom);
+				return false;
+			}
+		} else {
+			return false;
+		}
+		power_state = AMP_POWER_ON;
 		say("smart amplifier powered on (top=%#x, bot=%#x, below=%u.%03u dB, muted=%d)\n",
 		    addr_top, addr_bot, current_below_eighths / 8, (current_below_eighths % 8) * 125, current_muted);
 	} else {
-		if (amp_bus_online && detected_amp == AMP_TYPE_TFA986X) {
-			tfa986x_powerdown_one(addr_top);
-			tfa986x_powerdown_one(addr_bot);
+		if (detected_amp == AMP_TYPE_TFA986X) {
+			bool down = tfa986x_powerdown_both();
+			gpio_push_pull(PIN_SPK_SW, false);
+			if (!down) {
+				return false;
+			}
+		} else if (detected_amp == AMP_TYPE_SIA9197X) {
+			/* Preserve the SIA stop path; its manager state is not checked. */
+			gpio_push_pull(PIN_SPK_SW, false);
+			power_state = AMP_POWER_OFF;
+		} else {
+			return false;
 		}
-		gpio_push_pull(PIN_SPK_SW, false);
 		say("smart amplifier powered off\n");
 	}
+	return true;
 }
 
 void
 annibale_audio_amp_status(const char *when)
 {
 	gpio_init_once();
-	say("status (%s): type=%d powered=%d bus_online=%d top=%#x(%u mOhm) bot=%#x(%u mOhm)\n",
-	    when, detected_amp, amp_is_powered, amp_bus_online,
+	say("status (%s): type=%d power_state=%d bus_online=%d top=%#x(%u mOhm) bot=%#x(%u mOhm)\n",
+	    when, detected_amp, power_state, amp_bus_online,
 	    addr_top, TFA_CAL_TOP_MOHM, addr_bot, TFA_CAL_BOT_MOHM);
 }

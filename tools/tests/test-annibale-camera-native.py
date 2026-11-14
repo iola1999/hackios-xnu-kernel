@@ -43,7 +43,7 @@ def main():
     camera = (DRIVER / "annibale_camera.c").read_text()
     hardware = (DRIVER / "annibale_camera_hw.inc").read_text()
     constants = "\n".join(line for line in hardware.splitlines()
-                          if line.startswith(("#define GPIO_", "#define FRONT_SENSOR_", "#define GCC_",
+                          if line.startswith(("#define GPIO_", "#define FRONT_SENSOR_", "#define WIDE_SENSOR_", "#define GCC_",
                                               "#define MCLKCC_", "#define GDSC_", "#define CAMCC_TITAN_")))
     read_close = "\n".join([
         function(profile, "cam_capture_resources_held"), function(profile, "cam_native_read"),
@@ -64,6 +64,7 @@ def main():
         (directory / "sys").mkdir()
         (directory / "sys/ioccom.h").write_text("#define _IOR(g, n, t) 0\n")
         shutil.copyfile(ROOT / "xnu/files/bsd/sys/annibale_camera.h", directory / "annibale_camera.h")
+        shutil.copyfile(DRIVER / "annibale_camera_exposure.inc", directory / "annibale_camera_exposure.inc")
         (directory / "fixture.c").write_text("#include <errno.h>\n" + constants + "\n" + FIXTURE.read_text())
         (directory / "annibale_camera_clock.inc").write_text(function(clock, "cam_poll"))
         (directory / "annibale_camera_phy.inc").write_text("")

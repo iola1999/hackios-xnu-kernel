@@ -867,8 +867,20 @@ iris_pas_authenticate(void)
 		const struct iris_mbn_seg *s = &img.segs[i];
 		uint32_t at = (uint32_t)(s->paddr - img.min_paddr);
 		const uint8_t *src = g_iris.fw_data + s->file_off;
-		for (uint32_t j = 0; j < s->file_sz; j++) {
+		uint32_t j = 0;
+		while (j < s->file_sz && ((uintptr_t)(carveout + at + j) & 7UL) != 0) {
 			carveout[at + j] = src[j];
+			j++;
+		}
+		while (j + 8u <= s->file_sz) {
+			uint64_t w;
+			memcpy(&w, src + j, sizeof(w));
+			*(volatile uint64_t *)(carveout + at + j) = w;
+			j += 8u;
+		}
+		while (j < s->file_sz) {
+			carveout[at + j] = src[j];
+			j++;
 		}
 		uint32_t cur = at + s->file_sz;
 		uint32_t end = at + s->mem_sz;

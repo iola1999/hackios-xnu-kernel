@@ -37,7 +37,7 @@ def main():
     camera = (DRIVER / "annibale_camera.c").read_text()
     profile = (DRIVER / "annibale_camera_profile.inc").read_text()
     constants = "\n".join(line for line in hardware.splitlines()
-                          if line.startswith(("#define GPIO_", "#define FRONT_SENSOR_", "#define GCC_",
+                          if line.startswith(("#define GPIO_", "#define FRONT_SENSOR_", "#define WIDE_SENSOR_", "#define GCC_",
                                               "#define MCLKCC_", "#define GDSC_", "#define CAMCC_TITAN_")))
     fixture = native_test.FIXTURE.read_text()
     for name in ("cam_smmu_configure_bypass", "cam_smmu_route", "cam_smmu_release"):
@@ -94,6 +94,7 @@ def main():
         (directory / "sys").mkdir()
         (directory / "sys/ioccom.h").write_text("#define _IOR(g, n, t) 0\n")
         shutil.copyfile(ROOT / "xnu/files/bsd/sys/annibale_camera.h", directory / "annibale_camera.h")
+        shutil.copyfile(DRIVER / "annibale_camera_exposure.inc", directory / "annibale_camera_exposure.inc")
         shutil.copyfile(Path(__file__).with_name("annibale-camera-smmu.fixture.c"), directory / "annibale-camera-smmu.fixture.c")
         (directory / "fixture.c").write_text("#include <errno.h>\n" + constants + "\n" + fixture)
         (directory / "annibale_camera_native.inc").write_text(native)

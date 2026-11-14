@@ -38,6 +38,7 @@
 #include <sys/proc.h>
 #include <sys/annibale_audio.h>
 #include <sys/systm.h>
+#include <sys/sysctl.h>
 #include <sys/uio.h>
 #include <vm/vm_kern.h>
 
@@ -73,6 +74,40 @@ static bool rec_fed;                    /* boot-arg rec_sound_fed=1: what the gu
 static bool rec_mic;                    /* boot-arg rec_sound_mic=1: what the microphone hears */
 static uint64_t rec_size, rec_used;
 static uint64_t rec_frames, rec_frames_max;
+
+SYSCTL_DECL(_kern_annibale);
+
+static int
+annibale_sound_snapshot(__unused struct sysctl_oid *oidp, __unused void *arg1,
+    __unused int arg2, struct sysctl_req *req)
+{
+	struct rec_header header;
+	const uint8_t *data;
+	size_t capacity, used;
+
+	lck_mtx_lock(&audio_lock);
+	data = rec_base;
+	capacity = (size_t)rec_size;
+	used = (size_t)rec_used;
+	if (data != NULL) {
+		memcpy(&header, data, sizeof(header));
+	}
+	lck_mtx_unlock(&audio_lock);
+
+	/* Size queries report the fixed allocation size; appends only change used. */
+	if (req->oldptr == USER_ADDR_NULL) {
+		return SYSCTL_OUT(req, NULL, capacity);
+	}
+	if (data == NULL) {
+		return 0;
+	}
+	/* Blocks below used are immutable; only the header's block count needs a private copy. */
+	int error = SYSCTL_OUT(req, &header, sizeof(header));
+	return error != 0 ? error : SYSCTL_OUT(req, data + sizeof(header), used - sizeof(header));
+}
+
+SYSCTL_PROC(_kern_annibale, OID_AUTO, sound_snapshot, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED,
+    NULL, 0, annibale_sound_snapshot, "S", "Completed RWSND001 blocks; size queries return recording capacity");
 
 /* the stretch of writing in progress */
 static uint64_t stretch_first, stretch_last;    /* mach_absolute_time() of its first and its latest write */

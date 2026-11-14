@@ -405,11 +405,11 @@ static unsigned camera_smmu_cases(void)
         CHECK(annibale_cam_open(0, 0, 0, NULL) == EBUSY); cases++;
     }
     const uint64_t dma_limit = 1ULL << 36;
-    const uint64_t rounded_bytes = (3248ULL * 1458u + 255u) & ~255ULL;
+    const uint64_t rounded_bytes = (3248ULL * 1458u + 511u) & ~511ULL;
     for (unsigned kind = 0; kind < 3u; kind++) {
         reset_fixture(); smmu_regs[0x028u / 4u] = 0x5111u;
         physical = kind == 0u ? dma_limit - rounded_bytes :
-                   kind == 1u ? dma_limit - rounded_bytes + 256u : 0;
+                   kind == 1u ? dma_limit - rounded_bytes + 512u : 0;
         cam_native_capture();
         if (kind == 0u) {
             check_success();

@@ -33,8 +33,8 @@ static uint8_t region[CAMERA_REGION_SIZE], output[CAMERA_REGION_SIZE];
 static vm_offset_t cam_region_vbase, csid_lite_base = 1;
 static vm_offset_t gcc_base = 2, mclkcc_base = 3, camcc_base = 4, tlmm_base = 5;
 static void *kernel_map, *cam_lock;
-static uint16_t front_chip_id;
-static uint8_t front_slave_addr, wide_bus_mode;
+static uint16_t front_chip_id, wide_chip_id;
+static uint8_t front_slave_addr, wide_slave_addr, wide_bus_mode;
 static uint32_t cached_csid_ver, cached_ife_ver, cam_hw_mmio, current_sensor;
 static uint64_t cam_frame_seq;
 static bool cam_is_open, cam_hw_dma_verified, cam_sensor_streaming, cci_ready;
@@ -105,6 +105,13 @@ void FlushPoC_DcacheRegion(vm_offset_t va, size_t bytes)
 {
     CHECK(va == cam_region_vbase && bytes >= profile_data.stride * profile_data.height);
     cache_flushes++;
+}
+
+static bool cci0_m1_read16(uint8_t slave, uint16_t reg, uint16_t *id)
+{
+    CHECK(slave == 0x10 && reg == 0x300a);
+    *id = 0x5650;
+    return true;
 }
 
 static bool od_i2c_read16_reg16(uint32_t sda, uint32_t scl, uint8_t slave, uint16_t reg, uint16_t *id)
@@ -182,6 +189,7 @@ static void tlmm_set_out(uint32_t pin __unused, bool high __unused) { gpio_write
 static void cam_vote_rpmh_supplies(bool enable) { CHECK(!enable); power_stops++; }
 static bool cam_hardware_power_up(void) { return power_up_ok; }
 
+#include "annibale_camera_exposure.inc"
 #include "annibale_camera_native.inc"
 #include "camera-production-read-close.inc"
 

@@ -1,4 +1,4 @@
-"""Export the verified annibale front mode 4 as a kernel RWCTAB03 profile.
+"""Export checked annibale front mode 4 or back mode 24 as a RWCTAB03 profile.
 
 The input stays a local vendor module. The exporter validates its V5 container,
 pool references, settings and complete module identity before selecting the mode.
@@ -11,6 +11,7 @@ from camsensor_v5 import Module, require
 
 
 FRONT_SOURCE_SHA256 = '378bc647dea4676437c0c72e631f42b357d96ca8cf351c2829c7e80eb2801c72'
+BACK_SOURCE_SHA256 = '68cd37a479ad2b8a681a1d965ca15005f5875c875b568664c9a9ec63e2033470'
 PROFILE_FIELDS = (
     'bytes', 'sensor', 'mode', 'width', 'height', 'stride', 'bayer',
     'lane_assign', 'lane_count', 'settle_count', 'virtual_channel', 'data_type',
@@ -32,23 +33,30 @@ def registers(settings):
                 setting['operation'] == 0 and len(setting['registerData']) == 1,
                 'profile requires one 16-bit-address/8-bit-data write per setting')
         delay = setting['delayUs']
-        require(delay in (None, 0), 'unverified profile register delay')
+        require(delay in (None, 0, 4000), 'unverified profile register delay')
         result += REGISTER.pack(setting['registerAddr'], setting['registerData'][0],
-                                2, 1, 0, 0, 0)
+                                2, 1, 0, 0, delay or 0)
     return result
 
 
 def export(data, mode_index):
     module = Module(data)
     report = module.inspect()
-    require(report['source_sha256'] == FRONT_SOURCE_SHA256, 'unverified annibale sensor module')
-    require(mode_index == 4, 'only front mode 4 has a verified receive profile')
+    require(report['source_sha256'] in (FRONT_SOURCE_SHA256, BACK_SOURCE_SHA256),
+            'unverified annibale sensor module')
+    back = report['source_sha256'] == BACK_SOURCE_SHA256
+    require(mode_index == (24 if back else 4), 'unverified native receive mode')
     require(len(report['resolutionInfo']) == 1 and len(report['initSettings']) == 1 and
             report['initSettings'][0]['sensorVersion'] == 0, 'unverified sensor version')
     mode = report['resolutionInfo'][0]['resolutionData'][mode_index]
-    require(len(mode['streams']) == 1 and mode['streams'][0]['virtualChannel'] == [0] and
+    require(len(mode['streams']) == (2 if back else 1) and
+            mode['streams'][0]['virtualChannel'] == [0] and
             mode['streams'][0]['dataType'] == 0x2b and mode['streams'][0]['bitWidth'] == 10 and
-            mode['is3Phase'] == 0, 'profile requires one VC0 RAW10 D-PHY stream')
+            mode['is3Phase'] == int(back), 'unverified VC0 RAW10 receive stream')
+    if back:
+        require(mode['streams'][1] == {'virtualChannel': [1], 'dataType': 0x2b,
+                'xStart': 0, 'yStart': 0, 'width': 2560, 'height': 480,
+                'bitWidth': 10, 'streamType': 2}, 'unverified back PDAF stream')
     stream = mode['streams'][0]
 
     ref, size = module.named['cameraModuleData']
@@ -79,9 +87,11 @@ def export(data, mode_index):
     require(stream['width'] % 4 == 0, 'partial RAW10 group')
     # Native line-based RDI with PLAIN_128 packs 16-byte WM units.
     stride = (row_bytes + 15) & ~15
+    cfa = mode['colorFilterArrangement']
+    bayer = {1: 3, 2: 2, 3: 1, 4: 0}[cfa] if back else {0: 3, 1: 2, 2: 1, 3: 0}[cfa]
     fields = (
-        HEADER.size + len(payload), 2, mode_index, stream['width'], stream['height'], stride,
-        {0: 3, 1: 2, 2: 1, 3: 0}[mode['colorFilterArrangement']],
+        HEADER.size + len(payload), 1 if back else 2, mode_index, stream['width'], stream['height'], stride,
+        bayer,
         struct.unpack('<H', lane)[0], mode['laneCount'], mode['settleTimeNs'], 0, stream['dataType'],
         mode['outputPixelClock'], mode['lineLengthPixelClock'], mode['frameLengthLines'],
         round(mode['frameRate'] * 1000), *(len(table) for table in tables),
@@ -92,5 +102,5 @@ def export(data, mode_index):
     summary.update(source_sha256=report['source_sha256'], profile_sha256=hashlib.sha256(blob).hexdigest(),
                    row_bytes=row_bytes, frame_bytes=stride * stream['height'],
                    dma_bytes=(stride * stream['height'] + 255) & ~255,
-                   source_stream=stream, mipi_flags=[])
+                   source_stream=stream, ignored_streams=mode['streams'][1:], mipi_flags=[])
     return blob, summary

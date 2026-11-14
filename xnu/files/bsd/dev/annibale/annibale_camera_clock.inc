@@ -1,5 +1,5 @@
 /*
- * Native front-mode clocks and CRM SW DRV0 votes. Rates and register layouts
+ * Native sensor-mode clocks and CRM SW DRV0 votes. Rates and register layouts
  * come from annibale's camcc-sun/clk-qcom/crm-v2 modules and device tree.
  * CRM-controlled RX and CAMNOC RCGs are changed through their native voters.
  */
@@ -16,6 +16,9 @@
 #define CAM_PLL_LOCK             (1u << 31)
 #define CAM_PLL_VOTE_RUN         (1u << 25)
 #define CAM_RCG_FIELDS           (0x1fu | (7u << 8) | (3u << 12) | (1u << 20))
+#define CAMCC_PHY3_TIMER_CMD     0x10064u
+#define CAMCC_PHY3_TIMER_CBCR    0x1007cu
+#define CAMCC_PHY3_RX_CBCR       0x10080u
 #define CAMCC_PHY4_TIMER_CMD     0x10084u
 #define CAMCC_PHY4_TIMER_CBCR    0x1009cu
 #define CAMCC_PHY4_RX_CBCR       0x100a0u
@@ -39,7 +42,7 @@ static struct cam_native_rcg cam_native_rcgs[] = {
 	{ CAMCC_PHY4_TIMER_CMD, (1u << 20) | (1u << 8) | 5u, 0, 0 },
 };
 
-static const uint32_t cam_native_branches[] = {
+static uint32_t cam_native_branches[] = {
 	CAMCC_IFE_LITE_CBCR, CAMCC_IFE_LITE_CSID_CBCR,
 	CAMCC_IFE_LITE_CPHY_RX_CBCR, CAMCC_PHY4_TIMER_CBCR,
 	CAMCC_PHY4_RX_CBCR, CAMCC_CAMNOC_AXI_RT_CBCR,
@@ -183,6 +186,10 @@ cam_native_clocks_up(void)
 	    ((counts >> 20) & 0xfu) == 0) {
 		return false;
 	}
+	bool back = cam_profile->sensor == 1u;
+	cam_native_rcgs[4].command = back ? CAMCC_PHY3_TIMER_CMD : CAMCC_PHY4_TIMER_CMD;
+	cam_native_branches[3] = back ? CAMCC_PHY3_TIMER_CBCR : CAMCC_PHY4_TIMER_CBCR;
+	cam_native_branches[4] = back ? CAMCC_PHY3_RX_CBCR : CAMCC_PHY4_RX_CBCR;
 	for (size_t i = 0; i < sizeof(cam_native_pll_offsets) / sizeof(uint32_t); i++) {
 		cam_native_pll_saved[i] = reg_rd(camcc_base, cam_native_pll_offsets[i]);
 		if (cam_native_pll_saved[i] == UINT32_MAX) {
@@ -316,37 +323,61 @@ cam_native_clocks_down(void)
 static bool
 cam_native_sensor_power(bool up)
 {
+	bool back = cam_profile->sensor == 1u;
 	const struct annibale_camera_power *power = cam_profile_power(up);
 	uint32_t count = up ? cam_profile->up_count : cam_profile->down_count;
 	for (uint32_t i = 0; i < count; i++) {
 		bool ok;
 		switch (power[i].type) {
-		case 0:
+		case 0: {
+			uint32_t command = back ? MCLKCC_MCLK1_CMD_RCGR : MCLKCC_MCLK4_CMD_RCGR;
+			uint32_t config = command + 4u;
+			uint32_t branch = back ? MCLKCC_MCLK1_CBCR : MCLKCC_MCLK4_CBCR;
 			ok = power[i].value == 0 || power[i].value == 19200000u;
 			if (ok && power[i].value != 0) {
-				ok = cam_native_rcg_write(mclkcc_base, MCLKCC_MCLK4_CMD_RCGR,
-				    (reg_rd(mclkcc_base, MCLKCC_MCLK4_CFG_RCGR) & ~CAM_RCG_FIELDS) | 1u, 2u) &&
-				    cbcr_enable(mclkcc_base, MCLKCC_MCLK4_CBCR, true);
+				ok = cam_native_rcg_write(mclkcc_base, command,
+				    (reg_rd(mclkcc_base, config) & ~CAM_RCG_FIELDS) | 1u, 2u) &&
+				    cbcr_enable(mclkcc_base, branch, true);
 			} else if (ok) {
-				reg_wr(mclkcc_base, MCLKCC_MCLK4_CBCR, reg_rd(mclkcc_base, MCLKCC_MCLK4_CBCR) & ~1u);
+				reg_wr(mclkcc_base, branch, reg_rd(mclkcc_base, branch) & ~1u);
 			}
 			break;
+		}
 		case 1:
-			ok = annibale_rpmh_regulator("ldom3", 2800u, power[i].value != 0, ANNIBALE_RPMH_MODE_NONE);
+			if (back) {
+				tlmm_config_pin(GPIO_WIDE_VANA, 0, 0, 2, true, power[i].value != 0);
+				ok = (reg_rd(tlmm_base, GPIO_WIDE_VANA * 0x1000u + 4u) & 2u) ==
+				    (power[i].value != 0 ? 2u : 0);
+			} else {
+				ok = annibale_rpmh_regulator("ldom3", 2800u, power[i].value != 0, ANNIBALE_RPMH_MODE_NONE);
+			}
 			break;
 		case 2:
-			ok = power[i].value == 0 || power[i].value == 1200000u;
-			ok = ok && annibale_rpmh_regulator("ldom1", 1200u, power[i].value != 0,
+			ok = power[i].value == 0 || power[i].value == (back ? 1u : 1200000u);
+			ok = ok && annibale_rpmh_regulator(back ? "ldoi1" : "ldom1", back ? 1152u : 1200u,
+			    power[i].value != 0,
 			    power[i].value != 0 ? ANNIBALE_RPMH_MODE_HPM : ANNIBALE_RPMH_MODE_NONE);
 			break;
 		case 3:
-			ok = annibale_rpmh_regulator("ldom5", 1800u, power[i].value != 0, ANNIBALE_RPMH_MODE_NONE);
+			ok = annibale_rpmh_regulator(back ? "ldob10" : "ldom5", 1800u, power[i].value != 0,
+			    back && power[i].value != 0 ? ANNIBALE_RPMH_MODE_HPM : ANNIBALE_RPMH_MODE_NONE);
 			break;
-		case 8:
-			tlmm_config_pin(GPIO_FRONT_RESET, 0, 0, 2, true, power[i].value != 0);
-			ok = (reg_rd(tlmm_base, GPIO_FRONT_RESET * 0x1000u + 4u) & 2u) ==
+		case 4:
+			ok = back && annibale_rpmh_regulator("ldob8", 3104u, power[i].value != 0,
+			    power[i].value != 0 ? ANNIBALE_RPMH_MODE_HPM : ANNIBALE_RPMH_MODE_NONE);
+			break;
+		case 14:
+			ok = back && (power[i].value == 0 || power[i].value == 3296000u) &&
+			    annibale_rpmh_regulator("bobb2", 3296u, power[i].value != 0,
+			    power[i].value != 0 ? ANNIBALE_RPMH_MODE_AUTO : ANNIBALE_RPMH_MODE_NONE);
+			break;
+		case 8: {
+			uint32_t pin = back ? GPIO_WIDE_RESET : GPIO_FRONT_RESET;
+			tlmm_config_pin(pin, 0, 0, 2, true, power[i].value != 0);
+			ok = (reg_rd(tlmm_base, pin * 0x1000u + 4u) & 2u) ==
 			    (power[i].value != 0 ? 2u : 0);
 			break;
+		}
 		default:
 			return false;
 		}
@@ -361,12 +392,48 @@ cam_native_sensor_power(bool up)
 static bool
 cam_native_register_table(uint32_t table, uint32_t count)
 {
+	if (table == 2u && cam_native_exposure_lines != 0 && cam_native_gain != 0 &&
+	    (cam_native_is_ov20b_m4(cam_profile) || cam_native_is_ovx8000_m24(cam_profile))) {
+		uint32_t fll = cam_native_frame_lines;
+		uint32_t lines = cam_native_exposure_lines;
+		uint32_t gain = cam_native_gain;
+		const struct {
+			uint16_t reg;
+			uint8_t val;
+		} exp_ops[7] = {
+			{ 0x380eu, (uint8_t)((fll >> 8) & 0xffu) },
+			{ 0x380fu, (uint8_t)(fll & 0xffu) },
+			{ 0x3500u, (uint8_t)((lines >> 16) & 0xffu) },
+			{ 0x3501u, (uint8_t)((lines >> 8) & 0xffu) },
+			{ 0x3502u, (uint8_t)(lines & 0xffu) },
+			{ 0x3508u, (uint8_t)((gain >> 8) & 0x7fu) },
+			{ 0x3509u, (uint8_t)(gain & 0xffu) },
+		};
+		for (size_t k = 0; k < 7u; k++) {
+			bool exp_ok = cam_profile->sensor == 1u ?
+			    wide_bus_write(wide_slave_addr, (uint8_t)(exp_ops[k].reg >> 8),
+			    (uint8_t)exp_ops[k].reg, exp_ops[k].val, 3u) :
+			    od_i2c_write_bytes(GPIO_SE9_I2C_SDA, GPIO_SE9_I2C_SCL, front_slave_addr,
+			    (uint8_t)(exp_ops[k].reg >> 8), (uint8_t)exp_ops[k].reg,
+			    exp_ops[k].val, 3u);
+			if (!exp_ok) {
+				say("sensor %u exposure register %#x failed\n",
+				    cam_profile->sensor, exp_ops[k].reg);
+				return false;
+			}
+		}
+	}
 	const struct annibale_camera_register *entries = cam_profile_registers(table);
 	for (uint32_t i = 0; i < count; i++) {
-		if (!od_i2c_write_bytes(GPIO_SE9_I2C_SDA, GPIO_SE9_I2C_SCL, front_slave_addr,
+		bool ok = cam_profile->sensor == 1u ?
+		    wide_bus_write(wide_slave_addr, (uint8_t)(entries[i].address >> 8),
+		    (uint8_t)entries[i].address, (uint8_t)entries[i].value, 3u) :
+		    od_i2c_write_bytes(GPIO_SE9_I2C_SDA, GPIO_SE9_I2C_SCL, front_slave_addr,
 		    (uint8_t)(entries[i].address >> 8), (uint8_t)entries[i].address,
-		    (uint8_t)entries[i].value, 3u)) {
-			say("front register %#x failed in table %u at %u\n", entries[i].address, table, i);
+		    (uint8_t)entries[i].value, 3u);
+		if (!ok) {
+			say("sensor %u register %#x failed in table %u at %u\n",
+			    cam_profile->sensor, entries[i].address, table, i);
 			return false;
 		}
 		delay_for_interval(entries[i].delay_us, NSEC_PER_USEC);

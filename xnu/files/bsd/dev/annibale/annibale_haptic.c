@@ -46,6 +46,7 @@
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
+#include <kern/sched_prim.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -629,6 +630,7 @@ haptic_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 			heard_us = now;
 			heard_peak = scale * 3600;
 			written_frames++;
+			thread_wakeup((event_t)&heard_us);
 			return 0;
 		}
 	}
@@ -660,6 +662,7 @@ haptic_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 			if (peak > heard_peak) {
 				heard_peak = peak;
 			}
+			thread_wakeup((event_t)&heard_us);
 		} else {
 			quiet_us = now_us();
 		}
@@ -818,7 +821,17 @@ serve(void)
 				state = IDLE;
 			}
 		}
-		wait_ms(4);
+		if (state == IDLE) {
+			assert_wait((event_t)&heard_us, THREAD_INTERRUPTIBLE);
+			uint64_t check_now = now_us();
+			if (broken || (heard_us != 0 && check_now - heard_us < ACTIVE_US)) {
+				clear_wait(current_thread(), THREAD_AWAKENED);
+			} else {
+				thread_block(THREAD_CONTINUE_NULL);
+			}
+		} else {
+			wait_ms(4);
+		}
 	}
 	say("haptic: the motor is given up on (%u taps and %u vibrations played, %u cut at %u ms)\n", taps, loops, capped,
 	    HAPTIC_MAX_MS);
