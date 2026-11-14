@@ -91,7 +91,9 @@ def main():
     args = parser.parse_args()
     source = args.source.read_text()
     start = source.index("static NSCache *rw_air_memcache;")
-    end = source.index("static NSString *\nrw_air_cache_key", start)
+    end = min(source.index(marker, start) for marker in
+              ("static BOOL\nrw_air_key_bytes", "static NSString *\nrw_air_cache_key")
+              if marker in source[start:])
     store = source.index("static void\nrw_air_cache_store", end)
     stop = source.index("static id (*rw_library_function", store)
     functions = source[start:end] + source[store:stop]

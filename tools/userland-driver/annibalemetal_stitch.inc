@@ -160,6 +160,7 @@ rw_stitch_dump_linked(id descriptor)
  * bitcodeData included.
  */
 #include <CommonCrypto/CommonDigest.h>
+#include <stdbool.h>
 #include <sys/stat.h>
 
 #define RW_AIR_CACHE_DIR "/private/var/db/annibale-aircache"
@@ -183,10 +184,16 @@ rw_stitch_dump_linked(id descriptor)
 - (instancetype)initWithFunction:(id)function name:(NSString *)name constantValues:(id)values
 		  cachedBitcode:(NSData *)bitcode
 {
-	_function = [function retain];
-	_name = [name copy];
-	_constantValues = [values retain];
-	_cachedBitcode = [bitcode retain];
+	@try {
+		_function = [function retain];
+		_name = [name copy];
+		_constantValues = [values retain];
+		_cachedBitcode = [bitcode retain];
+	} @catch (id exception) {
+		(void)exception;
+		[self release];
+		@throw;
+	}
 	return self;
 }
 
@@ -255,8 +262,185 @@ rw_air_cache_init(void)
 	});
 }
 
+static BOOL
+rw_air_key_bytes(CC_SHA256_CTX *ctx, const void *bytes, NSUInteger length)
+{
+	if (length > UINT32_MAX || (length != 0 && bytes == NULL))
+		return NO;
+	uint8_t size[8];
+	for (unsigned i = 0; i < sizeof(size); i++)
+		size[i] = (uint64_t)length >> (i * 8);
+	CC_SHA256_Update(ctx, size, sizeof(size));
+	if (length != 0)
+		CC_SHA256_Update(ctx, bytes, (CC_LONG)length);
+	return YES;
+}
+
 static NSString *
-rw_air_cache_key(id library, NSString *name, NSString *specialized, id constantValues)
+rw_air_cache_key(id function, NSString *name, NSString *specialized, id constantValues, id descriptor)
+{
+	void *constants = NULL;
+	@try {
+		uint64_t compiler_inputs[] = { 0, 0, 1, 0 };
+		uint8_t descriptor_kind = 0;
+		if (descriptor != nil) {
+			Class cls = object_getClass(descriptor);
+			if (cls != NSClassFromString(@"MTLFunctionDescriptor") &&
+			    cls != NSClassFromString(@"MTLIntersectionFunctionDescriptor"))
+				return nil;
+			descriptor_kind = cls == NSClassFromString(@"MTLIntersectionFunctionDescriptor");
+			static const char *const scalars[] = { "options", "pipelineOptions" };
+			for (unsigned i = 0; i < sizeof(scalars) / sizeof(scalars[0]); i++) {
+				SEL sel = sel_getUid(scalars[i]);
+				if (![descriptor respondsToSelector:sel])
+					return nil;
+				compiler_inputs[i] = ((NSUInteger (*)(id, SEL))objc_msgSend)(descriptor, sel);
+			}
+			SEL apply = sel_getUid("applyFunctionConstants");
+			if (![descriptor respondsToSelector:apply])
+				return nil;
+			compiler_inputs[2] = ((BOOL (*)(id, SEL))objc_msgSend)(descriptor, apply);
+			static const char *const objects[] = { "privateFunctions", "binaryArchives" };
+			for (unsigned i = 0; i < sizeof(objects) / sizeof(objects[0]); i++) {
+				SEL sel = sel_getUid(objects[i]);
+				if (![descriptor respondsToSelector:sel])
+					return nil;
+				id value = ((id (*)(id, SEL))objc_msgSend)(descriptor, sel);
+				if ([value count] != 0)
+					return nil;
+			}
+			SEL plugin = sel_getUid("pluginData");
+			if (![descriptor respondsToSelector:plugin] ||
+			    ((id (*)(id, SEL))objc_msgSend)(descriptor, plugin) != nil)
+				return nil;
+		}
+		/* The retained base function owns its 32-byte bitCodeHash array. */
+		SEL hash_sel = sel_getUid("bitCodeHash");
+		if (function == nil || name == nil || ![function respondsToSelector:hash_sel] ||
+		    ![function respondsToSelector:@selector(device)])
+			return nil;
+		const uint8_t *hash = ((const uint8_t *(*)(id, SEL))objc_msgSend)(function, hash_sel);
+		static const uint8_t missing_hash[CC_SHA256_DIGEST_LENGTH];
+		if (hash == NULL || memcmp(hash, missing_hash, sizeof(missing_hash)) == 0)
+			return nil;
+		id device = ((id (*)(id, SEL))objc_msgSend)(function, @selector(device));
+		SEL compiler_sel = sel_getUid("compiler");
+		if (device != nil && ![device respondsToSelector:compiler_sel])
+			return nil;
+		id compiler = ((id (*)(id, SEL))objc_msgSend)(device, compiler_sel);
+		SEL flags_sel = sel_getUid("compilerFlags");
+		if (compiler != nil && ![compiler respondsToSelector:flags_sel])
+			return nil;
+		compiler_inputs[3] = ((NSUInteger (*)(id, SEL))objc_msgSend)(compiler, flags_sel);
+		static dispatch_once_t config_once;
+		static bool (*compile_stats)(void);
+		static bool (*internal_build)(void);
+		dispatch_once(&config_once, ^{
+			compile_stats = (bool (*)(void))dlsym(RTLD_DEFAULT, "_MTLCompilePerformanceStatisticsEnabled");
+			internal_build = (bool (*)(void))dlsym(RTLD_DEFAULT, "_MTLIsInternalBuild");
+		});
+		if (compile_stats == NULL || internal_build == NULL)
+			return nil;
+		/* Metal retains its first fast-math environment value; keep it unchanged from that read. */
+		bool internal = internal_build();
+		const char *relaxed_env = internal ? getenv("MTL_REPLACE_FAST_MATH_WITH_RELAXED_MATH") : NULL;
+		const char *thread_env = getenv("MTL_DISABLE_MULTITHREADED_COMPILATION");
+		NSData *name_data = [name dataUsingEncoding:NSUTF8StringEncoding];
+		NSData *specialized_data = [specialized dataUsingEncoding:NSUTF8StringEncoding];
+		if (name_data == nil || (specialized != nil && specialized_data == nil))
+			return nil;
+		uint32_t empty_constants = 0;
+		NSUInteger constants_size = sizeof(empty_constants);
+		const void *constant_bytes = &empty_constants;
+		if (constantValues != nil) {
+			SEL serialize = sel_getUid("serializedConstantDataForFunction:dataSize:errorMessage:");
+			if (![constantValues respondsToSelector:serialize])
+				return nil;
+			NSString *why = nil;
+			constants = ((void *(*)(id, SEL, id, NSUInteger *, NSString **))objc_msgSend)
+			    (constantValues, serialize, function, &constants_size, &why);
+			if (constants == NULL || why != nil || constants_size < sizeof(empty_constants))
+				return nil;
+			constant_bytes = constants;
+		}
+		CC_SHA256_CTX ctx;
+		CC_SHA256_Init(&ctx);
+		static const char version[] = "annibale-air-v2";
+		CC_SHA256_Update(&ctx, version, sizeof(version));
+		CC_SHA256_Update(&ctx, hash, CC_SHA256_DIGEST_LENGTH);
+		uint8_t present[] = { specialized != nil, constantValues != nil,
+				     compiler != nil, compile_stats(), internal, descriptor_kind,
+				     relaxed_env != NULL, thread_env != NULL };
+		CC_SHA256_Update(&ctx, present, sizeof(present));
+		uint8_t inputs[sizeof(compiler_inputs)];
+		for (unsigned i = 0; i < sizeof(compiler_inputs) / sizeof(compiler_inputs[0]); i++)
+			for (unsigned j = 0; j < sizeof(compiler_inputs[0]); j++)
+				inputs[i * sizeof(compiler_inputs[0]) + j] = compiler_inputs[i] >> (j * 8);
+		if (!rw_air_key_bytes(&ctx, [name_data bytes], [name_data length]) ||
+		    !rw_air_key_bytes(&ctx, [specialized_data bytes], [specialized_data length]) ||
+		    !rw_air_key_bytes(&ctx, constant_bytes, constants_size) ||
+		    !rw_air_key_bytes(&ctx, inputs, sizeof(inputs)) ||
+		    !rw_air_key_bytes(&ctx, relaxed_env, relaxed_env != NULL ? strlen(relaxed_env) : 0) ||
+		    !rw_air_key_bytes(&ctx, thread_env, thread_env != NULL ? strlen(thread_env) : 0))
+			return nil;
+		unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+		CC_SHA256_Final(digest, &ctx);
+		char hex[CC_SHA256_DIGEST_LENGTH * 2 + 1];
+		for (unsigned i = 0; i < CC_SHA256_DIGEST_LENGTH; i++)
+			snprintf(&hex[i * 2], 3, "%02x", digest[i]);
+		return [NSString stringWithUTF8String:hex];
+	} @catch (id exception) {
+		(void)exception;
+		return nil;
+	} @finally {
+		free(constants);
+	}
+}
+
+static NSData *
+rw_air_cache_lookup(NSString *key)
+{
+	rw_air_cache_init();
+	if (key == nil)
+		return nil;
+	NSData *data = [rw_air_memcache objectForKey:key];
+	if (data != nil)
+		return data;
+
+	NSString *path = [NSString stringWithFormat:@"%s/%@.air", RW_AIR_CACHE_DIR, key];
+	data = [NSData dataWithContentsOfFile:path options:0 error:nil];
+	if (data != nil && [data length] > 0) {
+		[rw_air_memcache setObject:data forKey:key];
+		return data;
+	}
+	return nil;
+}
+
+static void
+rw_air_cache_store(NSString *key, NSData *bitcode)
+{
+	rw_air_cache_init();
+	if (key == nil || bitcode == nil || [bitcode length] == 0)
+		return;
+
+	[rw_air_memcache setObject:bitcode forKey:key];
+
+	NSString *path = [NSString stringWithFormat:@"%s/%@.air", RW_AIR_CACHE_DIR, key];
+	NSData *persisted = [NSData dataWithContentsOfFile:path options:0 error:nil];
+	if ([persisted isEqualToData:bitcode])
+		return;
+	mkdir(RW_AIR_CACHE_DIR, 0777);
+	NSError *err = nil;
+	[bitcode writeToFile:path options:NSDataWritingAtomic error:&err];
+}
+
+static id (*rw_library_function_with_name)(id, SEL, NSString *);
+static id (*rw_library_function_with_descriptor)(id, SEL, id, NSError **);
+static id (*rw_library_function_with_constants)(id, SEL, NSString *, id, NSError **);
+
+/* Preserve existing cache reads; only native success creates v2 entries. */
+static NSString *
+rw_air_cache_legacy_key(id library, NSString *name, NSString *specialized, id constantValues)
 {
 	CC_SHA256_CTX ctx;
 	CC_SHA256_Init(&ctx);
@@ -317,52 +501,10 @@ rw_air_cache_key(id library, NSString *name, NSString *specialized, id constantV
 	return [NSString stringWithUTF8String:hex];
 }
 
-static NSData *
-rw_air_cache_lookup(NSString *key)
-{
-	rw_air_cache_init();
-	if (key == nil)
-		return nil;
-	NSData *data = [rw_air_memcache objectForKey:key];
-	if (data != nil)
-		return data;
-
-	NSString *path = [NSString stringWithFormat:@"%s/%@.air", RW_AIR_CACHE_DIR, key];
-	data = [NSData dataWithContentsOfFile:path options:0 error:nil];
-	if (data != nil && [data length] > 0) {
-		[rw_air_memcache setObject:data forKey:key];
-		return data;
-	}
-	return nil;
-}
-
-static void
-rw_air_cache_store(NSString *key, NSData *bitcode)
-{
-	rw_air_cache_init();
-	if (key == nil || bitcode == nil || [bitcode length] == 0)
-		return;
-
-	[rw_air_memcache setObject:bitcode forKey:key];
-
-	NSString *path = [NSString stringWithFormat:@"%s/%@.air", RW_AIR_CACHE_DIR, key];
-	NSData *persisted = [NSData dataWithContentsOfFile:path options:0 error:nil];
-	if ([persisted isEqualToData:bitcode])
-		return;
-	mkdir(RW_AIR_CACHE_DIR, 0777);
-	NSError *err = nil;
-	[bitcode writeToFile:path options:NSDataWritingAtomic error:&err];
-}
-
-static id (*rw_library_function_with_name)(id, SEL, NSString *);
-static id (*rw_library_function_with_descriptor)(id, SEL, id, NSError **);
-static id (*rw_library_function_with_constants)(id, SEL, NSString *, id, NSError **);
-
 static id
-rw_specialize_by_proxy(id library, NSString *name, NSString *specialized, id values, id descriptor,
+rw_specialize_by_proxy(id function, NSString *name, NSString *specialized, id values, id descriptor,
 		       NSError *why, NSData *cached_bitcode)
 {
-	id function;
 	id proxy;
 
 	if (cached_bitcode == nil && rw_stitch_dump_begin("a specialization _MTLLibrary refused")) {
@@ -370,47 +512,70 @@ rw_specialize_by_proxy(id library, NSString *name, NSString *specialized, id val
 		rw_print("stitch: _MTLLibrary said %s; the proxy runs the function with every "
 			 "constant zero\n", why != nil ? [[why description] UTF8String] : "nothing");
 	}
-	function = name != nil ? rw_library_function_with_name(library, @selector(newFunctionWithName:),
-								name) : nil;
 	if (function == nil) {
 		return nil;
 	}
 	if ([specialized length] == 0 && values == nil && cached_bitcode == nil) {
-		return function;
+		return [function retain];
 	}
 	proxy = [[AnnibaleMetalSpecializedFunction alloc]
 	    initWithFunction:function name:[specialized length] != 0 ? specialized : name
 	      constantValues:values cachedBitcode:cached_bitcode];
-	[function release];
 	return proxy;
+}
+
+static id
+rw_library_finish_specialization(id library, id function, NSString *name, NSString *specialized,
+				 id values, id descriptor, NSError *why)
+{
+	id base = nil;
+	@try {
+		base = name != nil
+		    ? rw_library_function_with_name(library, @selector(newFunctionWithName:), name) : nil;
+		NSString *cache_key = rw_air_cache_key(base, name, specialized, values, descriptor);
+		if (function != nil) {
+			SEL bitcode = sel_getUid("bitcodeData");
+			if (cache_key != nil && [function respondsToSelector:bitcode]) {
+				NSData *bc = ((NSData *(*)(id, SEL))objc_msgSend)(function, bitcode);
+				if (bc != nil && [bc length] > 0)
+					rw_air_cache_store(cache_key, bc);
+			}
+		} else {
+			NSData *cached = cache_key != nil ? rw_air_cache_lookup(cache_key) : nil;
+			if (cached == nil) {
+				NSString *legacy_key = rw_air_cache_legacy_key(library, name, specialized, values);
+				cached = rw_air_cache_lookup(legacy_key);
+			}
+			function = rw_specialize_by_proxy(base, name, specialized, values,
+						  descriptor != nil ? descriptor : name, why, cached);
+		}
+	} @catch (id exception) {
+		/* Cache failures preserve the original specialization result. */
+		(void)exception;
+	} @finally {
+		[base release];
+	}
+	return function;
 }
 
 static id
 rw_library_new_function_with_descriptor(id self, SEL _cmd, id descriptor, NSError **error)
 {
-	NSString *name = [descriptor name];
-	NSString *specialized = [descriptor respondsToSelector:@selector(specializedName)]
-	    ? [descriptor specializedName] : nil;
-	id values = [descriptor respondsToSelector:@selector(constantValues)]
-	    ? [descriptor constantValues] : nil;
-	NSString *cache_key = rw_air_cache_key(self, name, specialized, values);
 	NSError *why = nil;
 	id function = rw_library_function_with_descriptor(self, _cmd, descriptor, &why);
-
-	if (function != nil) {
-		SEL bitcode = sel_getUid("bitcodeData");
-		if ([function respondsToSelector:bitcode]) {
-			NSData *bc = ((NSData *(*)(id, SEL))objc_msgSend)(function, bitcode);
-			if (bc != nil && [bc length] > 0)
-				rw_air_cache_store(cache_key, bc);
-		}
-	} else {
-		NSData *cached = rw_air_cache_lookup(cache_key);
-		function = rw_specialize_by_proxy(self, name, specialized, values, descriptor, why, cached);
+	@try {
+		NSString *name = [descriptor name];
+		NSString *specialized = [descriptor respondsToSelector:@selector(specializedName)]
+		    ? [descriptor specializedName] : nil;
+		id values = [descriptor respondsToSelector:@selector(constantValues)]
+		    ? [descriptor constantValues] : nil;
+		function = rw_library_finish_specialization(self, function, name, specialized, values,
+						    descriptor, why);
+	} @catch (id exception) {
+		(void)exception;
 	}
-	if (function == nil && error != NULL) {
+	if (function == nil && error != NULL)
 		*error = why;
-	}
 	return function;
 }
 
@@ -418,24 +583,11 @@ static id
 rw_library_new_function_with_constants(id self, SEL _cmd, NSString *name, id values,
 				       NSError **error)
 {
-	NSString *cache_key = rw_air_cache_key(self, name, nil, values);
 	NSError *why = nil;
 	id function = rw_library_function_with_constants(self, _cmd, name, values, &why);
-
-	if (function != nil) {
-		SEL bitcode = sel_getUid("bitcodeData");
-		if ([function respondsToSelector:bitcode]) {
-			NSData *bc = ((NSData *(*)(id, SEL))objc_msgSend)(function, bitcode);
-			if (bc != nil && [bc length] > 0)
-				rw_air_cache_store(cache_key, bc);
-		}
-	} else {
-		NSData *cached = rw_air_cache_lookup(cache_key);
-		function = rw_specialize_by_proxy(self, name, nil, values, name, why, cached);
-	}
-	if (function == nil && error != NULL) {
+	function = rw_library_finish_specialization(self, function, name, nil, values, nil, why);
+	if (function == nil && error != NULL)
 		*error = why;
-	}
 	return function;
 }
 

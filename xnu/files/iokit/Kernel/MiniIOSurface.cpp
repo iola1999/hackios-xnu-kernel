@@ -609,14 +609,15 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 		s->release();
 		return NULL;
 	}
-	if (wrapped == NULL) {
-		alloc = alignUp(alloc, (uint32_t) PAGE_SIZE);
-	} else {
+	if (wrapped != NULL) {
 		/* (the memory is as big as its owner says, and not a byte of ours is added to it) */
 		alloc = dictNumber(props, "IOSurfaceAllocSize", (uint32_t) needed);
+	} else if (alloc > alignUp(needed, (uint32_t) PAGE_SIZE)) {
+		alloc = alignUp(needed, (uint32_t) PAGE_SIZE);
 	}
 
-	s->memory = surfaceMemory((vm_size_t) PAGE_SIZE + (wrapped ? 0 : alloc));
+	/* IOSurfaceGetAllocSize reports the buffer size; its owned backing remains page-aligned. */
+	s->memory = surfaceMemory((vm_size_t) PAGE_SIZE + (wrapped ? 0 : alignUp(alloc, (uint32_t) PAGE_SIZE)));
 	if (s->memory == NULL) {
 		IOLog("MiniIOSurface: no memory for %u bytes (%u surfaces, %llu MB in use)\n", alloc, gSurfaceCount,
 		    gSurfaceBytes >> 20);

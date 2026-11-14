@@ -46,6 +46,7 @@ struct rwa_device { int unused; };
 struct rwa_texture { int unused; };
 struct rwa_buffer { int unused; };
 struct rwa_sampler { int unused; };
+struct rwa_fence { int unused; };
 struct rwa_render { int unused; };
 struct rwa_compute { int unused; };
 struct rwa_buffer_bind { struct rwa_buffer *buffer; size_t offset; };
@@ -85,6 +86,8 @@ static int dispatch_sync_mock(struct rwa_compute *p,const struct rwa_bindings *b
 static struct {
  int (*flush)(struct rwa_device *,char *,size_t);
  int (*finish)(struct rwa_device *,char *,size_t);
+ struct rwa_fence *(*fence_take)(struct rwa_device *);
+ int (*texture_rgb2p_pass)(struct rwa_texture *,bool,char *,size_t);
  int (*texture_thumbnail)(struct rwa_texture *,unsigned,unsigned,uint8_t *);
  void (*buffer_textures_refresh)(struct rwa_device *);
  __typeof__(&dispatch_async_mock) dispatch_nowait,dispatch_threadgroup;
@@ -167,7 +170,7 @@ static int rw_run_copy(AnnibaleMetalWork *w,char *why,size_t n) { (void)w;(void)
 - (id)init { self=[super init];_queue=[FixtureQueue new];_work=[NSMutableArray new];return self; }
 - (void)dealloc { [_queue release];[_work release];[super dealloc]; }
 - (void)annibaleReturnSlot { returned_slots++; }
-- (void)annibaleCompleteLater:(unsigned)c { (void)c;completions++; }
+- (void)annibaleCompleteLater:(unsigned)c fence:(struct rwa_fence *)f { (void)c;(void)f;completions++; }
 - (void)failWith:(const char *)why { (void)why;_failed=true; }
 - (BOOL)runDraw:(AnnibaleMetalWork *)w why:(char *)why size:(size_t)n {
  draw_calls++;event('D');snprintf(why,n,"fixture draw");
@@ -247,6 +250,7 @@ class MatchedSync(unittest.TestCase):
     def setUpClass(cls):
         diag = (DRIVER / 'annibalemetal_diag.inc').read_text()
         command = (DRIVER / 'annibalemetal_commandbuffer.inc').read_text()
+        submit = (DRIVER / 'annibalemetal_commandbuffer_submit.inc').read_text()
         sync = body(diag, 'static bool\nrw_sync_draws(')
         if 'static unsigned rw_matched_left;' in diag:
             sync += '\n' + diag[diag.index('static unsigned rw_matched_left;'):diag.index('/*\n * Without ANNIBALE_MSAA')]
@@ -254,7 +258,7 @@ class MatchedSync(unittest.TestCase):
         helpers += '\n' + body(diag, 'static bool\nrw_sync_log_wanted(')
         helpers += '\n' + body(diag, 'static void\nrw_dump_kept_air(')
         helpers += '\n' + body(diag, 'static void\nrw_dump_refused_air(')
-        methods = body(command, '- (void)commit\n')
+        methods = body(submit, '- (void)commit\n')
         methods += '\n' + body(command, '- (BOOL)syncDraw:')
         methods += '\n' + body(command, '- (void)thumbWork:')
         source = PREFIX + '\n' + sync + '\n' + helpers + '\n' + SUPPORT

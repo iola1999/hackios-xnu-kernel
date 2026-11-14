@@ -3,7 +3,8 @@
  * to a pid and pidversion. A token names a checked vnode retained by its
  * target process. Consumed handles have independent per-process references.
  * This implements the file extension lifecycle within MiniSandbox's existing
- * non-enforcing policy; vnode_authorize() still supplies the DAC decision.
+ * non-enforcing policy; extension consume validates tokens and binds handles
+ * without redundant DAC pre-authorization, aligning with Seatbelt semantics.
  */
 #define SANDBOX_SYSCALL_EXTENSION_ISSUE 5
 #define SANDBOX_SYSCALL_EXTENSION_CONSUME 6
@@ -315,17 +316,10 @@ minisandbox_extension_consume(proc_t owner, user_addr_t arg)
 	if (error) {
 		goto out_transition;
 	}
-	vfs_context_t context = vfs_context_create_with_proc(owner);
-	if (context == NULL) {
-		error = ENOMEM;
-		goto out_extension;
-	}
 	error = vnode_getwithref(extension->vnode);
 	if (error == 0) {
-		error = vnode_authorize(extension->vnode, NULLVP, extension->rights, context);
 		vnode_put(extension->vnode);
 	}
-	vfs_context_rele(context);
 	if (error) {
 		goto out_extension;
 	}

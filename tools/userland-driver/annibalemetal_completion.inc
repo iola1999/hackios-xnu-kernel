@@ -8,7 +8,7 @@
  * caller had finished its own bookkeeping for the buffer.
  *
  * Now -commit takes the fence of its submission (rwa_fence_take) and queues the buffer here. One
- * thread per process waits for the fences in commit order, without the library's lock, writes back
+ * thread per process waits for the fences in queue order, without the library's lock, writes back
  * the textures laid over buffers by copy, marks the buffer completed and wakes -waitUntilCompleted.
  * Handlers run on the queue the caller named (-[MTLCommandQueueSPI setCompletionQueue:]) or on one
  * serial queue of this driver's, never on the completion thread: a handler that waits for a later
@@ -19,7 +19,7 @@
 struct rw_completion {
 	struct rw_completion *next;
 	AnnibaleMetalCommandBuffer *buffer;      /* retained until it has completed */
-	struct rwa_fence *fence;                /* NULL: nothing was handed to the GPU */
+	struct rwa_fence *fence;                /* NULL: no retained asynchronous fence */
 	unsigned commit;
 	uint64_t queued_us;
 };
@@ -57,10 +57,11 @@ static void *rw_completion_main(void *unused);
 	});
 }
 
-/* From -commit, after the submission: the scheduled handlers now, the rest when the GPU is done. */
-- (void)annibaleCompleteLater:(unsigned)commit
+/* Takes the retained submission fence from -commit. Handlers remain asynchronous. */
+- (void)annibaleCompleteLater:(unsigned)commit fence:(struct rwa_fence *)fence
 {
 	static dispatch_once_t once;
+	static BOOL worker_ready;
 	struct rw_completion *item = calloc(1, sizeof(*item));
 	NSArray *scheduled;
 
@@ -68,38 +69,32 @@ static void *rw_completion_main(void *unused);
 		pthread_t thread;
 		if (pthread_create(&thread, NULL, rw_completion_main, NULL) == 0) {
 			pthread_detach(thread);
+			worker_ready = YES;
 		}
 	});
 	pthread_mutex_lock(&rw_completion_lock);
-	_phase = RW_CB_PHASE_SCHEDULED;
-	if (_status < RW_CB_SCHEDULED) {
-		_status = RW_CB_SCHEDULED;
+	if (__atomic_load_n(&_status, __ATOMIC_ACQUIRE) < RW_CB_SCHEDULED) {
+		__atomic_store_n(&_status, RW_CB_SCHEDULED, __ATOMIC_RELEASE);
 	}
 	scheduled = _scheduled;
 	_scheduled = nil;
+	__atomic_store_n(&_phase, RW_CB_PHASE_SCHEDULED, __ATOMIC_RELEASE);
 	pthread_mutex_unlock(&rw_completion_lock);
 	[self annibaleDeliverLater:scheduled];
 	[scheduled release];
-	if (item == NULL) {
-		NSArray *completed;
+	if (item == NULL || !worker_ready) {
+		AnnibaleMetalCommandBuffer *buffer = [self retain];
 
-		rw_print("no memory to queue a command buffer for completion\n");
-		pthread_mutex_lock(&rw_completion_lock);
-		_phase = RW_CB_PHASE_FINISHED;
-		_status = _failed ? RW_CB_ERROR : RW_CB_COMPLETED;
-		completed = _completed;
-		_completed = nil;
-		pthread_cond_broadcast(&rw_completion_done);
-		pthread_mutex_unlock(&rw_completion_lock);
-		[self annibaleDeliverLater:completed];
-		[completed release];
+		rw_print("cannot queue a command buffer for completion; waiting for its submission\n");
+		free(item);
+		[buffer annibaleCompleteWithFence:fence commit:commit queued:rw_now_us()];
+		[buffer release];
 		return;
 	}
 	item->buffer = [self retain];
 	item->commit = commit;
 	item->queued_us = rw_now_us();
-	item->fence = _failed || mesa.fence_take == NULL ? NULL :
-	    mesa.fence_take([[_queue device] mesaDevice]);
+	item->fence = fence;
 	pthread_mutex_lock(&rw_completion_lock);
 	*rw_completion_tail = item;
 	rw_completion_tail = &item->next;
@@ -115,7 +110,8 @@ static void *rw_completion_main(void *unused);
 	uint64_t began_us = rw_now_us(), fence_us, writeback_us = 0;
 
 	char why[256] = { 0 };
-	bool waiting_gpu = (fence == NULL && mesa.fence_take == NULL && !_failed && mesa.finish != NULL) ||
+	BOOL wait_failed = NO;
+	bool waiting_gpu = (fence == NULL && mesa.fence_take == NULL && mesa.finish != NULL) ||
 	    fence != NULL;
 
 	if (waiting_gpu) {
@@ -128,17 +124,21 @@ static void *rw_completion_main(void *unused);
 		__atomic_store_n(&fence_wait, slot, __ATOMIC_RELEASE);
 	}
 	/* A compiler library without the fence calls: wait for everything, as -commit used to. */
-	if (fence == NULL && mesa.fence_take == NULL && !_failed && mesa.finish != NULL &&
+	if (fence == NULL && mesa.fence_take == NULL && mesa.finish != NULL &&
 	    mesa.finish(device, why, sizeof(why)) != 0) {
 		rw_print("THE GPU DID NOT FINISH: %s\n", why);
-		_failed = YES;
+		wait_failed = YES;
 	}
 	if (fence != NULL && mesa.fence_wait(device, fence) != 0) {
 		rw_print("THE GPU DID NOT FINISH: a command buffer's fence did not signal in time\n");
-		[_error release];
-		_error = [[NSError errorWithDomain:@"AnnibaleMetal" code:3
+		wait_failed = YES;
+	}
+	if (wait_failed) {
+		if (_error == nil) {
+			_error = [[NSError errorWithDomain:@"AnnibaleMetal" code:3
 					  userInfo:@{ NSLocalizedDescriptionKey:
 						      @"the GPU did not finish this command buffer in time" }] retain];
+		}
 		_failed = YES;
 	}
 	if (waiting_gpu) {
@@ -155,10 +155,10 @@ static void *rw_completion_main(void *unused);
 		writeback_us = rw_now_us() - writeback_began;
 	}
 	pthread_mutex_lock(&rw_completion_lock);
-	_phase = RW_CB_PHASE_FINISHED;
-	_status = _failed ? RW_CB_ERROR : RW_CB_COMPLETED;
+	__atomic_store_n(&_status, _failed ? RW_CB_ERROR : RW_CB_COMPLETED, __ATOMIC_RELEASE);
 	completed = _completed;
 	_completed = nil;
+	__atomic_store_n(&_phase, RW_CB_PHASE_FINISHED, __ATOMIC_RELEASE);
 	pthread_cond_broadcast(&rw_completion_done);
 	pthread_mutex_unlock(&rw_completion_lock);
 	rw_timing_completion(commit, began_us - queued_us, fence_us, writeback_us, !_failed);
@@ -170,7 +170,7 @@ static void *rw_completion_main(void *unused);
 - (void)annibaleAddScheduled:(void (^)(id))handler
 {
 	pthread_mutex_lock(&rw_completion_lock);
-	if (_phase < RW_CB_PHASE_SCHEDULED) {
+	if (__atomic_load_n(&_phase, __ATOMIC_ACQUIRE) < RW_CB_PHASE_SCHEDULED) {
 		if (_scheduled == nil) {
 			_scheduled = [[NSMutableArray alloc] init];
 		}
@@ -187,7 +187,7 @@ static void *rw_completion_main(void *unused);
 - (void)annibaleAddCompleted:(void (^)(id))handler
 {
 	pthread_mutex_lock(&rw_completion_lock);
-	if (_phase < RW_CB_PHASE_FINISHED) {
+	if (__atomic_load_n(&_phase, __ATOMIC_ACQUIRE) < RW_CB_PHASE_FINISHED) {
 		if (_completed == nil) {
 			_completed = [[NSMutableArray alloc] init];
 		}
@@ -205,11 +205,11 @@ static void *rw_completion_main(void *unused);
 - (BOOL)annibaleAwaitCompletion
 {
 	pthread_mutex_lock(&rw_completion_lock);
-	if (_phase < RW_CB_PHASE_COMMITTED) {
+	if (__atomic_load_n(&_phase, __ATOMIC_ACQUIRE) < RW_CB_PHASE_COMMITTED) {
 		pthread_mutex_unlock(&rw_completion_lock);
 		return NO;
 	}
-	while (_phase < RW_CB_PHASE_FINISHED) {
+	while (__atomic_load_n(&_phase, __ATOMIC_ACQUIRE) < RW_CB_PHASE_FINISHED) {
 		pthread_cond_wait(&rw_completion_done, &rw_completion_lock);
 	}
 	pthread_mutex_unlock(&rw_completion_lock);

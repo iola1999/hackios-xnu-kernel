@@ -32,6 +32,10 @@ void rwa_buffer_destroy(struct rwa_buffer *buffer);
 int rwa_buffer_copy(struct rwa_buffer *src, size_t src_offset,
                     struct rwa_buffer *dst, size_t dst_offset, size_t size,
                     char *why, size_t why_size);
+/* Fill each byte of a bounded buffer range, in context order, and wait for completion.
+ * An empty range is a no-op. Argument-buffer encodings are rejected like buffer copies. */
+int rwa_buffer_fill(struct rwa_buffer *dst, size_t offset, size_t size, uint8_t value,
+                    char *why, size_t why_size);
 int rwa_texture_copy(struct rwa_texture *src, unsigned src_level, unsigned src_slice,
                      const unsigned src_origin[3], struct rwa_texture *dst,
                      unsigned dst_level, unsigned dst_slice, const unsigned dst_origin[3],

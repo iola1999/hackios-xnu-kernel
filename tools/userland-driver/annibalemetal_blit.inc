@@ -3,6 +3,20 @@
 static int
 rw_run_copy(AnnibaleMetalWork *work, char *why, size_t why_size)
 {
+	if (work->copyKind == RW_COPY_FILL) {
+		if (mesa.buffer_fill)
+			return mesa.buffer_fill([work->buffers[0] mesaBuffer], work->copyOffsets[0],
+			    work->copyLength, (uint8_t)work->copySize[0], why, why_size);
+		snprintf(why, why_size, "AIR library lacks buffer fill support");
+		return -1;
+	}
+	if (work->copyKind == RW_COPY_RGB2P_BEGIN || work->copyKind == RW_COPY_RGB2P_END) {
+		if (mesa.texture_rgb2p_pass)
+			return mesa.texture_rgb2p_pass([work->textures[0] mesaTexture],
+			    work->copyKind == RW_COPY_RGB2P_BEGIN, why, why_size);
+		snprintf(why, why_size, "AIR library lacks RGB2P render-pass support");
+		return -1;
+	}
 	if (work->copyKind == RW_COPY_CLEAR) {
 		struct rwa_texture *color[8] = { 0 };
 		id owner = work->depth;
@@ -122,6 +136,21 @@ protocol_declares(const char *name, SEL selector, struct objc_method_description
 		return NO;
 	}
 	return YES;
+}
+
+- (void)fillBuffer:(id)buffer range:(NSRange)range value:(uint8_t)value
+{
+	if (![self acceptSource:buffer destination:buffer resourceClass:[AnnibaleMetalBuffer class]])
+		return;
+	AnnibaleMetalWork *work = [[AnnibaleMetalWork alloc] init];
+	work->copyKind = RW_COPY_FILL;
+	work->count = 1;
+	work->buffers[0] = buffer;
+	work->copyOffsets[0] = range.location;
+	work->copyLength = range.length;
+	work->copySize[0] = value;
+	[_commandBuffer recordWork:work];
+	[work release];
 }
 
 - (void)copyFromBuffer:(id)source sourceOffset:(NSUInteger)sourceOffset

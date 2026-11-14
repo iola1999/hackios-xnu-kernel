@@ -1,5 +1,6 @@
 #include "air_metal_copy.h"
 #include "air_metal_reflection.h"
+#include "air_metal_rgb2p.h"
 
 struct rwa_fence;
 
@@ -7,7 +8,10 @@ static struct {
 	void *handle;
 	struct rwa_texture *(*texture_combine_yuv)(struct rwa_texture *, struct rwa_texture *,
 		bool, unsigned, char *, size_t);
+	__typeof__(&rwa_texture_combine_rgb2p) texture_combine_rgb2p;
+	__typeof__(&rwa_texture_rgb2p_pass) texture_rgb2p_pass;
 	__typeof__(&rwa_buffer_copy) buffer_copy;
+	__typeof__(&rwa_buffer_fill) buffer_fill;
 	__typeof__(&rwa_texture_copy) texture_copy;
 	__typeof__(&rwa_texture_generate_mipmaps) texture_generate_mipmaps;
 	__typeof__(&rwa_texture_from_buffer) texture_from_buffer;
@@ -105,6 +109,7 @@ mesa_available(void)
 		return false;
 	}
 	*(void **)&mesa.buffer_copy = dlsym(mesa.handle, "rwa_buffer_copy");
+	*(void **)&mesa.buffer_fill = dlsym(mesa.handle, "rwa_buffer_fill");
 	*(void **)&mesa.texture_copy = dlsym(mesa.handle, "rwa_texture_copy");
 	*(void **)&mesa.texture_generate_mipmaps = dlsym(mesa.handle, "rwa_texture_generate_mipmaps");
 	*(void **)&mesa.texture_from_buffer = dlsym(mesa.handle, "rwa_texture_from_buffer");
@@ -112,6 +117,8 @@ mesa_available(void)
 	*(void **)&mesa.buffer_textures_writeback = dlsym(mesa.handle,
 							  "rwa_buffer_textures_writeback");
 	*(void **)&mesa.texture_combine_yuv = dlsym(mesa.handle, "rwa_texture_combine_yuv");
+	*(void **)&mesa.texture_combine_rgb2p = dlsym(mesa.handle, "rwa_texture_combine_rgb2p");
+	*(void **)&mesa.texture_rgb2p_pass = dlsym(mesa.handle, "rwa_texture_rgb2p_pass");
 	*(void **)&mesa.texture_view = dlsym(mesa.handle, "rwa_texture_view");
 	*(void **)&mesa.texture_set_swizzle = dlsym(mesa.handle, "rwa_texture_set_swizzle");
 	*(void **)&mesa.texture_thumbnail = dlsym(mesa.handle, "rwa_texture_thumbnail");

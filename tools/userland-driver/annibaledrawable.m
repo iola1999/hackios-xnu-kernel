@@ -505,23 +505,25 @@ ann_surface_plane(void *iosurface, unsigned long plane, const struct ann_texture
 	}
 	/* CoreImage Rh uses '1C0h'; CoreVideo OneComponent16Half uses 'L00h'. */
 	uint32_t fourcc = format(iosurface), expected;
-	unsigned bpp;
+	unsigned bpp, view_bpp;
 	if ((fourcc == '420v' || fourcc == '420f') && planes == 2) {
 		unsigned pixel_format = plane == 0 ? 10 : 30;
-		if (want->pixel_format != pixel_format) {
-			ann_say(why, why_size, "NV12 plane %lu requires Metal format %u; requested %u",
+		if (want->pixel_format != pixel_format && want->pixel_format != 80) {
+			ann_say(why, why_size, "NV12 plane %lu requires Metal format %u or packed BGRA8; requested %u",
 			    plane, pixel_format, want->pixel_format);
 			return -1;
 		}
 		bpp = plane == 0 ? 1 : 2;
-	} else if ((fourcc == 'x420' || fourcc == 'xf20') && planes == 2) {
+		view_bpp = want->pixel_format == 80 ? 4 : bpp;
+	} else if ((fourcc == 'x420' || fourcc == 'xf20' || fourcc == 'x422' || fourcc == 'xf22') && planes == 2) {
 		unsigned pixel_format = plane == 0 ? 20 : 60;
-		if (want->pixel_format != pixel_format) {
-			ann_say(why, why_size, "P010 plane %lu requires Metal format %u; requested %u",
-			    plane, pixel_format, want->pixel_format);
+		if (want->pixel_format != pixel_format && !(plane == 0 && want->pixel_format == 60)) {
+			ann_say(why, why_size, "P010 plane %lu requires Metal format %u%s; requested %u",
+			    plane, pixel_format, plane == 0 ? " or packed RG16" : "", want->pixel_format);
 			return -1;
 		}
 		bpp = plane == 0 ? 2 : 4;
+		view_bpp = want->pixel_format == 60 ? 4 : bpp;
 	} else if (planes > 1) {
 		ann_say(why, why_size, "unsupported planar surface FourCC %#x with %zu planes", fourcc, planes);
 		return -1;
@@ -534,13 +536,18 @@ ann_surface_plane(void *iosurface, unsigned long plane, const struct ann_texture
 		    height(iosurface, plane), element(iosurface, plane), row(iosurface, plane),
 		    offset(iosurface, plane), size(iosurface));
 		return -1;
+	} else {
+		view_bpp = bpp;
 	}
 	size_t w = width(iosurface, plane), h = height(iosurface, plane);
 	size_t stride = row(iosurface, plane), begin = offset(iosurface, plane);
 	uintptr_t pixels = (uintptr_t)address(iosurface, plane);
+	/* Affine output uses BGRA8/RG16 row views. The IOSurface element size and physical
+	 * plane bounds still describe the original storage. */
 	if (w == 0 || h == 0 || w > UINT32_MAX || h > UINT32_MAX || stride > UINT32_MAX ||
 	    begin > UINT32_MAX || pixels == 0 || pixels < begin || element(iosurface, plane) != bpp ||
 	    want->width == 0 || want->height == 0 || want->width > w || want->height > h ||
+	    (uint64_t)want->width * view_bpp > (uint64_t)w * bpp ||
 	    want->type != 2 || want->depth != 1 || want->array_length != 1 ||
 	    want->mip_levels != 1 || want->sample_count != 1) {
 		ann_say(why, why_size, "invalid surface plane %lu geometry or texture shape: "

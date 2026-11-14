@@ -653,6 +653,7 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
 {
 	if (_ended) return;
 	[self recordPassClear];
+	[self recordRGB2PPass:NO];
 	rw_record_resolve_blits(_commandBuffer, _colorCount, _color, _resolveTo, _colorLevel, _colorSlice, _resolveLevel, _resolveSlice);
 	_ended = YES;
 	[super endEncoding];

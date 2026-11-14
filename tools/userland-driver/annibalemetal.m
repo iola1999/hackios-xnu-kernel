@@ -936,6 +936,12 @@ struct gem_close { uint32_t handle, pad; };
 - (id)device;
 @end
 
+@interface AnnibaleMetalCommandBuffer (Completion)
+- (void)annibaleCompleteLater:(unsigned)commit fence:(struct rwa_fence *)fence;
+- (void)annibaleCompleteWithFence:(struct rwa_fence *)fence commit:(unsigned)commit queued:(uint64_t)queued_us;
+- (BOOL)annibaleAwaitCompletion;
+@end
+
 @interface AnnibaleMetalComputeEncoder : _MTLCommandEncoder
 - (instancetype)initWithAnnibaleCommandBuffer:(AnnibaleMetalCommandBuffer *)commandBuffer;
 @end

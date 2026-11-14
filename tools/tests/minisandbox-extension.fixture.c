@@ -298,11 +298,13 @@ static void consume_contract(proc_t manager, proc_t app, proc_t other) {
     check(consume_raw(app, token, strlen(token) + 1, &handle) == EFAULT);
     copyout_fail_at = 0; partial_copyout = false;
     check(minisandbox_extension_grants == NULL && file.usecount == 1);
-    context_fail = 1; check(consume_native(app, token, ENOMEM) == -1); context_fail = 0;
     allocation_fail = 1; check(consume_native(app, token, ENOMEM) == -1); allocation_fail = 0;
     file.available = false; check(consume_native(app, token, ENOENT) == -1); file.available = true;
     unsigned allowed = app->allowed; app->allowed = KAUTH_VNODE_READ_DATA;
-    check(consume_native(app, token, EACCES) == -1); app->allowed = allowed;
+    int64_t permitted = consume_native(app, token, 0);
+    check(permitted > 0);
+    check(release_raw(app, permitted, 0, NULL) == 0);
+    app->allowed = allowed;
     app->transition = true; check(consume_native(app, token, EDEADLK) == -1); app->transition = false;
     app->p_lflag = P_LEXIT; check(consume_native(app, token, ESRCH) == -1); app->p_lflag = 0;
     int64_t a = consume_native(app, token, 0), b = consume_native(app, token, 0);

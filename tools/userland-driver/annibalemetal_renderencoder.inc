@@ -30,7 +30,7 @@
 	id _fragmentSamplers[RW_MAX_BUFFERS], _vertexSamplers[RW_MAX_BUFFERS];
 	unsigned _vertexBufferCount, _fragmentBufferCount;
 	unsigned _fragmentTextureCount, _fragmentSamplerCount, _vertexTextureCount, _vertexSamplerCount;
-	BOOL _ended, _complained;
+	BOOL _ended, _complained, _rgb2pBegun;
 }
 
 - (instancetype)initWithAnnibaleCommandBuffer:(AnnibaleMetalCommandBuffer *)commandBuffer
@@ -276,9 +276,29 @@ rw_bind_slot(id *slots, unsigned *count, id object, NSUInteger index)
 	(void)r; (void)g; (void)b; (void)a;
 }
 
+- (void)recordRGB2PPass:(BOOL)begin
+{
+	if (_rgb2pBegun == begin) return;
+	for (unsigned i = 0; i < _colorCount; i++) {
+		NSUInteger format = [_color[i] pixelFormat];
+		if (format != 540 && format != 543 && format != 544) continue;
+		BOOL duplicate = NO;
+		for (unsigned j = 0; j < i; j++) duplicate |= _color[j] == _color[i];
+		if (duplicate) continue;
+		AnnibaleMetalWork *work = [[AnnibaleMetalWork alloc] init];
+		work->copyKind = begin ? RW_COPY_RGB2P_BEGIN : RW_COPY_RGB2P_END;
+		work->textureCount = 1;
+		work->textures[0] = _color[i];
+		[_commandBuffer recordWork:work];
+		[work release];
+	}
+	_rgb2pBegun = begin;
+}
+
 - (void)recordPassClear
 {
 	if (_ended || (!_clears && !_clearsDepth && !_clearsStencil)) return;
+	[self recordRGB2PPass:YES];
 	AnnibaleMetalWork *work = [[AnnibaleMetalWork alloc] init];
 	work->copyKind = RW_COPY_CLEAR;
 	work->colorCount = _colorCount;
@@ -339,6 +359,7 @@ rw_bind_slot(id *slots, unsigned *count, id object, NSUInteger index)
 		[work release];
 		return;
 	}
+	[self recordRGB2PPass:YES];
 	/* Said at the draw and not at the pass, because it is the pipeline that knows:
 	 * Metal drops a [[depth]] write when there is no depth attachment, and so does
 	 * this -- but a caller measuring such a shader would otherwise be left reading a
