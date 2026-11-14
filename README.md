@@ -9,10 +9,10 @@
 内核（`xnu-12377.121.6`）在 macOS 上用 Xcode 构建，依赖放在 Git 忽略的 `xnu-deps/26/`：
 
 ```sh
-xnu26/apply.sh                                # 取上游源码，应用 xnu26/patches/series，复制 xnu/files/ 与 xnu26/files/
+xnu26/apply.sh                                # 获取上游源码，应用 xnu26/patches/series，复制 xnu/files/ 与 xnu26/files/
 xnu26/deps-macos.sh --stage1                  # 依赖源码与 SDK
 xnu26/build-macos.sh exporthdrs installhdrs   # 导出内核头文件
-xnu26/deps-macos.sh --stage2                  # 用内核头文件编 libfirehose_kernel.a、libpthread_kext.a
+xnu26/deps-macos.sh --stage2                  # 用内核头文件编译 libfirehose_kernel.a、libpthread_kext.a
 tools/mk-ath12k.sh                            # Wi-Fi 驱动 ath12k，build-macos.sh 发现 out/ath12k.o 时链接进内核
 xnu26/build-macos.sh                          # 构建内核
 ```
@@ -21,21 +21,21 @@ xnu26/build-macos.sh                          # 构建内核
 - `xnu26/apply.sh` 在构建树已存在时直接退出；构建树里的修改用 `xnu26/export.sh` 导回仓库。
 - 真机轮次实际用的构建命令记在每轮 `kernel.json` 的 `build.command`，增量构建的做法见顶层 [k90auto 说明](https://github.com/iola1999/hackios-redmi-k90-annibale/blob/main/tools/k90auto/README.md)。
 - loader：`EXTRA_CFLAGS=-DDIRECT_PHONE_PLAT xnuloader/build.sh`，产物是 `xnuloader/loader-phone.efi`。
-- loader 镜像：`xnuloader/mkpayload.py` 封装载荷，`mkxnuimg.py` 把 BootShim、UEFI、载荷和设备树装成 Android boot 镜像。UEFI 源码在 [hackios-mu-silicium](https://github.com/iola1999/hackios-mu-silicium) 的 `k90-port`，克隆到 `Mu-Silicium/`。完整步骤见顶层 [annibale UEFI 与 loader 镜像构建](https://github.com/iola1999/hackios-redmi-k90-annibale/blob/main/docs/analysis/annibale-uefi-build.md)。
+- loader 镜像：`xnuloader/mkpayload.py` 封装载荷，`mkxnuimg.py` 把 BootShim、UEFI、载荷和设备树装配成 Android boot 镜像。UEFI 源码在 [hackios-mu-silicium](https://github.com/iola1999/hackios-mu-silicium) 的 `k90-port`，克隆到 `Mu-Silicium/`。完整步骤见顶层 [annibale UEFI 与 loader 镜像构建](https://github.com/iola1999/hackios-redmi-k90-annibale/blob/main/docs/analysis/annibale-uefi-build.md)。
 - 系统盘、Mesa 与打包上机：见顶层 [README](https://github.com/iola1999/hackios-redmi-k90-annibale/blob/main/README.md)。
 
 ## 2. 目录
 
 | 路径 | 内容 |
 |---|---|
-| `xnu26/` | 12377 内核：`patches/`（对上游文件的改动，`series` 定顺序）、`files/`（12377 专用的新文件）、构建脚本 |
+| `xnu26/` | 12377 内核：`patches/`（对上游文件的改动，由 `series` 指定顺序）、`files/`（12377 专用的新文件）、构建脚本 |
 | `xnu/files/` | 内核驱动与子系统新文件。K90 的驱动在 `bsd/dev/`：Adreno 830（`adreno8*.c`）、按键、电量、调频、触摸、WCN7850 的 MHI 上电等 |
 | `xnuloader/` | 驻留 loader（UEFI 应用）：USB 传输、看门狗、接收内核日志；`mkpayload.py` 封装载荷 |
 | `mkxnuimg.py` | 装配 loader 镜像 |
 | `uefi/` | Mu-Silicium 的覆盖文件，见 [uefi/README.md](uefi/README.md) |
 | `wifi/lx/` | ath12k 在本内核上编译所需的 LinuxKPI 层 |
 | `tools/userland-driver/` | iOS 26 的 Metal 驱动，由顶层 `tools/k90auto/package.py` 与用户态 `userland/build.sh` 编译 |
-| `tools/` | 主机工具与测试：`mk-fw-wifi.py`（从 modem 分区取 Wi-Fi 固件）、`mk-ath12k.sh`、`reseal-loader-img.py`、`test-*.py` |
+| `tools/` | 主机工具与测试：`mk-fw-wifi.py`（从 modem 分区提取 Wi-Fi 固件）、`mk-ath12k.sh`、`reseal-loader-img.py`、`test-*.py` |
 | `common/` | 设备配置 `devices/annibale.conf` 与构建辅助脚本 |
 | `docs/` | 上游的移植指南 [PORTING.md](docs/PORTING.md) 与 [checks.md](docs/checks.md)（英文） |
 

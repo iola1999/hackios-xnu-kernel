@@ -12,4 +12,4 @@ annibale 的 UEFI 源码在公开仓库 [iola1999/hackios-mu-silicium](https://g
 
 历史 loader v6～v16 镜像里的 FD 构建于这份副本之前（Mu 仓库标签 `loader-v16`），不含这个保留区间。`loader-v17` 已包含该区间，版本差异见[构建记录 §4](https://github.com/iola1999/hackios-redmi-k90-annibale/blob/main/docs/analysis/annibale-uefi-build.md#4-v17-的改动与真机验证)；设备当前镜像需按实际产物核对。
 
-XnuLoader.c/h 继续走 `uefi/files/` 的既有 overlay，Mu 与 kernel 两份的字节一致性由 [tools/tests/test-xnu-payload-terminal.py](../../tools/tests/test-xnu-payload-terminal.py) 检查；本副本与 Mu 文件的字节一致性、保留区间与 DTB 静态范围的契约由 [tools/tests/test-annibale-payload-contract.py](../../tools/tests/test-annibale-payload-contract.py) 检查。
+XnuLoader.c/h 继续使用 `uefi/files/` 中的既有 overlay，Mu 与 kernel 两份的字节一致性由 [tools/tests/test-xnu-payload-terminal.py](../../tools/tests/test-xnu-payload-terminal.py) 检查；本副本与 Mu 文件的字节一致性、保留区间与 DTB 静态范围的契约由 [tools/tests/test-annibale-payload-contract.py](../../tools/tests/test-annibale-payload-contract.py) 检查。
