@@ -24,33 +24,50 @@ ramfs_clone_contents(struct ramfs_mount *rm, struct ramfs_node *src, struct ramf
 				return error;
 			}
 			for (uint64_t i = 0; i < src->rn_nslots; i++) {
-				if (src->rn_pages != NULL && src->rn_pages[i] == NULL &&
-				    src->rn_blocks != NULL && src->rn_blocks[i] != 0) {
-					ramfs_disk_fault_page(src, i);
+				const void *from = src->rn_pages != NULL ? src->rn_pages[i] : NULL;
+				void *new_page;
+
+				/*
+				 * An evicted page is read from its block, as ramfs_fetch does. ramfs_disk_fault_page
+				 * refuses at half of rm_max_pages, and a page skipped here clones as a hole: a large
+				 * bundle cloned by NSFileManager read back as zeros past that point.
+				 */
+				if (from == NULL && src->rn_blocks != NULL && src->rn_blocks[i] != 0) {
+					if (rm->rm_io_page == NULL) {
+						return EIO;
+					}
+					error = ramfs_disk_read_block(rm, src->rn_blocks[i], rm->rm_io_page);
+					if (error != 0) {
+						return error;
+					}
+					from = rm->rm_io_page;
 				}
-				if (src->rn_pages != NULL && src->rn_pages[i] != NULL) {
-					void *new_page = ramfs_page_alloc(false);
-					if (new_page == NULL) {
+				if (from == NULL) {
+					continue;
+				}
+				new_page = ramfs_page_alloc(false);
+				if (new_page == NULL) {
+					return ENOSPC;
+				}
+				memcpy(new_page, from, PAGE_SIZE);
+				node->rn_pages[i] = new_page;
+				node->rn_nalloc++;
+				rm->rm_pages++;
+				os_atomic_inc(&ramfs_pages_in_use, relaxed);
+
+				if (rm->rm_disk_backed) {
+					uint32_t dblk = ramfs_disk_bmap_alloc(rm);
+					if (dblk == 0) {
 						return ENOSPC;
 					}
-					memcpy(new_page, src->rn_pages[i], PAGE_SIZE);
-					node->rn_pages[i] = new_page;
-					node->rn_nalloc++;
-					rm->rm_pages++;
-					os_atomic_inc(&ramfs_pages_in_use, relaxed);
-
-					if (rm->rm_disk_backed) {
-						uint32_t dblk = ramfs_disk_bmap_alloc(rm);
-						if (dblk == 0) {
-							return ENOSPC;
-						}
-						node->rn_blocks[i] = dblk;
-						os_atomic_inc(&ramfs_var_used_pages, relaxed);
-						error = ramfs_disk_write_block(rm, dblk, new_page);
-						if (error != 0) {
-							return error;
-						}
+					node->rn_blocks[i] = dblk;
+					os_atomic_inc(&ramfs_var_used_pages, relaxed);
+					error = ramfs_disk_write_block(rm, dblk, new_page);
+					if (error != 0) {
+						return error;
 					}
+					/* same resident-page limit as ramfs_store_write_locked */
+					ramfs_disk_evict_page_locked(rm, node, i, new_page);
 				}
 			}
 		}
