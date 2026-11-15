@@ -515,6 +515,16 @@ ann_surface_plane(void *iosurface, unsigned long plane, const struct ann_texture
 		}
 		bpp = plane == 0 ? 1 : 2;
 		view_bpp = want->pixel_format == 80 ? 4 : bpp;
+	} else if (fourcc == '_RB4' && planes == 2) {
+		/* RGB8_444_2P: plane 0 is G (R8), plane 1 is B, R (RG8), both full size. */
+		unsigned pixel_format = plane == 0 ? 10 : 30;
+		if (want->pixel_format != pixel_format) {
+			ann_say(why, why_size, "_RB4 plane %lu requires Metal format %u; requested %u",
+			    plane, pixel_format, want->pixel_format);
+			return -1;
+		}
+		bpp = plane == 0 ? 1 : 2;
+		view_bpp = bpp;
 	} else if ((fourcc == 'x420' || fourcc == 'xf20' || fourcc == 'x422' || fourcc == 'xf22') && planes == 2) {
 		unsigned pixel_format = plane == 0 ? 20 : 60;
 		if (want->pixel_format != pixel_format && !(plane == 0 && want->pixel_format == 60)) {

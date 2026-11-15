@@ -118,6 +118,7 @@ static struct {
 #define rw_keep_air(...) ((void)0)
 #define rw_blend_result(...) ((void)0)
 #define rw_combined_yuv(...) nil
+#define rw_combined_rgb2p(...) nil
 #define rw_surface_through_copy(...) nil
 @interface AnnibaleMetalDevice : NSObject { @public struct rwa_device *_mesa; }
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d;

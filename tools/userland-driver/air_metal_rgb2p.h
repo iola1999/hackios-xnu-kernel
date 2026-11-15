@@ -9,7 +9,8 @@
 struct rwa_texture;
 
 /* Retains the R8/RG8 or R16/RG16 planes. Formats 540/543 use 4:2:0;
- * 544 uses 4:2:2. Sampling returns {Cr,Y,Cb,1} without a colour matrix.
+ * 544 uses 4:2:2 and 542 uses 4:4:4. Sampling returns {Cr,Y,Cb,1} without a
+ * colour matrix: plane 0 holds G and plane 1 holds B, R.
  * Usage is Metal ShaderRead/RenderTarget/PixelFormatView, or Unknown (0).
  * RenderTarget requires both planes to support GPU image stores. */
 struct rwa_texture *rwa_texture_combine_rgb2p(struct rwa_texture *y,

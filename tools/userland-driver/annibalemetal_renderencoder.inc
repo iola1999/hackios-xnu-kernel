@@ -281,7 +281,7 @@ rw_bind_slot(id *slots, unsigned *count, id object, NSUInteger index)
 	if (_rgb2pBegun == begin) return;
 	for (unsigned i = 0; i < _colorCount; i++) {
 		NSUInteger format = [_color[i] pixelFormat];
-		if (format != 540 && format != 543 && format != 544) continue;
+		if (format != 540 && format != 542 && format != 543 && format != 544) continue;
 		BOOL duplicate = NO;
 		for (unsigned j = 0; j < i; j++) duplicate |= _color[j] == _color[i];
 		if (duplicate) continue;

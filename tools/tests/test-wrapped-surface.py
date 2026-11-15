@@ -84,6 +84,7 @@ static void texture_destroy(struct rwa_texture *t) {
 }
 static struct { void (*texture_destroy)(struct rwa_texture *); } mesa={texture_destroy};
 #define rw_combined_yuv(...) nil
+#define rw_combined_rgb2p(...) nil
 @interface AnnibaleMetalDevice:NSObject { @public struct rwa_device *_mesa; }
 - (id)newBufferWithBytesNoCopy:(void *)bytes length:(NSUInteger)n options:(NSUInteger)o deallocator:(void(^)(void *,NSUInteger))block;
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(void *)s plane:(NSUInteger)p;

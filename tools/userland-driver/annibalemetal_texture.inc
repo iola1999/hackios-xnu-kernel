@@ -712,7 +712,8 @@ rw_surface_through_copy(AnnibaleMetalDevice *device, MTLTextureDescriptor *d, vo
 	shape.usage = (unsigned)[d usage];
 	if (shape.pixel_format == 500 || shape.pixel_format == 505)
 		return rw_combined_yuv(self, d, s, p, &shape);
-	if (shape.pixel_format == 540 || shape.pixel_format == 543 || shape.pixel_format == 544)
+	if (shape.pixel_format == 540 || shape.pixel_format == 542 || shape.pixel_format == 543 ||
+	    shape.pixel_format == 544)
 		return rw_combined_rgb2p(self, d, s, p, &shape);
 	if (ann_surface_plane(s, p, (const struct ann_texture_shape *)&shape, &took,
 	    &allocation_base, why, sizeof(why)) != 0) {

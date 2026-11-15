@@ -90,9 +90,15 @@ rw_console_init(void)
 	struct stat out, null;
 	FILE *said;
 
-	if (fstat(STDOUT_FILENO, &out) == 0 && stat("/dev/null", &null) == 0 && S_ISCHR(out.st_mode) &&
+	if (stat("/dev/null", &null) != 0)
+		return;
+	if (fstat(STDOUT_FILENO, &out) == 0 && S_ISCHR(out.st_mode) &&
 	    out.st_rdev == null.st_rdev && (said = funopen(NULL, NULL, rw_say_write, NULL, NULL)) != NULL) {
 		setvbuf(said, NULL, _IOLBF, 0);
 		rw_console = said;
 	}
+	/* Mesa logs to stderr, including the annotated shader ir3_context_error prints before it
+	 * aborts the process; in an extension that is /dev/null as well. */
+	if (fstat(STDERR_FILENO, &out) == 0 && S_ISCHR(out.st_mode) && out.st_rdev == null.st_rdev)
+		stderr = prefixed;
 }
