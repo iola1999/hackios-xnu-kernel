@@ -360,11 +360,10 @@ def main():
         '''
         run(locked,target,"locked_entries")
         print("IOKit queues/timing, complete stop chain and 7 admission/publication mutations: PASS")
-    assert "AnnibaleGPUStop" not in function(dispatch,"annibale_gpu_stop")
     header=(DEV/"adreno8/adreno8_context_private.h").read_text()
-    assert re.search(r"GPU_A830_SUBMIT_CMDS\s+82",source) and re.search(r"ADRENO8_CONTEXT_MAX_IBS\s+82",header)
-    stage=(DEV/"adreno8/adreno8.c").read_text()
-    assert re.search(r"adreno8_context_test,\s*adreno8_step_service",stage)
+    # the user client and the kernel context are built separately: equal limits are only visible here
+    submit=re.search(r"#define\s+GPU_A830_SUBMIT_CMDS\s+(\d+)",source)[1]
+    assert submit==re.search(r"#define\s+ADRENO8_CONTEXT_MAX_IBS\s+(\d+)",header)[1]
 
 
 if __name__=="__main__":

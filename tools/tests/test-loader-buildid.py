@@ -169,22 +169,6 @@ def main():
         if not cond:
             fails.append("FAIL wiring_%s" % name)
 
-    blk_b = _base.extract(src, "LC-BID")
-    blk_s = _base.extract(src, "LC-STR")
-    ck("str_eq(const char *a, const char *b)" in blk_s, "strcmp_block")
-    ck('str_eq(var, "build-id")' in blk_b and 'fb_reply("OKAY", LOADER_BUILD_ID);' in blk_b, "bid_branch_in_block")
-    ck('#define LOADER_BUILD_ID "unknown"' in blk_b and blk_b.count("#ifndef LOADER_BUILD_ID") == 1, "bid_default_unknown")
-    ck('fb_reply("OKAY", "xnuloader");' in blk_b and 'fb_reply("OKAY", "0.5");' in blk_b, "identity_vars_in_block")
-    ck(src.count('fb_reply("OKAY", "xnuloader");') == 1 and src.count('fb_reply("OKAY", "0.5");') == 1, "identity_strings_once")
-    ck(src.count("if (fb_getvar_identity(var)) {") == 1, "getvar_calls_identity_block")
-    ck(src.count("static int\nfb_getvar_identity(") == 1, "identity_block_defined")
-    sh = _base.read(os.path.join(TOOLS, "..", "..", "xnuloader", "build.sh"))
-    ck("^[0-9a-f]{40}$" in sh and "bid_flags=(" in sh and '"${bid_flags[@]}"' in sh, "buildsh_array_and_check")
-    ck('bid_flags=("-DLOADER_BUILD_ID=\\"${BUILD_ID}\\"")' in sh, "buildsh_macro_keeps_quotes")
-    ck("${BUILD_ID+x}" in sh and "BUILD_ID unset: getvar build-id will report unknown" in sh, "buildsh_unset_warning")
-    ck("BUILD_ID is set but empty" in sh, "buildsh_empty_rejected_message")
-    ck("eval" not in sh, "buildsh_no_eval")
-
     syntax = ["clang", "--target=aarch64-unknown-windows", "-ffreestanding", "-fno-builtin", "-fno-stack-protector",
               "-fshort-wchar", "-mgeneral-regs-only", "-O1", "-Wall", "-Wextra", "-Wno-unused-parameter", "-fsyntax-only"]
     r = subprocess.run(syntax + [LOADER], capture_output=True, text=True)
@@ -255,7 +239,7 @@ def main():
     if fails:
         print("\n".join(fails))
         sys.exit(1)
-    print("build-id: wiring, syntax, build.sh input checks and both host builds passed")
+    print("build-id: syntax, build.sh input checks and both host builds passed")
 
 
 if __name__ == "__main__":

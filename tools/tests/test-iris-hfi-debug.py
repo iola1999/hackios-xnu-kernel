@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import struct
 import subprocess
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 HFI = Path('xnu/files/bsd/dev/annibale/annibale_iris_hfi.c')
@@ -99,9 +100,17 @@ def run_cases(binary, directory, selected):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--output-dir', type=Path, required=True)
+    ap.add_argument('--output-dir', type=Path, help='keep the harnesses and validation.json here; default is a temporary directory')
     ap.add_argument('--baseline-ref', help='Optional Git revision whose diagnostics must fail the baseline cases')
-    args = ap.parse_args(); out = args.output_dir.resolve(); out.mkdir(parents=True, exist_ok=True)
+    args = ap.parse_args()
+    if args.output_dir is None:
+        with tempfile.TemporaryDirectory(prefix='iris-hfi-debug-') as directory:
+            return validate(args, Path(directory))
+    out = args.output_dir.resolve(); out.mkdir(parents=True, exist_ok=True)
+    return validate(args, out)
+
+
+def validate(args, out):
     source = (ROOT / HFI).read_text(); selected = cases()
     binary = compile_harness(out / 'candidate', source)
     results = run_cases(binary, out / 'candidate', selected)

@@ -247,7 +247,8 @@ class IntentTests(unittest.TestCase):
     def test_production_receive_and_ownership(self):
         constants = '\n'.join(line for line in SOURCE.splitlines() if re.match(
             r'#define (?:GLINK_|GPR_|IPCC_|ITEM_GLINK_THEIR_Q|APM_CMD_|OP_)\w*\s+(?:0x[\da-fA-F]+|\d+)u?$', line))
-        pool = '\n'.join(re.findall(r'struct glink_(?:remote_intent|intent_pool) \{.*?\n\};', SOURCE, re.S))
+        pool = '\n'.join(re.findall(r'struct glink_(?:remote_intent|intent_pool|reasm) \{.*?\n\};', SOURCE, re.S))
+        pool += '\n' + re.search(r'^static struct glink_reasm glink_rx_reasm\[\d+\];$', SOURCE, re.M)[0]
         source = HEADER.replace('static uint8_t smem', constants + '\n' + pool +
             '\nstatic struct glink_intent_pool glink_gpr_intents,glink_pmic_intents;\nstatic uint8_t smem')
         source += 'static void glink_poll_rx(void);\n'

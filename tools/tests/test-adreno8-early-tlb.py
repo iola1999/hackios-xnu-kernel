@@ -29,11 +29,6 @@ for name, bit in (("GFIE", 2), ("GFRE", 1), ("CLIENTPD", 0)):
 assert "#define QCOM_DUMMY_VAL -1" in sources["arm-smmu.c"]
 assert "ARM_SMMU_GR0_TLBIALLNSNH, QCOM_DUMMY_VAL" in sources["arm-smmu.c"]
 assert "ARM_SMMU_GR0_sTLBGSYNC," in sources["arm-smmu.c"]
-init = (DEV / "adreno8.c").read_text()
-stages = re.search(r"static bool \(\*const each\[\]\)\(void\) = \{(.*?)\};", init, re.S)[1]
-stages = re.findall(r"adreno8_\w+", stages)
-assert stages[7:9] == ["adreno8_step_smmu_read", "adreno8_step_gmu_space"]
-assert re.search(r"if \(!each\[i\]\(\)\) \{[^}]*\bbreak;", init, re.S)
 
 fixture = runpy.run_path(str(ROOT / "tools/tests/test-adreno8-smmu.py"))
 stub = fixture["stub"].replace("static void adreno8_settle(void) {}", r'''

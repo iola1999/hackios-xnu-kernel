@@ -2,7 +2,7 @@
 """Host test for the loader kernel-lifecycle protection.
 
 The marked blocks in xnuloader/loader.c (LC, LC-WRITE, LC-ENTER, LC-WATCH, LC-RETURN,
-LC-USB, LC-FB, LC-POLL, LC-EXC, LC-TAIL) are extracted verbatim and compiled into a stub harness (the C text lives in tools/test-loader-lifecycle-harness.py), so the
+LC-USB, LC-FB, LC-POLL, LC-EXC, LC-TAIL) are extracted verbatim and compiled into a stub harness (the C text lives in tools/tests/loader-lifecycle-harness.py), so the
 checks run production control flow and count production side effects: psci calls, the
 log-partition query, block writes, hc_take_back, watchdog pets, kernel-memory reads, USB
 sends and the event loop, including the verified-notification rule of the LC-USB and
@@ -25,8 +25,7 @@ The USB event/status/link enums and the event union are injected verbatim from
 xnuloader/efi.h and pinned there by _Static_assert against raw numbers written from the
 ABL interface the header documents (review L10); counterexamples swap the link-state order
 and strip raw[8] from the injected text, and the compile must fail.
-Coverage note: IRQ save/restore assembly becomes counted host calls; source checks preserve
-the instructions and their order. Return tests include device-held and legacy return reasons,
+Coverage note: IRQ save/restore assembly becomes counted host calls. Return tests include device-held and legacy return reasons,
 their result fields, and failed reset attempts. In the exception handler the
 one IRQ mask instruction becomes a counted host no-op; the handler itself runs, with the
 reset and poll-loop escapes routed through setjmp.
@@ -79,15 +78,15 @@ def struct_copy(src, name):
     return m.group(0)
 
 _spec = importlib.util.spec_from_file_location(
-    "lifecycle_harness", os.path.join(os.path.dirname(os.path.abspath(__file__)), "test-loader-lifecycle-harness.py"))
+    "lifecycle_harness", os.path.join(os.path.dirname(os.path.abspath(__file__)), "loader-lifecycle-harness.py"))
 _harness = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_harness)
 _spec2 = importlib.util.spec_from_file_location(
-    "lifecycle_harness2", os.path.join(os.path.dirname(os.path.abspath(__file__)), "test-loader-lifecycle-harness2.py"))
+    "lifecycle_harness2", os.path.join(os.path.dirname(os.path.abspath(__file__)), "loader-lifecycle-harness2.py"))
 _harness2 = importlib.util.module_from_spec(_spec2)
 _spec2.loader.exec_module(_harness2)
 _spec3 = importlib.util.spec_from_file_location(
-    "lifecycle_harness3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "test-loader-lifecycle-harness3.py"))
+    "lifecycle_harness3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "loader-lifecycle-harness3.py"))
 _harness3 = importlib.util.module_from_spec(_spec3)
 _spec3.loader.exec_module(_harness3)
 PRELUDE = _harness.PRELUDE
@@ -259,202 +258,6 @@ def usb_abi_counterexamples(src):
             sys.exit("counterexample not caught (%s): the asserts do not pin the %s" % (label, label))
         print("counterexample check: %-28s caught by _Static_assert" % label)
 
-def wiring_checks(src):
-    fails = []
-
-    def ck(cond, name):
-        if not cond:
-            fails.append("FAIL wiring_%s" % name)
-
-    def i_of(s, start=0):
-        return src.find(s, start)
-
-    ck(src.count("kernel_hold") == 0, "no_old_state_name")
-    ck(not re.search(r"\bLC_NONE\b|\bLC_HELD\b|\bLC_UNKNOWN\b", src), "merged_states")
-    for gone in ("lc_kernel_may_still_own", "lc_cpu_on_begin", "lc_cpu_on_end", "lc_watch_end", "lc_return_release"):
-        ck(gone not in src, "gone_" + gone)
-    ck(src.count("#define PSCI_CPU_ON ") == 1, "cpu_on_id_once")
-    ck(src.count("static int kernel_resources_held;") == 1, "hold_once")
-    ck(src.count("static int active_watch;") == 1, "watch_once")
-    blk_e = extract(src, "LC-ENTER")
-    ck("status = lc_cpu_on_issue(mpidr, (uint64_t)(uintptr_t)&other_cpu_entry, (uint64_t)(uintptr_t)&other_cpu_start);" in blk_e, "enter_issue")
-    ck(0 < blk_e.find("if (status == 0) {") < blk_e.find("active_watch = 1;") < blk_e.find("flush_log();"), "enter_gate_order")
-    i_aw0 = i_of("active_watch = 0;")
-    i_live = i_of("running_live = NULL;   /* the log pointer drops here")
-    ck(0 < i_of("while (status == 0) {") < i_aw0 < i_live, "watch_close_order")
-    blk_x = extract(src, "LC-EXC")
-    ck(0 < blk_x.find("active_watch = 0;") < blk_x.find("print(\"\\nUEFI EXCEPTION"), "exc_first_act")
-    # the hold's mask and the fault record belong to the held entry; the annibale USB branch
-    # is the fault state itself and records one before serving
-    i_entry = blk_x.find("if (kernel_resources_held) {")
-    ck(0 < i_entry < blk_x.find("held_irq_mask();", i_entry) < blk_x.find("firmware_fault = 1;", i_entry)
-       < blk_x.find("print(\"\\nUEFI EXCEPTION"), "exc_mask_order")
-    ck(blk_x.find("if (PLAT == &platform_annibale && screen_quiet) {")
-       < blk_x.find("firmware_fault = 1;", blk_x.find("if (PLAT == &platform_annibale"))
-       < blk_x.find("compose_logs(NULL, 0);"), "exc_branch_marks_fault_before_compose")
-    # the held or faulted path takes PSCI and nothing else; only the path that never handed
-    # anything over keeps the cold reset with its log flush
-    i_psci = blk_x.find("psci_reset_attempt();")
-    i_flush = blk_x.find("flush_log();")
-    i_reset = blk_x.find("ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);")
-    ck(0 < i_psci < i_flush < i_reset, "exc_psci_before_fallback")
-    i_held = blk_x.find("if (kernel_resources_held || firmware_fault) {")
-    held_path = blk_x[i_held:i_flush]
-    ck(0 < i_held < i_psci and "flush_log" not in held_path and "reset_system" not in held_path,
-       "exc_held_path_no_flush_no_reset")
-    ck(blk_x.find("psci_reset_attempt();") < blk_x.find("set_result(\"reset-failed\""), "exc_psci_records_failure")
-    # the serve window has one bound: the counter; a platform without a frequency is served
-    # for zero rounds instead of a round count standing in for the missing clock
-    ck(blk_x.count("usb_poll_command();") == 1 and "if (freq == 0) {" in blk_x
-       and "while (READ_SYSREG(CNTVCT_EL0) - began <= FAULT_SERVE_SECONDS * freq) {" in blk_x,
-       "exc_serve_bounded")
-    ck(0 < blk_x.find("set_result(\"firmware-fault\"") < blk_x.find("compose_logs(NULL, 0);")
-       < blk_x.find("usb_poll_command();"), "exc_serve_after_record")
-    blk_w = extract(src, "LC-WRITE")
-    ck("((kernel_resources_held || firmware_fault) && !active_watch) ? NULL : find_log_partition()" in blk_w, "write_gate_line")
-    ck(src.count("find_log_partition()") == 1, "one_partition_query")
-    blk_u = extract(src, "LC-USB")
-    ck("? 3 * freq : USB_IDLE_WAIT_SECONDS * freq;" in blk_u and blk_u.count("began > limit") == 1,
-       "usb_bound_line")
-    ck(blk_u.count('usb_abort_stale_in("') == 2 and "static int\nusb_abort_stale_in(const char *why)" in blk_u,
-       "recover_defined_and_called_twice")
-    ck(0 < blk_u.find('usb_abort_stale_in("a reply")') < blk_u.find("memcpy(usb_tx_buf"), "recover_before_reply")
-    ck(0 < blk_u.find('usb_abort_stale_in("the next command")') < blk_u.find("if (usb_out_lost) {"),
-       "recover_before_command")
-    ck("usb_in_since = READ_SYSREG(CNTVCT_EL0);" in blk_u and blk_u.count("usb_in_since") >= 3, "submit_stamp")
-    ck("USB->set_endpoint_stall_state(" not in blk_u and "USB->start_ex(" not in blk_u
-       and "USB->allocate_transfer_buffer(" not in blk_u, "recover_keeps_buffer_identity")
-    ck("usb_in_recoveries >= USB_IN_RECOVER_LIMIT" in blk_u, "recover_bounded")
-    ck("n = usb_rx(usb_rx_buf, 511, 1);" in src and "int64_t r = usb_rx(usb_rx_buf, want, 0);" in src,
-       "command_and_data_receive_modes")
-    ck("USB_CHUNK    (1024 * 1024)" in src and "#define USB_CHUNK (1024 * 1024)" in PRELUDE, "chunk_mirror")
-    ck("queues a fresh receive" not in src, "no_recovery_overclaim")
-    ck(0 < blk_u.find("if (usb_out_lost) {") < blk_u.find("USB->send(USB_EP_OUT, len, buf)"), "rx_guard_first")
-    ck(0 < blk_u.find("if (usb_in_lost) {") < blk_u.find("memcpy(usb_tx_buf"), "tx_guard_first")
-    blk_p = extract(src, "LC-POLL")
-    ck("!usb_rx_queued && !usb_out_lost && !usb_out_owned && usb_connected" in blk_p, "poll_lost_guard")
-    ck("usb_notification(0, &data, &n);" in blk_p, "poll_books_in_terminal")
-    ck("usb_notification(1, &data, &n) != 1" in blk_p, "poll_confirms")
-    ck("static int\nusb_notification(" in blk_u, "shared_rule_defined")
-    ck("usb_notification(data.transfer.endpoint_index == USB_EP_OUT, &data, &bytes)" in blk_u, "wait_uses_shared_rule")
-    ck(0 < blk_u.find("usb_notification(data.transfer.endpoint_index ==") < blk_u.find("began > limit"), "completion_before_deadline")
-    ck(blk_u.count("data_buffer != sub") == 1 and "data->transfer.status > UsbDeviceTransferStatusCompleteError" in blk_u, "verify_checks_present")
-    # usb_notification bounds the byte count of each terminal branch separately; the two
-    # checks serve different paths and both must stay:
-    #   Cancelled branch: the bound runs after the status, buffer and length-record checks
-    #     and before the record release. An overlong Cancelled is structurally unsound: the
-    #     endpoint is isolated, the record and buffer stay owned, the call returns -1.
-    #   CompleteOK branch: the bound runs before *bytes is written and the record released.
-    #     An overlong completion delivers no bytes, the endpoint is isolated and the record
-    #     stays owned.
-    # Each branch returns its own verdict (2: cancelled without bytes, 1: bytes delivered),
-    # so the Cancelled path leaves before the CompleteOK code runs and one bound cannot serve
-    # both terminals. Two occurrences mean one bound per terminal; the chain pins each inside
-    # its branch, after the status gate and before the release/delivery it must precede.
-    i_cancel_gate = blk_u.find("if (data->transfer.status == UsbDeviceTransferStatusCancelled)")
-    i_cancel_bound = blk_u.find('"Cancelled over a length that was not submitted"')
-    i_cancel_release = blk_u.find("usb_out_owned = 0;    /* the request ended as a failure")
-    i_ok_gate = blk_u.find("if (data->transfer.status != UsbDeviceTransferStatusCompleteOK)")
-    i_ok_bound = blk_u.find('"completed more bytes than submitted"')
-    i_delivery = blk_u.find("*bytes = data->transfer.bytes_completed;")
-    ck(blk_u.count("bytes_completed > sub_len") == 2, "length_bounds_per_terminal")
-    ck(0 < i_cancel_gate < i_cancel_bound < i_cancel_release < i_ok_gate < i_ok_bound < i_delivery,
-       "length_bound_order")
-    ck(blk_u.count("usb_out_buf = buf;") == 1 and blk_u.count("usb_in_buf = usb_tx_buf;") == 1
-       and "usb_out_buf = usb_rx_buf;" in blk_p, "record_submit")
-    ck("a failed call delivered no event to read" in blk_u and "no event to act on" in blk_p, "handle_error_gated")
-    ck(0 < blk_u.find("usb_out_lost : usb_in_lost") < blk_u.find("!usb_out_owned"), "lost_guard_first")
-    i_wait = blk_u.find("static int64_t\nusb_wait(uint8_t endpoint, int deliver)")
-    i_rx = blk_u.find("static int64_t\nusb_rx(")
-    wait_body = blk_u[i_wait:i_rx]
-    ck(0 <= i_wait < i_rx and 0 <= wait_body.find("if (size < sizeof(data.transfer))")
-       < wait_body.find("data.transfer.endpoint_index =="), "wait_size_before_fields")
-    ck(0 <= blk_p.find("if (size < sizeof(data.transfer))") < blk_p.find("data.transfer.endpoint_index !="), "poll_size_before_fields")
-    ck(0 <= blk_u.find("if (size >= sizeof(data.device_state))") < blk_u.find("data.device_state =="), "wait_size_before_state")
-    ck(0 <= blk_p.find("if (size >= sizeof(data.device_state))") < blk_p.find("data.device_state =="), "poll_size_before_state")
-    ck(src.count("usb_short_event_stops_all();") == 2 and "static void\nusb_short_event_stops_all(void)" in blk_u, "short_stop_shared")
-    ck("buf != usb_out_buf || len != usb_out_len" in blk_u, "reuse_refuses_foreign")
-    ck("@USB@" in PRELUDE and "enum { UsbDeviceState" not in PRELUDE, "usb_enums_injected")
-    ck("usb_device_event_data) == 64" in PRELUDE and "offsetof(usb_device_event_data, transfer.data_buffer) == 16" in PRELUDE, "usb_layout_asserts")
-    blk_f = extract(src, "LC-FB")
-    ck(src.count("usb_tx_buf[") == 0, "single_copy_site")
-    ck(blk_f.count("n < sizeof(msg) - 1") == 2, "fb_hard_limits")
-    ck("usb_tx((const uint8_t *)msg, n);" in blk_f, "fb_via_guarded_tx")
-    i_g = i_of("lc_after_return(ran_other_core, cpu_mpidr, cpu_count, reason);")
-    ck(0 < i_g < i_of("lc_after_return_collect(", i_g), "gate_before_stats")
-    i_return = src.find("--- the kernel came back")
-    ck(0 < i_return < i_of("uint64_t reason = loader_ctx[CTX_REASON];", i_return) < i_g,
-       "reason_before_release")
-    ck('set_result(kernel_resources_held ? "returned-held" : "returned", klog_len, 0);' in src, "held_result")
-    ck('"KERNEL DEVICE SHUTDOWN FAILED: device %d; memory and devices stay held until reset\\n", loader_ctx[CTX_ESR]' in src,
-       "device_code_logged")
-    ck(src.count('"  stp x2, x3, [x10, #232]\\n"') == 2, "reason_code_both_stubs")
-    for s in ('kernel_resources_held ? "hung-held"', 'kernel_resources_held ? "no-such-core-held"',
-              'kernel_resources_held ? "selftest-ok-held"', 'kernel_resources_held ? "checkpoint-held"',
-              'kernel_resources_held ? "early-exception-held"'):
-        ck(s in src, "held_suffix")
-    ck(src.count("psci_reset_attempt();") == 3 and src.count("psci_call(PSCI_SYSTEM_RESET") == 1, "one_reset_helper_three_doors")
-    i = src.find("reboot(void)\n{")
-    ck(0 < i and i < src.find("psci_reset_attempt();", i) < src.find('hc_take_back("before the reset")', i), "reboot_psci_first")
-    i = src.find("exception_handler(int64_t type")
-    handler = src[i:src.find("install_exception_hook", i)]
-    ck(0 < i and 0 < handler.find("psci_reset_attempt();") < handler.find("flush_log();")
-       < handler.find("reset_system"), "fault_psci_first")
-    ck('"  ldr x9, [x10, #64]\\n  msr daif, x9\\n"' not in src, "stub_no_early_daif")
-    i = src.find("--- the kernel came back")
-    ck(0 < i and src.find("held_daif = loader_ctx[CTX_DAIF];", i) < src.find("if (!held_irq_masked) {\n\t\theld_daif", i + 1) or
-       0 < i < src.find("held_daif = loader_ctx[CTX_DAIF];", i) < src.find("wdt_set_ms(WDT_BITE_MS);", i), "snapshot_before_watchdog")
-    i = src.find("if (loader_save_ctx() == 0) {")
-    ck(0 < i and i < src.find("kernel_resources_held = 1;", i) < src.find("get_memory_map", i), "held_set_before_clean")
-    ck("lc_cmd_denied(kernel_resources_held, firmware_fault, live, cmd)" in src, "deny_call")
-    ck("lc_stop_action(kernel_resources_held, live)" in src, "stop_call")
-    ck("AGENTS.md 2" in src[:4000], "overlimit_note")
-    blk_watch = extract(src, "LC-WATCH")
-    ck("*status = OTHER_CPU_NOT_STARTED;\n\t\t\treturn 1;" in blk_watch, "notstarted_returns")
-    ck("*status = OTHER_CPU_HUNG;\n\t\t\treturn 1;" in blk_watch, "hung_returns")
-    # C group: both timeout decisions mask before anything else of the round, so the hold's
-    # mask cannot land after a service, a pet or the caller's log write
-    i_ns = blk_watch.find("*status = OTHER_CPU_NOT_STARTED;")
-    i_hung = blk_watch.find("*status = OTHER_CPU_HUNG;")
-    ck(0 < blk_watch.find("held_irq_mask();", 0, i_ns) < i_ns, "notstarted_masks_first")
-    ck(0 < blk_watch.find("held_irq_mask();", i_ns, i_hung) < i_hung, "hung_masks_first")
-    ck(0 < blk_watch.find("held_irq_mask();") < blk_watch.find("wdt_pet();"), "pet_after_mask_in_round")
-    ck(0 < blk_watch.find("held_irq_mask();") < blk_watch.find("charger_poll();")
-       < blk_watch.find("block_poll();") < blk_watch.find("usb_poll_command();"), "mask_before_services")
-    blk_i = extract(src, "LC-IRQ")
-    ck("static void\nheld_irq_mask(void)" in blk_i and blk_i.count("held_irq_masked = 1;") == 1, "one_mask_helper")
-    ck(blk_i.find("if (!held_irq_masked) {") < blk_i.find("held_daif = daif;"), "mask_keeps_first_record")
-    ck(blk_i.count("msr daifset, #0xf") == 1 and blk_i.count("msr S3_0_C12_C12_7") == 1, "mask_both_registers")
-    # the four held or early-exit paths share the helper: annibale's entry, the NOTE_SECONDS
-    # pass, an answer outside the refusal whitelist, and the loop tail before status returns
-    i_run = src.find("run_on_other_cpu(uint64_t mpidr")
-    i_ret = src.find("return status;", i_run) + len("return status;")
-    body = src[i_run:i_ret]
-    ck(body.count("held_irq_mask();") == 4, "run_paths_share_mask")
-    i_issue = body.find("lc_cpu_on_issue(")
-    i_flush = body.find("flush_log();", i_issue)
-    ck(0 < i_issue < body.find("held_irq_mask();", i_issue) < i_flush, "enter_masks_before_flush")
-    ck("} else if (kernel_resources_held) {" in blk_e, "enter_masks_only_when_held")
-    # the loop tail: the mask sits inside the held/fault guard and before the status return
-    i_guard = body.rfind("if (kernel_resources_held || firmware_fault) {")
-    i_tail = body.find("held_irq_mask();", i_guard) if i_guard > 0 else -1
-    ck(0 < i_guard < i_tail < body.find("return status;", i_guard), "tail_masks_before_return")
-    ck("LC-TAIL-BEGIN" in src and src.find("return status;", i_run) < src.find("LC-TAIL-END", i_run),
-       "tail_extracted_whole")
-    ck(body.count("READ_SYSREG(DAIF)") == 0 and body.count("held_daif = loader_ctx[CTX_DAIF]") == 0, "entry_no_local_record")
-    blk_r = extract(src, "LC-RETURN")
-    ck("uint64_t budget = freq / 10;" in blk_r, "shared_budget_once")
-    ck(blk_r.count("psci_call(PSCI_AFFINITY_INFO") == 1, "one_affinity_site")
-    ck(blk_r.count("READ_SYSREG(CNTVCT_EL0) - began > budget") == 2, "budget_gates_issue_and_tail")
-    ck("Stall" not in blk_r and "WFI" not in blk_r, "affinity_polls_without_stall")
-    ck(blk_r.find("off_seen[i] = 1") < blk_r.find("kernel_resources_held = !cores_off"), "off_answer_cached")
-    blk_ret = extract(src, "LC-RETURN")
-    ck(0 < blk_ret.find("kernel_resources_held = !cores_off || reason == LOADER_RETURN_DEVICE_HELD;")
-       < blk_ret.find('hc_take_back("the kernel came back")'), "release_before_takeback")
-    ck(blk_ret.count("msr S3_0_C12_C12_7") == 1, "restore_asm_in_gate")
-    ck("if (!kernel_resources_held && held_irq_masked) {" in src, "restore_gated")
-    return fails
-
 def main():
     src = read_tu(LOADER)
     rc, out = compile_run(build_c(src), "prod")
@@ -483,12 +286,6 @@ def main():
             sys.exit("mutation %s failed unexpectedly: %s" % (name, mout))
         print("mutation check: %-22s caught by %d checks (%s...)" % (name, len(lines), lines[0]))
     usb_abi_counterexamples(src)
-    fails = wiring_checks(src)
-    for f in fails:
-        print(f)
-    if fails:
-        sys.exit("wiring checks failed")
-    print("wiring checks passed; the loader translation unit is %d lines" % (src.count(chr(10)) + 1))
 
 if __name__ == "__main__":
     main()

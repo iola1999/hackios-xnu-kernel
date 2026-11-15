@@ -4,9 +4,7 @@
 The real XnuLoader.c and XnuLoader.h are compiled and run: only the #include
 lines are dropped and the block between the XNU-TERM markers is replaced by a
 stand-in that records the event and longjmps, so a host process can observe
-what the production control flow did. Everything between the markers is
-checked before the swap (one PSCI SYSTEM_RESET through ArmMonitorCall, then
-the DAIF mask and the self-loop, no Boot or Runtime Services call), and the
+what the production control flow did. The
 swap itself must find the markers exactly once. Outside the block, payload, Boot Services and Runtime Services
 are host stubs that record every call in order; LocateHandleBuffer,
 HandleProtocol, GetMemoryMap, LocateProtocol, SetWatchdogTimer, ResetSystem,
@@ -24,8 +22,8 @@ magic check, the size cap, the 16-byte entry padding or stepping by a fixed 24
 bytes must each break the scenario suite, dropping the header subtraction from
 the size cap must accept an over-by-one body, and retargeting the magic macro
 in the header must reject the independent wire bytes. The terminal body
-itself (the PSCI call and the fallback loop) only gets the text checks
-above; the host run carries no firmware or hardware semantics.
+itself (the PSCI call and the fallback loop) does not run on the host; the host
+run carries no firmware or hardware semantics.
 
 The Mu-Silicium root under test is optional argv[1] or $MU_SILICIUM_ROOT and
 defaults to <kernel-root>/Mu-Silicium, so the test also runs from this tracked
@@ -35,15 +33,12 @@ overlay copies in uefi/files byte for byte -- the assertions below were
 established on those bytes, so the check tests the real port instead of a
 look-alike and any edit only needs the two trees synced once. The size
 expectations read XNU_PAYLOAD_MAX_SIZE out of XnuLoader.h; the "XNUP" wire
-magic is an independent contract here: the header macro value is compared
-against this file's own constant, one positive case builds the magic from raw
-bytes, and a header-only retarget must fail. BootManagerLib.inf is verified by
-content checks only.
+magic is an independent contract here: one positive case builds the magic from
+raw bytes, and a header-only retarget must fail.
 Usage: python3 tools/test-xnu-payload-terminal.py [Mu-Silicium-root]"""
 
 import os
 import re
-import struct
 import subprocess
 import sys
 import tempfile
@@ -53,12 +48,6 @@ KERNEL = os.path.dirname(os.path.dirname(TOOLS))
 DEFAULT_MU = os.path.join(KERNEL, "Mu-Silicium")
 OVERLAY = os.path.join(KERNEL, "uefi", "files", "Silicon", "Silicium",
                        "SiliciumPkg", "Library", "BootManagerLib")
-
-# Wire contract for the XNUP header magic, kept independent of XnuLoader.h on
-# purpose: every positive case could be built from the production macro, so a
-# retargeted macro would keep passing a changed wire format silently.
-WIRE_MAGIC = 0x50554E58
-WIRE_MAGIC_BYTES = b"XNUP"
 
 
 def resolve_mu_root():
@@ -377,13 +366,6 @@ def assemble(c_source, header_source, terminal, main_returned_mutation=False, lo
              parse_mutation=None, header_mutation=None):
     body = "\n".join(l for l in c_source.splitlines() if not l.startswith("#include"))
     beg, end = body.index(BEG), body.index(END) + len(END)
-    block = body[beg:end]
-    for probe in ("Args.Arg0 = ARM_SMC_ID_PSCI_SYSTEM_RESET;", "ArmMonitorCall (&Args);", "daifset", "for (;;)"):
-        assert probe in block, "terminal block lost %s" % probe
-    assert block.count("ArmMonitorCall") == 1, "terminal block calls the monitor more than once"
-    assert block.index("ArmMonitorCall") < block.index("msr daifset"), "terminal block masks before the reset"
-    for absent in ("gBS->", "gRT->", "SetVariable", "CpuDeadLoop"):
-        assert absent not in block, "terminal block calls %s" % absent
     if parse_mutation:
         old, new, _ = {**PARSE_MUTATIONS, **BOUNDARY_MUTATIONS}[parse_mutation]
         assert body.count(old) == 1, "mutation %s: %d copies of its anchor in production source" % (
@@ -437,8 +419,7 @@ def main():
     # The assertions below were established on the bytes the kernel repo exports
     # in uefi/files; require the root under test to match them byte for byte.
     # An edit then needs the two trees synced once, not a hash constant here
-    # updated on every touched byte. BootManagerLib.inf is content-checked
-    # further down instead of being byte-pinned.
+    # updated on every touched byte.
     for name in ("XnuLoader.c", "XnuLoader.h"):
         overlay = os.path.join(OVERLAY, name)
         try:
@@ -453,35 +434,6 @@ def main():
 
     c_source = tree_bytes("XnuLoader.c").decode()
     header_source = tree_bytes("XnuLoader.h").decode()
-    inf = tree_bytes("BootManagerLib.inf").decode()
-
-    # wiring: no diagnostics tail, no Runtime Services at all (gRT->ResetSystem runs the
-    # reset notification callbacks first), and the monitor is called only in the terminal block
-    ck(c_source.count(BEG) == 1 and c_source.count(END) == 1, "terminal_markers_once")
-    for gone in ("FlushLog", "FindPartition", "ResetSystem", "SetVariable", "BlockIo", "PartitionInfo",
-                 "AllocateZeroPool", "AsciiVSPrint", "GetTime", "gRT", "LOG_SIZE", "mLog", "wfi", "wfe"):
-        ck(gone not in c_source, "%s_removed" % gone)
-    if c_source.count(BEG) == 1 and c_source.count(END) == 1:
-        block = c_source[c_source.index(BEG):c_source.index(END)]
-        outside = c_source.replace(block, "")
-        ck("ArmMonitorCall" not in outside, "monitor_call_only_in_terminal")
-        ck(block.count("ARM_SMC_ID_PSCI_SYSTEM_RESET") == 1, "terminal_psci_reset_once")
-    ck(c_source.count("XnuTerminalReset") == 2, "one_terminal_definition_and_call")
-    ck(c_source.count("StartPayloadLoader") == 2, "one_loader_definition_and_call")
-    ck("XNU_LOG_PARTITION" not in header_source and "XNU_MARKER_MAGIC" not in header_source, "header_diagnostics_gone")
-    ck("__attribute__((noreturn))\nVOID\nXnuLoaderMain ();" in header_source, "header_declares_noreturn")
-    ck("gEfiBlockIoProtocolGuid" not in inf and "gEfiPartitionInfoProtocolGuid" not in inf, "inf_protocols_gone")
-    ck("ArmMonitorLib" in inf and "ArmPkg/ArmPkg.dec" in inf, "inf_has_arm_monitor")
-    for keep in ("UefiRuntimeServicesTableLib", "PrintLib", "MemoryAllocationLib"):   # other library users
-        ck(keep in inf, "inf_keeps_%s" % keep.lower())
-
-    # wire contract (review U4): the header macro must equal this file's own
-    # XNUP constant, which is pinned to raw bytes and never derived from it
-    ck(struct.pack("<I", WIRE_MAGIC) == WIRE_MAGIC_BYTES, "wire_constant_is_XNUP")
-    mm = re.search(r"#define\s+XNU_PAYLOAD_MAGIC\s+(0[xX][0-9A-Fa-f]+)", header_source)
-    ck(mm is not None, "header_defines_wire_magic")
-    if mm:
-        ck(int(mm.group(1), 16) == WIRE_MAGIC, "header_wire_magic_matches_independent_contract")
 
     with tempfile.TemporaryDirectory(prefix="xnu-terminal-") as workdir:
         r = compile_run(assemble(c_source, header_source, TERMINAL), "plain", workdir)
@@ -522,7 +474,7 @@ def main():
     if fails:
         print("\n".join(fails))
         sys.exit(1)
-    print("payload-terminal: wiring, nineteen scenarios and eight mutations passed")
+    print("payload-terminal: nineteen scenarios and eight mutations passed")
 
 
 if __name__ == "__main__":

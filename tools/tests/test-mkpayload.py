@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Drive xnuloader/mkpayload.py input checks: single-read guarantee, item name
-rules, flag-owned names, epoch value class, NUL refusals, and output clobbering.
+rules, flag-owned names, the exact-cmd token set, NUL refusals, and output clobbering.
 Plain script: every check prints a PASS line; any failed assertion exits
 non-zero. Builds stay inside a temporary directory."""
 from pathlib import Path
@@ -84,7 +84,7 @@ with tempfile.TemporaryDirectory(prefix="mkpayload-test-") as directory:
     # Ordinary approved-style build: items, flags, require, exact-cmd, layout.
     out = d / "p.bin"
     rc, msg = run(["-o", str(out), f"kernel={kernel}", f"ramdisk={ramdisk}",
-                   f"--cmdline={approved.replace('1792813370', '1792900000')}",
+                   f"--cmdline={approved}",
                    f"--require=kernel={sha(kernel.read_bytes())}",
                    f"--require=ramdisk={sha(ramdisk.read_bytes())}",
                    f"--exact-cmd={approved}", "--forbid-cmd", "loader_return_after",
@@ -92,7 +92,7 @@ with tempfile.TemporaryDirectory(prefix="mkpayload-test-") as directory:
     assert rc == 0, msg
     got = entries(out.read_bytes())
     assert got == [(b"kernel", kernel.read_bytes()), (b"ramdisk", ramdisk.read_bytes()),
-                   (b"cmdline", approved.replace('1792813370', '1792900000').encode() + b'\0'),
+                   (b"cmdline", approved.encode() + b'\0'),
                    (b"rdfile", b"18:9220096\0"), (b"checkpoint", b"14\0")], got
     print("ordinary kernel/ramdisk + flags + require + exact-cmd build: PASS")
 
@@ -179,43 +179,42 @@ with tempfile.TemporaryDirectory(prefix="mkpayload-test-") as directory:
                                "--cmdline=debug=0x10e\x00cpus=1"])
     assert rc != 0 and "cmdline: contains a NUL byte" in msg, (rc, msg)
     rc, msg, counts = run_nul(["-o", str(d / "pecnul.bin"), f"kernel={kernel}",
-                               f"--cmdline={approved.replace('1792813370', '1792900000')}",
+                               f"--cmdline={approved}",
                                f"--exact-cmd={approved}\x00"])
     assert rc != 0 and "exact-cmd: contains a NUL byte" in msg, (rc, msg)
     print("NUL bytes in cmdline and exact-cmd refused: PASS")
 
-    # exact-cmd epoch value class.
-    rc, msg = run(["-o", str(d / "pex1.bin"), f"kernel={kernel}",
-                   "--cmdline=debug=0x10e cpus=1 epoch=abc", f"--exact-cmd={approved}"])
-    assert rc != 0 and "epoch value must be non-negative decimal: 'epoch=abc'" in msg, msg
+    # exact-cmd compares the token set: order may differ, nothing may be added, missing or repeated.
+    reordered = " ".join(reversed(approved.split()))
+    rc, msg = run(["-o", str(d / "pex1.bin"), f"kernel={kernel}", f"--cmdline={reordered}", f"--exact-cmd={approved}"])
+    assert rc == 0, msg
     rc, msg = run(["-o", str(d / "pex2.bin"), f"kernel={kernel}",
-                   "--cmdline=debug=0x10e cpus=1 epoch=-1", f"--exact-cmd={approved}"])
-    assert rc != 0 and "non-negative decimal" in msg, msg
-    rc, msg, counts = run_nul(["-o", str(d / "pex3.bin"), f"kernel={kernel}",
-                               "--cmdline=debug=0x10e cpus=1 epoch=1792813370\x002", f"--exact-cmd={approved}"])
-    assert rc != 0 and "contains a NUL byte" in msg, (rc, msg)
-    print("NUL inside the epoch value refused: PASS")
-    rc, msg = run(["-o", str(d / "pex4.bin"), f"kernel={kernel}",
-                   f"--cmdline={approved}", "--exact-cmd=debug=0x10e cpus=1 adreno8=14"])
-    assert rc != 0 and "need one epoch token" in msg, msg
-    rc, msg = run(["-o", str(d / "pex5.bin"), f"kernel={kernel}",
-                   "--cmdline=debug=0x10e cpus=1 epoch=1792813370 epoch=1792813371",
-                   f"--exact-cmd={approved}"])
-    assert rc != 0 and "duplicate token epoch=1792813371" in msg, msg
-    print("epoch token presence and duplication messages unchanged: PASS")
+                   f"--cmdline={approved.replace('epoch=1792813370', 'epoch=1792900000')}", f"--exact-cmd={approved}"])
+    assert rc != 0 and "exact-cmd: extra=['epoch=1792900000'] missing=['epoch=1792813370']" in msg, msg
+    rc, msg = run(["-o", str(d / "pex3.bin"), f"kernel={kernel}", f"--cmdline={approved} usb=1", f"--exact-cmd={approved}"])
+    assert rc != 0 and "exact-cmd: extra=['usb=1'] missing=[]" in msg, msg
+    rc, msg = run(["-o", str(d / "pex4.bin"), f"kernel={kernel}", f"--cmdline={approved} cpus=1", f"--exact-cmd={approved}"])
+    assert rc != 0 and msg.endswith("exact-cmd: extra=[] missing=[] duplicate=['cpus=1']"), msg
+    assert not any((d / f"pex{i}.bin").exists() for i in (2, 3, 4))
+    print("exact-cmd accepts a reordered token set and refuses changed, extra or repeated tokens: PASS")
 
     # --forbid-entry: explicit scope control over the final serialized entries.
     rc, msg = run(["-o", str(d / "pfe0.bin"), f"kernel={kernel}", f"ramdisk={ramdisk}",
-                   f"--cmdline={approved.replace('1792813370', '1792900000')}",
+                   f"--cmdline={approved}",
                    f"--require=kernel={sha(kernel.read_bytes())}",
                    f"--require=ramdisk={sha(ramdisk.read_bytes())}", f"--exact-cmd={approved}",
-                   "--rdfile=18:9220096", "--rdres=0x900000", "--usb", "--checkpoint=14"])
-    assert rc == 0, msg  # historical calls keep working; require never forbids rd by default
-    print("rdfile/rdres flags stay accepted with require + exact-cmd (no implicit ban): PASS")
+                   "--rdfile=18:9220096", "--usb", "--checkpoint=14"])
+    assert rc == 0, msg  # require never forbids a resident image by default
+    print("rdfile flag stays accepted with require + exact-cmd (no implicit ban): PASS")
+    rc, msg = run(["-o", str(d / "prd2.bin"), f"kernel={kernel}", "--rdfile=18:9220096", "--rdres=0x900000"])
+    assert rc != 0 and msg.endswith("resident image: use only one of rdimage, --rdres, or --rdfile"), msg
+    assert not (d / "prd2.bin").exists()
+    print("one resident image source at a time: PASS")
     for name in ("rdfile", "rdres", "usb", "checkpoint", "cmdline", "physbase",
                  "ramdisk", "kernel"):
+        resident = "--rdres=0x900000" if name == "rdres" else "--rdfile=18:9220096"
         rc, msg = run(["-o", str(d / f"pfe-{name}.bin"), f"kernel={kernel}", f"ramdisk={ramdisk}",
-                       "--cmdline=debug=0x10e", "--rdfile=18:9220096", "--rdres=0x900000",
+                       "--cmdline=debug=0x10e", resident,
                        "--usb", "--checkpoint=14", "--physbase=0x80000000", f"--forbid-entry={name}"])
         assert rc != 0 and msg.endswith(f"forbid-entry: the payload would carry {name}"), (name, rc, msg)
     rc, msg = run(["-o", str(d / "pfe-ok.bin"), f"kernel={kernel}", "--cmdline=debug=0x10e",

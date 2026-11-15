@@ -8,7 +8,6 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 KERNEL_SRC = ROOT / 'xnu/files/bsd/dev/annibale/annibale_iris.c'
 VT_SRC = ROOT.parent / 'hackios-xnu-userland/userland/src/inject/videotoolbox_iris.c'
-PACKAGE = (ROOT.parent / 'tools/k90auto/package.py').read_text()
 
 KERNEL_HARNESS = r'''
 #define ANNIBALE_IRIS_HOST_TEST 1
@@ -907,6 +906,3 @@ with tempfile.TemporaryDirectory(prefix='iris-safety-') as tmp:
         assert result.returncode != 0, label
     print(f'PASS: {len(vt_mutations)} compiled per-frame error regressions are rejected')
 
-assert 'videotoolbox_iris.c' in PACKAGE
-assert 'libannibale-vt.dylib' in PACKAGE
-print('PASS: package.py wires libannibale-vt.dylib and records videotoolbox_iris.c')

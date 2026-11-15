@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Check the XNU C scroll routines against guard pages and overlapping scanlines.
 
-Usage: python3 tools/test-video-scroll.py /path/to/xnu/osfmk/console/video_scroll.c
+Usage: python3 tools/tests/test-video-scroll.py [/path/to/xnu/osfmk/console/video_scroll.c]
+The default source is the patched XNU tree that xnu26/apply.sh fetches ($XNU26_SRC, else
+xnu-src/xnu-12377.121.6); without it the test reports SKIP and exits 77.
 """
 import argparse
+import os
+import sys
 from pathlib import Path
 import subprocess
 import tempfile
@@ -44,8 +48,13 @@ int main(void) {
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("source", type=Path)
+    root = Path(__file__).resolve().parents[2]
+    xnu = Path(os.environ.get("XNU26_SRC", root / "xnu-src/xnu-12377.121.6"))
+    parser.add_argument("source", type=Path, nargs="?", default=xnu / "osfmk/console/video_scroll.c")
     args = parser.parse_args()
+    if not args.source.is_file():
+        print(f"SKIP: {args.source} not found (xnu26/apply.sh fetches and patches it)")
+        sys.exit(77)
     source = args.source.read_text()
     # The routines only need bcopy and size_t; retain their actual implementation.
     source = "\n".join(line for line in source.splitlines()

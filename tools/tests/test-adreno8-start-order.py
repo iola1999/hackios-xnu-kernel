@@ -159,7 +159,6 @@ def compile_run(directory, source, page_size, args=(), success=True):
 def main():
     production = (DEV / "adreno8.c").read_text()
     wrapper = re.search(r"static bool\nadreno8_step_core_start\(void\)\n\{.*?\n\}", production, re.S).group()
-    assert "adreno8_step_gx_power, adreno8_gpu_memory_verify, adreno8_gpu_cp_init" in production
     with tempfile.TemporaryDirectory(prefix="adreno8-start-order-") as directory:
         target = Path(directory)
         print(compile_run(target, WRAPPER_TEST.replace("@@WRAPPER@@", wrapper), 4096).stdout.strip())

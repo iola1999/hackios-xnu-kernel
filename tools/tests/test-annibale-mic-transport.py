@@ -61,6 +61,22 @@ static jmp_buf thread_exit;
 static void delay_for_interval(uint32_t n,uint32_t unit) {
     if(thread_test && n==20 && unit==NSEC_PER_MSEC) longjmp(thread_exit,1);
 }
+typedef void *event_t;
+typedef void *thread_t;
+#define THREAD_INTERRUPTIBLE 1
+#define THREAD_AWAKENED 0
+#define THREAD_CONTINUE_NULL NULL
+static unsigned idle_waits,wakeups;
+static int assert_wait_timeout(event_t e,int interruptible,uint32_t interval,uint32_t scale) {
+    (void)e;(void)interruptible;(void)interval;(void)scale;idle_waits++;return 0;
+}
+static thread_t current_thread(void) { return NULL; }
+static int clear_wait(thread_t t,int result) { (void)t;(void)result;return 0; }
+/* an idle feeder blocks until the next open: the host run leaves the thread here */
+static int thread_block(void *continuation) {
+    (void)continuation;if(thread_test) longjmp(thread_exit,2);return 0;
+}
+static void thread_wakeup(event_t e) { (void)e;wakeups++; }
 static int amic_lock, cmd_lock, spin;
 static int *amic_ring_lock=&spin, *cmd_oob_lock=&cmd_lock;
 static int locked;

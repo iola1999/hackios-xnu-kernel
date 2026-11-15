@@ -1,7 +1,7 @@
-"""C group (held / interrupt mask / exception) harness text for tools/test-loader-lifecycle.py.
+"""C group (held / interrupt mask / exception) harness text for tools/tests/test-loader-lifecycle.py.
 
 C_PRELUDE is spliced into the stub prelude before the clock helper, C_GROUP into the scenario
-section before main(). Split out of test-loader-lifecycle-harness.py to keep each file under
+section before main(). Split out of loader-lifecycle-harness.py to keep each file under
 the 1000-line limit (AGENTS.md 2); the driver concatenates all three into one C file.
 """
 

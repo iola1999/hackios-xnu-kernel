@@ -165,6 +165,7 @@ static void ubc_upl_abort_range(upl_t upl, size_t off, size_t len, int flags) {
 struct hc_cmd { uint32_t lba, blocks; };
 struct hc_slot { uint8_t data[PAGE_SIZE]; uint32_t number, lba, blocks; bool used; };
 static struct hc_slot slots[SLOTS];
+static lck_mtx_t hc_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t hc_slot_buffer = PAGE_SIZE;
 static bool hc_usable = true, hc_in = true, hc_write_enabled = true, hc_dead, hc_closed;
 static _Atomic uint64_t hc_write_requests, hc_write_bytes, hc_write_errors;

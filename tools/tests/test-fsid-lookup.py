@@ -15,7 +15,7 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-APFS = "xnu/files/bsd/miscfs/apfs/apfs_vfsops.c"
+APFS = "xnu/files/bsd/miscfs/apfs/apfs_vfsops_mount.inc"
 
 
 def function(source, name):
@@ -195,6 +195,9 @@ def main():
     parser.add_argument("--case", help="Run one scenario.")
     parser.add_argument("--keep-dir", type=Path, help="Keep generated source and output in an ignored directory.")
     args = parser.parse_args()
+    if not (args.xnu_root / "bsd/vfs/vfs_subr.c").is_file():
+        print(f"SKIP: XNU source not found at {args.xnu_root} (xnu26/apply.sh fetches it)")
+        raise SystemExit(77)
     apfs = subprocess.check_output(["git", "-C", str(ROOT), "show", f"{args.source_ref}:{APFS}"], text=True) if args.source_ref else (ROOT / APFS).read_text()
     mount = function(apfs, "apfs_mount_common")
     identity = mount.split("sp->f_ffree = 0;", 1)[1].split('strlcpy(sp->f_fstypename, "apfs"', 1)[0]

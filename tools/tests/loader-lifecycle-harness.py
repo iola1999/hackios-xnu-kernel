@@ -1,4 +1,4 @@
-"""Embedded C text for tools/test-loader-lifecycle.py.
+"""Embedded C text for tools/tests/test-loader-lifecycle.py.
 
 PRELUDE is the stub firmware harness (fake clock, captured prints, counting psci/storage/USB
 stubs) and SCENARIOS the scenario main() that runs the extracted production blocks against

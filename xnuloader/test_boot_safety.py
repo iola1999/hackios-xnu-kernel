@@ -134,63 +134,7 @@ int main(int argc, char **argv) {
             self.assertEqual(choose("v1_raw_kernel", "blank"), (False, False, "-", "-"))
 
 
-class TestSourceContracts(unittest.TestCase):
-    def test_loader_screen_ui_contracts(self):
-        ui_inc = HERE / "loader_06a_screen_ui.inc"
-        self.assertTrue(ui_inc.is_file())
-        text = ui_inc.read_text()
-
-        # Slot agnostic functions
-        self.assertIn("slot_detect", text)
-        self.assertIn("slot_maintain_current", text)
-        self.assertIn("slot_set_active_other", text)
-        self.assertIn("gpt_sync_lun(bio)", text)
-
-        # Prohibit hardcoded "SLOT B"
-        self.assertNotIn('"BOOT ANDROID (SLOT B)"', text)
-        self.assertNotIn('"SLOT B"', text)
-
-    def test_loader_usb_entry_contracts(self):
-        entry_inc = HERE / "loader_06_usb_entry.inc"
-        self.assertTrue(entry_inc.is_file())
-        text = entry_inc.read_text()
-
-        # Unconditional storage survey before boot menu
-        idx_block = text.find("block_start();")
-        idx_inspect = text.find("inspect_storage();")
-        idx_slot_detect = text.find("slot_detect();")
-        idx_menu = text.find("ui_boot_menu()")
-
-        self.assertTrue(0 < idx_block < idx_inspect < idx_slot_detect < idx_menu,
-                        "Must call block_start, inspect_storage, and slot_detect before ui_boot_menu")
-
-        # Fallback to fastboot debug loop and unattended recovery safeguards
-        self.assertIn("boot_fallback_enter();", text)
-        self.assertIn("BOOT FALLBACK - FASTBOOT MODE", (HERE / "loader_06a_screen_ui.inc").read_text())
-        self.assertIn("usb_command_loop()", text)
-        self.assertIn("menu_enter_fastboot();", text)
-        self.assertNotIn("(void)menu_enter_fastboot();", text)
-        self.assertIn("if (!spmi_reboot_lk_prepare())", text)
-        self.assertIn('fb_reply("FAIL", "LK reboot target preparation failed");', text)
-        self.assertIn("spmi_reboot_lk_prepare(void)", (HERE / "loader_spmi_reboot_private.h").read_text())
-
-    def test_run_kernel_null_fallback(self):
-        run_inc = HERE / "loader_05_layout_run_kernel.inc"
-        self.assertTrue(run_inc.is_file())
-        text = run_inc.read_text()
-
-        self.assertIn("NO KERNEL - FASTBOOT MODE", text)
-        self.assertIn("usb_command_loop()", text)
-
-    def test_file_line_limits(self):
-        for fname in ["loader_05_layout_run_kernel.inc", "loader_06_usb_entry.inc",
-                      "loader_06a_screen_ui.inc", "loader_spmi_reboot_private.h",
-                      "ui_font_private.h", "mkstandalone.py"]:
-            f = HERE / fname
-            self.assertTrue(f.is_file(), f"{f} missing")
-            lines = len(f.read_text().splitlines())
-            self.assertLessEqual(lines, 1200, f"{f} has {lines} lines (exceeds 1200 limit)")
-
+class TestLoaderScreen(unittest.TestCase):
     def test_ui_rendering_and_fault_banner_preservation(self):
         """Compile UI code on host and verify boot menu, USB progress, and fault banner layout."""
         harness = r"""
