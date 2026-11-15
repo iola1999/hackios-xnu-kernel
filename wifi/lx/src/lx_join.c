@@ -139,8 +139,8 @@ station_abilities(struct lx_radio *radio, const uint8_t *elements, unsigned leng
 	sta->deflink.supp_rates[band->band] = rates;
 	conf->basic_rates = basic;
 	sta->wme = conf->qos = lx_vendor_element(elements, length, wmm) != NULL;
-	sta->deflink.bandwidth = radio->width == 80 ? IEEE80211_STA_RX_BW_80 : radio->width == 40 ? IEEE80211_STA_RX_BW_40 :
-	    IEEE80211_STA_RX_BW_20;
+	sta->deflink.bandwidth = radio->width == 160 ? IEEE80211_STA_RX_BW_160 : radio->width == 80 ? IEEE80211_STA_RX_BW_80 :
+	    radio->width == 40 ? IEEE80211_STA_RX_BW_40 : IEEE80211_STA_RX_BW_20;
 	sta->deflink.rx_nss = 1;
 	sta->deflink.smps_mode = IEEE80211_SMPS_OFF;
 	if ((e = lx_element(elements, length, 45)) != NULL && e[1] >= 26 && band->ht_cap.ht_supported) {	/* HT capabilities */
@@ -457,24 +457,35 @@ station_width(struct lx_radio *radio, struct linuxkpi_ieee80211_channel *primary
 	def->width = NL80211_CHAN_WIDTH_20;
 	def->center_freq1 = primary->center_freq;
 	radio->width = 20;
-	if (!lx_os_option("wifi_wide") || ht == NULL || ht[1] < 22 || !band->ht_cap.ht_supported ||
+	if (ht == NULL || ht[1] < 22 || !band->ht_cap.ht_supported ||
 	    !(band->ht_cap.cap & IEEE80211_HT_CAP_SUP_WIDTH_20_40) || !(ht[3] & 4)) {
 		return;
 	}
-	if (vht != NULL && vht[1] >= 3 && vht[2] == 1 && primary->band == NL80211_BAND_5GHZ && band->vht_cap.vht_supported) {
-		unsigned center = 5000 + 5 * vht[3];
-		bool all = true;
-
-		for (unsigned frequency = center - 30; frequency <= center + 30; frequency += 20) {
-			struct linuxkpi_ieee80211_channel *c = linuxkpi_ieee80211_get_channel(radio->wiphy, frequency);
-
-			all &= c != NULL && !(c->flags & (IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_80MHZ));
+	if (vht != NULL && vht[1] >= 3 && primary->band == NL80211_BAND_5GHZ && band->vht_cap.vht_supported) {
+		if (vht[2] == 2) {
+			unsigned center = 5000 + 5 * vht[3];
+			if (primary->center_freq >= center - 70 && primary->center_freq <= center + 70) {
+				def->width = NL80211_CHAN_WIDTH_160;
+				def->center_freq1 = center;
+				radio->width = 160;
+				return;
+			}
 		}
-		if (all && primary->center_freq >= center - 30 && primary->center_freq <= center + 30) {
-			def->width = NL80211_CHAN_WIDTH_80;
-			def->center_freq1 = center;
-			radio->width = 80;
-			return;
+		if (vht[2] == 1) {
+			unsigned center = 5000 + 5 * vht[3];
+			bool all = true;
+
+			for (unsigned frequency = center - 30; frequency <= center + 30; frequency += 20) {
+				struct linuxkpi_ieee80211_channel *c = linuxkpi_ieee80211_get_channel(radio->wiphy, frequency);
+
+				all &= c != NULL && !(c->flags & (IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_80MHZ));
+			}
+			if (all && primary->center_freq >= center - 30 && primary->center_freq <= center + 30) {
+				def->width = NL80211_CHAN_WIDTH_80;
+				def->center_freq1 = center;
+				radio->width = 80;
+				return;
+			}
 		}
 	}
 	offset = ht[3] & 3;		/* the second 20 MHz: 1 above, 3 below, 0 none */
@@ -1022,6 +1033,19 @@ boundary_channels(struct annibale_sta_channel *channels, unsigned most)
 	return (count);
 }
 
+static int
+boundary_powersave(bool on)
+{
+	struct lx_radio *radio = the_radio;
+
+	if (radio == NULL || radio->vif == NULL) {
+		return (ENXIO);
+	}
+	radio->vif->cfg.ps = on;
+	bss_changed(radio, BSS_CHANGED_PS);
+	return (0);
+}
+
 static struct annibale_sta_ops boundary = {
 	.power = boundary_power,
 	.scan = boundary_scan,
@@ -1030,6 +1054,7 @@ static struct annibale_sta_ops boundary = {
 	.leave = boundary_leave,
 	.state = boundary_state,
 	.channels = boundary_channels,
+	.powersave = boundary_powersave,
 };
 
 /*

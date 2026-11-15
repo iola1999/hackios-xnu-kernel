@@ -286,6 +286,8 @@
 	char why[512] = { 0 };
 	struct rwa_compute_info info = { 0 };
 	struct rwa_compute *compute = NULL;
+	unsigned char key[CC_SHA256_DIGEST_LENGTH] = { 0 };
+
 	if ([function respondsToSelector:@selector(annibaleGraph)]) {
 		struct rwa_stitched_kernel kernel = { 0 };
 		struct rwa_linked_function graph = { 0 };
@@ -304,8 +306,14 @@
 		NSData *air = ((NSData *(*)(id, SEL))objc_msgSend)(function, bitcode);
 		if ([air length] == 0)
 			return [self fail:error with:@"the compute function has no bitcode"];
-		compute = mesa.compute_create(_mesa, [air bytes], [air length],
-			[[function name] UTF8String], &info, why, sizeof(why));
+		rw_compute_pipe_key(key, [air bytes], [air length], [[function name] UTF8String]);
+		compute = rw_compute_pipe_find(_mesa, key, &info);
+		if (compute == NULL) {
+			compute = mesa.compute_create(_mesa, [air bytes], [air length],
+				[[function name] UTF8String], &info, why, sizeof(why));
+			if (compute != NULL)
+				rw_compute_pipe_keep(_mesa, key, compute, &info);
+		}
 	}
 	if (compute == NULL) {
 		/* The front end's own sentence, passed through rather than replaced: it says

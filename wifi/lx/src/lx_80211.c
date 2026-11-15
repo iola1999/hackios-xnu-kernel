@@ -30,6 +30,18 @@ int linuxkpi_debug_80211;			/* (which of the headers' own remarks are printed: n
 struct lx_radio *the_radio;
 const uint8_t no_network[ETH_ALEN];
 
+int
+lx_radio_state_mode(void)
+{
+	if (the_radio == NULL || !the_radio->started || the_radio->vif == NULL) {
+		return (0);
+	}
+	if (the_radio->joined) {
+		return (1);
+	}
+	return (2);
+}
+
 struct lx_radio *
 lx_radio_of(struct ieee80211_hw *hw)
 {
@@ -698,6 +710,7 @@ lx_ethernet_send(struct lx_radio *radio, const uint8_t *frame, unsigned length)
 	IEEE80211_SKB_CB(skb)->control.hw_key = radio->pairwise_key;
 	radio->sent++;
 	lx_frame_send(radio, skb);
+	lx_pci_wake_rings();
 	return (true);
 }
 

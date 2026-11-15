@@ -214,6 +214,9 @@ apfs_unlock_inner(struct apfs_mount *am)
 void
 apfs_lock_at(struct apfs_mount *am, const char *site)
 {
+	if (am == NULL) {
+		return;
+	}
 	lock_take(am, site, false);
 	if (am->am_nops < APFS_OPS_MAX) {
 		am->am_ops[am->am_nops].th = current_thread();
@@ -229,6 +232,9 @@ apfs_lock_at(struct apfs_mount *am, const char *site)
 void
 apfs_unlock(struct apfs_mount *am)
 {
+	if (am == NULL) {
+		return;
+	}
 	thread_t self = current_thread();
 	uint64_t oldest = am->am_nx.epoch;
 	uint32_t i;
@@ -255,13 +261,58 @@ apfs_unlock(struct apfs_mount *am)
 	apfs_unlock_inner(am);
 }
 
+void
+apfs_lock_shared(struct apfs_mount *am)
+{
+	if (am == NULL) {
+		return;
+	}
+	lck_rw_lock_shared(&am->am_rwlock);
+	apfs_lock(am);
+}
+
+void
+apfs_unlock_shared(struct apfs_mount *am)
+{
+	if (am == NULL) {
+		return;
+	}
+	apfs_unlock(am);
+	lck_rw_unlock_shared(&am->am_rwlock);
+}
+
+void
+apfs_lock_exclusive(struct apfs_mount *am)
+{
+	if (am == NULL) {
+		return;
+	}
+	lck_rw_lock_exclusive(&am->am_rwlock);
+	apfs_lock(am);
+}
+
+void
+apfs_unlock_exclusive(struct apfs_mount *am)
+{
+	if (am == NULL) {
+		return;
+	}
+	apfs_unlock(am);
+	lck_rw_unlock_exclusive(&am->am_rwlock);
+}
+
 /* The inode record of the object a vnode stands for. */
-static int
+__unused static int
 apfs_vp_inode(vnode_t vp, struct apfs_inode *ino)
 {
 	struct apfs_node *an = APFS_VP(vp);
+	struct apfs_mount *am = an->an_mount;
+	int error;
 
-	return apfs_inode_get(&an->an_mount->am_vol, an->an_id, ino);
+	apfs_lock_shared(am);
+	error = apfs_inode_get(&am->am_vol, an->an_id, ino);
+	apfs_unlock_shared(am);
+	return error;
 }
 
 /* ------------------------------------------------------------------ lookup */
@@ -307,7 +358,7 @@ apfs_vnop_lookup(struct vnop_lookup_args *ap)
 		return ENOENT;
 	}
 
-	apfs_lock(am);
+	apfs_lock_shared(am);
 	if (dn->an_id >= APFS_SYNTH_BASE) {
 		error = ENOENT;                 /* nothing of a synthetic directory is on the volume */
 	} else {
@@ -323,7 +374,7 @@ apfs_vnop_lookup(struct vnop_lookup_args *ap)
 			error = 0;
 		}
 	}
-	apfs_unlock(am);
+	apfs_unlock_shared(am);
 	/*
 	 * What is there is found whatever the caller means to do with it -- VFS refuses the
 	 * change itself on a read-only mount, and mkdir of a directory that exists is to fail
@@ -359,11 +410,8 @@ apfs_vnop_getattr(struct vnop_getattr_args *ap)
 	struct apfs_mount *am = APFS_VP_MOUNT(vp);
 	struct apfs_node *an = APFS_VP(vp);
 	struct apfs_inode ino;
-	uint64_t size = 0;
-	int error;
-
+	uint64_t size = an->an_size;
 	ino = an->an_ino;
-	size = an->an_size;
 
 	VATTR_RETURN(vap, va_rdev, (dev_t)ino.rdev);
 	VATTR_RETURN(vap, va_nlink, vnode_isdir(vp) ? 2 : (uint32_t)(ino.nchildren > 0 ? ino.nchildren : 1));
@@ -479,9 +527,9 @@ apfs_fill(struct apfs_mount *am, vnode_t vp, struct apfs_inode *ino, uint64_t si
 		}
 		want = (size_t)MIN((uint64_t)len, size - (uint64_t)at);
 		os_atomic_inc(&am->am_nx.requests, relaxed);
-		apfs_lock(am);
+		apfs_lock_shared(am);
 		error = apfs_read_file(&am->am_vol, ino, &APFS_VP(vp)->an_cf, (uint64_t)at, dst, want, &got);
-		apfs_unlock(am);
+		apfs_unlock_shared(am);
 		os_atomic_dec(&am->am_nx.requests, relaxed);
 		if (error) {
 			break;
@@ -620,7 +668,7 @@ apfs_read_direct(struct vnop_read_args *ap)
 		}
 		/* (how many reads are going on: a hint to apfs_lib, kept without the lock) */
 		os_atomic_inc(&am->am_nx.requests, relaxed);
-		apfs_lock(am);
+		apfs_lock_shared(am);
 		{
 			lp = lock_proc(am);
 			os_atomic_inc(&lp->read_calls, relaxed);
@@ -640,7 +688,7 @@ apfs_read_direct(struct vnop_read_args *ap)
 
 			error = apfs_read_file(&am->am_vol, &ino, &APFS_VP(vp)->an_cf,
 			    (uint64_t)uio_offset(uio), buf, want, &got);
-			apfs_unlock(am);
+			apfs_unlock_shared(am);
 			if (error || got == 0) {
 				break;
 			}
@@ -652,7 +700,7 @@ apfs_read_direct(struct vnop_read_args *ap)
 			if (uio_resid(uio) <= 0 || (uint64_t)uio_offset(uio) >= size) {
 				break;
 			}
-			apfs_lock(am);
+			apfs_lock_shared(am);
 		}
 		os_atomic_dec(&am->am_nx.requests, relaxed);
 		apfs_iobuf_put(am, buf);
@@ -777,7 +825,7 @@ apfs_vnop_pagein(struct vnop_pagein_args *ap)
 		}
 		want = (size_t)MIN(end - at, (off_t)(size - (uint64_t)at));
 		os_atomic_inc(&am->am_nx.requests, relaxed);
-		apfs_lock(am);
+		apfs_lock_shared(am);
 		if (at == offset) {
 			lp = lock_proc(am);
 			lp->pagein_calls++;
@@ -785,7 +833,7 @@ apfs_vnop_pagein(struct vnop_pagein_args *ap)
 		}
 		error = apfs_read_file(&am->am_vol, &ino, &APFS_VP(vp)->an_cf, (uint64_t)at,
 		    dst, want, &got);
-		apfs_unlock(am);
+		apfs_unlock_shared(am);
 		os_atomic_dec(&am->am_nx.requests, relaxed);
 		if (error) {
 			break;
@@ -906,7 +954,7 @@ apfs_vnop_readdir(struct vnop_readdir_args *ap)
 	if (error == 0) {
 		uint32_t i;
 
-		apfs_lock(am);
+		apfs_lock_shared(am);
 		if (an->an_id < APFS_SYNTH_BASE) {
 			error = apfs_readdir(&am->am_vol, an->an_id, apfs_readdir_cb, &rc);
 		}
@@ -917,7 +965,7 @@ apfs_vnop_readdir(struct vnop_readdir_args *ap)
 				    strlen(am->am_synth[i].name), am->am_synth[i].id, DT_DIR);
 			}
 		}
-		apfs_unlock(am);
+		apfs_unlock_shared(am);
 	}
 	if (error == EEXIST) {
 		error = 0;              /* we stopped it ourselves */
@@ -959,9 +1007,9 @@ apfs_vnop_readlink(struct vnop_readlink_args *ap)
 		if (buf == NULL) {
 			return ENOMEM;
 		}
-		apfs_lock(am);
+		apfs_lock_shared(am);
 		error = apfs_readlink(&am->am_vol, an->an_id, buf, MAXPATHLEN, &n);
-		apfs_unlock(am);
+		apfs_unlock_shared(am);
 		if (error) {
 			kfree_data(buf, MAXPATHLEN);
 			return error;
@@ -1015,9 +1063,9 @@ apfs_vnop_getxattr(struct vnop_getxattr_args *ap)
 	if (apfs_xattr_hidden(ap->a_name)) {
 		return ENOATTR;
 	}
-	apfs_lock(am);
+	apfs_lock_shared(am);
 	error = apfs_xattr_lookup(&am->am_vol, an->an_id, ap->a_name, &xa);
-	apfs_unlock(am);
+	apfs_unlock_shared(am);
 	if (error) {
 		return error == ENOENT ? ENOATTR : error;
 	}
@@ -1033,9 +1081,9 @@ apfs_vnop_getxattr(struct vnop_getxattr_args *ap)
 	if (buf == NULL) {
 		return ENOMEM;
 	}
-	apfs_lock(am);
+	apfs_lock_shared(am);
 	error = apfs_xattr_read(&am->am_vol, an->an_id, ap->a_name, buf, whole, &n);
-	apfs_unlock(am);
+	apfs_unlock_shared(am);
 	if (error == 0) {
 		error = uiomove((caddr_t)buf, (int)n, ap->a_uio);
 	}
@@ -1080,9 +1128,9 @@ apfs_vnop_listxattr(struct vnop_listxattr_args *ap)
 
 	bzero(&lc, sizeof(lc));
 	lc.lx_uio = ap->a_uio;
-	apfs_lock(am);
+	apfs_lock_shared(am);
 	error = apfs_xattr_list(&am->am_vol, an->an_id, apfs_listxattr_cb, &lc);
-	apfs_unlock(am);
+	apfs_unlock_shared(am);
 	if (error == EEXIST) {
 		error = 0;
 	}
@@ -1100,98 +1148,6 @@ apfs_vnop_listxattr(struct vnop_listxattr_args *ap)
 
 /* ------------------------------------------------------------------ the rest */
 
-static int
-apfs_vnop_open(struct vnop_open_args *ap)
-{
-	if ((vfs_flags(vnode_mount(ap->a_vp)) & MNT_RDONLY) &&
-	    (ap->a_mode & (FWRITE | O_TRUNC | O_CREAT))) {
-		return EROFS;
-	}
-	return 0;
-}
-
-static int
-apfs_vnop_close(__unused struct vnop_close_args *ap)
-{
-	return 0;
-}
-
-static int
-apfs_vnop_mmap(__unused struct vnop_mmap_args *ap)
-{
-	/* the mount is read-only, so VFS has already refused a writable mapping */
-	return 0;
-}
-
-static int
-apfs_vnop_mnomap(__unused struct vnop_mnomap_args *ap)
-{
-	return 0;
-}
-
-/*
- * The last reference to this file has gone.  Give back what was worked out about how its
- * contents are stored -- the table of compressed pieces and, above all, the 64 KB of the
- * piece last decompressed.
- *
- * It used to be kept until the vnode was reclaimed, which is later: VFS holds on to
- * vnodes it may want again, up to desiredvnodes of them (1024 here), so up to 64 MB of
- * pieces nobody was reading.  Here each file gives it back as soon as it is closed, and
- * the cache still covers what it is for: the reads of one file, one after another.
- * (This was first suspected of resetting the phone on long walks; it was not -- memory
- * stayed flat throughout -- see annibale_apfs_check.c for what was.)
- */
-static int
-apfs_vnop_inactive(struct vnop_inactive_args *ap)
-{
-	struct apfs_node *an = APFS_VP(ap->a_vp);
-
-	if (an == NULL) {
-		return 0;
-	}
-	/*
-	 * Most files hold nothing to give back (a directory, a link, a file not compressed): then
-	 * not even the lock. Looked at without it: a state being set up meanwhile is given back with
-	 * the vnode instead (apfs_vnop_reclaim), which is all a wrong "nothing" can cost.
-	 */
-	if (os_atomic_load(&an->an_cf.piece_off, relaxed) == NULL &&
-	    os_atomic_load(&an->an_cf.piece_len, relaxed) == NULL &&
-	    os_atomic_load(&an->an_cf.held_data, relaxed) == NULL &&
-	    os_atomic_load(&an->an_cf.ra_data, relaxed) == NULL) {
-		os_atomic_inc(&an->an_mount->am_inactive_free, relaxed);
-		return 0;
-	}
-	apfs_lock(an->an_mount);
-	apfs_cfile_fini(&an->an_cf);
-	apfs_unlock(an->an_mount);
-	return 0;
-}
-
-static int
-apfs_vnop_reclaim(struct vnop_reclaim_args *ap)
-{
-	vnode_t vp = ap->a_vp;
-	struct apfs_node *an = APFS_VP(vp);
-
-	if (an != NULL) {
-		apfs_lock(an->an_mount);
-		apfs_cfile_fini(&an->an_cf);
-		apfs_unlock(an->an_mount);
-		apfs_node_detach(an);
-		vnode_clearfsnode(vp);
-		if (an->an_link != NULL) {
-			kfree_data(an->an_link, sizeof(*an->an_link) + an->an_link->len);
-		}
-		kfree_type(struct apfs_node, an);
-	}
-	return 0;
-}
-
-/*
- * No ioctl or fsctl means anything here.  ENOTTY is what callers take for "this filesystem
- * does not have that"; the default, ENOTSUP, is not -- the iOS dyld, probing the root
- * volume for APFS features, gives up on it.
- */
 #include "apfs_vnops_write.inc"
 
 #define VOPFUNC int (*)(void *)
@@ -1203,6 +1159,12 @@ const struct vnodeopv_entry_desc apfs_vnodeop_entries[] = {
 	{ .opve_op = &vnop_lookup_desc, .opve_impl = (VOPFUNC)apfs_vnop_lookup },
 	{ .opve_op = &vnop_create_desc, .opve_impl = (VOPFUNC)apfs_vnop_create },
 	{ .opve_op = &vnop_remove_desc, .opve_impl = (VOPFUNC)apfs_vnop_remove },
+	{ .opve_op = &vnop_mkdir_desc, .opve_impl = (VOPFUNC)apfs_vnop_mkdir },
+	{ .opve_op = &vnop_rmdir_desc, .opve_impl = (VOPFUNC)apfs_vnop_rmdir },
+	{ .opve_op = &vnop_symlink_desc, .opve_impl = (VOPFUNC)apfs_vnop_symlink },
+	{ .opve_op = &vnop_link_desc, .opve_impl = (VOPFUNC)apfs_vnop_link },
+	{ .opve_op = &vnop_mknod_desc, .opve_impl = (VOPFUNC)apfs_vnop_mknod },
+	{ .opve_op = &vnop_rename_desc, .opve_impl = (VOPFUNC)apfs_vnop_rename },
 	{ .opve_op = &vnop_open_desc, .opve_impl = (VOPFUNC)apfs_vnop_open },
 	{ .opve_op = &vnop_close_desc, .opve_impl = (VOPFUNC)apfs_vnop_close },
 	{ .opve_op = &vnop_getattr_desc, .opve_impl = (VOPFUNC)apfs_vnop_getattr },
@@ -1210,8 +1172,10 @@ const struct vnodeopv_entry_desc apfs_vnodeop_entries[] = {
 	{ .opve_op = &vnop_read_desc, .opve_impl = (VOPFUNC)apfs_vnop_read },
 	{ .opve_op = &vnop_write_desc, .opve_impl = (VOPFUNC)apfs_vnop_write },
 	{ .opve_op = &vnop_getxattr_desc, .opve_impl = (VOPFUNC)apfs_vnop_getxattr },
+	{ .opve_op = &vnop_setxattr_desc, .opve_impl = (VOPFUNC)apfs_vnop_setxattr },
+	{ .opve_op = &vnop_removexattr_desc, .opve_impl = (VOPFUNC)apfs_vnop_removexattr },
 	{ .opve_op = &vnop_listxattr_desc, .opve_impl = (VOPFUNC)apfs_vnop_listxattr },
-	{ .opve_op = &vnop_fsync_desc, .opve_impl = (VOPFUNC)nop_fsync },
+	{ .opve_op = &vnop_fsync_desc, .opve_impl = (VOPFUNC)apfs_vnop_fsync },
 	{ .opve_op = &vnop_readdir_desc, .opve_impl = (VOPFUNC)apfs_vnop_readdir },
 	{ .opve_op = &vnop_readlink_desc, .opve_impl = (VOPFUNC)apfs_vnop_readlink },
 	{ .opve_op = &vnop_inactive_desc, .opve_impl = (VOPFUNC)apfs_vnop_inactive },
@@ -1220,6 +1184,7 @@ const struct vnodeopv_entry_desc apfs_vnodeop_entries[] = {
 	{ .opve_op = &vnop_mmap_desc, .opve_impl = (VOPFUNC)apfs_vnop_mmap },
 	{ .opve_op = &vnop_mnomap_desc, .opve_impl = (VOPFUNC)apfs_vnop_mnomap },
 	{ .opve_op = &vnop_pagein_desc, .opve_impl = (VOPFUNC)apfs_vnop_pagein },
+	{ .opve_op = &vnop_pageout_desc, .opve_impl = (VOPFUNC)apfs_vnop_pageout },
 	{ .opve_op = (struct vnodeop_desc *)NULL, .opve_impl = (VOPFUNC)NULL }
 };
 const struct vnodeopv_desc apfs_vnodeop_opv_desc = {

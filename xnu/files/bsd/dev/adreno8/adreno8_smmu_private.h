@@ -30,6 +30,7 @@ uint64_t *adreno8_space_entry(struct adreno8_gpu_space *, uint32_t address);
 bool adreno8_space_prepare_page(struct adreno8_gpu_space *, uint32_t address);
 bool adreno8_space_publish(struct adreno8_gpu_space *);
 bool adreno8_space_publish_range(struct adreno8_gpu_space *, uint64_t address, uint64_t size);
+bool adreno8_smmu_tlb_invalidate_range(struct adreno8_gpu_space *space, uint64_t va, uint64_t size);
 
 static inline uint64_t
 adreno8_space_attributes(uint32_t prot)

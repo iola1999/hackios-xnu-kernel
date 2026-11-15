@@ -92,6 +92,8 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern const uint8_t *annibale_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 extern kern_return_t thread_terminate(thread_t thread);
 extern void loader_log_putc(char c);
+extern uint64_t mhi_pcie_get_sink_pa(void);
+void mhi_pcie_msi_init(uint64_t msi_phys);
 
 static bool leaving;
 
@@ -155,6 +157,14 @@ wr(vm_offset_t address, uint32_t value)
 /* inbound memory, mapped without translation: the device tree's ranges, cpu == pci */
 #define PCIE_MEM_BASE             0x40300000UL
 #define PCIE_MEM_END              0x44000000UL      /* + 0x3d00000 */
+
+/* DesignWare PCIe Root Complex MSI receiver registers */
+#define PCIE_MSI_ADDR_LO          0x0820
+#define PCIE_MSI_ADDR_HI          0x0824
+#define PCIE_MSI_INTR_ENABLE(g)   (0x0828 + (g) * 12)
+#define PCIE_MSI_INTR_MASK(g)     (0x082c + (g) * 12)
+#define PCIE_MSI_INTR_STATUS(g)   (0x0830 + (g) * 12)
+#define PCIE_MSI_PHYS             0x40200000UL      /* dedicated MSI address outside WCN7850 BAR0 (0x40400000) */
 
 /*
  * The clock controller's power domains for root complex 0: gcc_pcie_0_gdsc at 0x6b004 and
@@ -549,6 +559,82 @@ config_window(void)
 	region0_write(dm_core + IATU_OFF, want);
 }
 
+void
+mhi_pcie_msi_init(uint64_t msi_phys)
+{
+	if (dm_core == 0) {
+		return;
+	}
+	wr(dm_core + PCIE_MSI_ADDR_LO, (uint32_t)msi_phys);
+	wr(dm_core + PCIE_MSI_ADDR_HI, (uint32_t)(msi_phys >> 32));
+	for (unsigned g = 0; g < 4; g++) {
+		wr(dm_core + PCIE_MSI_INTR_ENABLE(g), 0xffffffffu);
+		wr(dm_core + PCIE_MSI_INTR_MASK(g), 0);
+		wr(dm_core + PCIE_MSI_INTR_STATUS(g), 0xffffffffu);
+	}
+	printf("pcie: RC0 DesignWare MSI receiver initialized at target %#llx (GICv3 edge SPI INTID 181..184)\n",
+	    (unsigned long long)msi_phys);
+}
+
+uint32_t
+mhi_pcie_msi_status(unsigned g)
+{
+	if (dm_core == 0 || g >= 4) {
+		return 0;
+	}
+	return rd(dm_core + PCIE_MSI_INTR_STATUS(g));
+}
+
+void
+mhi_pcie_msi_ack(unsigned g, uint32_t mask)
+{
+	if (dm_core == 0 || g >= 4 || mask == 0) {
+		return;
+	}
+	wr(dm_core + PCIE_MSI_INTR_STATUS(g), mask);
+}
+
+static void
+enable_ep_msi(void)
+{
+	uint32_t head;
+	unsigned cap, hops = 0;
+	uint64_t sink = mhi_pcie_get_sink_pa();
+	if (sink == 0) {
+		sink = PCIE_MSI_PHYS;
+	}
+
+	for (cap = ep_conf(0x34) & 0xfc; cap != 0 && hops++ < 48; cap = head >> 8 & 0xfc) {
+		head = ep_conf(cap);
+		if ((head & 0xff) == 0x05) { /* PCI_CAP_ID_MSI */
+			bool is_64bit = ((head >> 16) & (1u << 7)) != 0;
+
+			wr(conf + cap + 0x04, (uint32_t)sink);
+			if (is_64bit) {
+				wr(conf + cap + 0x08, (uint32_t)(sink >> 32));
+				wr(conf + cap + 0x0c, 0);
+			} else {
+				wr(conf + cap + 0x08, 0);
+			}
+			/* Set Multiple Message Enable (MME) to Multiple Message Capable (MMC), and enable MSI */
+			uint32_t mctrl = (((head >> 16) & ~0x70u) | ((((head >> 17) & 7u) << 4)) | 1u);
+			wr(conf + cap, (head & 0xffff) | (mctrl << 16));
+
+			/* Explicitly enable Memory Space, Bus Master, and INTx Disable in PCI command register */
+			uint32_t cmd = ep_conf(0x04);
+			wr(conf + 0x04, cmd | 0x0406u);
+
+			unsigned mmc = ((head >> 17) & 7u);
+			printf("pcie: endpoint MSI capability enabled at cap offset %#x, target %#llx, MMC %u -> MME %u, command %#06x\n",
+			    cap, (unsigned long long)sink, mmc, mmc, ep_conf(0x04) & 0xffff);
+			break;
+		}
+		if ((head >> 8 & 0xfc) == cap) {
+			break;
+		}
+	}
+}
+
 static void
 probe_endpoint(void)
 {
@@ -583,6 +669,7 @@ probe_endpoint(void)
 		show_bars();
 		if (power && ep_alive && (ep_bar0 & ~0xfu) == 0 && (ep_bar0 & 0x7) == 4) {
 			assign_bar0();
+			enable_ep_msi();
 		}
 		show_capabilities();
 		printf("pcie: command %#010x, interrupt pin %u line %u\n", ep_conf(0x04),
@@ -965,12 +1052,15 @@ pcie_thread(void *parameter, __unused wait_result_t result)
 		    "pcie: pcie_power=1 powers it up (mhi_pcie_power.c)\n");
 		goto out;
 	}
-	printf("pcie: step 2 in 30 s: the root complex's own registers\n");
-	assert_wait_timeout((event_t)&steps, THREAD_UNINT, 30000, NSEC_PER_MSEC);
-	thread_block(THREAD_CONTINUE_NULL);
+	printf("pcie: step 2: the root complex's own registers\n");
 	show_link();
 	show_root_complex();
 	show_iatu();
+	uint64_t msi_sink = mhi_pcie_get_sink_pa();
+	if (msi_sink == 0) {
+		msi_sink = PCIE_MSI_PHYS;
+	}
+	mhi_pcie_msi_init(msi_sink);
 	if (steps < 3) {
 		goto out;
 	}

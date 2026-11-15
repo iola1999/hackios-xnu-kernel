@@ -10,6 +10,8 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <sys/types.h>
+#include <ctype.h>
+#include <CommonCrypto/CommonDigest.h>
 #ifndef __APPLE__
 typedef uint64_t user_addr_t;
 #endif
@@ -35,6 +37,10 @@ typedef uint64_t user_addr_t;
 #define KAUTH_VNODE_ADD_SUBDIRECTORY 16
 #define KAUTH_VNODE_DELETE_CHILD 64
 typedef uint32_t kauth_action_t;
+typedef CC_SHA256_CTX SHA256_CTX;
+#define SHA256_Init(c) CC_SHA256_Init(c)
+#define SHA256_Update(c, d, n) CC_SHA256_Update(c, d, (CC_LONG)(n))
+#define SHA256_Final(md, c) CC_SHA256_Final((unsigned char *)(md), c)
 typedef void *kauth_cred_t;
 struct proc {
     int pid, version, p_lflag, refs, ppid, ppidversion;
@@ -85,7 +91,7 @@ static unsigned os_ref_release(struct os_refcnt *r) {
 }
 static void read_random(void *buffer, unsigned n) {
     static unsigned sequence;
-    assert(!table_locked && n == 16); sequence++;
+    assert(!table_locked && (n == 16 || n == 32)); sequence++;
     for (unsigned i = 0; i < n; i++) ((uint8_t *)buffer)[i] = (uint8_t)(sequence * 17 + i);
 }
 static int copyin(user_addr_t source, void *dest, size_t n) {
@@ -380,6 +386,72 @@ static void identifier_contract(proc_t manager, proc_t app) {
     free(token); clean();
 }
 
+static int issue_untargeted_raw(proc_t issuer, const char *class_name, uint64_t type, const char *path,
+    uint64_t flags, int64_t pid, uint64_t version, char *token) {
+    uint64_t slots[7] = {(user_addr_t)class_name, type, (user_addr_t)path, flags, (user_addr_t)token,
+        (uint64_t)pid, version};
+    running = issuer; return minisandbox_policy_syscall(issuer, 5, (user_addr_t)slots);
+}
+
+/* tccd's sandbox_extension_issue_generic(class, 0) and sandbox_extension_issue_file(class, "/", 0):
+ * no table entry, any consumer, the hash covers class and path, no vnode kept. */
+static void untargeted_contract(proc_t tccd, proc_t app, proc_t child) {
+    const char *class_name = "com.apple.tcc.kTCCServiceAddressBook";
+    char output[0x3ff0], second[0x3ff0];
+    memset(output, 0xa5, sizeof(output)); memset(second, 0xa5, sizeof(second));
+    check(issue_untargeted_raw(tccd, class_name, 3, NULL, 0, 0, 0, output) == 0);
+    check(!minisandbox_extensions && !allocations);
+    check(strlen(output) == 49 + strlen(class_name) && output[48] == ';' && !strcmp(output + 49, class_name));
+    for (unsigned i = 0; i < 48; i++) check(isxdigit((unsigned char)output[i]));
+    check(issue_untargeted_raw(tccd, class_name, 3, NULL, 0, 0, 0, second) == 0 && strcmp(output, second) != 0);
+    int64_t a = consume_native(app, output, 0), b = consume_native(tccd, output, 0);
+    check(a > 0 && b > 0 && a != b && allocations == 4);
+    fork_grants(app, child);
+    check(release_raw(child, a, 0, NULL) == 0 && release_raw(app, a, 0, NULL) == 0);
+    check(release_raw(tccd, b, 0, NULL) == 0 && allocations == 0);
+    char changed[0x3ff0];
+    strcpy(changed, output); changed[20] ^= 1; check(consume_native(app, changed, EINVAL) == -1);
+    strcpy(changed, output); changed[strlen(changed) - 1] = 'X'; check(consume_native(app, changed, EINVAL) == -1);
+    strcpy(changed, output); changed[48] = ':'; check(consume_native(app, changed, EINVAL) == -1);
+    strcpy(changed, output); changed[49] = 0; check(consume_native(app, changed, EINVAL) == -1);
+    strcpy(changed, output); strcat(changed, ";"); check(consume_native(app, changed, EINVAL) == -1);
+    strcpy(changed, output); strcat(changed, ";/"); check(consume_native(app, changed, EINVAL) == -1);
+
+    check(issue_untargeted_raw(tccd, class_name, 0, "/files/document", 0, 0, 0, output) == 0);
+    check(!minisandbox_extensions && !allocations && !file.usecount && !file.iocount);
+    check(output[48] == ';' && !strncmp(output + 49, class_name, strlen(class_name)));
+    check(!strcmp(output + 49 + strlen(class_name), ";/files/document"));
+    a = consume_native(app, output, 0);
+    check(a > 0 && release_raw(app, a, 0, NULL) == 0 && !allocations && !file.usecount);
+    strcpy(changed, output); changed[strlen(changed) - 1] = 'X'; check(consume_native(app, changed, EINVAL) == -1);
+    strcpy(changed, output); changed[49 + strlen(class_name)] = 0; check(consume_native(app, changed, EINVAL) == -1);
+    check(issue_untargeted_raw(tccd, class_name, 0, "/containers/app", 0, 0, 0, output) == 0);
+    check(!directory.usecount && !directory.iocount);
+    check(issue_untargeted_raw(tccd, class_name, 0, "/missing", 0, 0, 0, output) == ENOENT);
+    check(issue_untargeted_raw(tccd, class_name, 0, "relative", 0, 0, 0, output) == EINVAL);
+    check(issue_untargeted_raw(tccd, class_name, 0, NULL, 0, 0, 0, output) == ENOTSUP);
+    check(issue_untargeted_raw(tccd, class_name, 1, "/files/document", 0, 0, 0, output) == ENOTSUP);
+    check(issue_untargeted_raw(tccd, class_name, 3, "/files/document", 0, 0, 0, output) == ENOTSUP);
+    unsigned allowed = tccd->allowed; tccd->allowed = 0;
+    check(issue_untargeted_raw(tccd, class_name, 0, "/files/document", 0, 0, 0, output) == EACCES);
+    tccd->allowed = allowed; context_fail = 1;
+    check(issue_untargeted_raw(tccd, class_name, 0, "/files/document", 0, 0, 0, output) == ENOMEM);
+    context_fail = 0;
+    check(!file.iocount && !directory.iocount);
+
+    check(issue_untargeted_raw(tccd, class_name, 3, NULL, 0x30000, 0, 0, output) == ENOTSUP);
+    check(issue_untargeted_raw(tccd, class_name, 3, NULL, 0, app->pid, (uint32_t)app->version, output) == ENOTSUP);
+    check(issue_untargeted_raw(tccd, "a;b", 3, NULL, 0, 0, 0, output) == EINVAL);
+    check(issue_untargeted_raw(tccd, "", 3, NULL, 0, 0, 0, output) == EINVAL);
+    check(issue_untargeted_raw(tccd, class_name, 3, NULL, 0, 0, 0, NULL) == EFAULT);
+    char long_class[200]; memset(long_class, 'a', sizeof(long_class) - 1); long_class[sizeof(long_class) - 1] = 0;
+    check(issue_untargeted_raw(tccd, long_class, 3, NULL, 0, 0, 0, output) == ENAMETOOLONG);
+    check(issue_untargeted_raw(tccd, class_name, 3, NULL, 0, 0, 0, output) == 0);
+    allocation_fail = 1; check(consume_native(app, output, ENOMEM) == -1); allocation_fail = 0;
+    a = consume_native(app, output, 0); check(a > 0);
+    clean();
+}
+
 int main(void) {
     for (unsigned i = 0; i < 5; i++) {
         processes[i] = (struct proc){.pid = 10 + (int)i, .version = 100 + (int)i,
@@ -390,6 +462,7 @@ int main(void) {
     consume_contract(&processes[0], &processes[1], &processes[2]);
     lifecycle_contract(&processes[0], &processes[1], &processes[3]);
     identifier_contract(&processes[0], &processes[1]);
+    untargeted_contract(&processes[4], &processes[1], &processes[3]);
     check(minisandbox_policy_syscall(&processes[0], 66, 123) == EPERM && set_calls == 1);
     check(minisandbox_policy_syscall(&processes[1], 4, 456) == EFAULT && get_calls == 1);
     int other_calls[] = {-1, 0, 1, 2, 3, 8, 9, 17, 63, 64};

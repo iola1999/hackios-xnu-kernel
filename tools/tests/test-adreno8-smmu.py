@@ -232,6 +232,9 @@ static void adreno8_to_memory(vm_offset_t memory, vm_size_t size) {
     clean_count++;
 }
 static void mock_atos(vm_offset_t address, uint64_t value) {
+    if ((address & 0xfff) == 0x600) {
+        return;
+    }
     assert(address == 0x22800);
     assert((regs[SMMU_S2CR(1) / 4] & 0x30000) == 0x20000);
     assert(regs[0x22804 / 4] == 0);

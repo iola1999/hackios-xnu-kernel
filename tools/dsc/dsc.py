@@ -49,7 +49,12 @@ def parse_addr(text):
 def resolve_cache_dir(explicit):
     if explicit:
         return explicit
-    candidates = [DEFAULT_CACHE, os.path.join(TOOL_ROOT, 'ios26', '23G90__iPhone18,3')]
+    candidates = [
+        DEFAULT_CACHE,
+        os.path.join(TOOL_ROOT, 'ios26', '23G90__iPhone18,3'),
+        os.path.join(os.path.dirname(TOOL_ROOT), 'hackios-xnu-userland', 'ios26', '23G90__iPhone18,3'),
+        os.path.join('hackios-xnu-userland', 'ios26', '23G90__iPhone18,3'),
+    ]
     for path in candidates:
         if os.path.isdir(path):
             return path

@@ -16,6 +16,7 @@
 #include <string.h>
 
 #include "minicrypto.h"
+#include "mc_ce_arm64.h"
 
 static const uint8_t aes_sbox[256] = {
 	0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
@@ -55,10 +56,7 @@ static const uint8_t aes_inv_sbox[256] = {
 	0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26, 0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d,
 };
 
-struct mc_aes_key {
-	uint32_t rounds;
-	uint8_t  rk[240];           /* (rounds + 1) round keys of 16 bytes */
-};
+/* struct mc_aes_key is defined in mc_ce_arm64.h */
 
 static inline uint8_t
 xtime(uint8_t x)
@@ -102,11 +100,11 @@ mc_aes_setkey(struct mc_aes_key *k, size_t key_len, const uint8_t *key)
 			t[3] = aes_sbox[first];
 			rcon = xtime(rcon);
 		} else if (nk > 6 && i % nk == 4) {
-			for (int j = 0; j < 4; j++) {
+			for (uint32_t j = 0; j < 4; j++) {
 				t[j] = aes_sbox[t[j]];
 			}
 		}
-		for (int j = 0; j < 4; j++) {
+		for (uint32_t j = 0; j < 4; j++) {
 			k->rk[4 * i + j] = k->rk[4 * (i - nk) + j] ^ t[j];
 		}
 	}
@@ -118,7 +116,7 @@ mc_aes_encrypt_block(const struct mc_aes_key *k, const uint8_t *in, uint8_t *out
 {
 	uint8_t s[16], t[16];
 
-	for (int i = 0; i < 16; i++) {
+	for (uint32_t i = 0; i < 16; i++) {
 		s[i] = in[i] ^ k->rk[i];
 	}
 	for (uint32_t r = 1; r <= k->rounds; r++) {
@@ -138,7 +136,7 @@ mc_aes_encrypt_block(const struct mc_aes_key *k, const uint8_t *in, uint8_t *out
 				p[3] = (uint8_t)(xtime(a0) ^ a0 ^ a1 ^ a2 ^ xtime(a3));
 			}
 		}
-		for (int i = 0; i < 16; i++) {
+		for (uint32_t i = 0; i < 16; i++) {
 			s[i] = t[i] ^ k->rk[16 * r + i];
 		}
 	}
@@ -150,7 +148,7 @@ mc_aes_decrypt_block(const struct mc_aes_key *k, const uint8_t *in, uint8_t *out
 {
 	uint8_t s[16], t[16];
 
-	for (int i = 0; i < 16; i++) {
+	for (uint32_t i = 0; i < 16; i++) {
 		s[i] = in[i] ^ k->rk[16 * k->rounds + i];
 	}
 	for (uint32_t r = k->rounds; r-- > 0;) {
@@ -160,7 +158,7 @@ mc_aes_decrypt_block(const struct mc_aes_key *k, const uint8_t *in, uint8_t *out
 				t[4 * ((c + row) & 3) + row] = aes_inv_sbox[s[4 * c + row]];
 			}
 		}
-		for (int i = 0; i < 16; i++) {
+		for (uint32_t i = 0; i < 16; i++) {
 			t[i] ^= k->rk[16 * r + i];
 		}
 		if (r != 0) {
@@ -189,10 +187,25 @@ mc_ecb_init(const struct ccmode_ecb *ecb __unused, ccecb_ctx *ctx, size_t key_nb
 static int
 mc_ecb_encrypt(const ccecb_ctx *ctx, size_t nblocks, const void *in, void *out)
 {
+	const struct mc_aes_key *k = (const struct mc_aes_key *)ctx;
+#if defined(KERNEL)
+	if (mc_ce_has_aes() && !ml_at_interrupt_context() && nblocks >= 4) {
+		struct mc_fpu_state fpu;
+		kernel_fpu_begin(&fpu);
+		mc_ce_aes_ecb_encrypt(k, nblocks, in, out);
+		kernel_fpu_end(&fpu);
+		return 0;
+	}
+#else
+	if (mc_ce_has_aes() && nblocks >= 4) {
+		mc_ce_aes_ecb_encrypt(k, nblocks, in, out);
+		return 0;
+	}
+#endif
 	const uint8_t *i = in;
 	uint8_t *o = out;
 	for (; nblocks > 0; nblocks--, i += 16, o += 16) {
-		mc_aes_encrypt_block((const struct mc_aes_key *)ctx, i, o);
+		mc_aes_encrypt_block(k, i, o);
 	}
 	return 0;
 }
@@ -200,10 +213,25 @@ mc_ecb_encrypt(const ccecb_ctx *ctx, size_t nblocks, const void *in, void *out)
 static int
 mc_ecb_decrypt(const ccecb_ctx *ctx, size_t nblocks, const void *in, void *out)
 {
+	const struct mc_aes_key *k = (const struct mc_aes_key *)ctx;
+#if defined(KERNEL)
+	if (mc_ce_has_aes() && !ml_at_interrupt_context() && nblocks >= 4) {
+		struct mc_fpu_state fpu;
+		kernel_fpu_begin(&fpu);
+		mc_ce_aes_ecb_decrypt(k, nblocks, in, out);
+		kernel_fpu_end(&fpu);
+		return 0;
+	}
+#else
+	if (mc_ce_has_aes() && nblocks >= 4) {
+		mc_ce_aes_ecb_decrypt(k, nblocks, in, out);
+		return 0;
+	}
+#endif
 	const uint8_t *i = in;
 	uint8_t *o = out;
 	for (; nblocks > 0; nblocks--, i += 16, o += 16) {
-		mc_aes_decrypt_block((const struct mc_aes_key *)ctx, i, o);
+		mc_aes_decrypt_block(k, i, o);
 	}
 	return 0;
 }
@@ -233,6 +261,21 @@ mc_cbc_init(const struct ccmode_cbc *cbc __unused, cccbc_ctx *ctx, size_t key_le
 static int
 mc_cbc_encrypt(const cccbc_ctx *ctx, cccbc_iv *iv, size_t nblocks, const void *in, void *out)
 {
+	const struct mc_aes_key *k = (const struct mc_aes_key *)ctx;
+#if defined(KERNEL)
+	if (mc_ce_has_aes() && !ml_at_interrupt_context() && nblocks >= 4) {
+		struct mc_fpu_state fpu;
+		kernel_fpu_begin(&fpu);
+		mc_ce_aes_cbc_encrypt(k, (uint8_t *)iv, nblocks, in, out);
+		kernel_fpu_end(&fpu);
+		return 0;
+	}
+#else
+	if (mc_ce_has_aes() && nblocks >= 4) {
+		mc_ce_aes_cbc_encrypt(k, (uint8_t *)iv, nblocks, in, out);
+		return 0;
+	}
+#endif
 	const uint8_t *i = in;
 	uint8_t *o = out, *chain = (uint8_t *)iv;
 
@@ -240,7 +283,7 @@ mc_cbc_encrypt(const cccbc_ctx *ctx, cccbc_iv *iv, size_t nblocks, const void *i
 		for (int b = 0; b < 16; b++) {
 			chain[b] ^= i[b];
 		}
-		mc_aes_encrypt_block((const struct mc_aes_key *)ctx, chain, chain);
+		mc_aes_encrypt_block(k, chain, chain);
 		memcpy(o, chain, 16);
 	}
 	return 0;
@@ -249,13 +292,28 @@ mc_cbc_encrypt(const cccbc_ctx *ctx, cccbc_iv *iv, size_t nblocks, const void *i
 static int
 mc_cbc_decrypt(const cccbc_ctx *ctx, cccbc_iv *iv, size_t nblocks, const void *in, void *out)
 {
+	const struct mc_aes_key *k = (const struct mc_aes_key *)ctx;
+#if defined(KERNEL)
+	if (mc_ce_has_aes() && !ml_at_interrupt_context() && nblocks >= 4) {
+		struct mc_fpu_state fpu;
+		kernel_fpu_begin(&fpu);
+		mc_ce_aes_cbc_decrypt(k, (uint8_t *)iv, nblocks, in, out);
+		kernel_fpu_end(&fpu);
+		return 0;
+	}
+#else
+	if (mc_ce_has_aes() && nblocks >= 4) {
+		mc_ce_aes_cbc_decrypt(k, (uint8_t *)iv, nblocks, in, out);
+		return 0;
+	}
+#endif
 	const uint8_t *i = in;
 	uint8_t *o = out, *chain = (uint8_t *)iv;
 
 	for (; nblocks > 0; nblocks--, i += 16, o += 16) {
 		uint8_t cipher[16], plain[16];
 		memcpy(cipher, i, 16); /* in and out may be the same buffer */
-		mc_aes_decrypt_block((const struct mc_aes_key *)ctx, cipher, plain);
+		mc_aes_decrypt_block(k, cipher, plain);
 		for (int b = 0; b < 16; b++) {
 			o[b] = plain[b] ^ chain[b];
 		}
@@ -313,6 +371,38 @@ mc_ctr_crypt(ccctr_ctx *ctx, size_t nbytes, const void *in, void *out)
 	struct mc_aes_ctr *c = (struct mc_aes_ctr *)ctx;
 	const uint8_t *i = in;
 	uint8_t *o = out;
+
+	/* Drain any remaining keystream in stream buffer */
+	while (nbytes > 0 && c->used < 16) {
+		*o++ = *i++ ^ c->stream[c->used++];
+		nbytes--;
+	}
+	if (nbytes == 0) {
+		return 0;
+	}
+
+#if defined(KERNEL)
+	if (mc_ce_has_aes() && !ml_at_interrupt_context() && nbytes >= 64) {
+		struct mc_fpu_state fpu;
+		kernel_fpu_begin(&fpu);
+		size_t full_blocks = (nbytes / 16) * 16;
+		mc_ce_aes_ctr_crypt(&c->key, c->counter, full_blocks, i, o);
+		kernel_fpu_end(&fpu);
+		i += full_blocks;
+		o += full_blocks;
+		nbytes -= full_blocks;
+		c->used = 16;
+	}
+#else
+	if (mc_ce_has_aes() && nbytes >= 64) {
+		size_t full_blocks = (nbytes / 16) * 16;
+		mc_ce_aes_ctr_crypt(&c->key, c->counter, full_blocks, i, o);
+		i += full_blocks;
+		o += full_blocks;
+		nbytes -= full_blocks;
+		c->used = 16;
+	}
+#endif
 
 	for (; nbytes > 0; nbytes--) {
 		if (c->used == 16) {
@@ -389,5 +479,78 @@ mc_aes_selftest(void)
 	if (memcmp(out, ctr256, 40) != 0) {
 		return "aes-256-ctr";
 	}
+
+	/*
+	 * 80-byte (5 blocks) cross-comparison: exercises the ARMv8 CE hardware
+	 * path (nblocks >= 4 for ECB/CBC and nbytes >= 64 for CTR) and verifies
+	 * exact bit-for-bit equivalence against the scalar reference.
+	 */
+	static const uint8_t plain80[80] = {
+		0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+		0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96, 0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a,
+		0xae, 0x2d, 0x8a, 0x57, 0x1e, 0x03, 0xac, 0x9c, 0x9e, 0xb7, 0x6f, 0xac, 0x45, 0xaf, 0x8e, 0x51,
+		0x30, 0xc8, 0x1c, 0x46, 0xa3, 0x5c, 0xe4, 0x11, 0xe5, 0xfb, 0xc1, 0x19, 0x1a, 0x0a, 0x52, 0xef,
+		0xf6, 0x9f, 0x24, 0x45, 0xdf, 0x4f, 0x9b, 0x17, 0xad, 0x2b, 0x41, 0x7b, 0xe6, 0x6c, 0x37, 0x10,
+	};
+	uint8_t sc_ref[80], hw_out[80], hw_dec[80];
+
+	/* 1. ECB 80-byte cross-comparison (5 blocks >= 4) */
+	mc_aes_setkey(&k, 32, key);
+	for (int b = 0; b < 5; b++) {
+		mc_aes_encrypt_block(&k, plain80 + b * 16, sc_ref + b * 16);
+	}
+	mc_ecb_encrypt((const ccecb_ctx *)&k, 5, plain80, hw_out);
+	if (memcmp(hw_out, sc_ref, 80) != 0) {
+		return "aes-256-ecb-80 hardware encrypt";
+	}
+	mc_ecb_decrypt((const ccecb_ctx *)&k, 5, hw_out, hw_dec);
+	if (memcmp(hw_dec, plain80, 80) != 0) {
+		return "aes-256-ecb-80 hardware decrypt";
+	}
+
+	/* 2. CBC 80-byte cross-comparison (5 blocks >= 4) */
+	uint8_t cbc_iv[16];
+	memcpy(cbc_iv, iv, 16);
+	for (int b = 0; b < 5; b++) {
+		for (int j = 0; j < 16; j++) {
+			cbc_iv[j] ^= plain80[b * 16 + j];
+		}
+		mc_aes_encrypt_block(&k, cbc_iv, cbc_iv);
+		memcpy(sc_ref + b * 16, cbc_iv, 16);
+	}
+	memcpy(cbc_iv, iv, 16);
+	mc_cbc_encrypt((const cccbc_ctx *)&k, (cccbc_iv *)cbc_iv, 5, plain80, hw_out);
+	if (memcmp(hw_out, sc_ref, 80) != 0) {
+		return "aes-256-cbc-80 hardware encrypt";
+	}
+	memcpy(cbc_iv, iv, 16);
+	mc_cbc_decrypt((const cccbc_ctx *)&k, (cccbc_iv *)cbc_iv, 5, hw_out, hw_dec);
+	if (memcmp(hw_dec, plain80, 80) != 0) {
+		return "aes-256-cbc-80 hardware decrypt";
+	}
+
+	/* 3. CTR 80-byte cross-comparison (80 bytes >= 64) */
+	uint8_t ctr_cnt[16];
+	memcpy(ctr_cnt, iv, 16);
+	for (int b = 0; b < 5; b++) {
+		uint8_t ks[16];
+		mc_aes_encrypt_block(&k, ctr_cnt, ks);
+		for (int j = 15; j >= 0 && ++ctr_cnt[j] == 0; j--) {
+		}
+		for (int j = 0; j < 16; j++) {
+			sc_ref[b * 16 + j] = (uint8_t)(plain80[b * 16 + j] ^ ks[j]);
+		}
+	}
+	mc_ctr_init(&mc_aes_ctr_crypt, (ccctr_ctx *)&c, 32, key, iv);
+	mc_ctr_crypt((ccctr_ctx *)&c, 80, plain80, hw_out);
+	if (memcmp(hw_out, sc_ref, 80) != 0) {
+		return "aes-256-ctr-80 hardware crypt";
+	}
+	mc_ctr_init(&mc_aes_ctr_crypt, (ccctr_ctx *)&c, 32, key, iv);
+	mc_ctr_crypt((ccctr_ctx *)&c, 80, hw_out, hw_dec);
+	if (memcmp(hw_dec, plain80, 80) != 0) {
+		return "aes-256-ctr-80 hardware decrypt";
+	}
+
 	return NULL;
 }

@@ -58,6 +58,7 @@ static struct {
 	volatile bool looks;			/* ... and runs */
 	volatile bool data;			/* ... and looks at the data path's groups as well */
 	volatile bool in_pass;			/* ... and is in the middle of a look */
+	volatile bool wake_pending;		/* wake requested while in pass or before sleep */
 } bus;
 
 /* ---- what the driver says (debug.c is not built) ------------------------------------------------- */
@@ -339,15 +340,41 @@ tx_watch(struct ath12k_base *ab)
 	}
 }
 
+static spinlock_t ce_locks[16];
+static spinlock_t srng_locks[ATH12K_EXT_IRQ_GRP_NUM_MAX];
+
+void
+lx_pci_wake_rings(void)
+{
+	lx_os_lock();
+	bus.wake_pending = true;
+	lx_os_wakeup(&bus.looks);
+	lx_os_unlock();
+}
+
+static void
+ce_irq_handler(__unused void *context)
+{
+	lx_pci_wake_rings();
+}
+
+static void
+dp_irq_handler(__unused void *context)
+{
+	lx_pci_wake_rings();
+}
+
 static void
 bus_looks(void *argument)
 {
 	struct ath12k_base *ab = argument;
 	unsigned long long said = lx_os_nanoseconds();
+	unsigned active_loops = 0;
 
 	bus.looks = true;
 	while (bus.looking) {
 		bool more = false;
+		bool had_traffic = false;
 
 		if (lx_os_nanoseconds() - said > 300000000000ull) {	/* every five minutes: how the station and memory stand */
 			said = lx_os_nanoseconds();
@@ -356,19 +383,51 @@ bus_looks(void *argument)
 		}
 		bus.in_pass = true;
 		wmi_rx_wrap(ab);
-		for (unsigned i = 0; i < ab->hw_params->ce_count; i++) {
+		for (unsigned i = 0; i < ab->hw_params->ce_count && i < nitems(ce_locks); i++) {
+			spin_lock_bh(&ce_locks[i]);
 			ath12k_ce_per_engine_service(ab, i);
+			spin_unlock_bh(&ce_locks[i]);
 		}
 		if (bus.data && watch.said < TX_SAID_MOST) {
 			tx_watch(ab);
 		}
 		for (unsigned i = 0; bus.data && i < ATH12K_EXT_IRQ_GRP_NUM_MAX; i++) {
-			more |= ath12k_dp_service_srng(ath12k_ab_to_dp(ab), &ab->ext_irq_grp[i], DATA_BUDGET) >= DATA_BUDGET;
+			spin_lock_bh(&srng_locks[i]);
+			int serviced = ath12k_dp_service_srng(ath12k_ab_to_dp(ab), &ab->ext_irq_grp[i], DATA_BUDGET);
+			if (serviced > 0) {
+				had_traffic = true;
+			}
+			more |= (serviced >= DATA_BUDGET);
+			spin_unlock_bh(&srng_locks[i]);
 		}
 		bus.in_pass = false;
-		if (!more) {
-			lx_pause_ms(1);
+
+		lx_os_lock();
+		if (bus.wake_pending) {
+			had_traffic = true;
 		}
+		if (had_traffic) {
+			active_loops = 100;
+		}
+
+		if (!more) {
+			if (!bus.wake_pending && bus.looking) {
+				unsigned long long sleep_ns;
+				if (bus.data) {
+					if (active_loops > 0) {
+						sleep_ns = 1000000ull; /* 1 ms */
+						active_loops--;
+					} else {
+						sleep_ns = 5000000ull; /* 5 ms */
+					}
+				} else {
+					sleep_ns = 20000000ull; /* 20 ms */
+				}
+				lx_os_sleep(&bus.looks, sleep_ns);
+			}
+			bus.wake_pending = false;
+		}
+		lx_os_unlock();
 	}
 	bus.looks = false;
 }
@@ -378,6 +437,7 @@ static void
 bus_data_off(void)
 {
 	bus.data = false;
+	lx_pci_wake_rings();
 	while (bus.looks && bus.in_pass) {
 		lx_pause_ms(1);
 	}
@@ -389,6 +449,7 @@ bus_quiet(void)
 {
 	bus.data = false;
 	bus.looking = false;
+	lx_pci_wake_rings();
 	while (bus.looks) {
 		lx_pause_ms(1);
 	}
@@ -417,7 +478,14 @@ bus_start(struct ath12k_base *ab)
 {
 	printf("lx: the driver starts the bus: buffers for the copy engines that receive (%u reads and %u writes of the chip's "
 	    "registers so far)\n", bus.reads, bus.writes);
+	for (unsigned i = 0; i < nitems(ce_locks); i++) {
+		spin_lock_init(&ce_locks[i]);
+	}
+	for (unsigned i = 0; i < ATH12K_EXT_IRQ_GRP_NUM_MAX; i++) {
+		spin_lock_init(&srng_locks[i]);
+	}
 	ath12k_ce_rx_post_buf(ab);
+	bus.wake_pending = false;
 	bus.looking = true;
 	if (lx_os_thread("wifi-rings", bus_looks, ab) != 0) {
 		bus.looking = false;

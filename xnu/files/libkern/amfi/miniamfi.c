@@ -17,29 +17,38 @@
 #include <libkern/libkern.h>
 #include <libkern/amfi/amfi.h>
 
+/* Queries on OSEntitlements objects and processes are implemented in miniamfi_entitlements.cpp. */
+extern void *miniamfi_osent_asdict(void *osentitlements);
+extern bool miniamfi_osent_get_transmuted(void *osentitlements, const CS_GenericBlob **blob);
+extern bool miniamfi_osent_get_xml(void *osentitlements, CS_GenericBlob **blob);
+extern kern_return_t miniamfi_osent_boolean(const void *os_entitlements, const char *name);
+extern kern_return_t miniamfi_osent_string(const void *os_entitlements, const char *name, const char *value);
+extern kern_return_t miniamfi_osent_object(const void *os_entitlements, const char *name, void **object);
+extern kern_return_t miniamfi_entitlement_boolean(struct proc *proc, const char *name);
+extern kern_return_t miniamfi_entitlement_string(struct proc *proc, const char *name, const char *value);
+extern kern_return_t miniamfi_entitlement_object(struct proc *proc, const char *name, void **object);
+
 static void
 mini_OSEntitlements_invalidate(__unused void *osentitlements)
 {
 }
 
 static void *
-mini_OSEntitlements_asdict(__unused void *osentitlements)
+mini_OSEntitlements_asdict(void *osentitlements)
 {
-	return NULL;
+	return miniamfi_osent_asdict(osentitlements);
 }
 
 static bool
-mini_OSEntitlements_get_transmuted(__unused void *osentitlements, const CS_GenericBlob **blob)
+mini_OSEntitlements_get_transmuted(void *osentitlements, const CS_GenericBlob **blob)
 {
-	*blob = NULL;
-	return false;
+	return miniamfi_osent_get_transmuted(osentitlements, blob);
 }
 
 static bool
-mini_OSEntitlements_get_xml(__unused void *osentitlements, CS_GenericBlob **blob)
+mini_OSEntitlements_get_xml(void *osentitlements, CS_GenericBlob **blob)
 {
-	*blob = NULL;
-	return false;
+	return miniamfi_osent_get_xml(osentitlements, blob);
 }
 
 static bool
@@ -80,15 +89,10 @@ mini_adjustContextWithoutMonitor(__unused void *os_entitlements, __unused struct
 }
 
 static kern_return_t
-mini_queryEntitlementBoolean(__unused const void *os_entitlements, __unused const char *entitlement_name)
+mini_queryEntitlementBoolean(const void *os_entitlements, const char *entitlement_name)
 {
-	return KERN_NOT_FOUND;
+	return miniamfi_osent_boolean(os_entitlements, entitlement_name);
 }
-
-/* Queries about a process are answered from the entitlements in its code signature: miniamfi_entitlements.cpp */
-extern kern_return_t miniamfi_entitlement_boolean(struct proc *proc, const char *name);
-extern kern_return_t miniamfi_entitlement_string(struct proc *proc, const char *name, const char *value);
-extern kern_return_t miniamfi_entitlement_object(struct proc *proc, const char *name, void **object);
 
 static kern_return_t
 mini_queryEntitlementBooleanWithProc(const proc_t proc, const char *entitlement_name)
@@ -97,10 +101,10 @@ mini_queryEntitlementBooleanWithProc(const proc_t proc, const char *entitlement_
 }
 
 static kern_return_t
-mini_queryEntitlementString(__unused const void *os_entitlements, __unused const char *entitlement_name,
-    __unused const char *entitlement_value)
+mini_queryEntitlementString(const void *os_entitlements, const char *entitlement_name,
+    const char *entitlement_value)
 {
-	return KERN_NOT_FOUND;
+	return miniamfi_osent_string(os_entitlements, entitlement_name, entitlement_value);
 }
 
 static kern_return_t
@@ -110,11 +114,10 @@ mini_queryEntitlementStringWithProc(const proc_t proc, const char *entitlement_n
 }
 
 static kern_return_t
-mini_copyEntitlementAsOSObject(__unused const void *os_entitlements, __unused const char *entitlement_name,
+mini_copyEntitlementAsOSObject(const void *os_entitlements, const char *entitlement_name,
     void **entitlement_object)
 {
-	*entitlement_object = NULL;
-	return KERN_NOT_FOUND;
+	return miniamfi_osent_object(os_entitlements, entitlement_name, entitlement_object);
 }
 
 static kern_return_t

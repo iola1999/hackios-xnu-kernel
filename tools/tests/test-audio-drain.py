@@ -43,6 +43,13 @@ HARNESS = r'''
 #define THREAD_AWAKENED 0
 #define THREAD_CONTINUE_NULL 0
 #define audio_spin_lock ((void *)1)
+#define CHANNELS 2u
+#define PERIOD_BYTES (PERIOD_FRAMES * CHANNELS * 2u)
+#ifndef __DECONST
+#define __DECONST(t, v) ((t)(uintptr_t)(const void *)(v))
+#endif
+static uint8_t mock_dma[0x10000];
+static volatile uint8_t *reach_buffer = mock_dma;
 typedef int wait_result_t;
 typedef void *event_t;
 static uint32_t ring_head=960, ring_tail, in_flight_mask, reach_sent_count=100, reach_done_count=100;
@@ -71,7 +78,7 @@ static bool build_audioreach_graphs(void) { return true; }
 static void delay_for_interval(int a,int b) { (void)a;(void)b; }
 static void *current_thread(void) { return NULL; }
 static void thread_terminate(void *p) {
-    (void)p;assert((fail || fail_start || fail_stop || fail_submission) && reports==(fail_stop ? 1u : 0u));
+    (void)p;assert((fail || fail_submission) && reports==0u);
     assert(reach_write_failed && !reach_stream_active);longjmp(finished,1);
 }
 static bool annibale_audio_volume(uint32_t *a,bool *b,uint32_t *c) { (void)a;(void)b;(void)c;return false; }
@@ -99,6 +106,7 @@ static void thread_block(int mode) {
     if(fail) {reach_write_failed=true;return;}
     reach_done_count+=(unsigned)__builtin_popcount(in_flight_mask);in_flight_mask=0;
     if(reports==1 && !second) {ring_head+=960;second=true;}
+    if(fail_start && iterations >= 10) longjmp(finished, 1);
     if(reports==2 && iterations>300) longjmp(finished,1);
 }
 PRODUCTION_FUNCTION
@@ -109,11 +117,11 @@ int main(int argc,char **argv) {
     fail_submission=!strcmp(argv[1],"submission-failure");
     loud=!strcmp(argv[1],"loud") || fail_start || fail_stop;
     if(!setjmp(finished)) reach_feeder_thread(NULL,0);
-    bool failed=fail || fail_start || fail_stop || fail_submission;
-    assert(reports==(failed ? (fail_stop ? 1u : 0u) : 2u));
+    bool failed=fail || fail_submission;
+    assert(reports==(failed ? 0u : 2u));
     if(fail || fail_submission) assert(!amp_on && amp_off==1);
-    else if(fail_start) assert(amp_on==1 && !amp_off);
-    else if(fail_stop) assert(amp_on==1 && amp_off==1);
+    else if(fail_start) assert(amp_on>=1 && !amp_off && !reach_write_failed);
+    else if(fail_stop) assert(amp_on==1 && amp_off==1 && !reach_write_failed);
     else assert(amp_on==(loud ? 1u : 0u) && amp_off==amp_on);
     if(failed) {
         uint32_t head=ring_head,pending=in_flight_mask;
@@ -121,6 +129,9 @@ int main(int argc,char **argv) {
         assert(reach_audio_sink(frames,1)==0 && ring_head==head);
         assert(in_flight_mask==pending && ring_storage==ring_data);
         assert(annibale_audio_reach_is_active()==(pending!=0));
+    } else if(fail_start || fail_stop) {
+        const int16_t frames[2]={100,-100};
+        assert(reach_audio_sink(frames,1)==1);
     }
     puts("PASS: feeder drain and amplifier failure contract");
 }

@@ -268,7 +268,7 @@ static bool smem_ensure(void)
 
 static bool smem_peek(uint32_t offset, void *to, uint32_t size)
 {
-	if (!smem_ensure() || offset + size > SMEM_SIZE) {
+	if (!smem_ensure() || (uint64_t)offset + (uint64_t)size > SMEM_SIZE) {
 		return false;
 	}
 	for (uint32_t i = 0; i < size; i++) {
@@ -279,7 +279,7 @@ static bool smem_peek(uint32_t offset, void *to, uint32_t size)
 
 static void smem_poke(uint32_t offset, uint32_t val)
 {
-	if (smem_ensure() && offset + 4 <= SMEM_SIZE) {
+	if (smem_ensure() && (uint64_t)offset + 4ULL <= SMEM_SIZE) {
 		mmio_wr((vm_offset_t)(smem_base + offset), val);
 	}
 }
@@ -327,38 +327,61 @@ static uint32_t smem_item_in_partition(uint16_t host0, uint16_t host1, uint32_t 
 	part_off = smem_partition_find(host0, host1, &part_size, &cacheline);
 	if (part_off == 0 || !smem_peek(part_off, &part, sizeof(part)) ||
 	    part.free_uncached > part_size || part.free_cached > part_size ||
-	    part.free_uncached > part.free_cached) {
+	    part.free_uncached > part.free_cached ||
+	    (uint64_t)part_off + (uint64_t)part_size > SMEM_SIZE) {
 		return 0;
 	}
-	for (uint32_t at = sizeof(part); at + sizeof(e) <= part.free_uncached; ) {
+	for (uint32_t at = sizeof(part); (uint64_t)at + sizeof(e) <= (uint64_t)part.free_uncached; ) {
 		if (!smem_peek(part_off + at, &e, sizeof(e)) || e.canary != SMEM_CANARY) {
 			break;
 		}
-		uint32_t data = part_off + at + sizeof(e) + e.padding_header;
-		if (e.size > part_size || data + e.size > part_off + part.free_uncached) {
+		if (e.padding_data > e.size || (uint64_t)e.size > (uint64_t)part_size) {
+			break;
+		}
+		uint64_t data = (uint64_t)part_off + (uint64_t)at + sizeof(e) + (uint64_t)e.padding_header;
+		if (data < (uint64_t)part_off ||
+		    data + (uint64_t)e.size > (uint64_t)part_off + (uint64_t)part.free_uncached ||
+		    data + (uint64_t)e.size > SMEM_SIZE) {
 			break;
 		}
 		if (e.item == wanted) {
 			if (size_out != NULL) *size_out = e.size - e.padding_data;
-			return data;
+			return (uint32_t)data;
 		}
-		at += sizeof(e) + e.padding_header + e.size;
+		uint64_t step = sizeof(e) + (uint64_t)e.padding_header + (uint64_t)e.size;
+		if ((uint64_t)at + step > (uint64_t)part.free_uncached) {
+			break;
+		}
+		at = (uint32_t)((uint64_t)at + step);
 	}
-	if (cacheline != 0) {
-		for (uint32_t at = part_size - cacheline; at >= part.free_cached && at < part_size; ) {
-			if (!smem_peek(part_off + at, &e, sizeof(e)) || e.canary != SMEM_CANARY ||
-			    e.size > at - part.free_cached) {
+	if (cacheline != 0 && (uint64_t)cacheline <= (uint64_t)part_size) {
+		for (uint32_t at = part_size - cacheline;
+		    (uint64_t)at >= (uint64_t)part.free_cached && (uint64_t)at < (uint64_t)part_size; ) {
+			if (!smem_peek(part_off + at, &e, sizeof(e)) || e.canary != SMEM_CANARY) {
 				break;
 			}
-			uint32_t data = part_off + at - e.padding_header - e.size;
+			if (e.padding_data > e.size || (uint64_t)e.size > (uint64_t)at - (uint64_t)part.free_cached) {
+				break;
+			}
+			uint64_t sub_offset = (uint64_t)e.padding_header + (uint64_t)e.size;
+			if ((uint64_t)at < sub_offset) {
+				break;
+			}
+			uint64_t data = (uint64_t)part_off + ((uint64_t)at - sub_offset);
+			if (data < (uint64_t)part_off + (uint64_t)part.free_cached ||
+			    data + (uint64_t)e.size > (uint64_t)part_off + (uint64_t)part_size ||
+			    data + (uint64_t)e.size > SMEM_SIZE) {
+				break;
+			}
 			if (e.item == wanted) {
 				if (size_out != NULL) *size_out = e.size - e.padding_data;
-				return data;
+				return (uint32_t)data;
 			}
-			if (at < e.padding_header + e.size + cacheline) {
+			uint64_t decr = sub_offset + (uint64_t)cacheline;
+			if ((uint64_t)at < decr) {
 				break;
 			}
-			at = at - e.padding_header - e.size - cacheline;
+			at = (uint32_t)((uint64_t)at - decr);
 		}
 	}
 	return 0;
@@ -610,6 +633,19 @@ static int adsp_pmic_glink_tx(const void *data, uint32_t len)
 	return 0;
 }
 
+#define GLINK_REASM_MAX 2048u
+
+struct glink_reasm {
+	uint16_t cid;
+	uint32_t total_len;
+	uint32_t assembled_len;
+	bool     in_progress;
+	bool     oversize;
+	uint8_t  buf[GLINK_REASM_MAX];
+};
+
+static struct glink_reasm glink_rx_reasm[2];
+
 static void glink_poll_rx(void)
 {
 	/* Boot, GPR and PMIC callers share one receive cursor. */
@@ -625,38 +661,54 @@ static void glink_poll_rx(void)
 	smem_peek(glink_their_read_at, &r, 4);
 	smem_peek(glink_their_write_at, &w, 4);
 
+	if (r >= glink_their_q_size || w >= glink_their_q_size) {
+		if (w < glink_their_q_size) {
+			smem_poke(glink_their_read_at, w);
+		}
+		lck_mtx_unlock(&glink_rx_lock);
+		return;
+	}
+
 	while (r != w && r < glink_their_q_size && w < glink_their_q_size) {
 		uint32_t w0 = glink_q_read32(glink_their_q, glink_their_q_size, r);
 		uint32_t w1 = glink_q_read32(glink_their_q, glink_their_q_size, r + 4);
 		uint16_t cmd = (uint16_t)(w0 & 0xffffu), param = (uint16_t)(w0 >> 16);
-		uint32_t step_bytes = 8;
+		uint64_t step_bytes = 8;
+		bool invalid_len = false;
 
 		if (cmd == GLINK_VERSION) {
 			glink_send_cmd2(GLINK_VERSION_ACK, param, w1 & 1u);
+		} else if (cmd == GLINK_VERSION_ACK || cmd == GLINK_CLOSE_ACK || cmd == GLINK_RX_INTENT_REQ_ACK) {
+			/* Fixed 8-byte acknowledgment messages. */
 		} else if (cmd == GLINK_OPEN) {
 			char name[32] = { 0 };
 			uint16_t nlen = (uint16_t)(w1 & 0xffffu);
-			for (uint16_t i = 0; i < nlen && i < sizeof(name) - 1; i++) {
-				smem_peek(glink_their_q + ((r + 8 + i) % glink_their_q_size), &name[i], 1);
-			}
-			step_bytes = (8u + nlen + 7u) & ~7u;
-			glink_send_cmd2(GLINK_OPEN_ACK, param, 0);
-			if (strcmp(name, "adsp_apps") == 0 || strcmp(name, "apr_audio_svc") == 0) {
-				glink_gpr_their_cid = param;
-				if (glink_gpr_our_cid == 0) {
-					glink_gpr_our_cid = 2;
-					glink_send_open(glink_gpr_our_cid, name);
-				} else {
-					glink_queue_intents(glink_gpr_our_cid);
+			uint64_t raw_step = (uint64_t)8 + (uint64_t)nlen;
+			step_bytes = (raw_step + 7ULL) & ~7ULL;
+			if (nlen > 256 || step_bytes > (uint64_t)glink_their_q_size) {
+				invalid_len = true;
+			} else {
+				for (uint16_t i = 0; i < nlen && i < sizeof(name) - 1; i++) {
+					smem_peek(glink_their_q + (((uint64_t)r + 8ULL + i) % glink_their_q_size), &name[i], 1);
 				}
-			} else if (strcmp(name, "PMIC_RTR_ADSP_APPS") == 0) {
-				glink_pmic_their_cid = param;
-				if (glink_pmic_our_cid == 0) {
-					glink_pmic_our_cid = 3;
-					glink_send_open(glink_pmic_our_cid, name);
-				} else {
-					glink_queue_intents(glink_pmic_our_cid);
-					annibale_pmic_glink_set_tx(adsp_pmic_glink_tx);
+				glink_send_cmd2(GLINK_OPEN_ACK, param, 0);
+				if (strcmp(name, "adsp_apps") == 0 || strcmp(name, "apr_audio_svc") == 0) {
+					glink_gpr_their_cid = param;
+					if (glink_gpr_our_cid == 0) {
+						glink_gpr_our_cid = 2;
+						glink_send_open(glink_gpr_our_cid, name);
+					} else {
+						glink_queue_intents(glink_gpr_our_cid);
+					}
+				} else if (strcmp(name, "PMIC_RTR_ADSP_APPS") == 0) {
+					glink_pmic_their_cid = param;
+					if (glink_pmic_our_cid == 0) {
+						glink_pmic_our_cid = 3;
+						glink_send_open(glink_pmic_our_cid, name);
+					} else {
+						glink_queue_intents(glink_pmic_our_cid);
+						annibale_pmic_glink_set_tx(adsp_pmic_glink_tx);
+					}
 				}
 			}
 		} else if (cmd == GLINK_OPEN_ACK) {
@@ -677,18 +729,22 @@ static void glink_poll_rx(void)
 			}
 		} else if (cmd == GLINK_INTENT) {
 			uint32_t count = w1;
-			if (count > 64) count = 0;
-			for (uint32_t i = 0; i < count; i++) {
-				uint32_t sz = glink_q_read32(glink_their_q, glink_their_q_size, r + 8 + 8 * i);
-				uint32_t iid = glink_q_read32(glink_their_q, glink_their_q_size, r + 12 + 8 * i);
-				if (param == glink_pmic_their_cid) {
-					glink_add_their_intent(&glink_pmic_intents, iid, sz);
-				} else if (param == glink_gpr_their_cid) {
-					glink_add_their_intent(&glink_gpr_intents, iid, sz);
-					say("GPR intent id %u size %u\n", iid, sz);
+			uint64_t raw_step = (uint64_t)8 + 8ULL * (uint64_t)count;
+			step_bytes = (raw_step + 7ULL) & ~7ULL;
+			if (count > 64 || step_bytes > (uint64_t)glink_their_q_size) {
+				invalid_len = true;
+			} else {
+				for (uint32_t i = 0; i < count; i++) {
+					uint32_t sz = glink_q_read32(glink_their_q, glink_their_q_size, r + 8 + 8 * i);
+					uint32_t iid = glink_q_read32(glink_their_q, glink_their_q_size, r + 12 + 8 * i);
+					if (param == glink_pmic_their_cid) {
+						glink_add_their_intent(&glink_pmic_intents, iid, sz);
+					} else if (param == glink_gpr_their_cid) {
+						glink_add_their_intent(&glink_gpr_intents, iid, sz);
+						say("GPR intent id %u size %u\n", iid, sz);
+					}
 				}
 			}
-			step_bytes = (8u + 8u * w1 + 7u) & ~7u;
 		} else if (cmd == GLINK_RX_DONE || cmd == GLINK_DONE_REUSE) {
 			if (param == glink_pmic_their_cid) {
 				glink_complete_their_intent(&glink_pmic_intents, w1, cmd == GLINK_DONE_REUSE);
@@ -698,26 +754,98 @@ static void glink_poll_rx(void)
 		} else if (cmd == GLINK_TX_DATA || cmd == GLINK_TX_DATA_CONT) {
 			uint32_t chunk = glink_q_read32(glink_their_q, glink_their_q_size, r + 8);
 			uint32_t left = glink_q_read32(glink_their_q, glink_their_q_size, r + 12);
-			step_bytes = (16u + chunk + 7u) & ~7u;
-			if ((param == glink_gpr_their_cid || param == glink_pmic_their_cid) && chunk <= 512) {
-				uint8_t buf[512];
-				for (uint32_t i = 0; i < chunk; i++) {
-					smem_peek(glink_their_q + ((r + 16 + i) % glink_their_q_size), &buf[i], 1);
+			uint64_t raw_step = (uint64_t)16 + (uint64_t)chunk;
+			step_bytes = (raw_step + 7ULL) & ~7ULL;
+			if (chunk > glink_their_q_size || step_bytes > (uint64_t)glink_their_q_size) {
+				invalid_len = true;
+			} else {
+				struct glink_reasm *reasm = NULL;
+				if (param == glink_gpr_their_cid && glink_gpr_their_cid != 0) {
+					reasm = &glink_rx_reasm[0];
+				} else if (param == glink_pmic_their_cid && glink_pmic_their_cid != 0) {
+					reasm = &glink_rx_reasm[1];
 				}
-				if (param == glink_gpr_their_cid) {
-					handle_incoming_gpr(buf, chunk);
-				} else {
-					annibale_pmic_glink_rx(buf, chunk);
+
+				if (reasm != NULL) {
+					if (cmd == GLINK_TX_DATA) {
+						uint64_t total = (uint64_t)chunk + (uint64_t)left;
+						if (total > GLINK_REASM_MAX || total == 0) {
+							reasm->in_progress = true;
+							reasm->oversize = true;
+							reasm->cid = param;
+							reasm->total_len = 0;
+							reasm->assembled_len = 0;
+						} else {
+							reasm->in_progress = true;
+							reasm->oversize = false;
+							reasm->cid = param;
+							reasm->total_len = (uint32_t)total;
+							for (uint32_t i = 0; i < chunk; i++) {
+								smem_peek(glink_their_q + (((uint64_t)r + 16ULL + i) % glink_their_q_size),
+								    &reasm->buf[i], 1);
+							}
+							reasm->assembled_len = chunk;
+							if (left == 0) {
+								if (param == glink_gpr_their_cid) {
+									handle_incoming_gpr(reasm->buf, reasm->assembled_len);
+								} else {
+									annibale_pmic_glink_rx(reasm->buf, reasm->assembled_len);
+								}
+								reasm->in_progress = false;
+							}
+						}
+					} else { /* GLINK_TX_DATA_CONT */
+						if (reasm->in_progress && reasm->cid == param) {
+							if (reasm->oversize) {
+								if (left == 0) {
+									reasm->in_progress = false;
+									reasm->oversize = false;
+								}
+							} else if ((uint64_t)reasm->assembled_len + (uint64_t)chunk > (uint64_t)reasm->total_len ||
+							    (uint64_t)reasm->assembled_len + (uint64_t)chunk > GLINK_REASM_MAX) {
+								reasm->oversize = true;
+								if (left == 0) {
+									reasm->in_progress = false;
+									reasm->oversize = false;
+								}
+							} else {
+								for (uint32_t i = 0; i < chunk; i++) {
+									smem_peek(glink_their_q + (((uint64_t)r + 16ULL + i) % glink_their_q_size),
+									    &reasm->buf[reasm->assembled_len + i], 1);
+								}
+								reasm->assembled_len += chunk;
+								if (left == 0) {
+									if (reasm->assembled_len == reasm->total_len) {
+										if (param == glink_gpr_their_cid) {
+											handle_incoming_gpr(reasm->buf, reasm->assembled_len);
+										} else {
+											annibale_pmic_glink_rx(reasm->buf, reasm->assembled_len);
+										}
+									}
+									reasm->in_progress = false;
+								}
+							}
+						}
+					}
+				}
+				if (left == 0) {
+					uint16_t our_cid = (param == glink_pmic_their_cid) ? glink_pmic_our_cid : glink_gpr_our_cid;
+					if (our_cid != 0) {
+						glink_send_cmd2(GLINK_DONE_REUSE, our_cid, w1);
+					}
 				}
 			}
-			if (left == 0) {
-				uint16_t our_cid = (param == glink_pmic_their_cid) ? glink_pmic_our_cid : glink_gpr_our_cid;
-				if (our_cid != 0) {
-					glink_send_cmd2(GLINK_DONE_REUSE, our_cid, w1);
-				}
-			}
+		} else {
+			invalid_len = true;
 		}
-		r = (r + step_bytes) % glink_their_q_size;
+
+		if (invalid_len || step_bytes == 0 || step_bytes > (uint64_t)glink_their_q_size) {
+			r = w;
+			smem_poke(glink_their_read_at, r);
+			break;
+		}
+
+		r = (uint32_t)(((uint64_t)r + step_bytes) % (uint64_t)glink_their_q_size);
 		smem_poke(glink_their_read_at, r);
 		smem_peek(glink_their_write_at, &w, 4);
 	}
@@ -748,6 +876,7 @@ static bool glink_init_queues(bool cold_boot)
 		smem_peek(glink_our_write_at, &glink_tx_write_pos, 4);
 	}
 	glink_their_q = smem_item(ITEM_GLINK_THEIR_Q, &glink_their_q_size);
+	bzero(glink_rx_reasm, sizeof(glink_rx_reasm));
 	glink_send_cmd2(GLINK_VERSION, 1, 1);
 	return true;
 }
@@ -952,7 +1081,7 @@ static void annibale_adsp_boot_thread(void *arg __unused, wait_result_t w __unus
 			    !annibale_ufs_fat16_fw_read("adsp_dtb.mdt", &probe_sz, NULL, 0); wait++) {
 				sleep_ms(100);
 			}
-			struct fw_image dtb_fw, main_fw;
+			struct fw_image dtb_fw = {0}, main_fw = {0};
 			if (fw_load_mdt("adsp_dtb", ADSP_DTB_MEMORY, ADSP_DTB_MEMORY_SIZE, &dtb_fw) &&
 			    fw_load_mdt("adsp", ADSP_MEMORY, ADSP_MEMORY_SIZE, &main_fw)) {
 				say("loaded adsp_dtb.mdt (%u segs, %#x B) and adsp.mdt (%u segs, %#x B)\n",

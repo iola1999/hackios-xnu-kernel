@@ -227,15 +227,30 @@ ufs_strategy(buf_t bp)
 	if (ufs_native_on && ufs_lun[part] != 0xff) {
 		int err = ufshc_strategy_async(bp, ufs_lun[part], ufs_lun_offset[part] + offset, !is_read);
 		if (err == 0) {
-			return; /* Completed asynchronously via GICv3 SPI 297 interrupt and buf_biodone(bp) */
+			return; /* Completed asynchronously via GICv3 SPI 297 interrupt and completion thread */
 		}
 	}
 
 	/* Synchronous fallback */
+	caddr_t data = (caddr_t)buf_dataptr(bp);
+	bool mapped = false;
+	if (data == NULL) {
+		if (buf_map(bp, &data) != 0 || data == NULL) {
+			buf_seterror(bp, ENOMEM);
+			buf_setresid(bp, buf_count(bp));
+			buf_biodone(bp);
+			return;
+		}
+		mapped = true;
+	}
+
 	if (!is_read) {
-		error = ufs_write(part, offset, (const uint8_t *)buf_dataptr(bp), len);
+		error = ufs_write(part, offset, (const uint8_t *)data, len);
 	} else {
-		error = ufs_read(part, offset, (uint8_t *)buf_dataptr(bp), len);
+		error = ufs_read(part, offset, (uint8_t *)data, len);
+	}
+	if (mapped) {
+		buf_unmap(bp);
 	}
 	buf_setresid(bp, (uint32_t)(buf_count(bp) - (error ? 0 : len)));
 	if (error) {
@@ -295,6 +310,7 @@ ufs_ioctl(dev_t dev, u_long cmd, caddr_t data, __unused int fflag, __unused proc
 		return 0;
 	case DKIOCUNMAP: {
 		dk_unmap_t *unmap = (dk_unmap_t *)data;
+		uint32_t bsz = ufs_bsize[part] ? ufs_bsize[part] : 4096u;
 		if (ufs_darwin_var_part < 0 || part != (uint32_t)ufs_darwin_var_part) {
 			return EROFS;
 		}
@@ -305,11 +321,11 @@ ufs_ioctl(dev_t dev, u_long cmd, caddr_t data, __unused int fflag, __unused proc
 			for (uint32_t i = 0; i < unmap->extentsCount; i++) {
 				uint64_t off = unmap->extents[i].offset;
 				uint64_t elen = unmap->extents[i].length;
-				if (off % BLOCK != 0 || elen % BLOCK != 0) {
+				if (off % bsz != 0 || elen % bsz != 0) {
 					return EINVAL;
 				}
-				uint64_t lba = (ufs_lun_offset[part] + off) / BLOCK;
-				uint32_t blocks = (uint32_t)(elen / BLOCK);
+				uint64_t lba = (ufs_lun_offset[part] + off) / bsz;
+				uint32_t blocks = (uint32_t)(elen / bsz);
 				int err = ufshc_unmap(ufs_lun[part], lba, blocks);
 				if (err != 0) {
 					return err;

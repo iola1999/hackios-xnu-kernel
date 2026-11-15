@@ -133,6 +133,9 @@ static struct {
 	int      (*tx_fn)(const void *data, uint32_t len);
 } pmic_glink_state = { .last_chg_enable = -1 };
 
+static LCK_GRP_DECLARE(pmic_glink_lck_grp, "pmic-glink");
+static LCK_MTX_DECLARE(pmic_glink_lock, &pmic_glink_lck_grp);
+
 #define SDA 0
 #define SCL 1
 #define OUTPUT (1u << 9)
@@ -456,67 +459,85 @@ pm8550b_charger_probe(void)
 void
 annibale_pmic_glink_set_tx(int (*tx_fn)(const void *data, uint32_t len))
 {
+	lck_mtx_lock(&pmic_glink_lock);
 	pmic_glink_state.tx_fn = tx_fn;
 	pmic_glink_state.active = (tx_fn != NULL);
 	pmic_glink_state.notify_enabled = false;
 	pmic_glink_state.last_chg_enable = -1;
+	lck_mtx_unlock(&pmic_glink_lock);
 }
 
 void
 annibale_pmic_glink_rx(const void *data, uint32_t len)
 {
-	const uint32_t *w = data;
+	uint32_t header[7];
 
-	if (data == NULL || len < 16 || w[0] != BATTMGR_OWNER) {
+	if (data == NULL || len < 16) {
 		return;
 	}
+	uint32_t owner = 0;
+	memcpy(&owner, data, sizeof(owner));
+	if (owner != BATTMGR_OWNER) {
+		return;
+	}
+
+	lck_mtx_lock(&pmic_glink_lock);
 	pmic_glink_state.active = true;
 	/* Xiaomi MCA 280-byte response: owner, type, opcode(1=read,2=write), property, result, seq, value */
-	if (len >= 28 && w[1] == BATTMGR_TYPE_REQ && (w[2] == BATTMGR_OP_BAT_INFO || w[2] == BATTMGR_OP_CHG_CTRL)) {
-		uint32_t prop = w[3];
-		uint32_t res = w[4];
-		int32_t val = (int32_t)w[6];
+	if (len >= 28) {
+		memcpy(header, data, sizeof(header));
+		uint32_t type = header[1];
+		uint32_t op = header[2];
+		if (type == BATTMGR_TYPE_REQ && (op == BATTMGR_OP_BAT_INFO || op == BATTMGR_OP_CHG_CTRL)) {
+			uint32_t prop = header[3];
+			uint32_t res = header[4];
+			int32_t val = (int32_t)header[6];
 
-		if (res != 0) {
-			return;
-		}
-		switch (prop) {
-		case MCA_PROP_CHG_STATUS:
-			pmic_glink_state.chg_status = (val == 5) ? 4 : val;
-			break;
-		case MCA_PROP_CHG_TYPE:
-		case MCA_PROP_USB_REAL_TYPE:
-			if (val > 0) {
-				pmic_glink_state.chg_type = val;
+			if (res == 0) {
+				switch (prop) {
+				case MCA_PROP_CHG_STATUS:
+					pmic_glink_state.chg_status = (val == 5) ? 4 : val;
+					break;
+				case MCA_PROP_CHG_TYPE:
+				case MCA_PROP_USB_REAL_TYPE:
+					if (val > 0) {
+						pmic_glink_state.chg_type = val;
+					}
+					break;
+				case MCA_PROP_PACK_VBAT:
+					pmic_glink_state.vbat_mv = val;
+					break;
+				case MCA_PROP_PACK_IBAT:
+					pmic_glink_state.ibat_ma = val;
+					break;
+				case MCA_PROP_PACK_TBAT:
+					pmic_glink_state.tbat_deci_c = val;
+					break;
+				case MCA_PROP_VBUS_UV:
+					pmic_glink_state.vbus_uv = val;
+					break;
+				case MCA_PROP_IBUS_UA:
+					pmic_glink_state.ibus_ua = val;
+					break;
+				default:
+					break;
+				}
 			}
-			break;
-		case MCA_PROP_PACK_VBAT:
-			pmic_glink_state.vbat_mv = val;
-			break;
-		case MCA_PROP_PACK_IBAT:
-			pmic_glink_state.ibat_ma = val;
-			break;
-		case MCA_PROP_PACK_TBAT:
-			pmic_glink_state.tbat_deci_c = val;
-			break;
-		case MCA_PROP_VBUS_UV:
-			pmic_glink_state.vbus_uv = val;
-			break;
-		case MCA_PROP_IBUS_UA:
-			pmic_glink_state.ibus_ua = val;
-			break;
-		default:
-			break;
 		}
 	}
+	lck_mtx_unlock(&pmic_glink_lock);
 }
 
 static void
 pmic_glink_mca_send_buf(uint32_t opcode, uint32_t property, const void *buf, uint32_t buf_len)
 {
 	struct pmic_mca_request req;
+	int (*tx_fn)(const void *data, uint32_t len) = NULL;
 
-	if (pmic_glink_state.tx_fn == NULL) {
+	lck_mtx_lock(&pmic_glink_lock);
+	tx_fn = pmic_glink_state.tx_fn;
+	if (tx_fn == NULL) {
+		lck_mtx_unlock(&pmic_glink_lock);
 		return;
 	}
 	bzero(&req, sizeof(req));
@@ -528,7 +549,9 @@ pmic_glink_mca_send_buf(uint32_t opcode, uint32_t property, const void *buf, uin
 	if (opcode == BATTMGR_OP_CHG_CTRL && buf != NULL && buf_len > 0 && buf_len <= sizeof(req.data)) {
 		memcpy(req.data, buf, buf_len);
 	}
-	(void)pmic_glink_state.tx_fn(&req, sizeof(req));
+	lck_mtx_unlock(&pmic_glink_lock);
+
+	(void)tx_fn(&req, sizeof(req));
 }
 
 static void
@@ -544,11 +567,31 @@ pmic_glink_poll_and_control(bool enable_charging)
 		MCA_PROP_CHG_STATUS, MCA_PROP_PACK_IBAT, MCA_PROP_VBUS_UV
 	};
 	static uint32_t poll_tick = 0;
+	bool need_notify = false;
+	bool need_state_update = false;
+	int last_chg = -1;
 
+	lck_mtx_lock(&pmic_glink_lock);
 	if (pmic_glink_state.tx_fn == NULL) {
+		lck_mtx_unlock(&pmic_glink_lock);
 		return;
 	}
 	if (!pmic_glink_state.notify_enabled) {
+		pmic_glink_state.notify_enabled = true;
+		need_notify = true;
+	}
+	poll_tick++;
+	if (pmic_glink_state.last_chg_enable != (int)enable_charging ||
+	    (enable_charging && (poll_tick % 3) == 1)) {
+		need_state_update = true;
+		if (pmic_glink_state.last_chg_enable != (int)enable_charging) {
+			pmic_glink_state.last_chg_enable = (int)enable_charging;
+			last_chg = (int)enable_charging;
+		}
+	}
+	lck_mtx_unlock(&pmic_glink_lock);
+
+	if (need_notify) {
 		uint8_t zero_u8 = 0, one_u8 = 1;
 
 		pmic_glink_mca_send_buf(BATTMGR_OP_CHG_CTRL, MCA_PROP_ADC_ENABLE, &one_u8, 1);
@@ -556,11 +599,8 @@ pmic_glink_poll_and_control(bool enable_charging)
 		pmic_glink_mca_send(BATTMGR_OP_CHG_CTRL, MCA_PROP_INPUT_CURR, 2500u);
 		pmic_glink_mca_send(BATTMGR_OP_CHG_CTRL, MCA_PROP_ICHG, 3000u);
 		pmic_glink_mca_send_buf(BATTMGR_OP_CHG_CTRL, MCA_PROP_CHG_ENABLE, &one_u8, 1);
-		pmic_glink_state.notify_enabled = true;
 	}
-	poll_tick++;
-	if (pmic_glink_state.last_chg_enable != (int)enable_charging ||
-	    (enable_charging && (poll_tick % 3) == 1)) {
+	if (need_state_update) {
 		uint8_t susp_u8 = 0;
 		uint8_t chg_en_u8 = enable_charging ? 1u : 0u;
 		uint32_t icl_ma = enable_charging ? 2500u : 500u;
@@ -570,8 +610,7 @@ pmic_glink_poll_and_control(bool enable_charging)
 		pmic_glink_mca_send(BATTMGR_OP_CHG_CTRL, MCA_PROP_INPUT_CURR, icl_ma);
 		pmic_glink_mca_send(BATTMGR_OP_CHG_CTRL, MCA_PROP_ICHG, ichg_ma);
 		pmic_glink_mca_send_buf(BATTMGR_OP_CHG_CTRL, MCA_PROP_CHG_ENABLE, &chg_en_u8, 1);
-		if (pmic_glink_state.last_chg_enable != (int)enable_charging) {
-			pmic_glink_state.last_chg_enable = (int)enable_charging;
+		if (last_chg >= 0) {
 			printf("battery: PMIC_RTR_ADSP_APPS MCA charging %s (0x2019=0 0x2003=%u 0x2008 ICL=%u mA 0x2005 ICHG=%u mA)\n",
 			    enable_charging ? "enabled" : "standby", chg_en_u8, icl_ma, ichg_ma);
 		}
@@ -624,7 +663,11 @@ pm8550b_configure_charging(bool enable)
 			last_attempt = (int)enable;
 			printf("battery: no PM8550B charger peripherals available on SPMI bus\n");
 		}
-		return pmic_glink_state.active;
+		bool active = false;
+		lck_mtx_lock(&pmic_glink_lock);
+		active = pmic_glink_state.active;
+		lck_mtx_unlock(&pmic_glink_lock);
+		return active;
 	}
 
 	/* If charger APIDs are owned by ADSP rather than APPS, PMIC_RTR_ADSP_APPS handles charging control. */

@@ -426,7 +426,14 @@ adreno8_space_publish_range(struct adreno8_gpu_space *space, uint64_t address, u
 		}
 		adreno8_to_memory((vm_offset_t)entry, (vm_size_t)((stop - at) / SMMU_GRANULE * sizeof(*entry)));
 	}
-	return publish_sync(space, size / SMMU_GRANULE * sizeof(uint64_t), began);
+	uint64_t cleaned = mach_absolute_time();
+	bool quiet = adreno8_quiet, synced;
+
+	adreno8_quiet = true;
+	synced = adreno8_smmu_tlb_invalidate_range(space, address, size);
+	adreno8_quiet = quiet;
+	publish_note(size / SMMU_GRANULE * sizeof(uint64_t), began, cleaned, mach_absolute_time());
+	return synced;
 }
 
 bool
@@ -1088,5 +1095,32 @@ adreno8_space_faulted(struct adreno8_gpu_space *space)
 	    adreno8_rd(adreno8_smmu.base + SMMU_SGFSR));
 	if (space == &adreno8_gpu_space)
 		adreno8_bo_describe_fault(address);
+	return true;
+}
+
+/*
+ * Invalidate Stage-1 TLB for a virtual address range (TLBI VAE1IS).
+ * Avoids global SMMU TLBIALLNSNH flush on external buffer unmap.
+ */
+bool
+adreno8_smmu_tlb_invalidate_range(struct adreno8_gpu_space *space, uint64_t va, uint64_t size)
+{
+	if (!space || !space->is_on || size == 0) return true;
+	uint64_t start = va & ~SMMU_GRANULE_MASK;
+	uint64_t end = (va + size + SMMU_GRANULE - 1) & ~SMMU_GRANULE_MASK;
+	if ((end - start) / SMMU_GRANULE > 64)
+		return adreno8_space_sync(space);
+	uint32_t cb = (adreno8_smmu_pages + space->context) * adreno8_smmu_page;
+	for (uint64_t addr = start; addr < end; addr += SMMU_GRANULE) {
+		uint64_t tlbiva = (((uint64_t)space->context & 0xffULL) << 48) | ((addr >> 12) & 0xfffffffffULL);
+		adreno8_smmu_write64(adreno8_smmu.base + cb + SMMU_CB_TLBIVA, tlbiva);
+	}
+	adreno8_settle();
+	adreno8_put(&adreno8_smmu, "cb tlb sync", cb + SMMU_CB_TLBSYNC, 1);
+	if (!adreno8_wait_for(&adreno8_smmu, cb + SMMU_CB_TLBSTATUS, 1, 0, 100)) {
+		printf("adreno8: %u: context %u TLB range sync timed out\n", adreno8_step, space->context);
+		return false;
+	}
+	adreno8_settle();
 	return true;
 }

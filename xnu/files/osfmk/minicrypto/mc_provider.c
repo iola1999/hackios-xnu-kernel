@@ -34,6 +34,7 @@
 #include <string.h>
 
 #include "minicrypto.h"
+#include "mc_ce_arm64.h"
 
 #ifndef MIN
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -44,48 +45,58 @@ extern int printf(const char *format, ...) __printflike(1, 2);
 
 /* ------------------------------------------------------- kernel PRNG --- */
 
-static struct {
+#define MC_MAX_CPUS 16
+
+struct mc_cpu_prng {
 	struct ccdrbg_info info;
 	struct ccdrbg_nisthmac_custom custom;
 	uint8_t state[512];
+	bool ready;
+	simple_lock_data_t lock;
+	uint32_t reseed_count;
+};
+
+static struct {
+	struct mc_cpu_prng cpu_pool[MC_MAX_CPUS];
 	cckprng_getentropy getentropy;
 	void *getentropy_arg;
 	bool ready;
-	simple_lock_data_t lock;
 } mc_prng;
-
-static boolean_t
-mc_prng_lock(void)
-{
-	boolean_t intr = ml_set_interrupts_enabled(FALSE);
-	simple_lock(&mc_prng.lock, LCK_GRP_NULL);
-	return intr;
-}
-
-static void
-mc_prng_unlock(boolean_t intr)
-{
-	simple_unlock(&mc_prng.lock);
-	ml_set_interrupts_enabled(intr);
-}
 
 static void
 mc_prng_init_with_getentropy(struct cckprng_ctx *ctx __unused, unsigned max_ngens __unused, size_t seed_nbytes,
     const void *seed, size_t nonce_nbytes, const void *nonce, cckprng_getentropy getentropy, void *getentropy_arg)
 {
-	static const char ps[] = "xnu minicrypto kernel prng";
+	static const char ps[] = "xnu minicrypto kernel percpu prng";
 
-	simple_lock_init(&mc_prng.lock, 0);
-	mc_prng.custom.di = &ccsha256_ltc_di;
-	mc_prng.custom.strictFIPS = 0;
-	ccdrbg_factory_nisthmac(&mc_prng.info, &mc_prng.custom);
-	if (mc_prng.info.size > sizeof(mc_prng.state)) {
-		panic("minicrypto: DRBG state does not fit (%zu)", mc_prng.info.size);
-	}
-	int rc = ccdrbg_init(&mc_prng.info, (struct ccdrbg_state *)mc_prng.state, seed_nbytes, seed, nonce_nbytes, nonce,
-	    sizeof(ps) - 1, ps);
-	if (rc != CCDRBG_STATUS_OK) {
-		panic("minicrypto: ccdrbg_init failed (%d)", rc);
+	for (unsigned int cpu = 0; cpu < MC_MAX_CPUS; cpu++) {
+		struct mc_cpu_prng *cp = &mc_prng.cpu_pool[cpu];
+		simple_lock_init(&cp->lock, 0);
+		cp->custom.di = &mc_sha256_di;
+		cp->custom.strictFIPS = 0;
+		ccdrbg_factory_nisthmac(&cp->info, &cp->custom);
+		if (cp->info.size > sizeof(cp->state)) {
+			panic("minicrypto: DRBG state does not fit (%zu)", cp->info.size);
+		}
+		uint8_t cpu_nonce[36];
+		size_t nlen = MIN(nonce_nbytes, (size_t)32);
+		if (nonce && nlen > 0) {
+			memcpy(cpu_nonce, nonce, nlen);
+		} else {
+			memset(cpu_nonce, 0, 32);
+		}
+		cpu_nonce[32] = (uint8_t)(cpu & 0xff);
+		cpu_nonce[33] = (uint8_t)((cpu >> 8) & 0xff);
+		cpu_nonce[34] = 0x5a;
+		cpu_nonce[35] = 0xa5;
+
+		int rc = ccdrbg_init(&cp->info, (struct ccdrbg_state *)cp->state, seed_nbytes, seed,
+		    nlen + 4, cpu_nonce, sizeof(ps) - 1, ps);
+		if (rc != CCDRBG_STATUS_OK) {
+			panic("minicrypto: ccdrbg_init failed on cpu %u (%d)", cpu, rc);
+		}
+		cp->ready = true;
+		cp->reseed_count = 0;
 	}
 	mc_prng.getentropy = getentropy;
 	mc_prng.getentropy_arg = getentropy_arg;
@@ -96,16 +107,18 @@ static void
 mc_prng_init(struct cckprng_ctx *ctx, size_t seed_nbytes, const void *seed, size_t nonce_nbytes, const void *nonce,
     cckprng_getentropy getentropy, void *getentropy_arg)
 {
-	mc_prng_init_with_getentropy(ctx, 1, seed_nbytes, seed, nonce_nbytes, nonce, getentropy, getentropy_arg);
+	mc_prng_init_with_getentropy(ctx, MC_MAX_CPUS, seed_nbytes, seed, nonce_nbytes, nonce, getentropy, getentropy_arg);
 }
 
 static void
-mc_prng_initgen(struct cckprng_ctx *ctx __unused, unsigned gen_idx __unused)
+mc_prng_initgen(struct cckprng_ctx *ctx __unused, unsigned gen_idx)
 {
-	/* one generator shared by all CPUs */
+	if (gen_idx < MC_MAX_CPUS) {
+		mc_prng.cpu_pool[gen_idx].ready = true;
+	}
 }
 
-/* Mix caller-supplied bytes into the generator (HMAC-DRBG "additional input"). */
+/* Mix caller-supplied bytes into all per-CPU generators. */
 static void
 mc_prng_reseed(struct cckprng_ctx *ctx __unused, size_t nbytes, const void *seed)
 {
@@ -114,9 +127,17 @@ mc_prng_reseed(struct cckprng_ctx *ctx __unused, size_t nbytes, const void *seed
 	if (!mc_prng.ready || nbytes == 0) {
 		return;
 	}
-	boolean_t intr = mc_prng_lock();
-	(void)ccdrbg_generate(&mc_prng.info, (struct ccdrbg_state *)mc_prng.state, sizeof(discard), discard, nbytes, seed);
-	mc_prng_unlock(intr);
+	for (unsigned int cpu = 0; cpu < MC_MAX_CPUS; cpu++) {
+		struct mc_cpu_prng *cp = &mc_prng.cpu_pool[cpu];
+		if (!cp->ready) {
+			continue;
+		}
+		boolean_t intr = ml_set_interrupts_enabled(FALSE);
+		simple_lock(&cp->lock, LCK_GRP_NULL);
+		(void)ccdrbg_generate(&cp->info, (struct ccdrbg_state *)cp->state, sizeof(discard), discard, nbytes, seed);
+		simple_unlock(&cp->lock);
+		ml_set_interrupts_enabled(intr);
+	}
 	cc_clear(sizeof(discard), discard);
 }
 
@@ -137,15 +158,38 @@ mc_prng_refresh(struct cckprng_ctx *ctx)
 }
 
 static void
-mc_prng_generate(struct cckprng_ctx *ctx __unused, unsigned gen_idx __unused, size_t nbytes, void *out)
+mc_prng_generate(struct cckprng_ctx *ctx __unused, unsigned gen_idx, size_t nbytes, void *out)
 {
 	uint8_t *p = out;
 
 	while (nbytes > 0) {
 		size_t n = MIN(nbytes, (size_t)1024);
-		boolean_t intr = mc_prng_lock();
-		int rc = ccdrbg_generate(&mc_prng.info, (struct ccdrbg_state *)mc_prng.state, n, p, 0, NULL);
-		mc_prng_unlock(intr);
+#if defined(KERNEL)
+		disable_preemption();
+		int cpu = cpu_number();
+		if (cpu < 0 || cpu >= MC_MAX_CPUS) {
+			cpu = (int)(gen_idx % MC_MAX_CPUS);
+		}
+#else
+		int cpu = (int)(gen_idx % MC_MAX_CPUS);
+#endif
+		struct mc_cpu_prng *cp = &mc_prng.cpu_pool[cpu];
+
+		boolean_t intr = ml_set_interrupts_enabled(FALSE);
+		simple_lock(&cp->lock, LCK_GRP_NULL);
+
+		/* Hardware RNDR replenishment: mix in genuine hardware entropy every 16 requests */
+		uint64_t hw_rnd;
+		if ((++cp->reseed_count & 0x0f) == 0 && mc_ce_has_rndr() && mc_ce_rndr(&hw_rnd)) {
+			(void)ccdrbg_generate(&cp->info, (struct ccdrbg_state *)cp->state, 0, NULL, sizeof(hw_rnd), &hw_rnd);
+		}
+
+		int rc = ccdrbg_generate(&cp->info, (struct ccdrbg_state *)cp->state, n, p, 0, NULL);
+		simple_unlock(&cp->lock);
+		ml_set_interrupts_enabled(intr);
+#if defined(KERNEL)
+		enable_preemption();
+#endif
 		if (rc != CCDRBG_STATUS_OK) {
 			panic("minicrypto: ccdrbg_generate failed (%d)", rc);
 		}
@@ -266,7 +310,7 @@ mc_di(crypto_digest_alg_t alg)
 	case CRYPTO_DIGEST_ALG_SHA1:
 		return &mc_sha1_di;
 	case CRYPTO_DIGEST_ALG_SHA256:
-		return ccsha256_di();
+		return &mc_sha256_di;
 	case CRYPTO_DIGEST_ALG_SHA384:
 		return &mc_sha384_di;
 	case CRYPTO_DIGEST_ALG_SHA512:
@@ -451,6 +495,8 @@ __startup_func
 static void
 minicrypto_init(void)
 {
+	mc_ce_init();
+
 	const char *failed = mc_digest_selftest();
 	if (failed == NULL) {
 		failed = mc_aes_selftest();
@@ -459,12 +505,15 @@ minicrypto_init(void)
 		panic("minicrypto: %s self-test failed", failed);
 	}
 
-	mc_funcs.ccsha256_di = ccsha256_di();
+	mc_funcs.ccsha256_di = &mc_sha256_di;
 	if (register_crypto_functions(&mc_funcs) != 0) {
 		return; /* a real provider got there first */
 	}
 	/* The PRNG context is ours; the kernel only hands the pointer back to us. */
 	register_and_init_prng((struct cckprng_ctx *)(void *)&mc_prng, &mc_prng_funcs);
-	printf("minicrypto: registered (md5, sha1, sha2, hmac, aes-ecb/cbc/ctr, hmac-drbg prng); no xts/gcm, no RSA\n");
+	printf("minicrypto: CE caps: AES=%d PMULL=%d SHA1=%d SHA256=%d SHA512=%d RNDR=%d\n",
+	    mc_ce_has_aes(), mc_ce_has_pmull(), mc_ce_has_sha1(),
+	    mc_ce_has_sha256(), mc_ce_has_sha512(), mc_ce_has_rndr());
+	printf("minicrypto: registered (ARMv8/v9 CE: AES, PMULL, SHA256, SHA512, RNDR; per-CPU PRNG pool)\n");
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_FIRST, minicrypto_init);

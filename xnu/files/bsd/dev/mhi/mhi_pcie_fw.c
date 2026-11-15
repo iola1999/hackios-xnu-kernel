@@ -39,11 +39,12 @@
 #include <sys/systm.h>
 #include <sys/annibale_qrtr.h>
 #include <vm/vm_kern.h>
+#include <vm/memory_types.h>
 #include "mhi_boot.h"
 #include "mhi_pcie_private.h"
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
-extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 extern uint64_t kvtophys(vm_offset_t va);
 extern const uint8_t *annibale_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 
@@ -156,7 +157,7 @@ dma_open(void)
 	}
 	dma.pa = low;
 	dma.size = mb << 20;
-	dma.va = ml_io_map_wcomb((vm_offset_t)dma.pa, (vm_size_t)dma.size);
+	dma.va = ml_io_map_unmappable((vm_offset_t)dma.pa, (vm_size_t)dma.size, VM_WIMG_DEFAULT);
 	return dma.va != 0;
 }
 
@@ -202,6 +203,20 @@ void *
 mhi_pcie_radio_memory(uint64_t bytes, uint64_t *pa)
 {
 	return dma_alloc_aligned(bytes, 4096, pa);
+}
+
+extern void mhi_pcie_msi_init(uint64_t msi_phys);
+uint64_t mhi_pcie_get_sink_pa(void);
+
+static uint64_t mhi_pcie_sink_pa;
+
+uint64_t
+mhi_pcie_get_sink_pa(void)
+{
+	if (mhi_pcie_sink_pa == 0) {
+		(void)dma_alloc(4096, &mhi_pcie_sink_pa);
+	}
+	return mhi_pcie_sink_pa;
 }
 
 /* ---- streams: the controller's table, then the SMMU ---------------------------------------------------------- */
@@ -361,14 +376,16 @@ card_link_setup(uint64_t sink)
 			} else {
 				wr(conf + cap + 8, 0);
 			}
-			wr(conf + cap, (w & 0xffff) | ((((w >> 16) & ~0x70u) | 0x20u | 1u) << 16));
-			printf("pcie: step 7: MSI at %#x: control %#x, address %#llx\n", cap, rd(conf + cap) >> 16, sink);
+			uint32_t mctrl = (((w >> 16) & ~0x70u) | ((((w >> 17) & 7u) << 4)) | 1u);
+			wr(conf + cap, (w & 0xffff) | (mctrl << 16));
+			printf("pcie: step 7: MSI at %#x: control %#x, address %#llx\n", cap, rd(conf + cap) >> 16, (unsigned long long)sink);
 		}
 		if (next == cap) {
 			break;
 		}
 		cap = next;
 	}
+	mhi_pcie_msi_init(sink);
 }
 
 /* the device's context arrays (mhi_init_dev_ctxt; UniXNU programContexts): 128 channels off, two event rings, the
@@ -651,9 +668,10 @@ mhi_pcie_firmware(const struct mhi_pcie_card *card)
 	}
 	table = dma_alloc(4096, &table_pa);
 	ctx_va = dma_alloc(32 << 10, &ctx_pa);
-	if (table == NULL || ctx_va == NULL || dma_alloc(4096, &sink_pa) == NULL) {
+	if (table == NULL || ctx_va == NULL || (mhi_pcie_sink_pa == 0 && dma_alloc(4096, &mhi_pcie_sink_pa) == NULL)) {
 		return false;
 	}
+	sink_pa = mhi_pcie_sink_pa;
 	entries = mhi_bhie_table(table, 4096 / sizeof(MhiBhieEntry), seg_pa, size, SEGMENT);
 	__builtin_arm_dsb(0xf);
 	printf("pcie: step 7: image %u bytes in %u segments from %#llx, table %#llx (%u entries), contexts %#llx\n",
@@ -817,6 +835,7 @@ ipcr_send(const void *data, uint32_t length)
 	ul_pending++;
 	doorbell(MHI_CHDB(IPCR_UL), ul.wp);
 	lck_mtx_unlock(&ul_lock);
+	thread_wakeup((event_t)&dl);
 	return 0;
 }
 
@@ -860,7 +879,7 @@ event(unsigned r, const uint8_t *el)
 }
 
 /* what the card posted since the last look, handled, and the ring given back */
-static void
+static unsigned
 events(unsigned r)
 {
 	uint8_t *c = ctx_va + CHANNELS * CTX + r * CTX;
@@ -869,7 +888,7 @@ events(unsigned r)
 	unsigned moved = 0;
 
 	if (device < ev_pa[r] || device >= end) {
-		return;
+		return 0;
 	}
 	while (ev_local[r] != device && moved < ev_len[r] / ELEMENT) {
 		event(r, ring + (ev_local[r] - ev_pa[r]));
@@ -885,6 +904,7 @@ events(unsigned r)
 		put64(c + 36, wp);
 		doorbell(MHI_ERDB(r), wp);
 	}
+	return moved;
 }
 
 static bool
@@ -930,15 +950,16 @@ mhi_pcie_wake(void)
 	printf("pcie: the card is asked to stay awake (the wake doorbell)\n");
 }
 
-/* the link's thread: both event rings, every 5 ms, for as long as the phone runs */
+/* the link's thread: event-driven via assert_wait on both event rings */
 static void
 ipcr_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	for (;;) {
-		events(0);
-		events(1);
+		unsigned moved = events(0) + events(1);
 		annibale_qrtr_fresh();
-		ms(5);
+		uint32_t to_ms = (moved != 0) ? 2 : 10;
+		assert_wait_timeout((event_t)&dl, THREAD_UNINT, to_ms, NSEC_PER_MSEC);
+		thread_block(THREAD_CONTINUE_NULL);
 	}
 }
 

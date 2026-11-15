@@ -6,6 +6,18 @@
 #ifndef _ANNIBALE_UFSHC_RW_INC_
 #define _ANNIBALE_UFSHC_RW_INC_
 
+static uint32_t hc_sync_event;
+static volatile uint32_t hc_sync_waiters;
+
+#ifndef _UFSHC_DCACHE_CLEAN_INVAL_DEFINED
+#define _UFSHC_DCACHE_CLEAN_INVAL_DEFINED
+static inline void
+ufshc_dcache_clean_inval(vm_offset_t va, size_t length)
+{
+	FlushPoC_DcacheRegion(va, length);
+}
+#endif
+
 static uint64_t hc_write_lba_start, hc_write_lba_end;
 static uint8_t hc_write_lun;
 static bool hc_write_enabled;
@@ -84,6 +96,32 @@ hc_refusal(const uint8_t *upiu, uint32_t dw0, uint32_t lun_mask, bool any_comman
 		if (lba < hc_write_lba_start || lba + blocks > hc_write_lba_end) {
 			return "write outside permitted darwin_var LBA range";
 		}
+		if ((cdb[1] & ~0x08) != 0) {
+			return "write CDB[1] has unsupported flags other than FUA";
+		}
+		return NULL;
+	}
+	case 0x35: {    /* SYNCHRONIZE CACHE(10) */
+		if (dd != UTRD_DD_NONE || expected != 0 || (upiu[1] & (UPIU_FLAG_READ | UPIU_FLAG_WRITE)) != 0) {
+			return "SYNCHRONIZE CACHE with data or unexpected flags";
+		}
+		if (!hc_write_enabled || lun != hc_write_lun) {
+			return "SYNCHRONIZE CACHE targeted at non-writable LUN or writes disabled";
+		}
+		return NULL;
+	}
+	case 0x42: {    /* UNMAP */
+		uint16_t param_len = (uint16_t)cdb[7] << 8 | cdb[8];
+
+		if (dd != UTRD_DD_OUT || (upiu[1] & UPIU_FLAG_WRITE) == 0 || (upiu[1] & UPIU_FLAG_READ) != 0) {
+			return "UNMAP without write data direction";
+		}
+		if (expected != 24 || param_len != 24) {
+			return "UNMAP length mismatch or not single-segment (expected 24 bytes)";
+		}
+		if (!hc_write_enabled || lun != hc_write_lun) {
+			return "UNMAP targeted at non-writable LUN or writes disabled";
+		}
 		return NULL;
 	}
 	case 0x00:      /* TEST UNIT READY */
@@ -136,7 +174,7 @@ hc_make_read(struct hc_cmd *c, uint8_t lun, uint8_t tag, uint32_t lba, uint32_t 
 	c->upiu[21] = (uint8_t)lba;
 	c->upiu[23] = (uint8_t)(blocks >> 8);
 	c->upiu[24] = (uint8_t)blocks;
-	c->dw0 = UTRD_CT_UFS | UTRD_DD_IN;
+	c->dw0 = UTRD_CT_UFS | UTRD_DD_IN | UTRD_INT;
 }
 
 static void
@@ -160,7 +198,7 @@ hc_make_write(struct hc_cmd *c, uint8_t lun, uint8_t tag, uint32_t lba, uint32_t
 	c->upiu[21] = (uint8_t)lba;
 	c->upiu[23] = (uint8_t)(blocks >> 8);
 	c->upiu[24] = (uint8_t)blocks;
-	c->dw0 = UTRD_CT_UFS | UTRD_DD_OUT;
+	c->dw0 = UTRD_CT_UFS | UTRD_DD_OUT | UTRD_INT;
 }
 
 static void
@@ -241,7 +279,7 @@ hc_whitelist_selftest(void)
 			right = false;
 		}
 	}
-	/* verify write range whitelist check */
+	/* verify write range whitelist check, FUA, SYNCHRONIZE CACHE, and UNMAP */
 	{
 		struct hc_cmd c;
 
@@ -253,6 +291,16 @@ hc_whitelist_selftest(void)
 		hc_make_write(&c, 0, 1, 12000, 16);
 		right &= (hc_refusal(c.upiu, c.dw0, 1u << 0, false) == NULL);
 
+		/* FUA write (cdb[1] = 0x08) */
+		c.upiu[17] = 0x08;
+		right &= (hc_refusal(c.upiu, c.dw0, 1u << 0, false) == NULL);
+		c.upiu[17] = 0x00;
+
+		/* Non-FUA invalid flags in cdb[1] */
+		c.upiu[17] = 0x10;
+		right &= (hc_refusal(c.upiu, c.dw0, 1u << 0, false) != NULL);
+		c.upiu[17] = 0x00;
+
 		hc_make_write(&c, 0, 1, 9000, 16);   /* under start */
 		right &= (hc_refusal(c.upiu, c.dw0, 1u << 0, false) != NULL);
 
@@ -262,10 +310,42 @@ hc_whitelist_selftest(void)
 		hc_make_write(&c, 1, 1, 12000, 16);  /* wrong LUN */
 		right &= (hc_refusal(c.upiu, c.dw0, 1u << 0, false) != NULL);
 
+		/* SYNCHRONIZE CACHE(10) when write enabled on target LUN */
+		bzero(&c, sizeof(c));
+		c.upiu[0] = UPIU_COMMAND;
+		c.upiu[2] = 0;
+		c.upiu[3] = 1;
+		c.upiu[16] = 0x35;
+		c.dw0 = UTRD_CT_UFS | UTRD_DD_NONE;
+		right &= (hc_refusal(c.upiu, c.dw0, 1u << 0, false) == NULL);
+
+		/* UNMAP (0x42) when write enabled on target LUN */
+		bzero(&c, sizeof(c));
+		c.upiu[0] = UPIU_COMMAND;
+		c.upiu[1] = UPIU_FLAG_WRITE;
+		c.upiu[2] = 0;
+		c.upiu[3] = 1;
+		c.upiu[15] = 24; /* expected */
+		c.upiu[16] = 0x42;
+		c.upiu[24] = 24; /* cdb[8] param_len */
+		c.dw0 = UTRD_CT_UFS | UTRD_DD_OUT;
+		right &= (hc_refusal(c.upiu, c.dw0, 1u << 0, false) == NULL);
+
+		/* UNMAP with wrong length */
+		c.upiu[15] = 48;
+		right &= (hc_refusal(c.upiu, c.dw0, 1u << 0, false) != NULL);
+
 		hc_write_enabled = false;
 	}
 	return right;
 }
+
+#define UCD_PRDT_ENTRIES    64u
+
+struct ufshc_sg {
+	uint64_t pa;
+	uint32_t len;
+};
 
 static void
 hc_put(volatile uint32_t *to, const void *from, uint32_t bytes)
@@ -279,9 +359,9 @@ hc_put(volatile uint32_t *to, const void *from, uint32_t bytes)
 }
 
 static int
-hc_place(struct hc_slot *s, const struct hc_cmd *c, uint32_t bytes)
+hc_place_sg(struct hc_slot *s, const struct hc_cmd *c, const struct ufshc_sg *sg, uint32_t nsegs, __unused uint32_t total_bytes)
 {
-	uint32_t n = 0, back[8];
+	uint32_t back[8];
 
 	if (!ufshc_permitted(c->upiu, c->dw0)) {
 		return EPERM;
@@ -290,15 +370,22 @@ hc_place(struct hc_slot *s, const struct hc_cmd *c, uint32_t bytes)
 	for (uint32_t i = sizeof(c->upiu) / 4; i < UCD_PRDT / 4; i++) {
 		s->ucd[i] = 0;
 	}
-	for (uint32_t at = 0; at < bytes; at += PRD_MAX, n++) {
-		volatile uint32_t *prd = s->ucd + (UCD_PRDT + 16 * n) / 4;
-		uint64_t pa = s->data_pa + at;
-		uint32_t len = bytes - at < PRD_MAX ? bytes - at : PRD_MAX;
+	for (uint32_t i = 0; i < nsegs; i++) {
+		volatile uint32_t *prd = s->ucd + (UCD_PRDT + 16 * i) / 4;
+		uint64_t pa = sg[i].pa;
+		uint32_t len = sg[i].len;
 
 		prd[0] = (uint32_t)pa;
 		prd[1] = (uint32_t)(pa >> 32);
 		prd[2] = 0;
 		prd[3] = len - 1;
+	}
+	for (uint32_t i = nsegs; i < UCD_PRDT_ENTRIES; i++) {
+		volatile uint32_t *prd = s->ucd + (UCD_PRDT + 16 * i) / 4;
+		prd[0] = 0;
+		prd[1] = 0;
+		prd[2] = 0;
+		prd[3] = 0;
 	}
 	s->utrd[0] = c->dw0;
 	s->utrd[1] = 0;
@@ -307,7 +394,7 @@ hc_place(struct hc_slot *s, const struct hc_cmd *c, uint32_t bytes)
 	s->utrd[4] = (uint32_t)s->ucd_pa;
 	s->utrd[5] = (uint32_t)(s->ucd_pa >> 32);
 	s->utrd[6] = ((UCD_RESPONSE / 4) << 16) | (UCD_RESPONSE / 4);
-	s->utrd[7] = ((UCD_PRDT / 4) << 16) | n;
+	s->utrd[7] = ((UCD_PRDT / 4) << 16) | (nsegs & 0xffff);
 	__asm__ volatile ("dsb sy" ::: "memory");
 	for (int i = 0; i < 8; i++) {
 		back[i] = s->ucd[i];
@@ -318,6 +405,122 @@ hc_place(struct hc_slot *s, const struct hc_cmd *c, uint32_t bytes)
 		hc_refused++;
 		return EPERM;
 	}
+	return 0;
+}
+
+static int
+hc_place(struct hc_slot *s, const struct hc_cmd *c, uint32_t bytes)
+{
+	struct ufshc_sg sg[UCD_PRDT_ENTRIES];
+	uint32_t n = 0;
+
+	for (uint32_t at = 0; at < bytes && n < UCD_PRDT_ENTRIES; at += PRD_MAX, n++) {
+		sg[n].pa = s->data_pa + at;
+		sg[n].len = (bytes - at < PRD_MAX) ? (bytes - at) : PRD_MAX;
+	}
+	return hc_place_sg(s, c, sg, n, bytes);
+}
+
+extern void *buf_upl(buf_t bp);
+extern uint32_t buf_uploffset(buf_t bp);
+extern upl_page_info_t *upl_get_internal_page_list(upl_t upl);
+extern ppnum_t upl_phys_page(upl_page_info_t *upl, int index);
+extern errno_t buf_map(buf_t bp, caddr_t *io_addr);
+extern errno_t buf_unmap(buf_t bp);
+
+static int
+ufs_build_sg(buf_t bp, struct ufshc_sg *sg, uint32_t max_segs, uint32_t *out_segs)
+{
+	upl_t upl = (upl_t)buf_upl(bp);
+	uint32_t total = buf_count(bp);
+	uint32_t nsegs = 0;
+	uint32_t cur = 0;
+
+	if (total == 0) {
+		return EINVAL;
+	}
+
+	if (upl != NULL) {
+		uint32_t upl_off = buf_uploffset(bp);
+		upl_page_info_t *pl = upl_get_internal_page_list(upl);
+		if (pl == NULL) {
+			return EFAULT;
+		}
+
+		while (cur < total) {
+			uint32_t byte_in_upl = upl_off + cur;
+			uint32_t page_idx = byte_in_upl / PAGE_SIZE;
+			uint32_t page_off = byte_in_upl % PAGE_SIZE;
+			uint32_t chunk = PAGE_SIZE - page_off;
+			if (chunk > total - cur) {
+				chunk = total - cur;
+			}
+
+			ppnum_t pp = upl_phys_page(pl, (int)page_idx);
+			uint64_t pa = ((uint64_t)pp << PAGE_SHIFT) + page_off;
+
+			if (nsegs > 0 && sg[nsegs - 1].pa + sg[nsegs - 1].len == pa &&
+			    sg[nsegs - 1].len + chunk <= PRD_MAX) {
+				sg[nsegs - 1].len += chunk;
+			} else {
+				if (nsegs >= max_segs) {
+					return E2BIG;
+				}
+				sg[nsegs].pa = pa;
+				sg[nsegs].len = chunk;
+				nsegs++;
+			}
+			cur += chunk;
+		}
+	} else {
+		caddr_t data = (caddr_t)buf_dataptr(bp);
+		bool mapped = false;
+		if (data == NULL) {
+			if (buf_map(bp, &data) != 0 || data == NULL) {
+				return EFAULT;
+			}
+			mapped = true;
+		}
+
+		while (cur < total) {
+			vm_offset_t va = (vm_offset_t)data + cur;
+			uint32_t page_off = (uint32_t)(va & PAGE_MASK);
+			uint32_t chunk = PAGE_SIZE - page_off;
+			if (chunk > total - cur) {
+				chunk = total - cur;
+			}
+
+			uint64_t pa = kvtophys(va);
+			if (pa == 0) {
+				if (mapped) {
+					buf_unmap(bp);
+				}
+				return EFAULT;
+			}
+
+			if (nsegs > 0 && sg[nsegs - 1].pa + sg[nsegs - 1].len == pa &&
+			    sg[nsegs - 1].len + chunk <= PRD_MAX) {
+				sg[nsegs - 1].len += chunk;
+			} else {
+				if (nsegs >= max_segs) {
+					if (mapped) {
+						buf_unmap(bp);
+					}
+					return E2BIG;
+				}
+				sg[nsegs].pa = pa;
+				sg[nsegs].len = chunk;
+				nsegs++;
+			}
+			cur += chunk;
+		}
+
+		if (mapped) {
+			buf_unmap(bp);
+		}
+	}
+
+	*out_segs = nsegs;
 	return 0;
 }
 
@@ -334,6 +537,10 @@ hc_ring(struct hc_slot *s)
 	    hc_read(UFSHC_UTRLBA) == hc_list_lo && hc_read(UFSHC_UTRLBAU) == hc_list_hi &&
 	    (hc_read(UFSHC_UTRLRSR) & 1) != 0 && (hc_read(UFSHC_UTRLDBR) & bit) == 0;
 	if (ok) {
+		s->start_time = mach_absolute_time();
+		if (s->is_async) {
+			os_atomic_or(&hc_active_slots, bit, release);
+		}
 		hc_write(UFSHC_UTRLDBR, bit);
 	}
 	ml_set_interrupts_enabled(istate);
@@ -363,43 +570,6 @@ hc_hang(uint32_t slot)
 	cpu_broadcast_xcall(&synch, TRUE, hc_spin_forever, NULL);
 }
 
-static uint32_t hc_waiting, hc_done;
-static bool hc_poller_asleep;
-static uint64_t hc_poller_rounds, hc_poller_polls, hc_sleeps;
-static uint32_t hc_spin_us = 100;
-
-static void
-hc_poller(__unused void *parm, __unused wait_result_t wr)
-{
-	for (;;) {
-		uint32_t waiting, db, done;
-
-		lck_mtx_lock(&hc_lock);
-		while (hc_waiting == 0) {
-			hc_poller_asleep = true;
-			msleep((void *)&hc_waiting, &hc_lock, PRIBIO, "ufshc-poll", NULL);
-		}
-		hc_poller_asleep = false;
-		waiting = hc_waiting;
-		lck_mtx_unlock(&hc_lock);
-		hc_poller_rounds++;
-		while (((db = hc_read(UFSHC_UTRLDBR)) & waiting) == waiting && hc_waiting == waiting) {
-			hc_poller_polls++;
-			__builtin_arm_yield();
-		}
-		done = waiting & ~db;
-		if (done != 0) {
-			lck_mtx_lock(&hc_lock);
-			hc_done |= done;
-			hc_waiting &= ~done;
-			for (uint32_t m = done; m != 0; m &= m - 1) {
-				wakeup(&hc_slots[__builtin_ctz(m)]);
-			}
-			lck_mtx_unlock(&hc_lock);
-		}
-	}
-}
-
 static int
 hc_complete(struct hc_slot *s, const char *what, bool tur)
 {
@@ -408,34 +578,33 @@ hc_complete(struct hc_slot *s, const char *what, bool tur)
 	uint32_t ocs, bit = 1u << s->number;
 	uint64_t polls = 1;
 
-	while ((hc_read(UFSHC_UTRLDBR) & bit) && hc_us_since(started) < hc_spin_us) {
+	while ((hc_read(UFSHC_UTRLDBR) & bit) != 0 && hc_us_since(started) < hc_spin_us) {
 		polls++;
 		__builtin_arm_yield();
 	}
-	if (hc_read(UFSHC_UTRLDBR) & bit) {
-		struct timespec second = { 1, 0 };
-
+	if ((hc_read(UFSHC_UTRLDBR) & bit) != 0) {
 		lck_mtx_lock(&hc_lock);
 		hc_sleeps++;
-		hc_waiting |= bit;
-		if (hc_poller_asleep) {
-			wakeup((void *)&hc_waiting);
-		}
-		while ((hc_done & bit) == 0) {
-			(void)msleep(s, &hc_lock, PRIBIO, "ufshc-io", &second);
-			us = hc_us_since(started);
-			if ((hc_done & bit) == 0 && us > TIMEOUT_MS * 1000ULL) {
-				hc_waiting &= ~bit;
-				lck_mtx_unlock(&hc_lock);
-				hc_say("ufs: native: slot %u (%s) not done in %u s (doorbell %08x, IS %08x, HCS %08x): "
-				    "this path is off from now on\n", s->number, what, TIMEOUT_MS / 1000, hc_read(UFSHC_UTRLDBR),
-				    hc_read(UFSHC_IS), hc_read(UFSHC_HCS));
-				hc_off();
-				return ETIMEDOUT;
+		os_atomic_inc(&hc_sync_waiters, relaxed);
+		struct timespec wait_ts = { 0, 1 * 1000 * 1000 }; /* 1 ms */
+		while ((hc_read(UFSHC_UTRLDBR) & bit) != 0) {
+			wait_result_t wr = msleep(&hc_sync_event, &hc_lock, PRIBIO, "ufshc-io", &wait_ts);
+			if (wr == THREAD_TIMED_OUT) {
+				us = hc_us_since(started);
+				if (us > TIMEOUT_MS * 1000ULL) {
+					break;
+				}
 			}
 		}
-		hc_done &= ~bit;
+		os_atomic_dec(&hc_sync_waiters, relaxed);
 		lck_mtx_unlock(&hc_lock);
+	}
+	if ((hc_read(UFSHC_UTRLDBR) & bit) != 0) {
+		hc_say("ufs: native: slot %u (%s) not done in %u s (doorbell %08x, IS %08x, HCS %08x): "
+		    "this path is off from now on\n", s->number, what, TIMEOUT_MS / 1000, hc_read(UFSHC_UTRLDBR),
+		    hc_read(UFSHC_IS), hc_read(UFSHC_HCS));
+		hc_off();
+		return ETIMEDOUT;
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");
 	os_atomic_add(&hc_polls, polls, relaxed);
@@ -464,21 +633,23 @@ hc_take(bool wait)
 
 	lck_mtx_lock(&hc_lock);
 	hc_lock_ticks += mach_absolute_time() - t0;
-	if (hc_free == 0 && wait && !hc_dead && hc_in) {
+	while (os_atomic_load(&hc_free, acquire) == 0 && wait && !hc_dead && hc_in) {
 		uint64_t w0 = mach_absolute_time();
 
 		hc_slot_waits++;
-		while (hc_free == 0 && wait && !hc_dead && hc_in) {
-			msleep(&hc_free, &hc_lock, PRIBIO, "ufshc", NULL);
-		}
+		msleep(&hc_free, &hc_lock, PRIBIO, "ufshc", NULL);
 		hc_slot_wait_ticks += mach_absolute_time() - w0;
 	}
-	if (hc_free != 0 && hc_in && !hc_dead) {
-		uint32_t i = (uint32_t)__builtin_ctz(hc_free), f;
+	uint32_t cur = os_atomic_load(&hc_free, acquire);
+	if (cur != 0 && hc_in && !hc_dead) {
+		uint32_t i = (uint32_t)__builtin_ctz(cur);
 
-		hc_free &= ~(1u << i);
+		os_atomic_andnot(&hc_free, (1u << i), relaxed);
 		s = &hc_slots[i];
-		f = ++hc_in_flight;
+		s->done = false;
+		s->is_async = false;
+		s->bp = NULL;
+		uint32_t f = os_atomic_inc_orig(&hc_in_flight, relaxed) + 1;
 		if (f > hc_most_in_flight) {
 			hc_most_in_flight = f;
 		}
@@ -491,11 +662,10 @@ hc_take(bool wait)
 static void
 hc_give(struct hc_slot *s)
 {
-	lck_mtx_lock(&hc_lock);
-	hc_free |= 1u << (s - hc_slots);
-	hc_in_flight--;
+	uint32_t slot = (uint32_t)(s - hc_slots);
+	os_atomic_or(&hc_free, (1u << slot), release);
+	os_atomic_dec(&hc_in_flight, relaxed);
 	wakeup(&hc_free);
-	lck_mtx_unlock(&hc_lock);
 }
 
 int
@@ -530,7 +700,9 @@ ufshc_read(uint8_t lun, uint64_t offset, uint8_t *dst, uint64_t len)
 				blocks = per;
 			}
 			if (first + blocks > 0xffffffffULL) {
+				lck_mtx_lock(&hc_lock);
 				hc_give(s);
+				lck_mtx_unlock(&hc_lock);
 				error = EINVAL;
 				break;
 			}
@@ -549,7 +721,9 @@ ufshc_read(uint8_t lun, uint64_t offset, uint8_t *dst, uint64_t len)
 				hc_hang(s->number);
 			}
 			if (e != 0) {
+				lck_mtx_lock(&hc_lock);
 				hc_give(s);
+				lck_mtx_unlock(&hc_lock);
 				error = e;
 				break;
 			}
@@ -582,7 +756,9 @@ ufshc_read(uint8_t lun, uint64_t offset, uint8_t *dst, uint64_t len)
 				error = r;
 			}
 			if (r != ETIMEDOUT) {
+				lck_mtx_lock(&hc_lock);
 				hc_give(e->slot);
+				lck_mtx_unlock(&hc_lock);
 			}
 			head++;
 		}
@@ -625,7 +801,9 @@ ufshc_write(uint8_t lun, uint64_t offset, const uint8_t *src, uint64_t len)
 				blocks = per;
 			}
 			if (first + blocks > 0xffffffffULL) {
+				lck_mtx_lock(&hc_lock);
 				hc_give(s);
+				lck_mtx_unlock(&hc_lock);
 				error = EINVAL;
 				break;
 			}
@@ -639,7 +817,9 @@ ufshc_write(uint8_t lun, uint64_t offset, const uint8_t *src, uint64_t len)
 				e = hc_ring(s);
 			}
 			if (e != 0) {
+				lck_mtx_lock(&hc_lock);
 				hc_give(s);
+				lck_mtx_unlock(&hc_lock);
 				error = e;
 				break;
 			}
@@ -667,12 +847,208 @@ ufshc_write(uint8_t lun, uint64_t offset, const uint8_t *src, uint64_t len)
 				os_atomic_inc(&hc_write_errors, relaxed);
 			}
 			if (r != ETIMEDOUT) {
+				lck_mtx_lock(&hc_lock);
 				hc_give(e->slot);
+				lck_mtx_unlock(&hc_lock);
 			}
 			head++;
 		}
 	}
 	return error;
+}
+
+int
+ufshc_strategy_async(buf_t bp, uint8_t lun, uint64_t lun_offset, bool is_write)
+{
+	struct hc_slot *s;
+	struct hc_cmd c;
+	struct ufshc_sg sg[UCD_PRDT_ENTRIES];
+	uint32_t nsegs = 0;
+	uint32_t count = buf_count(bp);
+	uint64_t first_lba = lun_offset / BLOCK;
+	uint32_t blocks = count / BLOCK;
+	int err;
+
+	if (!hc_usable || !hc_in || hc_dead || hc_closed) {
+		return ENXIO;
+	}
+	if (is_write && !hc_write_enabled) {
+		return EROFS;
+	}
+	if (count == 0 || count % BLOCK != 0 || lun_offset % BLOCK != 0) {
+		return EINVAL;
+	}
+	if (is_write) {
+		if (lun != hc_write_lun || first_lba < hc_write_lba_start || first_lba + blocks > hc_write_lba_end) {
+			return EPERM;
+		}
+	}
+
+	err = ufs_build_sg(bp, sg, UCD_PRDT_ENTRIES, &nsegs);
+	if (err != 0) {
+		return err;
+	}
+
+	s = hc_take(true);
+	if (s == NULL) {
+		return ENXIO;
+	}
+
+	if (!is_write) {
+		hc_make_read(&c, lun, (uint8_t)s->number, (uint32_t)first_lba, blocks);
+		if (!hc_dma_coherent) {
+			for (uint32_t i = 0; i < nsegs; i++) {
+				ufshc_dcache_sg_poc(sg[i].pa, sg[i].len, false);
+			}
+		}
+	} else {
+		hc_make_write(&c, lun, (uint8_t)s->number, (uint32_t)first_lba, blocks);
+		if (!hc_dma_coherent) {
+			for (uint32_t i = 0; i < nsegs; i++) {
+				ufshc_dcache_sg_poc(sg[i].pa, sg[i].len, true);
+			}
+		}
+	}
+	/* Tag UTRD with interrupt completion */
+	c.dw0 |= UTRD_INT;
+
+	err = hc_place_sg(s, &c, sg, nsegs, count);
+	if (err != 0) {
+		lck_mtx_lock(&hc_lock);
+		hc_give(s);
+		lck_mtx_unlock(&hc_lock);
+		return err;
+	}
+
+	s->bp = bp;
+	s->blocks = blocks;
+	s->is_write = is_write;
+	s->is_async = true;
+	s->done = false;
+	s->error = 0;
+
+	err = hc_ring(s);
+	if (err != 0) {
+		s->bp = NULL;
+		lck_mtx_lock(&hc_lock);
+		hc_give(s);
+		lck_mtx_unlock(&hc_lock);
+		return err;
+	}
+
+	return 0;
+}
+
+int
+ufshc_sync_cache(uint8_t lun)
+{
+	struct hc_slot *s;
+	struct hc_cmd c;
+	int e;
+
+	if (!hc_usable || !hc_in || hc_dead || hc_closed || !hc_write_enabled) {
+		return ENXIO;
+	}
+	s = hc_take(true);
+	if (s == NULL) {
+		return ENXIO;
+	}
+
+	bzero(&c, sizeof(c));
+	c.upiu[0] = UPIU_COMMAND;
+	c.upiu[2] = lun;
+	c.upiu[3] = (uint8_t)s->number;
+	c.upiu[16] = 0x35; /* SYNCHRONIZE CACHE(10) */
+	c.dw0 = UTRD_CT_UFS | UTRD_DD_NONE | UTRD_INT;
+
+	e = hc_place(s, &c, 0);
+	if (e == 0) {
+		e = hc_ring(s);
+	}
+	if (e == 0) {
+		e = hc_complete(s, "SYNCHRONIZE CACHE(10)", false);
+	}
+	if (e != ETIMEDOUT) {
+		lck_mtx_lock(&hc_lock);
+		hc_give(s);
+		lck_mtx_unlock(&hc_lock);
+	}
+	return e;
+}
+
+int
+ufshc_unmap(uint8_t lun, uint64_t lba, uint32_t blocks)
+{
+	struct hc_slot *s;
+	struct hc_cmd c;
+	uint8_t param[24] = { 0 };
+	int e;
+
+	if (!hc_usable || !hc_in || hc_dead || hc_closed || !hc_write_enabled) {
+		return ENXIO;
+	}
+	if (lun != hc_write_lun || lba < hc_write_lba_start || lba + blocks > hc_write_lba_end) {
+		return EPERM;
+	}
+
+	s = hc_take(true);
+	if (s == NULL) {
+		return ENXIO;
+	}
+
+	/* 8-byte parameter list header */
+	param[0] = 0;
+	param[1] = 22; /* data length = 22 */
+	param[2] = 0;
+	param[3] = 16; /* block descriptor length = 16 */
+
+	/* 16-byte block descriptor */
+	param[8]  = (uint8_t)(lba >> 56);
+	param[9]  = (uint8_t)(lba >> 48);
+	param[10] = (uint8_t)(lba >> 40);
+	param[11] = (uint8_t)(lba >> 32);
+	param[12] = (uint8_t)(lba >> 24);
+	param[13] = (uint8_t)(lba >> 16);
+	param[14] = (uint8_t)(lba >> 8);
+	param[15] = (uint8_t)lba;
+
+	param[16] = (uint8_t)(blocks >> 24);
+	param[17] = (uint8_t)(blocks >> 16);
+	param[18] = (uint8_t)(blocks >> 8);
+	param[19] = (uint8_t)blocks;
+
+	memcpy(s->data, param, sizeof(param));
+	if (!hc_dma_coherent) {
+		FlushPoC_DcacheRegion((vm_offset_t)s->data, sizeof(param));
+	}
+
+	bzero(&c, sizeof(c));
+	c.upiu[0] = UPIU_COMMAND;
+	c.upiu[1] = UPIU_FLAG_WRITE;
+	c.upiu[2] = lun;
+	c.upiu[3] = (uint8_t)s->number;
+	c.upiu[12] = 0;
+	c.upiu[13] = 0;
+	c.upiu[14] = 0;
+	c.upiu[15] = 24; /* expected */
+	c.upiu[16] = 0x42; /* UNMAP */
+	c.upiu[23] = 0;
+	c.upiu[24] = 24; /* param list length */
+	c.dw0 = UTRD_CT_UFS | UTRD_DD_OUT | UTRD_INT;
+
+	e = hc_place(s, &c, 24);
+	if (e == 0) {
+		e = hc_ring(s);
+	}
+	if (e == 0) {
+		e = hc_complete(s, "UNMAP", false);
+	}
+	if (e != ETIMEDOUT) {
+		lck_mtx_lock(&hc_lock);
+		hc_give(s);
+		lck_mtx_unlock(&hc_lock);
+	}
+	return e;
 }
 
 #endif /* _ANNIBALE_UFSHC_RW_INC_ */

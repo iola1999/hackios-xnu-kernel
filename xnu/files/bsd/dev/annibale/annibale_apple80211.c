@@ -345,7 +345,7 @@ get(struct apple80211req *request)
 
 	switch (request->req_type) {
 	case 5:                                 /* POWERSAVE */
-		request->req_val = 0;
+		request->req_val = annibale_sta_is_powersave() ? 1 : 0;
 		return 0;
 	case 106: {                             /* RSSI_BOUNDS */
 		struct {
@@ -729,6 +729,9 @@ static int
 set(const struct apple80211req *request, char *said, size_t said_size)
 {
 	switch (request->req_type) {
+	case 5:                                 /* POWERSAVE */
+		snprintf(said, said_size, " (powersave: %d)", request->req_val);
+		return annibale_sta_ask_powersave(request->req_val != 0);
 	case 20:
 		return set_join(request, said, said_size);
 	case 22:                                /* leave the network */
@@ -771,7 +774,6 @@ set(const struct apple80211req *request, char *said, size_t said_size)
 		}
 		return 0;
 	}
-	case 5:
 	case 25:
 	case 51:
 	case 87:

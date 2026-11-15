@@ -62,6 +62,7 @@ struct apfs_mount {
 	mount_t            am_mp;
 	vnode_t            am_devvp;
 	lck_mtx_t          am_lock;
+	lck_rw_t           am_rwlock;
 	struct apfs_nx     am_nx;
 	struct apfs_vol    am_vol;
 	uint32_t           am_devblock;
@@ -96,7 +97,7 @@ struct apfs_mount {
 	 * the lock in between), and the container's epoch each began at: retired cache memory
 	 * older than the oldest of them is freed (apfs_nx_reclaim). Under am_lock.
 	 */
-#define APFS_OPS_MAX 128
+#define APFS_OPS_MAX 120
 	struct {
 		thread_t           th;
 		uint64_t           epoch;
@@ -176,6 +177,7 @@ struct apfs_mount {
 struct apfs_node {
 	struct apfs_node  *an_next;     /* the hash chain */
 	struct apfs_mount *an_mount;
+	lck_rw_t           an_rwlock;
 	vnode_t            an_vp;
 	uint64_t           an_id;       /* the object identifier */
 	uint64_t           an_parent;
@@ -234,6 +236,19 @@ void apfs_lock_at(struct apfs_mount *am, const char *site);  /* an operation beg
 void apfs_unlock(struct apfs_mount *am);         /* and ends */
 void apfs_lock_inner(struct apfs_mount *am);     /* the lock taken back in the middle of one (apfs_lib) */
 void apfs_unlock_inner(struct apfs_mount *am);   /* let go of in the middle of one */
+static inline uint64_t
+apfs_ticks_ms(uint64_t ticks)
+{
+	uint64_t ns = 0;
+
+	absolutetime_to_nanoseconds(ticks, &ns);
+	return ns / 1000000;
+}
+
+void apfs_lock_shared(struct apfs_mount *am);
+void apfs_unlock_shared(struct apfs_mount *am);
+void apfs_lock_exclusive(struct apfs_mount *am);
+void apfs_unlock_exclusive(struct apfs_mount *am);
 
 /* apfs_vnops.c */
 extern const struct vnodeopv_desc apfs_vnodeop_opv_desc;

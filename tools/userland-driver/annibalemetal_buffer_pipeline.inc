@@ -278,7 +278,8 @@
 - (void)dealloc
 {
 	if (_compute != NULL) {
-		mesa.compute_destroy(_compute);
+		rw_compute_pipe_release(_compute);
+		_compute = NULL;
 	}
 	[_owner release];
 	[super dealloc];

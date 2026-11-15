@@ -8,9 +8,10 @@
 source "$(dirname "${BASH_SOURCE[0]}")/env-macos.sh"
 cd "$XNU26_SRC" || exit 1
 SRC=$PWD
-# Copy xnu/files into the xnu-12377 source tree when files change.
-if [ -d "$XNU26_ROOT/xnu/files" ]; then
-  python3 - "$XNU26_ROOT/xnu/files" "$SRC" <<'PY'
+# Copy xnu/files and xnu26/files into the xnu-12377 source tree when files change.
+for fdir in "$XNU26_ROOT/xnu/files" "$XNU26_ROOT/xnu26/files"; do
+  if [ -d "$fdir" ]; then
+    python3 - "$fdir" "$SRC" <<'PY'
 import filecmp, os, shutil, sys
 src_root, dst_root = sys.argv[1], sys.argv[2]
 for dirpath, _, filenames in os.walk(src_root):
@@ -23,7 +24,8 @@ for dirpath, _, filenames in os.walk(src_root):
             shutil.copy2(p1, p2)
             os.utime(p2, None)
 PY
-fi
+  fi
+done
 export RC_DARWIN_KERNEL_VERSION=${RC_DARWIN_KERNEL_VERSION:-25.6.0}
 
 # Reproducible builds, part one: the version string.
@@ -37,6 +39,7 @@ export RC_DARWIN_KERNEL_VERSION=${RC_DARWIN_KERNEL_VERSION:-25.6.0}
 # build variant, so a build from another directory or with another MACHINE/KERNEL_CONFIG needs its
 # own value. `whoami` also lands in the string; an unattended build has to run as the same user.
 export KERNEL_BUILD_DATE=${KERNEL_BUILD_DATE:-Mon Oct 26 12:50:44 CST 2026}
+export KERNEL_BUILDER=${KERNEL_BUILDER:-builder}
 export KERNEL_BUILD_OBJROOT=${KERNEL_BUILD_OBJROOT:-xnu12377[xnu-12377.121.6-1-gaec10a9-dirty]/BUILD/obj/DEVELOPMENT_ARM64_BCM2837}
 
 # Reproducible builds, part two: LC_UUID.
@@ -49,9 +52,9 @@ export KERNEL_UUID=${KERNEL_UUID:-c71f02b3-2965-3ecc-9398-8915830464c4}
 # The Wi-Fi driver's object (tools/mk-ath12k.sh) is linked into the kernel when it is there; make does not see it
 # change, so the linked kernel is thrown away when it has.
 LX=$XNU26_ROOT/xnu-deps/build/ath12k/out/ath12k.o
-if [ -d "$XNU26_ROOT/wifi/lx" ] && [ -f "$LX" ]; then
-  if [ -n "$(find "$XNU26_ROOT/wifi/lx" -type f -newer "$LX" 2>/dev/null | head -1)" ]; then
-    echo "build-macos.sh: wifi/lx changed since $LX was built, running tools/mk-ath12k.sh..."
+if [ -z "$NO_WIFI" ] && [ -d "$XNU26_ROOT/wifi/lx" ]; then
+  if [ ! -f "$LX" ] || [ -n "$(find "$XNU26_ROOT/wifi/lx" -type f -newer "$LX" 2>/dev/null | head -1)" ]; then
+    echo "build-macos.sh: ath12k.o missing or wifi/lx changed, running tools/mk-ath12k.sh..."
     bash "$XNU26_ROOT/tools/mk-ath12k.sh" || exit 1
   fi
 fi

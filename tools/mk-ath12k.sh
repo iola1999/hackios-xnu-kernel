@@ -111,6 +111,13 @@ DFLAGS="-Isrc/ath12k -Isrc -include $W/include/lx_prelude.h -include $W/ath12k/l
 	-DLX_POOL_MB=96u -DLX_RINGS_MB=64u -DLX_ALIGN_NATURAL
 	-DKBUILD_MODNAME=\"ath12k\"
 	-DLX_ANNIBALE_LX_H=\"$K/annibale_lx.h\" -DLX_ANNIBALE_QMI_H=\"$K/annibale_qmi.h\""
+# Timestamp-based incremental skip: if out/ath12k.o exists and is newer than all inputs, return early
+if [ -f out/ath12k.o ] && [ -d "$W" ] && [ -d src/ath12k ]; then
+	if [ -z "$(find "$ROOT/tools/mk-ath12k.sh" "$W" src/ath12k "$K" -newer out/ath12k.o 2>/dev/null | head -1)" ]; then
+		echo "mk-ath12k.sh: out/ath12k.o is up to date"
+		exit 0
+	fi
+fi
 mkdir -p obj out
 rm -f obj/*.err
 compile() {		# compile SOURCE OBJECT [FLAGS]: only when the object is older than anything it was made of
@@ -121,16 +128,27 @@ compile() {		# compile SOURCE OBJECT [FLAGS]: only when the object is older than
 	fi
 	$CC $CFLAGS "$@" -MMD -MF "$obj.d" -c "$src" -o "$obj" 2> "$obj.err" || rm -f "$obj"
 }
+NPROC=$(sysctl -n hw.ncpu 2>/dev/null || echo 8)
+MAX_JOBS=${MAX_JOBS:-$NPROC}
+job_count=0
+run_compile() {
+	compile "$@" &
+	job_count=$((job_count + 1))
+	if [ "$job_count" -ge "$MAX_JOBS" ]; then
+		wait
+		job_count=0
+	fi
+}
 OBJECTS=
 for f in $DRIVER; do
 	o=obj/ath12k_$(echo $f | tr / _).o
 	OBJECTS="$OBJECTS $o"
-	compile src/ath12k/$f.c $o $DFLAGS &
+	run_compile src/ath12k/$f.c $o $DFLAGS
 done
 for f in "$W"/src/*.c "$W"/ath12k/*.c; do
 	o=obj/$(basename "$(dirname "$f")")_$(basename "$f" .c).o
 	OBJECTS="$OBJECTS $o"
-	compile "$f" $o $DFLAGS -I$W/src &
+	run_compile "$f" $o $DFLAGS -I$W/src
 done
 wait
 bad=

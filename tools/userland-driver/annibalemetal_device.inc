@@ -139,6 +139,7 @@ rw_image_uuid(const void *addr, char *out, size_t out_size)
 {
 	if (_mesa != NULL) {
 		rw_pipe_forget(_mesa);
+		rw_compute_pipe_forget(_mesa);
 		mesa.device_close(_mesa);
 	}
 	if (_gpu != IO_OBJECT_NULL) {

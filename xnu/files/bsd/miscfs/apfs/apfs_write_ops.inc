@@ -5,6 +5,13 @@
 
 /* ------------------------------------------------------------------ helpers */
 
+struct apfs_del_ext {
+	uint8_t key[16];
+	uint16_t key_len;
+	uint64_t phys_bno;
+	uint64_t blkcnt;
+};
+
 static int
 read_raw_inode(struct apfs_vol *vol, uint64_t obj_id, uint8_t *buf, uint16_t *out_len)
 {
@@ -58,19 +65,24 @@ apfs_write_file(struct apfs_vol *vol, uint64_t obj_id, uint64_t off,
 		return error;
 	}
 
-	struct apfs_txn txn;
-	error = txn_begin(vol, &txn);
-	if (error) return error;
+	struct apfs_txn *txn = txn_alloc();
+	if (txn == NULL) return ENOMEM;
+	error = txn_begin(vol, txn);
+	if (error) {
+		txn_free(txn);
+		return error;
+	}
 
 	uint32_t buf_pos = 0;
 	uint64_t cur_off = off;
 	uint64_t cur_len = len;
 
-	if (cur_off < old_blocks * bs) {
+	while (cur_off < old_blocks * bs && cur_len > 0) {
 		struct apfs_extent ext;
 		error = apfs_extent_at(vol, ino.private_id, cur_off, &ext);
 		if (error || ext.phys == 0) {
-			txn_destroy(&txn);
+			txn_destroy(txn);
+			txn_free(txn);
 			return error ? error : EIO;
 		}
 		uint64_t blk_idx = (cur_off - ext.logical) / bs;
@@ -81,19 +93,22 @@ apfs_write_file(struct apfs_vol *vol, uint64_t obj_id, uint64_t off,
 
 		uint8_t *blkbuf = apfs_alloc(bs);
 		if (blkbuf == NULL) {
-			txn_destroy(&txn);
+			txn_destroy(txn);
+			txn_free(txn);
 			return ENOMEM;
 		}
-		if (txn_read_block(&txn, phys_block, blkbuf, bs) != 0) {
+		if (txn_read_block(txn, phys_block, blkbuf, bs) != 0) {
 			apfs_free(blkbuf, bs);
-			txn_destroy(&txn);
+			txn_destroy(txn);
+			txn_free(txn);
 			return EIO;
 		}
 		memcpy(blkbuf + off_in_blk, (const uint8_t *)buf + buf_pos, to_write);
-		error = txn_put(&txn, phys_block, blkbuf, bs);
+		error = txn_put(txn, phys_block, blkbuf, bs);
 		apfs_free(blkbuf, bs);
 		if (error) {
-			txn_destroy(&txn);
+			txn_destroy(txn);
+			txn_free(txn);
 			return error;
 		}
 		buf_pos += to_write;
@@ -104,28 +119,43 @@ apfs_write_file(struct apfs_vol *vol, uint64_t obj_id, uint64_t off,
 	uint32_t add_blocks = (uint32_t)(new_total_blocks - old_blocks);
 	uint64_t new_phys = 0;
 	if (add_blocks > 0 && cur_len > 0) {
-		error = txn_alloc_blocks(&txn, add_blocks, &new_phys);
+		error = txn_alloc_blocks(txn, add_blocks, &new_phys);
 		if (error) {
-			txn_destroy(&txn);
+			txn_destroy(txn);
+			txn_free(txn);
 			return error;
 		}
 
 		uint8_t *zbuf = apfs_alloc(add_blocks * bs);
 		if (zbuf == NULL) {
-			txn_destroy(&txn);
+			txn_destroy(txn);
+			txn_free(txn);
 			return ENOMEM;
 		}
 		memset(zbuf, 0, add_blocks * bs);
 
+		if (cur_off < old_blocks * bs) {
+			apfs_free(zbuf, add_blocks * bs);
+			txn_destroy(txn);
+			txn_free(txn);
+			return EIO;
+		}
 		uint64_t write_off_in_new = cur_off - (old_blocks * bs);
+		if (write_off_in_new + cur_len > (uint64_t)add_blocks * bs) {
+			apfs_free(zbuf, add_blocks * bs);
+			txn_destroy(txn);
+			txn_free(txn);
+			return EIO;
+		}
 		memcpy(zbuf + write_off_in_new, (const uint8_t *)buf + buf_pos, cur_len);
 
 		for (uint32_t b = 0; b < add_blocks; b++) {
 			uint64_t target_b = new_phys + b;
-			error = txn_put(&txn, target_b, zbuf + b * bs, bs);
+			error = txn_put(txn, target_b, zbuf + b * bs, bs);
 			if (error) {
 				apfs_free(zbuf, add_blocks * bs);
-				txn_destroy(&txn);
+				txn_destroy(txn);
+				txn_free(txn);
 				return error;
 			}
 		}
@@ -142,10 +172,11 @@ apfs_write_file(struct apfs_vol *vol, uint64_t obj_id, uint64_t off,
 		w_put_le64(ext_val + 16, 0);
 
 		uint64_t intermediate_fs = 0;
-		error = txn_modify_fs_root(&txn, ext_key, sizeof(ext_key),
+		error = txn_modify_fs_root(txn, ext_key, sizeof(ext_key),
 		    ext_val, sizeof(ext_val), false, &intermediate_fs);
 		if (error) {
-			txn_destroy(&txn);
+			txn_destroy(txn);
+			txn_free(txn);
 			return error;
 		}
 		vol->tree.root = intermediate_fs;
@@ -162,12 +193,13 @@ apfs_write_file(struct apfs_vol *vol, uint64_t obj_id, uint64_t off,
 			erf_val.refcnt = 1;
 
 			uint64_t new_er_bno = 0;
-			error = txn_modify_btree_root(&txn, vol->extentref_oid,
+			error = txn_modify_btree_root(txn, vol->extentref_oid,
 			    vol->extentref_oid, APFS_OBJ_PHYSICAL | APFS_OBJECT_TYPE_BTREE,
 			    APFS_OBJECT_TYPE_BLOCKREFTREE, erf_key, sizeof(erf_key),
 			    (const uint8_t *)&erf_val, sizeof(erf_val), false, &new_er_bno);
 			if (error) {
-				txn_destroy(&txn);
+				txn_destroy(txn);
+				txn_free(txn);
 				return error;
 			}
 			vol->extentref_oid = new_er_bno;
@@ -196,15 +228,17 @@ apfs_write_file(struct apfs_vol *vol, uint64_t obj_id, uint64_t off,
 	}
 
 	uint64_t final_fs = 0;
-	error = txn_modify_fs_root(&txn, inokey, sizeof(inokey),
+	error = txn_modify_fs_root(txn, inokey, sizeof(inokey),
 	    inobuf, inobuf_len, false, &final_fs);
 	if (error) {
-		txn_destroy(&txn);
+		txn_destroy(txn);
+		txn_free(txn);
 		return error;
 	}
 
-	error = txn_commit(&txn, final_fs);
-	txn_destroy(&txn);
+	error = txn_commit(txn, final_fs);
+	txn_destroy(txn);
+	txn_free(txn);
 
 	if (error == 0 && rep != NULL) {
 		rep->bytes = len;
@@ -235,9 +269,11 @@ apfs_create_file(struct apfs_vol *vol, uint64_t parent_id, const char *name,
 	}
 	if ((w_le16(p_inobuf + 80) & APFS_S_IFMT) != APFS_S_IFDIR) return ENOTDIR;
 
-	struct apfs_txn txn;
-	error = txn_begin(vol, &txn);
+	struct apfs_txn *txn = txn_alloc();
+	if (txn == NULL) return ENOMEM;
+	error = txn_begin(vol, txn);
 	if (error) {
+		txn_free(txn);
 		return error;
 	}
 
@@ -260,10 +296,11 @@ apfs_create_file(struct apfs_vol *vol, uint64_t parent_id, const char *name,
 	w_put_le16(drec_val + 16, APFS_DT_REG);
 
 	uint64_t fs_stage1 = 0;
-	error = txn_modify_fs_root(&txn, drec_key, drec_klen,
+	error = txn_modify_fs_root(txn, drec_key, drec_klen,
 	    drec_val, sizeof(drec_val), false, &fs_stage1);
 	if (error) {
-		txn_destroy(&txn);
+		txn_destroy(txn);
+		txn_free(txn);
 		return error;
 	}
 	vol->tree.root = fs_stage1;
@@ -311,10 +348,11 @@ apfs_create_file(struct apfs_vol *vol, uint64_t parent_id, const char *name,
 	uint16_t inobuf_len = (uint16_t)(92 + 12 + name_pad + 40);
 
 	uint64_t fs_stage2 = 0;
-	error = txn_modify_fs_root(&txn, inokey, sizeof(inokey),
+	error = txn_modify_fs_root(txn, inokey, sizeof(inokey),
 	    inobuf, inobuf_len, false, &fs_stage2);
 	if (error) {
-		txn_destroy(&txn);
+		txn_destroy(txn);
+		txn_free(txn);
 		return error;
 	}
 	vol->tree.root = fs_stage2;
@@ -325,10 +363,11 @@ apfs_create_file(struct apfs_vol *vol, uint64_t parent_id, const char *name,
 	uint32_t refc = 1;
 
 	uint64_t fs_final = 0;
-	error = txn_modify_fs_root(&txn, dst_key, sizeof(dst_key),
+	error = txn_modify_fs_root(txn, dst_key, sizeof(dst_key),
 	    (const uint8_t *)&refc, sizeof(refc), false, &fs_final);
 	if (error) {
-		txn_destroy(&txn);
+		txn_destroy(txn);
+		txn_free(txn);
 		return error;
 	}
 	vol->tree.root = fs_final;
@@ -348,17 +387,19 @@ apfs_create_file(struct apfs_vol *vol, uint64_t parent_id, const char *name,
 		uint8_t p_inokey[8];
 		w_make_jkey(p_inokey, parent_id, APFS_TYPE_INODE);
 		uint64_t fs_parent_stage = 0;
-		error = txn_modify_fs_root(&txn, p_inokey, sizeof(p_inokey), p_inobuf, p_inolen, false, &fs_parent_stage);
+		error = txn_modify_fs_root(txn, p_inokey, sizeof(p_inokey), p_inobuf, p_inolen, false, &fs_parent_stage);
 		if (error) {
-			txn_destroy(&txn);
+			txn_destroy(txn);
+			txn_free(txn);
 			return error;
 		}
 		vol->tree.root = fs_parent_stage;
 		fs_final = fs_parent_stage;
 	}
 
-	error = txn_commit(&txn, fs_final);
-	txn_destroy(&txn);
+	error = txn_commit(txn, fs_final);
+	txn_destroy(txn);
+	txn_free(txn);
 
 	if (error == 0 && out_id != NULL) {
 		*out_id = new_id;
@@ -388,12 +429,8 @@ apfs_remove_file(struct apfs_vol *vol, uint64_t parent_id, const char *name)
 	(void)apfs_inode_get(vol, file_id, &file_ino);
 	uint64_t stream_id = file_ino.private_id ? file_ino.private_id : file_id;
 
-	struct {
-		uint8_t key[16];
-		uint16_t key_len;
-		uint64_t phys_bno;
-		uint64_t blkcnt;
-	} ext_to_del[32];
+	struct apfs_del_ext *ext_to_del = (struct apfs_del_ext *)apfs_alloc(32 * sizeof(struct apfs_del_ext));
+	if (ext_to_del == NULL) return ENOMEM;
 	int num_ext = 0;
 
 	struct apfs_cursor cur;
@@ -416,9 +453,17 @@ apfs_remove_file(struct apfs_vol *vol, uint64_t parent_id, const char *name)
 		}
 	}
 
-	struct apfs_txn txn;
-	error = txn_begin(vol, &txn);
-	if (error) return error;
+	struct apfs_txn *txn = txn_alloc();
+	if (txn == NULL) {
+		apfs_free(ext_to_del, 32 * sizeof(struct apfs_del_ext));
+		return ENOMEM;
+	}
+	error = txn_begin(vol, txn);
+	if (error) {
+		apfs_free(ext_to_del, 32 * sizeof(struct apfs_del_ext));
+		txn_free(txn);
+		return error;
+	}
 
 	uint32_t nh = 0;
 	apfs_name_hash(name, name_len, vol->hashed_names, &nh);
@@ -430,9 +475,11 @@ apfs_remove_file(struct apfs_vol *vol, uint64_t parent_id, const char *name)
 	uint16_t drec_klen = (uint16_t)(12 + name_len + 1);
 
 	uint64_t fs_stage1 = 0;
-	error = txn_modify_fs_root(&txn, drec_key, drec_klen, NULL, 0, true, &fs_stage1);
+	error = txn_modify_fs_root(txn, drec_key, drec_klen, NULL, 0, true, &fs_stage1);
 	if (error) {
-		txn_destroy(&txn);
+		apfs_free(ext_to_del, 32 * sizeof(struct apfs_del_ext));
+		txn_destroy(txn);
+		txn_free(txn);
 		return error;
 	}
 	vol->tree.root = fs_stage1;
@@ -441,9 +488,11 @@ apfs_remove_file(struct apfs_vol *vol, uint64_t parent_id, const char *name)
 	w_make_jkey(inokey, file_id, APFS_TYPE_INODE);
 
 	uint64_t fs_stage2 = 0;
-	error = txn_modify_fs_root(&txn, inokey, sizeof(inokey), NULL, 0, true, &fs_stage2);
+	error = txn_modify_fs_root(txn, inokey, sizeof(inokey), NULL, 0, true, &fs_stage2);
 	if (error) {
-		txn_destroy(&txn);
+		apfs_free(ext_to_del, 32 * sizeof(struct apfs_del_ext));
+		txn_destroy(txn);
+		txn_free(txn);
 		return error;
 	}
 	vol->tree.root = fs_stage2;
@@ -453,7 +502,7 @@ apfs_remove_file(struct apfs_vol *vol, uint64_t parent_id, const char *name)
 	uint8_t dst_key[8];
 	w_make_jkey(dst_key, stream_id, APFS_TYPE_DSTREAM_ID);
 	uint64_t fs_stage3 = 0;
-	if (txn_modify_fs_root(&txn, dst_key, sizeof(dst_key), NULL, 0, true, &fs_stage3) == 0 && fs_stage3 != 0) {
+	if (txn_modify_fs_root(txn, dst_key, sizeof(dst_key), NULL, 0, true, &fs_stage3) == 0 && fs_stage3 != 0) {
 		vol->tree.root = fs_stage3;
 		fs_final = fs_stage3;
 	}
@@ -468,18 +517,18 @@ apfs_remove_file(struct apfs_vol *vol, uint64_t parent_id, const char *name)
 				uint8_t erf_key[8];
 				w_make_jkey(erf_key, ext_to_del[e].phys_bno, APFS_TYPE_EXTENT);
 				uint64_t new_er_bno = 0;
-				if (txn_modify_btree_root(&txn, vol->extentref_oid, vol->extentref_oid,
+				if (txn_modify_btree_root(txn, vol->extentref_oid, vol->extentref_oid,
 				    APFS_OBJ_PHYSICAL | APFS_OBJECT_TYPE_BTREE, APFS_OBJECT_TYPE_BLOCKREFTREE,
 				    erf_key, sizeof(erf_key), NULL, 0, true, &new_er_bno) == 0 && new_er_bno != 0) {
 					vol->extentref_oid = new_er_bno;
 				}
 			}
 			if (ext_to_del[e].phys_bno != 0) {
-				txn_mark_freed_range(&txn, ext_to_del[e].phys_bno, (uint32_t)ext_to_del[e].blkcnt);
+				txn_mark_freed_range(txn, ext_to_del[e].phys_bno, (uint32_t)ext_to_del[e].blkcnt);
 			}
 		}
 		uint64_t stage_ext = 0;
-		if (txn_modify_fs_root(&txn, ext_to_del[e].key, ext_to_del[e].key_len, NULL, 0, true, &stage_ext) == 0 && stage_ext != 0) {
+		if (txn_modify_fs_root(txn, ext_to_del[e].key, ext_to_del[e].key_len, NULL, 0, true, &stage_ext) == 0 && stage_ext != 0) {
 			vol->tree.root = stage_ext;
 			fs_final = stage_ext;
 		}
@@ -499,15 +548,17 @@ apfs_remove_file(struct apfs_vol *vol, uint64_t parent_id, const char *name)
 		uint8_t p_inokey[8];
 		w_make_jkey(p_inokey, parent_id, APFS_TYPE_INODE);
 		uint64_t fs_parent_stage = 0;
-		if (txn_modify_fs_root(&txn, p_inokey, sizeof(p_inokey), p_inobuf, p_inolen, false, &fs_parent_stage) == 0 && fs_parent_stage != 0) {
+		if (txn_modify_fs_root(txn, p_inokey, sizeof(p_inokey), p_inobuf, p_inolen, false, &fs_parent_stage) == 0 && fs_parent_stage != 0) {
 			vol->tree.root = fs_parent_stage;
 			fs_final = fs_parent_stage;
 		}
 	}
 
 	if (vol->num_files > 0) vol->num_files--;
-	error = txn_commit(&txn, fs_final);
-	txn_destroy(&txn);
+	error = txn_commit(txn, fs_final);
+	apfs_free(ext_to_del, 32 * sizeof(struct apfs_del_ext));
+	txn_destroy(txn);
+	txn_free(txn);
 	return error;
 }
 
@@ -527,18 +578,22 @@ apfs_set_file_size(struct apfs_vol *vol, uint64_t obj_id, uint64_t new_size)
 	error = read_raw_inode(vol, obj_id, inobuf, &inobuf_len);
 	if (error) return error;
 
-	struct apfs_txn txn;
-	error = txn_begin(vol, &txn);
-	if (error) return error;
+	struct apfs_txn *txn = txn_alloc();
+	if (txn == NULL) return ENOMEM;
+	error = txn_begin(vol, txn);
+	if (error) {
+		txn_free(txn);
+		return error;
+	}
 
 	if (new_size == 0) {
 		uint64_t stream_id = inode.private_id ? inode.private_id : obj_id;
-		struct {
-			uint8_t key[16];
-			uint16_t key_len;
-			uint64_t phys_bno;
-			uint64_t blkcnt;
-		} ext_to_del[32];
+		struct apfs_del_ext *ext_to_del = (struct apfs_del_ext *)apfs_alloc(32 * sizeof(struct apfs_del_ext));
+		if (ext_to_del == NULL) {
+			txn_destroy(txn);
+			txn_free(txn);
+			return ENOMEM;
+		}
 		int num_ext = 0;
 
 		struct apfs_cursor cur;
@@ -570,23 +625,25 @@ apfs_set_file_size(struct apfs_vol *vol, uint64_t obj_id, uint64_t new_size)
 					uint8_t erf_key[8];
 					w_make_jkey(erf_key, ext_to_del[e].phys_bno, APFS_TYPE_EXTENT);
 					uint64_t new_er_bno = 0;
-					if (txn_modify_btree_root(&txn, vol->extentref_oid, vol->extentref_oid,
+					if (txn_modify_btree_root(txn, vol->extentref_oid, vol->extentref_oid,
 					    APFS_OBJ_PHYSICAL | APFS_OBJECT_TYPE_BTREE, APFS_OBJECT_TYPE_BLOCKREFTREE,
 					    erf_key, sizeof(erf_key), NULL, 0, true, &new_er_bno) == 0 && new_er_bno != 0) {
 						vol->extentref_oid = new_er_bno;
 					}
 				}
 				if (ext_to_del[e].phys_bno != 0) {
-					txn_mark_freed_range(&txn, ext_to_del[e].phys_bno, (uint32_t)ext_to_del[e].blkcnt);
+					txn_mark_freed_range(txn, ext_to_del[e].phys_bno, (uint32_t)ext_to_del[e].blkcnt);
 				}
 			}
 			uint64_t stage_ext = 0;
-			if (txn_modify_fs_root(&txn, ext_to_del[e].key, ext_to_del[e].key_len, NULL, 0, true, &stage_ext) == 0 && stage_ext != 0) {
+			if (txn_modify_fs_root(txn, ext_to_del[e].key, ext_to_del[e].key_len, NULL, 0, true, &stage_ext) == 0 && stage_ext != 0) {
 				vol->tree.root = stage_ext;
 			}
 		}
+		apfs_free(ext_to_del, 32 * sizeof(struct apfs_del_ext));
 	} else if ((new_size - 1) / bs != (inode.size - 1) / bs) {
-		txn_destroy(&txn);
+		txn_destroy(txn);
+		txn_free(txn);
 		return EOPNOTSUPP;
 	}
 
@@ -613,15 +670,17 @@ apfs_set_file_size(struct apfs_vol *vol, uint64_t obj_id, uint64_t new_size)
 	}
 
 	uint64_t fs_final = 0;
-	error = txn_modify_fs_root(&txn, inokey, sizeof(inokey),
+	error = txn_modify_fs_root(txn, inokey, sizeof(inokey),
 	    inobuf, inobuf_len, false, &fs_final);
 	if (error) {
-		txn_destroy(&txn);
+		txn_destroy(txn);
+		txn_free(txn);
 		return error;
 	}
 
-	error = txn_commit(&txn, fs_final);
-	txn_destroy(&txn);
+	error = txn_commit(txn, fs_final);
+	txn_destroy(txn);
+	txn_free(txn);
 	return error;
 }
 
@@ -635,9 +694,13 @@ apfs_set_file_attrs(struct apfs_vol *vol, uint64_t obj_id, uint16_t mode,
 	int error = read_raw_inode(vol, obj_id, inobuf, &inobuf_len);
 	if (error) return error;
 
-	struct apfs_txn txn;
-	error = txn_begin(vol, &txn);
-	if (error) return error;
+	struct apfs_txn *txn = txn_alloc();
+	if (txn == NULL) return ENOMEM;
+	error = txn_begin(vol, txn);
+	if (error) {
+		txn_free(txn);
+		return error;
+	}
 
 	uint8_t inokey[8];
 	w_make_jkey(inokey, obj_id, APFS_TYPE_INODE);
@@ -649,19 +712,24 @@ apfs_set_file_attrs(struct apfs_vol *vol, uint64_t obj_id, uint16_t mode,
 	if ((iflags & (0x4000 | 0x8000)) == 0) iflags |= 0x8000;
 	w_put_le64(inobuf + 48, iflags);
 
-	if (mode) w_put_le16(inobuf + 80, mode);
-	if (uid) w_put_le32(inobuf + 72, uid);
-	if (gid) w_put_le32(inobuf + 76, gid);
+	if (mode) {
+		uint16_t cur_mode = w_le16(inobuf + 80);
+		w_put_le16(inobuf + 80, (cur_mode & APFS_S_IFMT) | (mode & 07777));
+	}
+	if (uid != (uint32_t)-1) w_put_le32(inobuf + 72, uid);
+	if (gid != (uint32_t)-1) w_put_le32(inobuf + 76, gid);
 
 	uint64_t fs_final = 0;
-	error = txn_modify_fs_root(&txn, inokey, sizeof(inokey),
+	error = txn_modify_fs_root(txn, inokey, sizeof(inokey),
 	    inobuf, inobuf_len, false, &fs_final);
 	if (error) {
-		txn_destroy(&txn);
+		txn_destroy(txn);
+		txn_free(txn);
 		return error;
 	}
 
-	error = txn_commit(&txn, fs_final);
-	txn_destroy(&txn);
+	error = txn_commit(txn, fs_final);
+	txn_destroy(txn);
+	txn_free(txn);
 	return error;
 }

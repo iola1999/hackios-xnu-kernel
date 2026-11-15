@@ -5,6 +5,17 @@
  * This implements the file extension lifecycle within MiniSandbox's existing
  * non-enforcing policy; extension consume validates tokens and binds handles
  * without redundant DAC pre-authorization, aligning with Seatbelt semantics.
+ *
+ * An extension issued with no target process (pid and pidversion 0, no flags) is
+ * the other form: sandbox_extension_issue_generic() (type 3, no resource) and
+ * sandbox_extension_issue_file() (type 0, a path). tccd hands a granted client
+ * "com.apple.tcc.<service>" this way, as a file extension of "/" for the
+ * services it does not mark generic; a failed issue makes tccd answer the whole
+ * request as denied. Like Seatbelt's, such a token carries its class, its path
+ * and a keyed hash of them, so issuing keeps no table entry; any process that is
+ * given the token may consume it, and consuming checks the hash and binds a
+ * handle to the consumer. The path is checked against the issuer at issue time;
+ * the handle keeps no vnode, as this policy does not confine file access.
  */
 #define SANDBOX_SYSCALL_EXTENSION_ISSUE 5
 #define SANDBOX_SYSCALL_EXTENSION_CONSUME 6
@@ -12,6 +23,11 @@
 #define SANDBOX_SYSCALL_EXTENSION_RELEASE_DETECT 80
 #define MINISANDBOX_EXTENSION_TARGET_AUDIT 0x30000ULL
 #define MINISANDBOX_EXTENSION_TOKEN_LENGTH 49
+#define MINISANDBOX_EXTENSION_TYPE_FILE 0
+#define MINISANDBOX_EXTENSION_TYPE_GENERIC 3
+#define MINISANDBOX_EXTENSION_CLASS_MAX 128
+/* 16 hex digits of identifier, 32 of keyed hash, ";class", for a file ";path", and the NUL */
+#define MINISANDBOX_EXTENSION_UNTARGETED_MAX (MINISANDBOX_EXTENSION_TOKEN_LENGTH + MINISANDBOX_EXTENSION_CLASS_MAX + MAXPATHLEN)
 
 struct minisandbox_extension_issue_args {
 	user_addr_t class_name;
@@ -42,7 +58,7 @@ _Static_assert(sizeof(struct minisandbox_extension_release_args) == 24, "Sandbox
 struct minisandbox_extension {
 	struct minisandbox_extension *next;
 	struct os_refcnt refs;
-	vnode_t vnode;
+	vnode_t vnode;                          /* NULLVP for an extension issued with no target */
 	kauth_action_t rights;
 	uint64_t target_uniqueid;
 	uint32_t target_pidversion;
@@ -62,12 +78,16 @@ static LCK_MTX_DECLARE(minisandbox_extension_lock, &minisandbox_extension_lock_g
 static struct minisandbox_extension *minisandbox_extensions;
 static struct minisandbox_extension_grant *minisandbox_extension_grants;
 static uint64_t minisandbox_extension_identifier;
+static uint8_t minisandbox_extension_key[32];   /* per boot, for generic tokens */
+static bool minisandbox_extension_key_ready;
 
 static void
 minisandbox_extension_put(struct minisandbox_extension *extension)
 {
 	if (os_ref_release(&extension->refs) == 0) {
-		vnode_rele(extension->vnode);
+		if (extension->vnode != NULLVP) {
+			vnode_rele(extension->vnode);
+		}
 		kfree_type(struct minisandbox_extension, extension);
 	}
 }
@@ -139,19 +159,175 @@ minisandbox_extension_class_rights(proc_t issuer, const char *class_name,
 }
 
 static void
-minisandbox_extension_make_token(char token[MINISANDBOX_EXTENSION_TOKEN_LENGTH], int64_t identifier)
+minisandbox_extension_hex(char *out, const uint8_t *bytes, size_t count)
 {
 	static const char hex[] = "0123456789abcdef";
-	uint8_t bytes[24];
+	for (size_t i = 0; i < count; i++) {
+		out[i * 2] = hex[bytes[i] >> 4];
+		out[i * 2 + 1] = hex[bytes[i] & 15];
+	}
+}
+
+static void
+minisandbox_extension_identifier_bytes(uint8_t bytes[8], int64_t identifier)
+{
 	for (size_t i = 0; i < 8; i++) {
 		bytes[i] = (uint8_t)((uint64_t)identifier >> ((7 - i) * 8));
 	}
+}
+
+static void
+minisandbox_extension_make_token(char token[MINISANDBOX_EXTENSION_TOKEN_LENGTH], int64_t identifier)
+{
+	uint8_t bytes[24];
+	minisandbox_extension_identifier_bytes(bytes, identifier);
 	read_random(bytes + 8, 16);
-	for (size_t i = 0; i < sizeof(bytes); i++) {
-		token[i * 2] = hex[bytes[i] >> 4];
-		token[i * 2 + 1] = hex[bytes[i] & 15];
-	}
+	minisandbox_extension_hex(token, bytes, sizeof(bytes));
 	token[MINISANDBOX_EXTENSION_TOKEN_LENGTH - 1] = '\0';
+}
+
+static void
+minisandbox_extension_key_init(void)
+{
+	uint8_t key[sizeof(minisandbox_extension_key)];
+	lck_mtx_lock(&minisandbox_extension_lock);
+	bool ready = minisandbox_extension_key_ready;
+	lck_mtx_unlock(&minisandbox_extension_lock);
+	if (ready) {
+		return;
+	}
+	read_random(key, sizeof(key));
+	lck_mtx_lock(&minisandbox_extension_lock);
+	if (!minisandbox_extension_key_ready) {
+		memcpy(minisandbox_extension_key, key, sizeof(key));
+		minisandbox_extension_key_ready = true;
+	}
+	lck_mtx_unlock(&minisandbox_extension_lock);
+}
+
+/* The first 48 characters of an untargeted token: the identifier's hex, then HMAC-SHA256 over it, the class and the path. */
+static void
+minisandbox_extension_untargeted_digest(char out[MINISANDBOX_EXTENSION_TOKEN_LENGTH - 1], const char *identifier_hex,
+    const char *class_name, const char *path)
+{
+	uint8_t pad[64], inner[32], outer[32];
+	SHA256_CTX context;
+	for (size_t i = 0; i < sizeof(pad); i++) {
+		pad[i] = (i < sizeof(minisandbox_extension_key) ? minisandbox_extension_key[i] : 0) ^ 0x36;
+	}
+	SHA256_Init(&context);
+	SHA256_Update(&context, pad, sizeof(pad));
+	SHA256_Update(&context, identifier_hex, 16);
+	SHA256_Update(&context, class_name, strlen(class_name) + 1);
+	SHA256_Update(&context, path, strlen(path));
+	SHA256_Final(inner, &context);
+	for (size_t i = 0; i < sizeof(pad); i++) {
+		pad[i] ^= 0x36 ^ 0x5c;
+	}
+	SHA256_Init(&context);
+	SHA256_Update(&context, pad, sizeof(pad));
+	SHA256_Update(&context, inner, sizeof(inner));
+	SHA256_Final(outer, &context);
+	memcpy(out, identifier_hex, 16);
+	minisandbox_extension_hex(out + 16, outer, 16);
+}
+
+static int
+minisandbox_extension_issue_untargeted(proc_t issuer, const struct minisandbox_extension_issue_args *args)
+{
+	char class_name[MINISANDBOX_EXTENSION_CLASS_MAX], token[MINISANDBOX_EXTENSION_UNTARGETED_MAX], identifier_hex[16];
+	char *path = NULL;                      /* none for a generic extension */
+	uint8_t bytes[8];
+	size_t class_length, path_length = 0;
+	int64_t identifier;
+	if (args->type == MINISANDBOX_EXTENSION_TYPE_GENERIC ? args->resource != 0 :
+	    args->type != MINISANDBOX_EXTENSION_TYPE_FILE || args->resource == 0) {
+		return ENOTSUP;
+	}
+	if (!args->token) {
+		return EFAULT;
+	}
+	int error = copyinstr(args->class_name, class_name, sizeof(class_name), &class_length);
+	if (error) {
+		return error;
+	}
+	if (class_length < 2 || strchr(class_name, ';') != NULL) {
+		return EINVAL;
+	}
+	char *class_in_token = token + MINISANDBOX_EXTENSION_TOKEN_LENGTH;
+	memcpy(class_in_token, class_name, class_length);
+	if (args->type == MINISANDBOX_EXTENSION_TYPE_FILE) {
+		vfs_context_t context;
+		vnode_t vnode = NULLVP;
+		path = class_in_token + class_length;
+		error = copyinstr(args->resource, path, MAXPATHLEN, &path_length);
+		if (error) {
+			return error;
+		}
+		if (path_length < 2 || path[0] != '/') {
+			return EINVAL;
+		}
+		context = vfs_context_create_with_proc(issuer);
+		if (context == NULL) {
+			return ENOMEM;
+		}
+		error = vnode_lookup(path, 0, &vnode, context);
+		if (error == 0) {
+			error = vnode_authorize(vnode, NULLVP,
+			    vnode_vtype(vnode) == VDIR ? KAUTH_VNODE_SEARCH : KAUTH_VNODE_READ_DATA, context);
+			vnode_put(vnode);
+		}
+		vfs_context_rele(context);
+		if (error) {
+			return error;
+		}
+		class_in_token[class_length - 1] = ';';
+	}
+	error = minisandbox_extension_next_identifier(&identifier);
+	if (error) {
+		return error;
+	}
+	minisandbox_extension_key_init();
+	minisandbox_extension_identifier_bytes(bytes, identifier);
+	minisandbox_extension_hex(identifier_hex, bytes, sizeof(bytes));
+	minisandbox_extension_untargeted_digest(token, identifier_hex, class_name, path != NULL ? path : "");
+	token[MINISANDBOX_EXTENSION_TOKEN_LENGTH - 1] = ';';
+	return copyout(token, args->token, MINISANDBOX_EXTENSION_TOKEN_LENGTH + class_length + path_length);
+}
+
+/* An untargeted token whose hash matches becomes an extension of the consumer's own. */
+static int
+minisandbox_extension_untargeted_open(const char *token, proc_t owner, struct minisandbox_extension **out)
+{
+	char expected[MINISANDBOX_EXTENSION_TOKEN_LENGTH - 1], class_name[MINISANDBOX_EXTENSION_CLASS_MAX];
+	const char *class_start = token + MINISANDBOX_EXTENSION_TOKEN_LENGTH;
+	const char *path = strchr(class_start, ';');
+	size_t class_length = path != NULL ? (size_t)(path - class_start) : strlen(class_start);
+	if (token[sizeof(expected)] != ';' || class_length == 0 || class_length >= sizeof(class_name)) {
+		return EINVAL;
+	}
+	memcpy(class_name, class_start, class_length);
+	class_name[class_length] = '\0';
+	if (path != NULL && path[1] != '/') {
+		return EINVAL;
+	}
+	path = path != NULL ? path + 1 : "";
+	minisandbox_extension_key_init();
+	minisandbox_extension_untargeted_digest(expected, token, class_name, path);
+	if (timingsafe_bcmp(expected, token, sizeof(expected)) != 0) {
+		return EINVAL;
+	}
+	struct minisandbox_extension *extension = kalloc_type(struct minisandbox_extension, Z_WAITOK | Z_ZERO);
+	if (extension == NULL) {
+		return ENOMEM;
+	}
+	os_ref_init(&extension->refs, NULL);
+	extension->target_uniqueid = proc_uniqueid(owner);
+	extension->target_pid = proc_getpid(owner);
+	extension->target_pidversion = (uint32_t)proc_pidversion(owner);
+	memcpy(extension->token, token, sizeof(expected));
+	*out = extension;
+	return 0;
 }
 
 static int
@@ -169,6 +345,9 @@ minisandbox_extension_issue(proc_t issuer, user_addr_t arg)
 	int error = copyin(arg, &args, sizeof(args));
 	if (error) {
 		return error;
+	}
+	if (args.pid == 0 && args.pidversion == 0 && args.flags == 0) {
+		return minisandbox_extension_issue_untargeted(issuer, &args);
 	}
 	if (args.type != 0 || args.flags != MINISANDBOX_EXTENSION_TARGET_AUDIT) {
 		return ENOTSUP;
@@ -270,7 +449,7 @@ minisandbox_extension_consume(proc_t owner, user_addr_t arg)
 	struct minisandbox_extension_consume_args args;
 	struct minisandbox_extension *extension = NULL;
 	struct minisandbox_extension_grant *grant;
-	char token[MINISANDBOX_EXTENSION_TOKEN_LENGTH];
+	char token[MINISANDBOX_EXTENSION_UNTARGETED_MAX];
 	int64_t handle = -1;
 	int error = copyin(arg, &args, sizeof(args));
 	if (error) {
@@ -280,23 +459,30 @@ minisandbox_extension_consume(proc_t owner, user_addr_t arg)
 	if (error) {
 		return error;
 	}
-	if (args.length != sizeof(token)) {
+	if (args.length < MINISANDBOX_EXTENSION_TOKEN_LENGTH || args.length > sizeof(token)) {
 		return EINVAL;
 	}
-	error = copyin(args.token, token, sizeof(token));
+	error = copyin(args.token, token, (size_t)args.length);
 	if (error) {
 		return error;
 	}
-	if (token[sizeof(token) - 1] != '\0') {
+	if (token[args.length - 1] != '\0' || strlen(token) != args.length - 1) {
 		return EINVAL;
 	}
 	error = minisandbox_extension_proc_begin(owner);
 	if (error) {
 		return error;
 	}
+	if (args.length != MINISANDBOX_EXTENSION_TOKEN_LENGTH) {
+		error = minisandbox_extension_untargeted_open(token, owner, &extension);
+		if (error) {
+			goto out_transition;
+		}
+		goto bind;
+	}
 	lck_mtx_lock(&minisandbox_extension_lock);
 	for (extension = minisandbox_extensions; extension != NULL; extension = extension->next) {
-		if (memcmp(extension->token, token, sizeof(token)) == 0) {
+		if (memcmp(extension->token, token, MINISANDBOX_EXTENSION_TOKEN_LENGTH) == 0) {
 			break;
 		}
 	}
@@ -323,6 +509,7 @@ minisandbox_extension_consume(proc_t owner, user_addr_t arg)
 	if (error) {
 		goto out_extension;
 	}
+bind:
 	grant = kalloc_type(struct minisandbox_extension_grant, Z_WAITOK | Z_ZERO);
 	if (grant == NULL) {
 		error = ENOMEM;

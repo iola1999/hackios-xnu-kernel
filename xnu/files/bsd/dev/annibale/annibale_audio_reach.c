@@ -542,6 +542,9 @@ wait_for_spf_ready(struct gpr_pkt *p)
 }
 
 /* Build AudioReach APM Playback Graphs */
+static bool send_audio_period(uint32_t slot);
+static bool queue_audio_period_async(uint32_t slot);
+
 static bool
 build_audioreach_graphs(void)
 {
@@ -646,8 +649,35 @@ build_audioreach_graphs(void)
 	if (!gpr_graph_cmd(OP_GRAPH_START, SG_PLAY, "START SG_PLAY")) return false;
 
 	/* Prime smart amplifiers with cold calibration while BCLK is active, then hold in low-power standby */
+#if defined(KERNEL)
+	for (uint32_t s = 0; s < IN_FLIGHT; s++) {
+		if (reach_buffer != NULL) {
+			bzero(__DEVOLATILE(void *, reach_buffer + s * PERIOD_BYTES), PERIOD_BYTES);
+		}
+		(void)queue_audio_period_async(s);
+	}
+#elif defined(AUDIOREACH_ROUTING_TEST)
+	for (uint32_t s = 0; s < 4; s++) {
+		if (reach_buffer != NULL) {
+			bzero(__DEVOLATILE(void *, reach_buffer + s * PERIOD_BYTES), PERIOD_BYTES);
+		}
+		(void)send_audio_period(s);
+	}
+#endif
 	(void)annibale_audio_amp_power(true);
 	(void)annibale_audio_amp_power(false);
+#if defined(KERNEL)
+	uint32_t wait_iters = 0;
+	while (__atomic_load_n(&in_flight_mask, __ATOMIC_ACQUIRE) != 0) {
+		if (++wait_iters > 30) {
+			say("audioreach: waiting for warmup inflight timed out after 300 ms, clearing\n");
+			__atomic_store_n(&in_flight_mask, 0, __ATOMIC_RELEASE);
+			break;
+		}
+		assert_wait_timeout((event_t)__DEVOLATILE(void *, &in_flight_mask), THREAD_UNINT, 10, NSEC_PER_MSEC);
+		thread_block(THREAD_CONTINUE_NULL);
+	}
+#endif
 
 	say("AudioReach graphs SG_PLAY (0x4001) & SG_SPEAKER (0x4005) initialized and started\n");
 	return true;
@@ -701,7 +731,7 @@ reach_gpr_event(uint32_t src_port, uint32_t dst_port, uint32_t opcode,
 	}
 	if (payload == NULL || len < 32) {
 		__atomic_store_n(&reach_write_failed, true, __ATOMIC_RELEASE);
-		thread_wakeup((event_t)&in_flight_mask);
+		thread_wakeup((event_t)__DEVOLATILE(void *, &in_flight_mask));
 		return true;
 	}
 	uint32_t words[8];
@@ -711,7 +741,7 @@ reach_gpr_event(uint32_t src_port, uint32_t dst_port, uint32_t opcode,
 	    done_addr < dsp_address || done_addr >= dsp_address + (uint64_t)SLOTS * PERIOD_BYTES ||
 	    ((done_addr - dsp_address) % PERIOD_BYTES) != 0) {
 		__atomic_store_n(&reach_write_failed, true, __ATOMIC_RELEASE);
-		thread_wakeup((event_t)&in_flight_mask);
+		thread_wakeup((event_t)__DEVOLATILE(void *, &in_flight_mask));
 		return true;
 	}
 
@@ -726,7 +756,7 @@ reach_gpr_event(uint32_t src_port, uint32_t dst_port, uint32_t opcode,
 	if (done == 1 || done % 50 == 0) {
 		say("PCM periods: slot %u sent %u done %u\n", slot, sent, done);
 	}
-	thread_wakeup((event_t)&in_flight_mask);
+	thread_wakeup((event_t)__DEVOLATILE(void *, &in_flight_mask));
 	return true;
 }
 
@@ -811,6 +841,7 @@ reach_feeder_thread(void *arg __unused, wait_result_t w __unused)
 	uint32_t next = 0;
 	uint32_t quiet_count = QUIET_PERIODS;
 	bool amp_powered = false;
+	uint32_t amp_retry_cooldown = 0;
 	uint32_t last_vol_gen = 0;
 	uint32_t vol_below = 18 * 8;
 	bool vol_muted = false;
@@ -868,7 +899,6 @@ reach_feeder_thread(void *arg __unused, wait_result_t w __unused)
 			report_drain = false;
 		}
 
-		bool want_amp_on = false;
 		while (inflight < IN_FLIGHT && !slot_busy) {
 			bool have_work = (backlog >= PERIOD_FRAMES) ||
 			    (backlog > 0 && inflight == 0) ||
@@ -876,11 +906,82 @@ reach_feeder_thread(void *arg __unused, wait_result_t w __unused)
 			if (!have_work) {
 				break;
 			}
+			if (!amp_powered && !vol_muted && amp_retry_cooldown == 0) {
+				bool non_silent = false;
+				lck_spin_lock(audio_spin_lock);
+				uint32_t check_frames = backlog < PERIOD_FRAMES ? backlog : PERIOD_FRAMES;
+				if (ring_storage != NULL && check_frames > 0) {
+					for (uint32_t i = 0; i < check_frames; i++) {
+						uint32_t at = (ring_tail + i) & RING_MASK;
+						int16_t l = ring_storage[2 * at];
+						int16_t r = ring_storage[2 * at + 1];
+						if (l > 8 || l < -8 || r > 8 || r < -8) {
+							non_silent = true;
+							break;
+						}
+					}
+				}
+				lck_spin_unlock(audio_spin_lock);
+
+				if (non_silent) {
+					for (uint32_t warm_idx = 0;
+					    warm_idx < 4 && inflight < IN_FLIGHT && !(in_flight_mask & (1u << (next % SLOTS)));
+					    warm_idx++) {
+						uint32_t warm_slot = next % SLOTS;
+						if (reach_buffer != NULL) {
+							bzero(__DEVOLATILE(void *, reach_buffer + warm_slot * PERIOD_BYTES), PERIOD_BYTES);
+						}
+						bool warm_ok = reach_sync_mode != 0 ?
+						    send_audio_period(warm_slot) : queue_audio_period_async(warm_slot);
+						if (!warm_ok) {
+							__atomic_store_n(&reach_write_failed, true, __ATOMIC_RELEASE);
+							__atomic_store_n(&reach_stream_active, false, __ATOMIC_RELAXED);
+							(void)annibale_audio_amp_power(false);
+							say("PCM warmup submission failed; playback stopped\n");
+							thread_terminate(current_thread());
+							return;
+						}
+						next++;
+						inflight++;
+					}
+					report_drain = true;
+
+					if (annibale_audio_amp_power(true)) {
+						amp_powered = true;
+						quiet_count = 0;
+						say("damp: smart amplifier powered on\n");
+					} else {
+						amp_retry_cooldown = 50;
+						static uint32_t amp_startup_errors = 0;
+						amp_startup_errors++;
+						say("amplifier startup failed (err=%u); continuing\n", amp_startup_errors);
+					}
+					lck_spin_lock(audio_spin_lock);
+					backlog = ring_head - ring_tail;
+					lck_spin_unlock(audio_spin_lock);
+					inflight = (uint32_t)__builtin_popcount(in_flight_mask);
+					slot_busy = (in_flight_mask & (1u << (next % SLOTS))) != 0;
+					continue;
+				}
+			}
+
 			uint32_t slot = next % SLOTS;
 			bool loud = fill_period_slot(slot, vol_muted);
 			quiet_count = loud ? 0 : quiet_count + 1;
-			if (loud && !amp_powered) {
-				want_amp_on = true;
+			if (amp_retry_cooldown > 0) {
+				amp_retry_cooldown--;
+			}
+			if (loud && !amp_powered && amp_retry_cooldown == 0) {
+				if (annibale_audio_amp_power(true)) {
+					amp_powered = true;
+					quiet_count = 0;
+					say("damp: smart amplifier powered on\n");
+				} else {
+					amp_retry_cooldown = 50;
+					static uint32_t amp_startup_errors = 0;
+					amp_startup_errors++;
+					say("amplifier startup failed (err=%u); continuing\n", amp_startup_errors);
+				}
 			}
 			__atomic_store_n(&reach_stream_active, true, __ATOMIC_RELAXED);
 
@@ -906,24 +1007,9 @@ reach_feeder_thread(void *arg __unused, wait_result_t w __unused)
 				break;
 			}
 		}
-
-		if (want_amp_on && !amp_powered) {
-			if (!annibale_audio_amp_power(true)) {
-				__atomic_store_n(&reach_write_failed, true, __ATOMIC_RELEASE);
-				__atomic_store_n(&reach_stream_active, false, __ATOMIC_RELAXED);
-				say("amplifier startup failed; playback stopped\n");
-				thread_terminate(current_thread());
-				return;
-			}
-			amp_powered = true;
-		}
 		if (amp_powered && quiet_count >= QUIET_PERIODS && inflight == 0 && backlog == 0) {
 			if (!annibale_audio_amp_power(false)) {
-				__atomic_store_n(&reach_write_failed, true, __ATOMIC_RELEASE);
-				__atomic_store_n(&reach_stream_active, false, __ATOMIC_RELAXED);
-				say("amplifier powerdown failed; playback stopped\n");
-				thread_terminate(current_thread());
-				return;
+				say("amplifier powerdown failed; continuing\n");
 			}
 			amp_powered = false;
 			__atomic_store_n(&reach_stream_active, false, __ATOMIC_RELAXED);
@@ -932,7 +1018,7 @@ reach_feeder_thread(void *arg __unused, wait_result_t w __unused)
 		uint32_t wait_ms = active ? 5u : 25u;
 		uint64_t deadline = 0;
 		clock_interval_to_deadline(wait_ms, NSEC_PER_MSEC, &deadline);
-		assert_wait_deadline((event_t)&in_flight_mask, THREAD_UNINT, deadline);
+		assert_wait_deadline((event_t)__DEVOLATILE(void *, &in_flight_mask), THREAD_UNINT, deadline);
 
 		lck_spin_lock(audio_spin_lock);
 		uint32_t cur_backlog = ring_head - ring_tail;
@@ -971,7 +1057,7 @@ reach_audio_sink(const int16_t *frames, uint32_t count)
 	}
 	lck_spin_unlock(audio_spin_lock);
 	if (taken > 0) {
-		thread_wakeup((event_t)&in_flight_mask);
+		thread_wakeup((event_t)__DEVOLATILE(void *, &in_flight_mask));
 	}
 	return taken;
 }
@@ -1049,7 +1135,7 @@ annibale_audio_reach_init(void)
 		say("failed to map low DMA buffer at %#llx\n", buffer_pa);
 		return;
 	}
-	bzero(__DECONST(void *, reach_buffer), BUFFER_BYTES);
+	bzero(__DEVOLATILE(void *, reach_buffer), BUFFER_BYTES);
 	say("64 KiB contiguous DMA buffer ready at PA %#llx (DSP %#llx)\n", buffer_pa, dsp_address);
 
 	/* 4. Allocate local PCM ring and configure speaker protection */

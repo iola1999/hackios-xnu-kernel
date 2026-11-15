@@ -491,19 +491,48 @@ static struct {
 	void (*function)(void *);
 	void *argument;
 	bool attached;
+	bool enabled;
 } lx_vector[LX_VECTORS];
-static uint32_t lx_irq_first;                   /* the GIC's number of vector 0; 0: no interrupts */
+static uint32_t lx_irq_first = 181;             /* DesignWare PCIe RC0 MSI -> GICv3 edge SPI INTID 181..184 */
 static uint32_t lx_irq_pending;                 /* the vectors that have fired and are not dealt with yet */
 static uint32_t lx_irq_running;                 /* the vectors whose function the thread is in */
 static thread_t lx_irq_thread;
 static LCK_MTX_DECLARE(lx_irq_lock, &lx_lock_group);
 
-/* In interrupt context: the vector masked, and the thread told. */
+/* In interrupt context: the vector masked, DesignWare RC status read & ACKed (W1C), and the thread told. */
 static void
 lx_irq_arrived(__unused void *context, uint32_t intid)
 {
+	uint32_t line = intid >= lx_irq_first ? intid - lx_irq_first : 0;
+	uint32_t status = 0;
+	uint32_t mask = 0;
+
 	gic_v3_spi_mask(intid);
-	os_atomic_or(&lx_irq_pending, 1u << (intid - lx_irq_first), relaxed);
+	if (line < 4) {
+		status = mhi_pcie_msi_status(line);
+		if (status != 0) {
+			mhi_pcie_msi_ack(line, status);
+		}
+	}
+	if (status != 0) {
+		for (unsigned b = 0; b < 32; b++) {
+			unsigned v = line * 32 + b;
+			if (v < LX_VECTORS && (status & (1u << b))) {
+				if (lx_vector[v].attached) {
+					mask |= (1u << v);
+				}
+			}
+		}
+	}
+	if (mask == 0) {
+		for (unsigned b = 0; b < 32; b++) {
+			unsigned v = line * 32 + b;
+			if (v < LX_VECTORS && lx_vector[v].attached) {
+				mask |= (1u << v);
+			}
+		}
+	}
+	os_atomic_or(&lx_irq_pending, mask, relaxed);
 	thread_wakeup((event_t)&lx_irq_pending);
 }
 
@@ -536,28 +565,43 @@ lx_irq_runs(__unused void *parameter, __unused wait_result_t result)
 			lck_mtx_lock(&lx_irq_lock);
 			lx_irq_running &= ~(1u << v);
 			lck_mtx_unlock(&lx_irq_lock);
+			gic_v3_spi_unmask(lx_irq_first + (v / 32));
 			thread_wakeup((event_t)&lx_irq_running);
 		}
 	}
 }
 
+extern uint64_t mhi_pcie_get_sink_pa(void);
+
 int
-lx_os_irq_msi(__unused unsigned long long *address, __unused unsigned *data)
+lx_os_irq_msi(unsigned long long *address, unsigned *data)
 {
-	return 0;
+	uint64_t sink = mhi_pcie_get_sink_pa();
+	if (sink == 0) {
+		sink = 0x40200000ULL;
+	}
+	if (address != NULL) {
+		*address = sink;
+	}
+	if (data != NULL) {
+		*data = 0;
+	}
+	return 1;
 }
 
 int
 lx_os_irq_attach(unsigned vector, void (*function)(void *), void *argument)
 {
 	kern_return_t kr;
+	uint32_t spi_intid;
 
 	if (vector >= LX_VECTORS || lx_irq_first == 0 || function == NULL) {
 		return EINVAL;
 	}
+	spi_intid = lx_irq_first + (vector / 32);
 	if (lx_irq_thread == THREAD_NULL) {
-		annibale_wifi_tell("lx: wifi_irq: THE GIC'S DISTRIBUTOR IS WRITTEN for the radio's interrupts: each vector's SPI (%u + v) edge-"
-		    "triggered, group 1, routed to this processor, then enabled\n", lx_irq_first);
+		annibale_wifi_tell("lx: wifi_irq: GICv3 edge SPI INTID %u..%u attached for radio MSI vectors\n",
+		    lx_irq_first, lx_irq_first + 3);
 		if (kernel_thread_start(lx_irq_runs, NULL, &lx_irq_thread) != KERN_SUCCESS) {
 			lx_irq_thread = THREAD_NULL;
 			return ENOMEM;
@@ -568,14 +612,16 @@ lx_os_irq_attach(unsigned vector, void (*function)(void *), void *argument)
 	lx_vector[vector].function = function;
 	lx_vector[vector].argument = argument;
 	lx_vector[vector].attached = true;
+	lx_vector[vector].enabled = false;
 	lck_mtx_unlock(&lx_irq_lock);
-	if ((kr = gic_v3_spi_attach(lx_irq_first + vector, true, lx_irq_arrived, NULL)) != KERN_SUCCESS) {
+	kr = gic_v3_spi_attach(spi_intid, true, lx_irq_arrived, NULL);
+	if (kr != KERN_SUCCESS && kr != KERN_NAME_EXISTS) {
 		lck_mtx_lock(&lx_irq_lock);
 		lx_vector[vector].attached = false;
 		lck_mtx_unlock(&lx_irq_lock);
 		return kr == KERN_NAME_EXISTS ? EBUSY : EINVAL;
 	}
-	gic_v3_spi_mask(lx_irq_first + vector);
+	gic_v3_spi_mask(spi_intid);
 	return 0;
 }
 
@@ -583,7 +629,10 @@ void
 lx_os_irq_enable(unsigned vector)
 {
 	if (vector < LX_VECTORS && lx_vector[vector].attached) {
-		gic_v3_spi_unmask(lx_irq_first + vector);
+		lck_mtx_lock(&lx_irq_lock);
+		lx_vector[vector].enabled = true;
+		lck_mtx_unlock(&lx_irq_lock);
+		gic_v3_spi_unmask(lx_irq_first + (vector / 32));
 	}
 }
 
@@ -593,12 +642,25 @@ lx_os_irq_disable(unsigned vector)
 	if (vector >= LX_VECTORS || !lx_vector[vector].attached) {
 		return;
 	}
-	gic_v3_spi_mask(lx_irq_first + vector);
+	lck_mtx_lock(&lx_irq_lock);
+	lx_vector[vector].enabled = false;
+	bool others_enabled = false;
+	unsigned group = vector / 32;
+	for (unsigned i = group * 32; i < (group + 1) * 32 && i < LX_VECTORS; i++) {
+		if (lx_vector[i].attached && lx_vector[i].enabled) {
+			others_enabled = true;
+			break;
+		}
+	}
+	if (!others_enabled) {
+		gic_v3_spi_mask(lx_irq_first + group);
+	}
+	lck_mtx_unlock(&lx_irq_lock);
 	if (current_thread() == lx_irq_thread) {
 		return;                         /* (from the vector's own function, or another's: nothing to wait for) */
 	}
 	lck_mtx_lock(&lx_irq_lock);
-	while (lx_irq_running & 1u << vector) {
+	while (lx_irq_running & (1u << vector)) {
 		lck_mtx_sleep(&lx_irq_lock, LCK_SLEEP_DEFAULT, (event_t)&lx_irq_running, THREAD_UNINT);
 	}
 	lck_mtx_unlock(&lx_irq_lock);
@@ -607,14 +669,14 @@ lx_os_irq_disable(unsigned vector)
 void
 lx_os_irq_detach_all(void)
 {
-	for (unsigned v = 0; v < LX_VECTORS; v++) {
-		if (lx_vector[v].attached) {
-			gic_v3_spi_detach(lx_irq_first + v);
-		}
+	for (unsigned g = 0; g < 4; g++) {
+		gic_v3_spi_mask(lx_irq_first + g);
+		gic_v3_spi_detach(lx_irq_first + g);
 	}
 	lck_mtx_lock(&lx_irq_lock);
 	for (unsigned v = 0; v < LX_VECTORS; v++) {
 		lx_vector[v].attached = false;
+		lx_vector[v].enabled = false;
 	}
 	while (lx_irq_running != 0 && current_thread() != lx_irq_thread) {
 		lck_mtx_sleep(&lx_irq_lock, LCK_SLEEP_DEFAULT, (event_t)&lx_irq_running, THREAD_UNINT);
@@ -626,7 +688,7 @@ lx_os_irq_detach_all(void)
 unsigned long long
 lx_os_irq_count(unsigned vector)
 {
-	return vector < LX_VECTORS && lx_irq_first != 0 ? gic_v3_spi_count(lx_irq_first + vector) : 0;
+	return vector < LX_VECTORS && lx_irq_first != 0 ? gic_v3_spi_count(lx_irq_first + (vector / 32)) : 0;
 }
 
 /* ---- the station (sys/annibale_sta.h) --------------------------------------------------------------------- */

@@ -34,6 +34,7 @@
 #include <sys/ubc_internal.h>
 #include <sys/vnode_internal.h>
 #include <libkern/libkern.h>
+#include <libkern/crypto/sha2.h>
 #include <kern/startup.h>
 #include <kern/task.h>
 #include <kern/kalloc.h>
@@ -49,6 +50,7 @@
 #include <security/mac_policy.h>
 
 void minimac_policy_init(void);
+extern void miniamfi_blob_entitlements_init(struct cs_blob *cs_blob);
 
 static int
 miniamfi_vnode_check_signature(__unused struct vnode *vp, __unused struct label *label, __unused cpu_type_t cpu_type,
@@ -59,13 +61,51 @@ miniamfi_vnode_check_signature(__unused struct vnode *vp, __unused struct label 
 		return 0;
 	}
 	/*
-	 * Accepting a signature is what marks the process as signed; the
-	 * kernel consults the signature of a process only when that is set.
+	 * Accepting a signature marks the process as signed and its embedded
+	 * entitlements as validated; populate csb_entitlements while tmp_blob
+	 * is still mutable prior to RO-zone commit.
 	 */
-	*cs_flags |= CS_SIGNED;
+	*cs_flags |= CS_SIGNED | CS_ENTITLEMENTS_VALIDATED;
 	if (*cs_flags & CS_ADHOC) {
 		*cs_flags |= CS_PLATFORM_BINARY;
 	}
+	if (cs_blob != cs_blob->csb_ro_addr && cs_blob->csb_entitlements == NULL) {
+		miniamfi_blob_entitlements_init(cs_blob);
+	}
+	return 0;
+}
+
+/*
+ * Security.framework SecTaskEntitlementsValidated checks either
+ * (CS_VALID | CS_KILL | CS_ENTITLEMENTS_VALIDATED) or
+ * (CS_DEBUGGED | CS_ENTITLEMENTS_VALIDATED), and csops entitlement queries
+ * require (CS_VALID | CS_DEBUGGED). CS_KILL would make cs_invalid_page() kill
+ * the process at the first page that fails validation; CS_DEBUGGED is the flag
+ * XNU itself gives a process allowed to run with invalid pages
+ * (cs_allow_invalid()) and satisfies the same checks. It is set from the
+ * launch-constraints hook, which process_signature() calls right after it
+ * installs the new image's flags, before posix_spawn() returns to the spawner.
+ */
+static void
+miniamfi_mark_entitlements_usable(proc_t p)
+{
+	if (p == PROC_NULL) {
+		return;
+	}
+	proc_lock(p);
+	if ((proc_getcsflags(p) & CS_ENTITLEMENTS_VALIDATED) != 0) {
+		proc_csflags_set(p, CS_DEBUGGED);
+	}
+	proc_unlock(p);
+}
+
+static int
+miniamfi_proc_check_launch_constraints(proc_t curr_p, __unused pid_t original_parent_id,
+    __unused pid_t responsible_pid, __unused void *macpolicyattr, __unused size_t macpolicyattrlen,
+    __unused launch_constraint_data_t lcd, __unused char **fatal_failure_desc,
+    __unused size_t *fatal_failure_desc_len)
+{
+	miniamfi_mark_entitlements_usable(curr_p);
 	return 0;
 }
 
@@ -195,6 +235,7 @@ miniamfi_policy_syscall(__unused struct proc *p, int call, user_addr_t arg)
 
 static const struct mac_policy_ops miniamfi_ops = {
 	.mpo_vnode_check_signature = miniamfi_vnode_check_signature,
+	.mpo_proc_check_launch_constraints = miniamfi_proc_check_launch_constraints,
 	.mpo_policy_syscall = miniamfi_policy_syscall,
 };
 

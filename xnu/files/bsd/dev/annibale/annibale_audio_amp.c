@@ -800,13 +800,12 @@ tfa986x_start_operating_one(uint8_t addr, unsigned ch, uint32_t cal_mohm)
 	}
 	uint16_t r0 = 0, r1 = 0, r10 = 0, r11 = 0, r12 = 0, r51 = 0;
 	bool ready = false;
-	for (unsigned i = 0; i < 25; i++) {
+	for (unsigned i = 0; i < 150; i++) {
 		if (!amp_reg_read16(addr, TFA6X_REG_STATUS_FLAGS1, &r11) ||
 		    !amp_reg_read16(addr, TFA6X_REG_SYS_STATUS0, &r12)) {
 			return false;
 		}
-		bool amps_ready = current_muted || ((r11 & (1u << 9)) != 0 && (r11 & (1u << 10)) != 0);
-		if ((r11 & 1u) != 0 && (r11 & (1u << 2)) == 0 && amps_ready &&
+		if ((r11 & 1u) != 0 && (r11 & (1u << 2)) == 0 &&
 		    (r12 & 0x0fu) >= (current_muted ? 6u : 9u) &&
 		    (r12 & (1u << 13)) == 0) {
 			ready = true;

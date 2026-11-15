@@ -65,6 +65,24 @@ struct apfs_txn {
 	uint32_t num_omap_records;
 };
 
+static inline struct apfs_txn *
+txn_alloc(void)
+{
+	struct apfs_txn *txn = (struct apfs_txn *)apfs_alloc(sizeof(struct apfs_txn));
+	if (txn != NULL) {
+		memset(txn, 0, sizeof(*txn));
+	}
+	return txn;
+}
+
+static inline void
+txn_free(struct apfs_txn *txn)
+{
+	if (txn != NULL) {
+		apfs_free(txn, sizeof(struct apfs_txn));
+	}
+}
+
 static int
 txn_read_block(struct apfs_txn *txn, uint64_t bno, void *buf, uint32_t len)
 {
@@ -475,9 +493,10 @@ txn_cow_omap(struct apfs_txn *txn, uint64_t target_oid, uint64_t target_new_padd
 	uint32_t bs = nx->block_size;
 	uint8_t *omap_obj = apfs_alloc(bs);
 	uint8_t *omap_tree = apfs_alloc(bs);
+	struct omap_entry *entries = (struct omap_entry *)apfs_alloc(128 * sizeof(struct omap_entry));
 	int error = 0;
 
-	if (omap_obj == NULL || omap_tree == NULL) {
+	if (omap_obj == NULL || omap_tree == NULL || entries == NULL) {
 		error = ENOMEM;
 		goto done;
 	}
@@ -505,9 +524,12 @@ txn_cow_omap(struct apfs_txn *txn, uint64_t target_oid, uint64_t target_new_padd
 		goto done;
 	}
 
-	struct omap_entry entries[128];
 	uint32_t total = 0;
-	for (uint32_t i = 0; i < nkeys && total < 112; i++) {
+	for (uint32_t i = 0; i < nkeys; i++) {
+		if (total >= 112) {
+			error = ENOSPC;
+			goto done;
+		}
 		uint32_t koff = w_le16(omap_tree + toc + 4 * i);
 		uint32_t voff = w_le16(omap_tree + toc + 4 * i + 2);
 		if (koff > val_end - key_base || 16 > val_end - key_base - koff ||
@@ -533,7 +555,11 @@ txn_cow_omap(struct apfs_txn *txn, uint64_t target_oid, uint64_t target_new_padd
 			break;
 		}
 	}
-	if (!found && total < 112) {
+	if (!found) {
+		if (total >= 112) {
+			error = ENOSPC;
+			goto done;
+		}
 		entries[total].oid = target_oid;
 		entries[total].xid = txn->new_xid;
 		entries[total].flags = 0;
@@ -556,7 +582,11 @@ txn_cow_omap(struct apfs_txn *txn, uint64_t target_oid, uint64_t target_new_padd
 					break;
 				}
 			}
-			if (!r_found && total < 112) {
+			if (!r_found) {
+				if (total >= 112) {
+					error = ENOSPC;
+					goto done;
+				}
 				entries[total].oid = r_oid;
 				entries[total].xid = txn->new_xid;
 				entries[total].flags = 0;
@@ -658,6 +688,7 @@ txn_cow_omap(struct apfs_txn *txn, uint64_t target_oid, uint64_t target_new_padd
 	if (out_new_tree_bno != NULL) *out_new_tree_bno = new_tree_bno;
 
 done:
+	if (entries != NULL) apfs_free(entries, 128 * sizeof(struct omap_entry));
 	if (omap_obj != NULL) apfs_free(omap_obj, bs);
 	if (omap_tree != NULL) apfs_free(omap_tree, bs);
 	return error;
@@ -782,7 +813,7 @@ txn_commit(struct apfs_txn *txn, uint64_t new_fs_bno)
 	uint64_t sm_dest = nx->xp_data_base + data_at;
 	error = txn_put(txn, sm_dest, txn->sm_buf, txn->sm_size);
 	if (error) return error;
-	data_at += txn->sm_size / bs;
+	data_at = (data_at + (txn->sm_size / bs)) % nx->xp_data_blocks;
 
 	uint32_t old_cpm_count = w_le32(txn->cpm_buf + 36);
 	struct {
@@ -815,7 +846,7 @@ txn_commit(struct apfs_txn *txn, uint64_t new_fs_bno)
 		uint64_t oid = w_le64(entry + 24);
 		uint64_t paddr = w_le64(entry + 32);
 
-		if (sz != bs || data_at >= nx->xp_data_blocks) {
+		if (sz != bs) {
 			apfs_free(eph_block, bs);
 			return EOPNOTSUPP;
 		}
@@ -834,7 +865,7 @@ txn_commit(struct apfs_txn *txn, uint64_t new_fs_bno)
 			eph[eph_count].size = sz;
 			eph[eph_count].oid = oid;
 			eph_count++;
-			data_at += sz / bs;
+			data_at = (data_at + 1) % nx->xp_data_blocks;
 		} else {
 			apfs_free(eph_block, bs);
 			return error;
@@ -883,7 +914,7 @@ txn_commit(struct apfs_txn *txn, uint64_t new_fs_bno)
 	w_put_le32(new_nx + 136, desc_at);
 	w_put_le32(new_nx + 140, 2);
 	w_put_le32(new_nx + 144, data_index);
-	w_put_le32(new_nx + 148, data_at - data_index);
+	w_put_le32(new_nx + 148, eph_count);
 
 	uint64_t new_nx_bno = nx->xp_desc_base + (desc_at + 1) % nx->xp_desc_blocks;
 	w_seal_obj(new_nx, bs, 1, txn->new_xid,
@@ -957,7 +988,7 @@ txn_commit(struct apfs_txn *txn, uint64_t new_fs_bno)
 	nx->xp_desc_index = desc_at;
 	nx->xp_desc_len = 2;
 	nx->xp_data_index = data_index;
-	nx->xp_data_len = data_at - data_index;
+	nx->xp_data_len = eph_count;
 	txn->committed = true;
 	apfs_nx_cache_flush(nx);
 

@@ -1,5 +1,5 @@
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index ffe7ce093987..f5b257d423e0 100644
+index ffe7ce0..1759d44 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
 @@ -146,6 +146,13 @@
@@ -39,7 +39,32 @@ index ffe7ce093987..f5b257d423e0 100644
  
  #if DEBUG_BSDINIT
  #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
-@@ -1002,6 +1014,14 @@ bsd_init(void)
+@@ -698,6 +710,24 @@ bsd_init(void)
+ 	IOKitInitializeTime();
+ 
+ 	/* Initialize the file systems. */
++	extern int desiredvnodes;
++	/*
++	 * Capacity tier upgrade for Annibale (SM8750 / 16 GiB RAM).
++	 * Upgrade legacy BCM2837 limit (CONFIG_VNODES=1024) to large tier:
++	 * Sized based on (sane_size / 65536) + 1024, clamped to [65536, 263168].
++	 * This ensures that vntblinit() and nchinit() allocate full-capacity
++	 * vnode tables and enlarged namecache hash buckets for 16 GiB RAM.
++	 */
++	if (desiredvnodes < 65536) {
++		int target_vnodes = (int)(sane_size / 65536) + 1024;
++		if (target_vnodes < 65536) {
++			target_vnodes = 65536;
++		} else if (target_vnodes > 263168) {
++			target_vnodes = 263168;
++		}
++		desiredvnodes = target_vnodes;
++	}
++
+ 	bsd_init_kprintf("calling vfsinit\n");
+ 	vfsinit();
+ 
+@@ -1002,6 +1032,14 @@ bsd_init(void)
  
  		bsd_init_kprintf("calling devfs_kernel_mount\n");
  		devfs_kernel_mount(mounthere);

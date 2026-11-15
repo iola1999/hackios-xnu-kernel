@@ -9,6 +9,7 @@
 
 extern const struct ccdigest_info mc_md5_di;
 extern const struct ccdigest_info mc_sha1_di;
+extern const struct ccdigest_info mc_sha256_di;
 extern const struct ccdigest_info mc_sha384_di;
 extern const struct ccdigest_info mc_sha512_di;
 

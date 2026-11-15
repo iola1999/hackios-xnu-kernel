@@ -81,6 +81,7 @@ struct annibale_sta_ops {
 	int (*leave)(void);
 	void (*state)(struct annibale_sta_state *state);         /* on any thread; does not sleep */
 	unsigned (*channels)(struct annibale_sta_channel *channels, unsigned most);      /* what the radio may tune to */
+	int (*powersave)(bool on);
 	uint8_t address[6];
 };
 
@@ -106,6 +107,8 @@ int      annibale_sta_ask_join(const struct annibale_sta_join *what);
 /* ... and joined again whenever the radio is turned on, until some other network is asked for */
 int      annibale_sta_ask_join_standing(const struct annibale_sta_join *what);
 int      annibale_sta_ask_leave(void);
+int      annibale_sta_ask_powersave(bool on);
+bool     annibale_sta_is_powersave(void);
 bool     annibale_sta_busy(void);                                        /* something asked for is not over yet */
 bool     annibale_sta_powered(void);
 /* the `index`th access point the last scan heard: true, or false when there are not that many */

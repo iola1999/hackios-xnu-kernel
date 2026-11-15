@@ -49,6 +49,7 @@
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
+#include <kern/sched_prim.h>
 #include <kern/thread.h>
 #include <os/atomic_private.h>
 #include <libkern/libkern.h>
@@ -68,7 +69,9 @@
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
+extern vm_offset_t phystokv(uint64_t pa);
 extern boolean_t pmap_valid_address(uint64_t addr);
+extern void CleanPoC_DcacheRegion(vm_offset_t va, size_t length);
 extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
 extern void IOSleep(unsigned int milliseconds);
 extern boolean_t ml_set_interrupts_enabled(boolean_t enable);
@@ -111,6 +114,7 @@ extern boolean_t ml_set_interrupts_enabled(boolean_t enable);
 #define UTRD_DD_NONE        (0u << 25)
 #define UTRD_DD_OUT         (1u << 25)          /* host to device: never */
 #define UTRD_DD_IN          (2u << 25)
+#define UTRD_INT            (1u << 24)
 #define OCS_SUCCESS         0x0
 #define OCS_INVALID         0xf
 
@@ -142,6 +146,14 @@ struct hc_slot {
 	uint64_t ucd_pa;
 	uint8_t *data;                          /* this kernel's memory, cached */
 	uint64_t data_pa;
+	/* Asynchronous strategy fields */
+	buf_t bp;
+	uint32_t blocks;
+	uint64_t start_time;
+	bool is_write;
+	bool is_async;
+	volatile bool done;
+	int error;
 };
 
 static vm_offset_t hc;                          /* the registers */
@@ -153,9 +165,13 @@ static vm_offset_t hc_uefi_map_va;
 static struct hc_slot hc_slots[SLOTS];
 static uint32_t hc_nslots;                      /* slots 1..hc_nslots carry reads */
 static uint32_t hc_free;                        /* bit i: hc_slots[i] free */
+static volatile uint32_t hc_active_slots;
+static volatile uint32_t hc_pending_slots;
 static uint32_t hc_slot_buffer = SLOT_BUFFER_DEFAULT;
 static uint32_t hc_lun_mask = 1;                /* the logical units reads may go to: LUN 0 */
 static bool hc_usable;
+static bool hc_dma_coherent = true;
+static uint32_t hc_spin_us = 250;
 static uint32_t hc_leave;                       /* ufs_native_leave=1 (a test): the list left in at the end, for the loader */
 static volatile bool hc_in, hc_closed, hc_dead;
 static uint32_t hc_is_in, hc_cnr_in;            /* IS and UTRLCNR when this kernel's list went in */
@@ -163,6 +179,9 @@ static uint64_t hc_requests, hc_errors, hc_bytes, hc_wait_us, hc_refused, hc_mos
 static uint64_t hc_write_requests, hc_write_errors, hc_write_bytes;
 static uint64_t hc_switch_in_count, hc_switch_out_count;
 static uint32_t hc_in_flight;
+static uint64_t hc_interrupts;
+static uint64_t hc_async_completions;
+static uint64_t hc_sleeps;
 /* where the time goes: doorbell reads while waiting, waits for a free slot, taking hc_lock, how many in flight */
 static uint64_t hc_polls, hc_slot_waits, hc_slot_wait_ticks, hc_lock_ticks, hc_flight_hist[6];
 
@@ -188,6 +207,14 @@ SYSCTL_QUAD(_kern_annibale, OID_AUTO, ufs_native_write_errors, CTLFLAG_RD | CTLF
     "writes of this kernel's own UFS driver that failed");
 SYSCTL_QUAD(_kern_annibale, OID_AUTO, ufs_native_write_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, &hc_write_bytes,
     "bytes this kernel's own UFS driver has written");
+SYSCTL_QUAD(_kern_annibale, OID_AUTO, ufs_native_interrupts, CTLFLAG_RD | CTLFLAG_LOCKED, &hc_interrupts,
+    "hardware interrupts handled by UFS driver");
+SYSCTL_QUAD(_kern_annibale, OID_AUTO, ufs_native_async_completions, CTLFLAG_RD | CTLFLAG_LOCKED, &hc_async_completions,
+    "asynchronous requests completed by UFS driver");
+SYSCTL_QUAD(_kern_annibale, OID_AUTO, ufs_native_sleeps, CTLFLAG_RD | CTLFLAG_LOCKED, &hc_sleeps,
+    "times threads slept waiting for synchronous UFS completion");
+SYSCTL_INT(_kern_annibale, OID_AUTO, ufs_native_spin, CTLFLAG_RW | CTLFLAG_LOCKED, &hc_spin_us, 0,
+    "spin time in microseconds before sleeping");
 
 /*
  * What this file says goes to the kernel's log, and the last lines are kept: the start of a long
@@ -264,7 +291,35 @@ hc_off(void)
 	lck_mtx_unlock(&hc_lock);
 }
 
+static inline void
+ufshc_dcache_sg_poc(uint64_t pa, uint32_t len, bool clean_only)
+{
+	if (len == 0 || !pmap_valid_address(pa)) {
+		return;
+	}
+	uint64_t cur_pa = pa;
+	uint32_t remaining = len;
+	while (remaining > 0) {
+		uint32_t page_offset = (uint32_t)(cur_pa & PAGE_MASK);
+		uint32_t cur_len = PAGE_SIZE - page_offset;
+		if (cur_len > remaining) {
+			cur_len = remaining;
+		}
+		if (pmap_valid_address(cur_pa)) {
+			vm_offset_t kva = phystokv(cur_pa);
+			if (clean_only) {
+				CleanPoC_DcacheRegion(kva, (size_t)cur_len);
+			} else {
+				FlushPoC_DcacheRegion(kva, (size_t)cur_len);
+			}
+		}
+		cur_pa += cur_len;
+		remaining -= cur_len;
+	}
+}
+
 #include "annibale_ufshc_rw.inc"
+#include "annibale_ufshc_intr.inc"
 
 /* ---- the proof, and the switches ---- */
 
@@ -549,8 +604,8 @@ hc_report(const char *when, bool late)
 		    "5-8 %llu, 9-16 %llu, more %llu\n", when, hc_polls, hc_requests ? hc_polls / hc_requests : 0, hc_slot_waits,
 		    wait_ns / 1000000, lock_ns / 1000000, hc_flight_hist[0], hc_flight_hist[1], hc_flight_hist[2],
 		    hc_flight_hist[3], hc_flight_hist[4], hc_flight_hist[5]);
-		(late ? hc_say_late : hc_say)("ufs: native: %s: waiters spin %u us, then sleep: %llu slept; the poller %llu "
-		    "rounds, %llu doorbell reads\n", when, hc_spin_us, hc_sleeps, hc_poller_rounds, hc_poller_polls);
+		(late ? hc_say_late : hc_say)("ufs: native: %s: waiters spin %u us, then sleep: %llu slept; interrupts %llu, "
+		    "async completions %llu\n", when, hc_spin_us, hc_sleeps, hc_interrupts, hc_async_completions);
 	}
 }
 
@@ -593,7 +648,7 @@ ufshc_probe(const struct ufshc_loader *loader, bool only)
 	PE_parse_boot_argn("ufs_native_leave", &hc_leave, sizeof(hc_leave));
 	PE_parse_boot_argn("ufs_native_hang", &hc_hang_after, sizeof(hc_hang_after));
 	if (loader->hc_pa != UFSHC_PHYS || loader->area_pa == 0 || loader->slots != SLOTS || (loader->area_pa & 0x3ff) ||
-	    loader->ucd_size < UCD_PRDT + 16 * (hc_slot_buffer / PRD_MAX + 1) || (loader->ucd_offset & 0x7f) ||
+	    loader->ucd_size < 2048 || loader->ucd_size < UCD_PRDT + 16 * (hc_slot_buffer / PRD_MAX + 1) || (loader->ucd_offset & 0x7f) ||
 	    (loader->ucd_size & 0x7f) || loader->ucd_offset < SLOTS * 32 ||
 	    loader->area_size < loader->ucd_offset + SLOTS * loader->ucd_size) {
 		hc_say("ufs: native: not used: the loader offers no area for a list (or not one as expected: controller %llx, "
@@ -712,11 +767,15 @@ ufshc_probe(const struct ufshc_loader *loader, bool only)
 	if (hc_spin_us > 5000) {
 		hc_spin_us = 5000;
 	}
+	PE_parse_boot_argn("ufs_coherent", &hc_dma_coherent, sizeof(hc_dma_coherent));
+	if (!ufshc_intr_init()) {
+		hc_say("ufs: native: warning: GICv3 interrupt attachment failed, continuing\n");
+	}
 	{
 		thread_t th;
 
-		if (kernel_thread_start(hc_poller, NULL, &th) != KERN_SUCCESS) {
-			hc_say("ufs: native: not used: no poller thread\n");
+		if (kernel_thread_start(hc_watchdog, NULL, &th) != KERN_SUCCESS) {
+			hc_say("ufs: native: not used: no watchdog thread\n");
 			return false;
 		}
 		thread_deallocate(th);
@@ -752,6 +811,7 @@ annibale_ufs_quiesce(void)
 		return;
 	}
 	hc_closed = true;
+	ufshc_intr_quiesce();
 	__asm__ volatile ("dsb sy" ::: "memory");
 	hc_say_late("ufs: native: at the end: entered with doorbell %08x, %u reads of this kernel's in flight, its list %s\n",
 	    hc_read(UFSHC_UTRLDBR), hc_in_flight, hc_in ? "in" : "out");

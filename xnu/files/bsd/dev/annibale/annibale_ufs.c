@@ -19,6 +19,7 @@
  * what the loader read itself before the kernel started.
  */
 #include <kern/clock.h>
+#include <kern/kalloc.h>
 #include <kern/locks.h>
 #include <kern/thread.h>
 #include <os/atomic_private.h>
@@ -943,7 +944,9 @@ annibale_ufs_init(void)
 		uint32_t mode = check, compare = 0;
 
 		PE_parse_boot_argn("ufs_native_check", &compare, sizeof(compare));
-		if (!ufshc_probe(&offer, mode == 2)) {
+		if (offer.ucd_size < 2048) {
+			printf("ufs: native: ucd_size %u < 2048, falling back to loader\n", offer.ucd_size);
+		} else if (!ufshc_probe(&offer, mode == 2)) {
 			if (mode != 2) {
 				printf("ufs: this kernel's own UFS driver is not used: through the loader\n");
 			}

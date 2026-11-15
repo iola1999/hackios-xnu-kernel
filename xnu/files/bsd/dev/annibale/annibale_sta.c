@@ -413,6 +413,36 @@ annibale_sta_ask_leave(void)
 	return 0;
 }
 
+static bool sta_powersave_enabled;
+
+int
+annibale_sta_ask_powersave(bool on)
+{
+	const struct annibale_sta_ops *ops;
+	int error = 0;
+
+	lck_mtx_lock(&sta_lock);
+	sta_powersave_enabled = on;
+	if ((ops = sta_ops) != NULL && ops->powersave != NULL) {
+		sta_reads++;
+		lck_mtx_unlock(&sta_lock);
+		error = ops->powersave(on);
+		lck_mtx_lock(&sta_lock);
+		sta_reads--;
+		lck_mtx_unlock(&sta_lock);
+		thread_wakeup((event_t)&sta_calls);
+		return error;
+	}
+	lck_mtx_unlock(&sta_lock);
+	return error;
+}
+
+bool
+annibale_sta_is_powersave(void)
+{
+	return sta_powersave_enabled;
+}
+
 bool
 annibale_sta_heard(unsigned index, struct annibale_sta_bss *bss)
 {

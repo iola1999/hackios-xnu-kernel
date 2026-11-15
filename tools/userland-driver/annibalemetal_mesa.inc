@@ -11,8 +11,11 @@ static struct {
 	__typeof__(&rwa_texture_combine_rgb2p) texture_combine_rgb2p;
 	__typeof__(&rwa_texture_rgb2p_pass) texture_rgb2p_pass;
 	__typeof__(&rwa_buffer_copy) buffer_copy;
+	__typeof__(&rwa_buffer_copy_nowait) buffer_copy_nowait;
 	__typeof__(&rwa_buffer_fill) buffer_fill;
+	__typeof__(&rwa_buffer_fill_nowait) buffer_fill_nowait;
 	__typeof__(&rwa_texture_copy) texture_copy;
+	__typeof__(&rwa_texture_copy_nowait) texture_copy_nowait;
 	__typeof__(&rwa_texture_generate_mipmaps) texture_generate_mipmaps;
 	__typeof__(&rwa_texture_from_buffer) texture_from_buffer;
 	__typeof__(&rwa_buffer_textures_refresh) buffer_textures_refresh;
@@ -109,8 +112,11 @@ mesa_available(void)
 		return false;
 	}
 	*(void **)&mesa.buffer_copy = dlsym(mesa.handle, "rwa_buffer_copy");
+	*(void **)&mesa.buffer_copy_nowait = dlsym(mesa.handle, "rwa_buffer_copy_nowait");
 	*(void **)&mesa.buffer_fill = dlsym(mesa.handle, "rwa_buffer_fill");
+	*(void **)&mesa.buffer_fill_nowait = dlsym(mesa.handle, "rwa_buffer_fill_nowait");
 	*(void **)&mesa.texture_copy = dlsym(mesa.handle, "rwa_texture_copy");
+	*(void **)&mesa.texture_copy_nowait = dlsym(mesa.handle, "rwa_texture_copy_nowait");
 	*(void **)&mesa.texture_generate_mipmaps = dlsym(mesa.handle, "rwa_texture_generate_mipmaps");
 	*(void **)&mesa.texture_from_buffer = dlsym(mesa.handle, "rwa_texture_from_buffer");
 	*(void **)&mesa.buffer_textures_refresh = dlsym(mesa.handle, "rwa_buffer_textures_refresh");

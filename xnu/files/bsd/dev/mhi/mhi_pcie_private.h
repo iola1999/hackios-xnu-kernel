@@ -39,6 +39,8 @@ int mhi_pcie_radio_boot(void);                                  /* its firmware 
 void *mhi_pcie_radio_memory(uint64_t bytes, uint64_t *pa);      /* pages below 4 GB, the card's address = pa */
 bool mhi_pcie_radio_registers(uint64_t *pa, uint64_t *size);    /* BAR0 */
 const uint8_t *mhi_pcie_radio_file(const char *name, uint64_t *size);   /* by Linux's name for it */
+uint32_t mhi_pcie_msi_status(unsigned g);                       /* RC0 DesignWare MSI status register */
+void mhi_pcie_msi_ack(unsigned g, uint32_t mask);                /* W1C clear MSI interrupt status */
 
 static inline uint32_t
 mhi_pcie_rd(vm_offset_t address)

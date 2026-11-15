@@ -6,6 +6,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <sys/buf.h>
 
 /* what the loader's page says about it (struct loader_block's native sections) */
 struct ufshc_loader {
@@ -28,6 +29,9 @@ bool ufshc_list_in(void);
 int ufshc_read(uint8_t lun, uint64_t offset, uint8_t *dst, uint64_t len);
 void ufshc_set_write_range(uint8_t lun, uint64_t start_lba, uint64_t end_lba);
 int ufshc_write(uint8_t lun, uint64_t offset, const uint8_t *src, uint64_t len);
+int ufshc_strategy_async(buf_t bp, uint8_t lun, uint64_t lun_offset, bool is_write);
+int ufshc_sync_cache(uint8_t lun);
+int ufshc_unmap(uint8_t lun, uint64_t lba, uint32_t blocks);
 void ufshc_report(const char *when);
 void annibale_ufs_quiesce(void);
 

@@ -168,6 +168,146 @@ rw_pipe_release(struct rwa_render *render)
 	}
 }
 
+/*
+ * Compute pipeline cache.
+ */
+struct rw_compute_pipe_entry {
+	unsigned char key[CC_SHA256_DIGEST_LENGTH];
+	struct rwa_device *device;
+	struct rwa_compute *compute;
+	struct rwa_compute_info info;
+	unsigned users;
+	uint64_t idle_since;
+	struct rw_compute_pipe_entry *next;
+};
+
+static struct rw_compute_pipe_entry *rw_compute_pipes;
+static unsigned rw_compute_pipes_idle;
+static uint64_t rw_compute_pipes_released;
+static os_unfair_lock rw_compute_pipes_lock = OS_UNFAIR_LOCK_INIT;
+
+static void
+rw_compute_pipe_key(unsigned char key[CC_SHA256_DIGEST_LENGTH], const void *air,
+		    size_t air_len, const char *entry_name)
+{
+	CC_SHA256_CTX ctx;
+	CC_SHA256_Init(&ctx);
+	rw_pipe_add_bytes(&ctx, air, air_len);
+	rw_pipe_add_bytes(&ctx, entry_name, entry_name ? strlen(entry_name) : 0);
+	CC_SHA256_Final(key, &ctx);
+}
+
+static struct rwa_compute *
+rw_compute_pipe_find(struct rwa_device *device, const unsigned char key[CC_SHA256_DIGEST_LENGTH],
+		     struct rwa_compute_info *info)
+{
+	struct rwa_compute *compute = NULL;
+
+	os_unfair_lock_lock(&rw_compute_pipes_lock);
+	for (struct rw_compute_pipe_entry *e = rw_compute_pipes; e != NULL; e = e->next) {
+		if (e->device == device && memcmp(e->key, key, CC_SHA256_DIGEST_LENGTH) == 0) {
+			if (e->users++ == 0) {
+				rw_compute_pipes_idle--;
+			}
+			*info = e->info;
+			compute = e->compute;
+			break;
+		}
+	}
+	os_unfair_lock_unlock(&rw_compute_pipes_lock);
+	return compute;
+}
+
+static void
+rw_compute_pipe_keep(struct rwa_device *device, const unsigned char key[CC_SHA256_DIGEST_LENGTH],
+		     struct rwa_compute *compute, const struct rwa_compute_info *info)
+{
+	struct rw_compute_pipe_entry *e = calloc(1, sizeof(*e));
+	if (e == NULL) return;
+
+	memcpy(e->key, key, CC_SHA256_DIGEST_LENGTH);
+	e->device = device;
+	e->compute = compute;
+	e->info = *info;
+	e->users = 1;
+	os_unfair_lock_lock(&rw_compute_pipes_lock);
+	for (struct rw_compute_pipe_entry *cur = rw_compute_pipes; cur != NULL; cur = cur->next) {
+		if (cur->device == device && memcmp(cur->key, key, CC_SHA256_DIGEST_LENGTH) == 0) {
+			os_unfair_lock_unlock(&rw_compute_pipes_lock);
+			free(e);
+			return;
+		}
+	}
+	e->next = rw_compute_pipes;
+	rw_compute_pipes = e;
+	os_unfair_lock_unlock(&rw_compute_pipes_lock);
+}
+
+static void
+rw_compute_pipe_release(struct rwa_compute *compute)
+{
+	struct rw_compute_pipe_entry *e, *drop = NULL;
+	bool kept = false;
+
+	os_unfair_lock_lock(&rw_compute_pipes_lock);
+	for (e = rw_compute_pipes; e != NULL; e = e->next) {
+		if (e->compute == compute) {
+			kept = true;
+			if (--e->users == 0) {
+				e->idle_since = ++rw_compute_pipes_released;
+				rw_compute_pipes_idle++;
+			}
+			break;
+		}
+	}
+	if (rw_compute_pipes_idle > RW_PIPE_IDLE_MAX) {
+		struct rw_compute_pipe_entry **at, **oldest = NULL;
+		for (at = &rw_compute_pipes; *at != NULL; at = &(*at)->next) {
+			if ((*at)->users == 0 &&
+			    (oldest == NULL || (*at)->idle_since < (*oldest)->idle_since)) {
+				oldest = at;
+			}
+		}
+		drop = *oldest;
+		*oldest = drop->next;
+		rw_compute_pipes_idle--;
+	}
+	os_unfair_lock_unlock(&rw_compute_pipes_lock);
+	if (!kept) {
+		mesa.compute_destroy(compute);
+	}
+	if (drop != NULL) {
+		mesa.compute_destroy(drop->compute);
+		free(drop);
+	}
+}
+
+static void
+rw_compute_pipe_forget(struct rwa_device *device)
+{
+	struct rw_compute_pipe_entry **at = &rw_compute_pipes, *mine = NULL;
+
+	os_unfair_lock_lock(&rw_compute_pipes_lock);
+	while (*at != NULL) {
+		struct rw_compute_pipe_entry *e = *at;
+		if (e->device == device && e->users == 0) {
+			*at = e->next;
+			e->next = mine;
+			mine = e;
+			rw_compute_pipes_idle--;
+		} else {
+			at = &e->next;
+		}
+	}
+	os_unfair_lock_unlock(&rw_compute_pipes_lock);
+	while (mine != NULL) {
+		struct rw_compute_pipe_entry *next = mine->next;
+		mesa.compute_destroy(mine->compute);
+		free(mine);
+		mine = next;
+	}
+}
+
 /* The device is closing: its idle pipelines go first, since the library destroys a pipeline
  * through the device it was made on. */
 static void

@@ -4,6 +4,9 @@ static int
 rw_run_copy(AnnibaleMetalWork *work, char *why, size_t why_size)
 {
 	if (work->copyKind == RW_COPY_FILL) {
+		if (mesa.buffer_fill_nowait != NULL && !rw_sync_draws())
+			return mesa.buffer_fill_nowait([work->buffers[0] mesaBuffer], work->copyOffsets[0],
+			    work->copyLength, (uint8_t)work->copySize[0], why, why_size);
 		if (mesa.buffer_fill)
 			return mesa.buffer_fill([work->buffers[0] mesaBuffer], work->copyOffsets[0],
 			    work->copyLength, (uint8_t)work->copySize[0], why, why_size);
@@ -43,10 +46,17 @@ rw_run_copy(AnnibaleMetalWork *work, char *why, size_t why_size)
 		snprintf(why, why_size, "%s", work->copyError);
 		return -1;
 	}
-	if (work->copyKind == RW_COPY_BUFFER && mesa.buffer_copy) {
-		return mesa.buffer_copy([work->buffers[0] mesaBuffer], work->copyOffsets[0],
-			[work->buffers[1] mesaBuffer], work->copyOffsets[1], work->copyLength,
-			why, why_size);
+	if (work->copyKind == RW_COPY_BUFFER) {
+		if (mesa.buffer_copy_nowait != NULL && !rw_sync_draws()) {
+			return mesa.buffer_copy_nowait([work->buffers[0] mesaBuffer], work->copyOffsets[0],
+				[work->buffers[1] mesaBuffer], work->copyOffsets[1], work->copyLength,
+				why, why_size);
+		}
+		if (mesa.buffer_copy) {
+			return mesa.buffer_copy([work->buffers[0] mesaBuffer], work->copyOffsets[0],
+				[work->buffers[1] mesaBuffer], work->copyOffsets[1], work->copyLength,
+				why, why_size);
+		}
 	}
 	if (work->copyKind == RW_COPY_MIPMAP) {
 		if (mesa.texture_generate_mipmaps == NULL) {
@@ -60,17 +70,30 @@ rw_run_copy(AnnibaleMetalWork *work, char *why, size_t why_size)
 	 * which is how -replaceRegion: fills a texture; MercuryPosterExtension uploads its KTX
 	 * textures this way. */
 	if (work->copyKind == RW_COPY_BUFFER_TEXTURE && mesa.texture_write) {
+		id owner = work->textures[0] ? (id)work->textures[0] : (id)work->buffers[0];
+		if (mesa.finish != NULL) {
+			if (mesa.finish([[owner device] mesaDevice], why, why_size) != 0)
+				return -1;
+		}
 		const char *bytes = [work->buffers[0] contents];
 
 		return mesa.texture_write([work->textures[0] mesaTexture], work->copyLevels[1],
 			work->copySlices[1], work->copyOrigins[1], work->copySize,
 			bytes ? bytes + work->copyOffsets[0] : NULL, work->copyLength, why, why_size);
 	}
-	if (work->copyKind == RW_COPY_TEXTURE && mesa.texture_copy) {
-		return mesa.texture_copy([work->textures[0] mesaTexture], work->copyLevels[0],
-			work->copySlices[0], work->copyOrigins[0], [work->textures[1] mesaTexture],
-			work->copyLevels[1], work->copySlices[1], work->copyOrigins[1],
-			work->copySize, why, why_size);
+	if (work->copyKind == RW_COPY_TEXTURE) {
+		if (mesa.texture_copy_nowait != NULL && !rw_sync_draws()) {
+			return mesa.texture_copy_nowait([work->textures[0] mesaTexture], work->copyLevels[0],
+				work->copySlices[0], work->copyOrigins[0], [work->textures[1] mesaTexture],
+				work->copyLevels[1], work->copySlices[1], work->copyOrigins[1],
+				work->copySize, why, why_size);
+		}
+		if (mesa.texture_copy) {
+			return mesa.texture_copy([work->textures[0] mesaTexture], work->copyLevels[0],
+				work->copySlices[0], work->copyOrigins[0], [work->textures[1] mesaTexture],
+				work->copyLevels[1], work->copySlices[1], work->copyOrigins[1],
+				work->copySize, why, why_size);
+		}
 	}
 	snprintf(why, why_size, "this compiler library does not implement the requested copy");
 	return -1;

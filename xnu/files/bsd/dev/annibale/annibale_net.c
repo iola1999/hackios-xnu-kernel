@@ -15,6 +15,7 @@
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
+#include <kern/sched_prim.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -278,7 +279,19 @@ net_thread(__unused void *parameter, __unused wait_result_t result)
 	unsigned quiet = 0;
 
 	for (unsigned tick = 1;; tick++) {
-		quiet = net_link->poll != NULL && net_link->poll() ? 0 : quiet + 1;
+		if (net_link == NULL || net_link->poll == NULL) {
+			assert_wait_timeout((event_t)&net_count, THREAD_UNINT, 60000, NSEC_PER_MSEC);
+			thread_block(THREAD_CONTINUE_NULL);
+			total = net_count.sent + net_count.received + net_count.dropped_out + net_count.dropped_in;
+			if (total != said) {
+				said = total;
+				printf("net: so far %llu frames sent (%llu bytes), %llu received (%llu bytes); dropped: %llu out, %llu in\n",
+				    net_count.sent, net_count.sent_bytes, net_count.received, net_count.received_bytes,
+				    net_count.dropped_out, net_count.dropped_in);
+			}
+			continue;
+		}
+		quiet = net_link->poll() ? 0 : quiet + 1;
 		/* about once a minute, if anything has moved since */
 		total = net_count.sent + net_count.received + net_count.dropped_out + net_count.dropped_in;
 		if (tick % 8192 == 0 && total != said) {

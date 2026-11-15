@@ -245,6 +245,8 @@ static struct {
 	unsigned long when;
 } later[16];
 
+int lx_radio_state_mode(void);
+
 static void
 ticker(void *argument)
 {
@@ -254,9 +256,55 @@ ticker(void *argument)
 		struct timer_list *due = NULL;
 		struct delayed_work *work = NULL;
 		struct workqueue_struct *queue = NULL;
+		int mode;
+		unsigned long long sleep_ns;
+		bool any_pending = false;
+		unsigned long earliest = 0;
 
 		lx_os_lock();
-		lx_os_sleep(&jiffies, 2 * 1000000ull);
+		mode = lx_radio_state_mode();
+		for (unsigned i = 0; i < nitems(armed); i++) {
+			if (armed[i] != NULL) {
+				if (!any_pending || (long)(armed[i]->expires - earliest) < 0) {
+					earliest = armed[i]->expires;
+					any_pending = true;
+				}
+			}
+		}
+		for (unsigned i = 0; i < nitems(later); i++) {
+			if (later[i].work != NULL) {
+				if (!any_pending || (long)(later[i].when - earliest) < 0) {
+					earliest = later[i].when;
+					any_pending = true;
+				}
+			}
+		}
+		if (mode == 0) {
+			if (!any_pending) {
+				sleep_ns = 0;
+			} else if ((long)(earliest - jiffies) > 0) {
+				sleep_ns = (unsigned long long)(earliest - jiffies) * 1000000ull;
+			} else {
+				sleep_ns = 1 * 1000000ull;
+			}
+		} else if (mode == 1) {
+			sleep_ns = 100 * 1000000ull; /* 10 Hz in associated state */
+			if (any_pending && (long)(earliest - jiffies) > 0) {
+				unsigned long long delta_ns = (unsigned long long)(earliest - jiffies) * 1000000ull;
+				if (delta_ns < sleep_ns) {
+					sleep_ns = delta_ns;
+				}
+			}
+		} else {
+			sleep_ns = 10 * 1000000ull;
+			if (any_pending && (long)(earliest - jiffies) > 0) {
+				unsigned long long delta_ns = (unsigned long long)(earliest - jiffies) * 1000000ull;
+				if (delta_ns < sleep_ns) {
+					sleep_ns = delta_ns;
+				}
+			}
+		}
+		lx_os_sleep(&jiffies, sleep_ns);
 		jiffies = (unsigned long)((lx_os_nanoseconds() - began) / 1000000ull);
 		for (unsigned i = 0; i < nitems(armed) && due == NULL; i++) {
 			if (armed[i] != NULL && (long)(jiffies - armed[i]->expires) >= 0) {
@@ -312,6 +360,7 @@ linux_queue_delayed_work_on(int cpu, struct workqueue_struct *wq, struct delayed
 		later[slot].work = dwork;
 		later[slot].queue = wq;
 		later[slot].when = jiffies + delay;
+		lx_os_wakeup(&jiffies);
 	}
 	lx_os_unlock();
 	if (slot < 0) {
@@ -387,6 +436,7 @@ mod_timer(struct timer_list *timer, unsigned long expires)
 	timer->expires = expires;
 	if (slot >= 0) {
 		armed[slot] = timer;
+		lx_os_wakeup(&jiffies);
 	}
 	lx_os_unlock();
 	if (slot < 0) {
@@ -799,6 +849,16 @@ in_pool(const void *memory, size_t size)
 	return ((const uint8_t *)memory >= pool.memory && (const uint8_t *)memory + size <= pool.memory + POOL_SIZE);
 }
 
+#define COHERENT_CHUNKS 128
+struct coherent_chunk {
+	void *va;
+	dma_addr_t pa;
+	size_t size;
+	bool in_use;
+};
+static struct coherent_chunk coherent_chunks[COHERENT_CHUNKS];
+static unsigned coherent_chunk_count;
+
 void *
 linux_dma_alloc_coherent(struct device *dev, size_t size, dma_addr_t *dma_handle, gfp_t flag)
 {
@@ -816,6 +876,17 @@ linux_dma_alloc_coherent(struct device *dev, size_t size, dma_addr_t *dma_handle
 #endif
 	size = roundup2(size, 64);
 	lx_os_lock();
+	for (unsigned i = 0; i < coherent_chunk_count; i++) {
+		if (!coherent_chunks[i].in_use && coherent_chunks[i].size >= size &&
+		    coherent_chunks[i].size <= size + (size >= PAGE_SIZE ? PAGE_SIZE : 256)) {
+			coherent_chunks[i].in_use = true;
+			*dma_handle = coherent_chunks[i].pa;
+			void *va = coherent_chunks[i].va;
+			lx_os_unlock();
+			bzero(va, size);
+			return (va);
+		}
+	}
 	at = (uint32_t)(roundup2(pool.address + pool.rings_used, align) - pool.address);
 	if (pool.memory == NULL || at + size > POOL_RINGS) {
 		lx_os_unlock();
@@ -823,6 +894,13 @@ linux_dma_alloc_coherent(struct device *dev, size_t size, dma_addr_t *dma_handle
 		return (NULL);
 	}
 	pool.rings_used = at + size;
+	if (coherent_chunk_count < COHERENT_CHUNKS) {
+		unsigned idx = coherent_chunk_count++;
+		coherent_chunks[idx].va = pool.memory + at;
+		coherent_chunks[idx].pa = pool.address + at;
+		coherent_chunks[idx].size = size;
+		coherent_chunks[idx].in_use = true;
+	}
 	lx_os_unlock();
 	if (size >= (64u << 10)) {
 		printf("lx: %zu bytes of rings' memory at %#llx\n", size, pool.address + at);
@@ -835,7 +913,17 @@ linux_dma_alloc_coherent(struct device *dev, size_t size, dma_addr_t *dma_handle
 void
 kmem_free(void *address, vm_size_t size)
 {
-	/* (dma_free_coherent() ends here: rings are not given back) */
+	if (address == NULL) {
+		return;
+	}
+	lx_os_lock();
+	for (unsigned i = 0; i < coherent_chunk_count; i++) {
+		if (coherent_chunks[i].va == address) {
+			coherent_chunks[i].in_use = false;
+			break;
+		}
+	}
+	lx_os_unlock();
 }
 
 /*
@@ -852,6 +940,7 @@ dma_alloc_noncoherent(struct device *dev, size_t size, dma_addr_t *handle, enum 
 void
 dma_free_noncoherent(struct device *dev, size_t size, void *memory, dma_addr_t handle, enum dma_data_direction direction)
 {
+	kmem_free(memory, (vm_size_t)size);
 }
 
 /*

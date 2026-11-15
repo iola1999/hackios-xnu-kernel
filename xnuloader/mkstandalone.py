@@ -46,6 +46,7 @@ def find_default_ramdisk(root_dir: Path) -> Path:
     candidates = [
         root_dir / "out/ios26-resume/bbmetal-device/root.apfs",
         root_dir / "userland/root26.apfs",
+        root_dir.parent / "hackios-xnu-userland/userland/root26.apfs",
         root_dir / "out/ios26-resume/k90-ready/inputs/root26.apfs",
     ]
     for c in candidates:
@@ -55,7 +56,12 @@ def find_default_ramdisk(root_dir: Path) -> Path:
 
 
 def find_default_boot_image(root_dir: Path) -> Path:
-    return root_dir / "userland/flashboot.apfs"
+    p = root_dir / "userland/flashboot.apfs"
+    if not p.is_file():
+        p_alt = root_dir.parent / "hackios-xnu-userland/userland/flashboot.apfs"
+        if p_alt.is_file():
+            return p_alt
+    return p
 
 
 def sha256_file(path: Path) -> str:

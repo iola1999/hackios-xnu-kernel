@@ -132,4 +132,7 @@ int lx_station_up(struct lx_radio *radio);
 void lx_station_down(struct lx_radio *radio);
 int lx_scan(struct lx_radio *radio, const uint8_t *name, unsigned name_length, bool quiet, const struct annibale_sta_scan *what);
 
+int lx_radio_state_mode(void);
+void lx_pci_wake_rings(void);
+
 #endif
