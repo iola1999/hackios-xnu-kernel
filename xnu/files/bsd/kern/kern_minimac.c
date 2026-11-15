@@ -13,7 +13,9 @@
  *            in the trust cache and flags them as platform binaries.
  *            launchd panics if a system daemon is not one. There is no
  *            trust cache here, so every ad hoc signed binary is taken for
- *            a platform binary. Unsigned programs (our own) are not.
+ *            a platform binary, except applications installed under
+ *            /private/var/containers/Bundle that do not declare
+ *            platform-application. Unsigned programs (our own) are not.
  *
  *   Sandbox  Every query (may this process look up that service?) is
  *            answered "allowed", and every request to apply a profile
@@ -51,9 +53,44 @@
 
 void minimac_policy_init(void);
 extern void miniamfi_blob_entitlements_init(struct cs_blob *cs_blob);
+extern kern_return_t miniamfi_osent_boolean(const void *os_entitlements, const char *name);
+
+#define MINIAMFI_INSTALLED_BUNDLES      "/private/var/containers/Bundle/"
+#define MINIAMFI_PLATFORM_APPLICATION   "platform-application"
+
+/*
+ * On a device the trust cache holds only the operating system's code, so an application
+ * installed into the data volume is never a platform binary by its hash. Original TrollStore
+ * signs such applications through the CoreTrust bypass, and only those that declare
+ * platform-application (TrollStore and its root helper) run as platform binaries. Taking every
+ * installed application for one gave it platform restrictions version 3 and the enhanced IPC
+ * policy (imgact_setup_platform_restrictions(), ipc_policy_for_task()); under that policy a
+ * crash reporter's task_set_exception_ports() without an identity-protected behavior is a fatal
+ * EXC_GUARD (Weibo 16.11.0 is killed while its first scene is created).
+ */
+static bool
+miniamfi_is_installed_application(struct vnode *vp)
+{
+	char *path;
+	int len = MAXPATHLEN;
+	bool installed = false;
+
+	if (vp == NULL) {
+		return false;
+	}
+	path = kalloc_data(MAXPATHLEN, Z_WAITOK);
+	if (path == NULL) {
+		return false;
+	}
+	if (vn_getpath(vp, path, &len) == 0) {
+		installed = strncmp(path, MINIAMFI_INSTALLED_BUNDLES, sizeof(MINIAMFI_INSTALLED_BUNDLES) - 1) == 0;
+	}
+	kfree_data(path, MAXPATHLEN);
+	return installed;
+}
 
 static int
-miniamfi_vnode_check_signature(__unused struct vnode *vp, __unused struct label *label, __unused cpu_type_t cpu_type,
+miniamfi_vnode_check_signature(struct vnode *vp, __unused struct label *label, __unused cpu_type_t cpu_type,
     struct cs_blob *cs_blob, unsigned int *cs_flags, __unused unsigned int *signer_type, __unused int flags,
     __unused unsigned int platform, __unused char **fatal_failure_desc, __unused size_t *fatal_failure_desc_len)
 {
@@ -66,11 +103,17 @@ miniamfi_vnode_check_signature(__unused struct vnode *vp, __unused struct label 
 	 * is still mutable prior to RO-zone commit.
 	 */
 	*cs_flags |= CS_SIGNED | CS_ENTITLEMENTS_VALIDATED;
-	if (*cs_flags & CS_ADHOC) {
-		*cs_flags |= CS_PLATFORM_BINARY;
-	}
 	if (cs_blob != cs_blob->csb_ro_addr && cs_blob->csb_entitlements == NULL) {
 		miniamfi_blob_entitlements_init(cs_blob);
+	}
+	if (*cs_flags & CS_ADHOC) {
+		void *entitlements = csblob_os_entitlements_get(cs_blob);
+
+		if (!miniamfi_is_installed_application(vp) ||
+		    (entitlements != NULL &&
+		    miniamfi_osent_boolean(entitlements, MINIAMFI_PLATFORM_APPLICATION) == KERN_SUCCESS)) {
+			*cs_flags |= CS_PLATFORM_BINARY;
+		}
 	}
 	return 0;
 }
