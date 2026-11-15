@@ -6,8 +6,8 @@
  * non-enforcing policy; extension consume validates tokens and binds handles
  * without redundant DAC pre-authorization, aligning with Seatbelt semantics.
  *
- * An extension issued with no target process (pid and pidversion 0, no flags) is
- * the other form: sandbox_extension_issue_generic() (type 3, no resource) and
+ * An extension issued with no target process (no target bits in the flags, pid
+ * and pidversion 0) is the other form: sandbox_extension_issue_generic() (type 3, no resource) and
  * sandbox_extension_issue_file() (type 0, a path). tccd hands a granted client
  * "com.apple.tcc.<service>" this way, as a file extension of "/" for the
  * services it does not mark generic; a failed issue makes tccd answer the whole
@@ -16,12 +16,24 @@
  * given the token may consume it, and consuming checks the hash and binds a
  * handle to the consumer. The path is checked against the issuer at issue time;
  * the handle keeps no vnode, as this policy does not confine file access.
+ *
+ * Both forms take Seatbelt's issue modifiers. FileProvider, QuickLook and the
+ * share sheet issue file extensions with NOFOLLOW, and NO_REPORT when a denial
+ * is not to be reported; a refused issue makes FPSandboxingURLWrapper return
+ * nil, and the Files app, the document picker and the share sheet then do
+ * nothing with the file. NOFOLLOW stops the path lookup at a final symbolic
+ * link. CANONICAL, PREFIXMATCH and NO_STORAGE_CLASS change how Seatbelt matches
+ * paths and NO_REPORT how it reports denials; with no file access confined here
+ * they need no action. Any other bit is refused and logged.
  */
 #define SANDBOX_SYSCALL_EXTENSION_ISSUE 5
 #define SANDBOX_SYSCALL_EXTENSION_CONSUME 6
 #define SANDBOX_SYSCALL_EXTENSION_RELEASE 7
 #define SANDBOX_SYSCALL_EXTENSION_RELEASE_DETECT 80
 #define MINISANDBOX_EXTENSION_TARGET_AUDIT 0x30000ULL
+#define MINISANDBOX_EXTENSION_NOFOLLOW 0x20ULL
+/* CANONICAL 0x2, PREFIXMATCH 0x4, NO_REPORT 0x10, NOFOLLOW 0x20, NO_STORAGE_CLASS 0x40 */
+#define MINISANDBOX_EXTENSION_MODIFIERS 0x76ULL
 #define MINISANDBOX_EXTENSION_TOKEN_LENGTH 49
 #define MINISANDBOX_EXTENSION_TYPE_FILE 0
 #define MINISANDBOX_EXTENSION_TYPE_GENERIC 3
@@ -232,8 +244,24 @@ minisandbox_extension_untargeted_digest(char out[MINISANDBOX_EXTENSION_TOKEN_LEN
 	minisandbox_extension_hex(out + 16, outer, 16);
 }
 
+/* Issue requests this policy does not implement, logged so that a missing form shows up. */
+static unsigned minisandbox_extension_unsupported_logged;
+
 static int
-minisandbox_extension_issue_untargeted(proc_t issuer, const struct minisandbox_extension_issue_args *args)
+minisandbox_extension_unsupported(proc_t issuer, const struct minisandbox_extension_issue_args *args)
+{
+	if (minisandbox_extension_unsupported_logged < 16) {
+		minisandbox_extension_unsupported_logged++;
+		printf("minisandbox: extension issue from %s[%d] not supported: type %llu flags %#llx pid %lld\n",
+		    issuer->p_comm, proc_getpid(issuer), (unsigned long long)args->type,
+		    (unsigned long long)args->flags, (long long)args->pid);
+	}
+	return ENOTSUP;
+}
+
+static int
+minisandbox_extension_issue_untargeted(proc_t issuer, const struct minisandbox_extension_issue_args *args,
+    int lookup_flags)
 {
 	char class_name[MINISANDBOX_EXTENSION_CLASS_MAX], token[MINISANDBOX_EXTENSION_UNTARGETED_MAX], identifier_hex[16];
 	char *path = NULL;                      /* none for a generic extension */
@@ -242,7 +270,7 @@ minisandbox_extension_issue_untargeted(proc_t issuer, const struct minisandbox_e
 	int64_t identifier;
 	if (args->type == MINISANDBOX_EXTENSION_TYPE_GENERIC ? args->resource != 0 :
 	    args->type != MINISANDBOX_EXTENSION_TYPE_FILE || args->resource == 0) {
-		return ENOTSUP;
+		return minisandbox_extension_unsupported(issuer, args);
 	}
 	if (!args->token) {
 		return EFAULT;
@@ -271,7 +299,7 @@ minisandbox_extension_issue_untargeted(proc_t issuer, const struct minisandbox_e
 		if (context == NULL) {
 			return ENOMEM;
 		}
-		error = vnode_lookup(path, 0, &vnode, context);
+		error = vnode_lookup(path, lookup_flags, &vnode, context);
 		if (error == 0) {
 			error = vnode_authorize(vnode, NULLVP,
 			    vnode_vtype(vnode) == VDIR ? KAUTH_VNODE_SEARCH : KAUTH_VNODE_READ_DATA, context);
@@ -346,11 +374,16 @@ minisandbox_extension_issue(proc_t issuer, user_addr_t arg)
 	if (error) {
 		return error;
 	}
-	if (args.pid == 0 && args.pidversion == 0 && args.flags == 0) {
-		return minisandbox_extension_issue_untargeted(issuer, &args);
+	uint64_t target_bits = args.flags & MINISANDBOX_EXTENSION_TARGET_AUDIT;
+	uint64_t modifiers = args.flags & ~MINISANDBOX_EXTENSION_TARGET_AUDIT;
+	if ((modifiers & ~MINISANDBOX_EXTENSION_MODIFIERS) != 0 ||
+	    (target_bits == 0 ? args.pid != 0 || args.pidversion != 0 :
+	    target_bits != MINISANDBOX_EXTENSION_TARGET_AUDIT || args.type != MINISANDBOX_EXTENSION_TYPE_FILE)) {
+		return minisandbox_extension_unsupported(issuer, &args);
 	}
-	if (args.type != 0 || args.flags != MINISANDBOX_EXTENSION_TARGET_AUDIT) {
-		return ENOTSUP;
+	int lookup_flags = (modifiers & MINISANDBOX_EXTENSION_NOFOLLOW) != 0 ? VNODE_LOOKUP_NOFOLLOW : 0;
+	if (target_bits == 0) {
+		return minisandbox_extension_issue_untargeted(issuer, &args, lookup_flags);
 	}
 	if (args.pid <= 0 || args.pid > INT_MAX || args.pidversion > UINT32_MAX) {
 		return ESRCH;
@@ -382,7 +415,7 @@ minisandbox_extension_issue(proc_t issuer, user_addr_t arg)
 		error = ENOMEM;
 		goto out_target;
 	}
-	error = vnode_lookup(path, 0, &vnode, context);
+	error = vnode_lookup(path, lookup_flags, &vnode, context);
 	if (error == 0) {
 		error = minisandbox_extension_class_rights(issuer, class_name, vnode, &rights);
 	}

@@ -28,6 +28,7 @@ typedef uint64_t user_addr_t;
 #define NULLVP NULL
 #define VREG 1
 #define VDIR 2
+#define VNODE_LOOKUP_NOFOLLOW 1
 #define VCHR 3
 #define SANDBOX_SYSCALL_CONTAINER_PATH 4
 #define SANDBOX_SYSCALL_SET_CONTAINER_PATH 66
@@ -67,6 +68,7 @@ static bool partial_copyout;
 static uint64_t minisandbox_seen;
 static unsigned checks;
 static int set_calls, get_calls;
+static int last_lookup_flags = -1;
 
 static void lck_mtx_lock(struct host_lock *lock) {
     assert(!table_locked); assert(!pthread_mutex_lock(&lock->mutex)); table_locked = true;
@@ -150,7 +152,8 @@ static vfs_context_t vfs_context_create_with_proc(proc_t p) {
 }
 static int vfs_context_rele(vfs_context_t context) { assert(!table_locked && context); return 0; }
 static int vnode_lookup(const char *path, int flags, vnode_t *vnode, vfs_context_t context) {
-    assert(!table_locked && !flags && context);
+    assert(!table_locked && !(flags & ~VNODE_LOOKUP_NOFOLLOW) && context);
+    last_lookup_flags = flags;
     if (!strcmp(path, "/containers/app")) *vnode = &directory;
     else if (!strcmp(path, "/files/document")) *vnode = &file;
     else return ENOENT;
@@ -239,7 +242,14 @@ static void issue_contract(proc_t manager, proc_t app, proc_t other) {
     check(issue_raw(manager, app, "com.apple.app-sandbox.read", "/files/document", 0, 0, output) == ENOTSUP);
     check(issue_raw(manager, app, "com.apple.app-sandbox.read", "/files/document", 0x10000, 0, output) == ENOTSUP);
     check(issue_raw(manager, app, "com.apple.app-sandbox.read", "/files/document", 0x30000, 1, output) == ENOTSUP);
-    check(issue_raw(manager, app, "com.apple.app-sandbox.read", "/files/document", 0x30002, 0, output) == ENOTSUP);
+    check(issue_raw(manager, app, "com.apple.app-sandbox.read", "/files/document", 0x30008, 0, output) == ENOTSUP);
+    check(issue_raw(manager, app, "com.apple.app-sandbox.read", "/files/document", 0x30080, 0, output) == ENOTSUP);
+    /* Seatbelt's modifiers (CANONICAL, NO_REPORT, NOFOLLOW here) are taken; NOFOLLOW reaches the lookup */
+    check(issue_raw(manager, app, "com.apple.app-sandbox.read", "/files/document", 0x30032, 0, output) == 0);
+    check(last_lookup_flags == VNODE_LOOKUP_NOFOLLOW && file.usecount == 1);
+    check(issue_raw(manager, app, "com.apple.app-sandbox.read", "/files/document", 0x30004, 0, output) == 0);
+    check(last_lookup_flags == 0 && file.usecount == 2);
+    clean();
     check(issue_raw(manager, app, "com.apple.app-sandbox.read", "/files/document", 0x30000, 0, NULL) == EFAULT);
     check(issue_raw(manager, app, NULL, "/files/document", 0x30000, 0, output) == EFAULT);
     check(issue_raw(manager, app, "com.apple.app-sandbox.read", NULL, 0x30000, 0, output) == EFAULT);
@@ -427,6 +437,17 @@ static void untargeted_contract(proc_t tccd, proc_t app, proc_t child) {
     strcpy(changed, output); changed[49 + strlen(class_name)] = 0; check(consume_native(app, changed, EINVAL) == -1);
     check(issue_untargeted_raw(tccd, class_name, 0, "/containers/app", 0, 0, 0, output) == 0);
     check(!directory.usecount && !directory.iocount);
+    /* FileProvider's FPSandboxingURLWrapper: sandbox_extension_issue_file with NOFOLLOW, and NO_REPORT */
+    check(issue_untargeted_raw(tccd, class_name, 0, "/files/document", 0x20, 0, 0, output) == 0);
+    check(last_lookup_flags == VNODE_LOOKUP_NOFOLLOW && !file.usecount && !file.iocount);
+    a = consume_native(app, output, 0);
+    check(a > 0 && release_raw(app, a, 0, NULL) == 0 && !allocations);
+    check(issue_untargeted_raw(tccd, class_name, 0, "/files/document", 0x30, 0, 0, output) == 0);
+    check(issue_untargeted_raw(tccd, class_name, 0, "/files/document", 0x46, 0, 0, output) == 0 && !last_lookup_flags);
+    check(issue_untargeted_raw(tccd, class_name, 3, NULL, 0x10, 0, 0, output) == 0);
+    check(issue_untargeted_raw(tccd, class_name, 0, "/files/document", 0x28, 0, 0, output) == ENOTSUP);
+    check(issue_untargeted_raw(tccd, class_name, 0, "/files/document", 0x20, app->pid, 0, output) == ENOTSUP);
+    check(issue_untargeted_raw(tccd, class_name, 0, "/files/document", 0x10020, 0, 0, output) == ENOTSUP);
     check(issue_untargeted_raw(tccd, class_name, 0, "/missing", 0, 0, 0, output) == ENOENT);
     check(issue_untargeted_raw(tccd, class_name, 0, "relative", 0, 0, 0, output) == EINVAL);
     check(issue_untargeted_raw(tccd, class_name, 0, NULL, 0, 0, 0, output) == ENOTSUP);
