@@ -592,6 +592,7 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 		s->planes[0].size = (uint32_t) needed;
 		describeComponents(&s->planes[0], format);
 	}
+	bool geometry = needed != 0;
 	needed += offset;
 	alloc = dictNumber(props, "IOSurfaceAllocSize", 0);
 	if (alloc < needed) {
@@ -612,6 +613,11 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 	if (wrapped != NULL) {
 		/* (the memory is as big as its owner says, and not a byte of ours is added to it) */
 		alloc = dictNumber(props, "IOSurfaceAllocSize", (uint32_t) needed);
+	} else if (!geometry) {
+		/* Only a size was asked for, as AudioToolboxCore's shared buffers are: all of it, in whole
+		 * pages. Its unilaterally_billed_shared_memory throws "bad IOSurface" when IOSurfaceGetAllocSize
+		 * is below the request, and audiomxd ends on that. */
+		alloc = alignUp(alloc, (uint32_t) PAGE_SIZE);
 	} else if (alloc > alignUp(needed, (uint32_t) PAGE_SIZE)) {
 		alloc = alignUp(needed, (uint32_t) PAGE_SIZE);
 	}

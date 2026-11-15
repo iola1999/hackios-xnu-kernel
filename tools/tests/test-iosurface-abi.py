@@ -598,7 +598,26 @@ int main(void)
         props->release();
     }
 
-    puts("IOSurface allocation: non-wrapped clamping to alignUp(needed, PAGE_SIZE) and wrapped pass-through passed");
+    // Case 7: only IOSurfaceAllocSize, no geometry (AudioToolboxCore's shared buffers):
+    // the request is kept, in whole pages, and never clamped to the empty geometry
+    {
+        const uint32_t requested[] = { 0x1fff0u, 0x20000u, 0x40000u };
+        const uint32_t expected[] = { 0x20000u, 0x20000u, 0x40000u };
+        for (unsigned i = 0; i < 3; i++) {
+            OSDictionary *props = new OSDictionary();
+            props->setObject("IOSurfaceAllocSize", new OSNumber(requested[i]));
+            props->setObject("IOSurfacePreallocPages", new OSNumber(1));
+            IOReturn err = 0;
+            MiniIOSurface *s = surfaceCreate(props, &err);
+            assert(s != NULL && err == kIOReturnSuccess);
+            assert(s->info.allocSize == expected[i]);
+            assert(lastSurfaceMemoryAlloc == PAGE_SIZE + expected[i]);
+            s->release();
+            props->release();
+        }
+    }
+
+    puts("IOSurface allocation: non-wrapped clamping to alignUp(needed, PAGE_SIZE), size-only requests kept and wrapped pass-through passed");
     return 0;
 }
 '''
