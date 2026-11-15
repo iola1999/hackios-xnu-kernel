@@ -436,9 +436,8 @@ iris_qc08c_size(const struct iris_session *s)
 
 /* SM8750 vpu35 uses the native vpu33 decoder sizing with four VPP pipes. */
 static void
-iris_internal_sizes(const struct iris_session *s, uint32_t sizes[6])
+iris_internal_sizes(const struct iris_session *s, uint32_t w, uint32_t h, uint32_t sizes[6])
 {
-	uint32_t w = s->width, h = s->height;
 	uint32_t mw = (w + 15u) / 16u, mh = (h + 15u) / 16u;
 	uint32_t pixels = iris_align(w, 16u) * iris_align(h, 16u);
 	uint32_t yuv = (pixels < 1280u * 736u ? 1280u * 736u : pixels) * 3u / 2u;
@@ -501,7 +500,7 @@ iris_alloc_session_buffers(struct iris_session *s)
 	    s->uv_stride * s->uv_scanlines, (uint32_t)PAGE_SIZE);
 	s->dpb_frame_size = iris_qc08c_size(s);
 	uint32_t sizes[6];
-	iris_internal_sizes(s, sizes);
+	iris_internal_sizes(s, s->width, s->height, sizes);
 	uint64_t total = 0;
 	for (uint32_t i = 0; i < 6u; i++) total += sizes[i];
 	if (total > IRIS_IOVA_SESSION_STRIDE ||
@@ -644,6 +643,33 @@ iris_read_property(struct iris_session *s, const struct hfi_packet *pkt)
 	return 0;
 }
 
+/*
+ * Input PSC reports the coded size and the crop to the display size: 1080p H.264 is coded as
+ * 1920x1088 with 8 rows cropped at the bottom. CROP_OFFSETS packs left << 16 | top, then
+ * right << 16 | bottom (msm_vdec.c). The native driver adopts the coded size and recreates the
+ * input internal buffers (msm_vdec_input_port_settings_change); here the buffers and RAW layout
+ * allocated at open must already fit it, and the crop must leave exactly the session size at
+ * the top left, which is the window iris_copy_decoded_nv12 copies.
+ */
+static bool
+iris_psc_geometry_ok(const struct iris_session *s)
+{
+	uint32_t coded_w = s->psc_values[PSC_RES] >> 16, coded_h = s->psc_values[PSC_RES] & 0xffffu;
+	uint32_t right = s->psc_values[PSC_CROP_RB] >> 16, bottom = s->psc_values[PSC_CROP_RB] & 0xffffu;
+	if (s->psc_values[PSC_CROP_LT] != 0 || coded_w < s->width || coded_h < s->height ||
+	    coded_w - s->width != right || coded_h - s->height != bottom ||
+	    iris_align(coded_w, 128u) != s->y_stride || iris_align(coded_h, 32u) != s->y_scanlines ||
+	    iris_align(coded_h / 2u, 16u) != s->uv_scanlines) return false;
+	uint32_t sizes[6];
+	iris_internal_sizes(s, coded_w, coded_h, sizes);
+	const struct iris_dma_buf *bufs[] = { &s->intern_bin, &s->intern_comv, &s->intern_non_comv,
+		&s->intern_line, &s->intern_persist };
+	for (uint32_t i = 0; i < 5u; i++) {
+		if (sizes[i] > bufs[i]->size) return false;
+	}
+	return true;
+}
+
 static int
 iris_start_output(struct iris_session *s)
 {
@@ -652,17 +678,17 @@ iris_start_output(struct iris_session *s)
 	required |= s->codec_type == IRIS_CODEC_H264 ?
 	    (1u << PSC_CODED) | (1u << PSC_POC) : 1u << PSC_TIER;
 	uint32_t count = s->psc_values[PSC_MIN_COUNT];
-	iris_say("PSC sid=%u seen=0x%x required=0x%x resolution=0x%x depth=0x%x min=%u\n",
+	iris_say("PSC sid=%u seen=0x%x required=0x%x resolution=0x%x crop=0x%x/0x%x depth=0x%x min=%u\n",
 	    s->wire_session_id, s->psc_seen, required, s->psc_values[PSC_RES],
-	    s->psc_values[PSC_DEPTH], count);
+	    s->psc_values[PSC_CROP_LT], s->psc_values[PSC_CROP_RB], s->psc_values[PSC_DEPTH], count);
 	if ((s->psc_seen & required) != required ||
-	    s->psc_values[PSC_RES] != ((s->width << 16) | s->height) ||
-	    s->psc_values[PSC_CROP_LT] != 0 || s->psc_values[PSC_CROP_RB] != 0 ||
+	    !iris_psc_geometry_ok(s) ||
 	    s->psc_values[PSC_DEPTH] != 0x00080008u || count == 0 ||
 	    count > IRIS_RAW_POOL_MAX || s->raw_frame_size == 0 ||
 	    (uint64_t)s->raw_frame_size * count > IRIS_IOVA_RAW_SESSION_STRIDE ||
 	    s->dpb_frame_size == 0 || count > s->intern_dpb.size / s->dpb_frame_size ||
 	    (s->codec_type == IRIS_CODEC_H264 && (s->psc_values[PSC_CODED] & 1u) == 0)) {
+		s->psc_rejected = true;
 		return EOPNOTSUPP;
 	}
 	/* Keep the initial RAW allocations and add the buffers required by input PSC. */
@@ -1101,6 +1127,12 @@ iris_hfi_session_close(struct iris_session *s)
 {
 	s->closing = true;
 	if (s->opened) {
+		/* A PSC rejected by the host checks leaves the firmware session paused before RAW
+		 * START, with no firmware error. Native close stops the bitstream port and closes the
+		 * session from that state, so the normal STOP/CLOSE sequence below applies and the slot
+		 * is released. Firmware and protocol errors still keep the DMA. */
+		if (s->psc_rejected && s->error == EOPNOTSUPP && g_iris.hw_ready &&
+		    (s->started_ports & (1u << HFI_PORT_RAW)) == 0) s->error = 0;
 		if (s->error != 0 || !g_iris.hw_ready) return s->error != 0 ? s->error : EIO;
 		uint32_t flags = HFI_HOST_FLAGS_INTR_REQUIRED | HFI_HOST_FLAGS_RESPONSE_REQUIRED |
 		    HFI_HOST_FLAGS_NON_DISCARDABLE;

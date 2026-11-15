@@ -748,6 +748,7 @@ int main(int argc, char **argv)
 		assert(!s->input_queued && s->started_ports == 6 && s->raw_state[0] == 1);
 	}
 	else if (strncmp(name, "psc-", 4) == 0) {
+		if (strstr(name, "coded")) s->height = 474;
 		assert(iris_hfi_session_open(s) == 0); size_t before = tx_size;
 		s->input_queued = true; s->next_input_idx = 1;
 		push_psc(s->wire_session_id); int r = iris_receive(s, NULL);
@@ -756,6 +757,11 @@ int main(int argc, char **argv)
 			assert(count_type(0x01000009u, 2) == 6);
 		} else assert(r < 0 && s->error != 0 && s->started_ports == 2 && tx_size == before &&
 		    s->input_queued && free_calls == 0);
+		if (strstr(name, "-close")) {
+			assert(iris_hfi_session_close(s) == 0 && !s->opened && s->started_ports == 0 && free_calls == 11);
+			assert(count_type(0x01000006u, 1) == 1 && count_type(0x01000006u, 2) == 0 &&
+			    count_type(0x01000004u, 0) == 1);
+		}
 	}
 	else if (strcmp(name, "stale-wire") == 0) {
 		assert(iris_hfi_session_open(s) == 0); uint32_t old = s->wire_session_id;

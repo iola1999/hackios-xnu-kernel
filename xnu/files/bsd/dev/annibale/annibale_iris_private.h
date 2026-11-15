@@ -365,6 +365,7 @@ struct iris_session {
 	bool                draining;
 	bool                drain_ack;
 	bool                drain_last;
+	bool                psc_rejected;   /* input PSC failed host checks before RAW START */
 	uint32_t            started_ports;
 	uint32_t            drain_packet_id;
 	uint32_t            wire_session_id;

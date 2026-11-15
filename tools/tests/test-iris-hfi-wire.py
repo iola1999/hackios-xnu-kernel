@@ -135,7 +135,9 @@ def psc(codec=1, variation='valid', native=False, malformed=None):
     fields += [(0x03000155, 1, [0])]
     changes = {'depth': (0x0300010f, [0x000a000a]), 'zero-count': (0x03000124, [0]),
                'min7': (0x03000124, [7]), 'resolution': (0x03000103, [768 << 16 | 480]),
-               'crop': (0x03000105, [1, 0]), 'interlace': (0x03000120, [0])}
+               'crop': (0x03000105, [1, 0]), 'interlace': (0x03000120, [0]),
+               # A 640x474 session coded as 640x480: 6 rows cropped at the bottom, or a wrong crop.
+               'coded': (0x03000105, [0, 6]), 'coded-mismatch': (0x03000105, [0, 4])}
     packets = []
     # Observed AVC metadata; payload values remain the supported host fixture values.
     reply_types = {0x03000105: 3, 0x0300010f: 10, 0x03000120: 10, 0x03000155: 10}
@@ -255,6 +257,11 @@ def write_fixtures(directory):
         path = directory / f'psc-{variation}.bin'
         path.write_bytes(psc(variation=variation))
         cases.append(('psc-' + variation, path, expected))
+    for name, variation in (('psc-valid-coded', 'coded'), ('psc-coded-mismatch', 'coded-mismatch')):
+        path = directory / f'psc-{variation}.bin'
+        path.write_bytes(psc(variation=variation))
+        cases.append((name, path, expected))
+    cases.append(('psc-depth-close', directory / 'psc-depth.bin', expected))
     for kind in (0x03000105, 0x0300010f, 0x03000120, 0x03000155):
         for mode in ('short', 'wrong-info', 'wrong-port', 'information', 'short-buffer'):
             name = f'psc-metadata-{kind:x}-{mode}'
@@ -495,7 +502,11 @@ def mutations():
         'psc_complete': (HFI, 'static int\niris_start_output', 'struct iris_reply_wait',
                          '(s->psc_seen & required) != required ||', '', ['psc-missing']),
         'psc_resolution': (HFI, 'static int\niris_start_output', 'struct iris_reply_wait',
-                           's->psc_values[PSC_RES] != ((s->width << 16) | s->height) ||', '', ['psc-resolution']),
+                           '!iris_psc_geometry_ok(s) ||', '', ['psc-resolution', 'psc-coded-mismatch']),
+        'psc_crop_bottom': (HFI, 'static bool\niris_psc_geometry_ok', 'static int\niris_start_output',
+                            'coded_h - s->height != bottom', 'bottom != 0', ['psc-valid-coded']),
+        'psc_reject_close': (HFI, 'int\niris_hfi_session_close', None,
+                             's->psc_rejected && s->error == EOPNOTSUPP', 'false', ['psc-depth-close']),
         'psc_capacity': (HFI, 'static int\niris_start_output', 'struct iris_reply_wait',
                          'count > IRIS_RAW_POOL_MAX ||', '', ['raw-capacity-isolated']),
         'psc_depth': (HFI, 'static int\niris_start_output', 'struct iris_reply_wait',
