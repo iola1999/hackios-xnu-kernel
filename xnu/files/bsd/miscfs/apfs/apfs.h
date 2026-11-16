@@ -5,12 +5,14 @@
  * against real images on the build machine (tools/apfs/run-tests.sh).  This is the layer
  * between that and VFS: a mount, a vnode per object, and the vnode operations.
  *
- * Read only.  Nothing here writes to the device.
+ * A volume mounted without MNT_RDONLY is written through apfs_write.c: one open
+ * transaction, committed by apfs_vfsops_write.inc (struct apfs_wmount).  The system volume
+ * is always mounted read only.
  *
  * apfs_lib keeps a cache of metadata blocks and hands out pointers into it, and its
  * cursors are plain structures with no locking of their own, so every call into it is
- * made with am_lock held.  That makes the whole volume one lock wide, which is enough for
- * a read-only root: the work under the lock is a few block reads, usually from the cache.
+ * made with am_lock held.  Changes take am_rwlock exclusive as well, so that no reader is
+ * inside apfs_lib while a transaction moves the trees under it.
  */
 
 #ifndef _MISCFS_APFS_APFS_H_
@@ -27,6 +29,7 @@
 #define APFS_HASH_BUCKETS 1024
 
 struct apfs_node;
+struct apfs_wmount;
 
 /*
  * What one round of vnop_read reads.  Alone on the volume, am_iobuf_size (boot-arg
@@ -68,6 +71,7 @@ struct apfs_mount {
 	uint32_t           am_devblock;
 	bool               am_owns_devvp;  /* we opened it, so we close it */
 	bool               am_shares_devvp; /* another container of a device one of ours has open: not opened again */
+	int                am_open_mode;    /* FREAD, or FREAD | FWRITE for a writable mount */
 	dev_t              am_rdev;         /* the device, for those other containers to find (apfs_mounts) */
 	struct apfs_mount *am_next;         /* in apfs_mounts */
 	struct apfs_node  *am_hash[APFS_HASH_BUCKETS];
@@ -171,6 +175,7 @@ struct apfs_mount {
 	 */
 	struct apfs_synth *am_synth;        /* APFS_SYNTH_MAX of them, made at the first */
 	uint32_t           am_nsynth;
+	struct apfs_wmount *am_w;           /* a writable mount's transaction; NULL: read only */
 };
 
 /* The private part of a vnode: which object it is. */
@@ -192,12 +197,13 @@ struct apfs_node {
 	 */
 	struct apfs_cfile  an_cf;
 	/*
-	 * The inode record as it was when the vnode was made.  Nothing on this volume can
-	 * change -- the mount is read only and there is no writer anywhere -- so there is
-	 * nothing to invalidate, and a read no longer walks the tree for the record and the
-	 * decmpfs header on every call.
+	 * The inode record, read when the vnode was made, so that a read does not walk the tree
+	 * for the record and the decmpfs header on every call.  On a writable mount every change
+	 * to the object reads it again under the exclusive lock (apfs_node_refresh).
 	 */
 	struct apfs_inode  an_ino;
+	bool               an_orphan;   /* unlinked while open: reaped at vnop_inactive */
+	uint64_t           an_wseq;     /* the commit its last change goes out with (apfs_wcommits) */
 	/*
 	 * A symbolic link's target, read once: every path through the link asks for it again
 	 * (/var, /tmp, /etc -- thousands of times a second after a boot), and it cannot change.
@@ -249,6 +255,22 @@ void apfs_lock_shared(struct apfs_mount *am);
 void apfs_unlock_shared(struct apfs_mount *am);
 void apfs_lock_exclusive(struct apfs_mount *am);
 void apfs_unlock_exclusive(struct apfs_mount *am);
+
+/*
+ * A writable mount (apfs_vfsops_write.inc).  apfs_wtx_of is NULL on a read-only one.  The
+ * _locked calls and apfs_wdirty / apfs_wmap_add want the exclusive lock, apfs_wnote am_lock.
+ */
+struct apfs_wtx *apfs_wtx_of(struct apfs_mount *am);
+daddr64_t apfs_wdevblock(struct apfs_mount *am, uint64_t addr, uint64_t in);
+void apfs_wmap_add(struct apfs_mount *am, uint64_t addr, uint64_t blocks);
+void apfs_wio_start(struct apfs_mount *am, buf_t bp);
+void apfs_wdirty(struct apfs_mount *am);
+void apfs_wnote(struct apfs_mount *am, uint64_t id);
+int  apfs_wcommit_locked(struct apfs_mount *am);
+int  apfs_wcommit(struct apfs_mount *am, bool push);
+int  apfs_wflush(struct apfs_mount *am);         /* F_FULLFSYNC: a commit, or a flush */
+uint64_t apfs_wcommits(struct apfs_mount *am);  /* commits made since the mount */
+int  apfs_wpush_vnode(vnode_t vp, void *wait);   /* a vnode_iterate callback as well */
 
 /* apfs_vnops.c */
 extern const struct vnodeopv_desc apfs_vnodeop_opv_desc;

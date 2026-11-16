@@ -301,19 +301,9 @@ apfs_unlock_exclusive(struct apfs_mount *am)
 	lck_rw_unlock_exclusive(&am->am_rwlock);
 }
 
-/* The inode record of the object a vnode stands for. */
-__unused static int
-apfs_vp_inode(vnode_t vp, struct apfs_inode *ino)
-{
-	struct apfs_node *an = APFS_VP(vp);
-	struct apfs_mount *am = an->an_mount;
-	int error;
-
-	apfs_lock_shared(am);
-	error = apfs_inode_get(&am->am_vol, an->an_id, ino);
-	apfs_unlock_shared(am);
-	return error;
-}
+/* a writable mount's plain files read through the cluster layer (apfs_vnops_write.inc) */
+static int apfs_wread(struct vnop_read_args *ap);
+static int apfs_wpagein(struct vnop_pagein_args *ap);
 
 /* ------------------------------------------------------------------ lookup */
 
@@ -383,12 +373,12 @@ apfs_vnop_lookup(struct vnop_lookup_args *ap)
 	 */
 	if (error == ENOENT && (cnp->cn_flags & ISLASTCN) &&
 	    (cnp->cn_nameiop == CREATE || cnp->cn_nameiop == RENAME)) {
-		return (vfs_flags(vnode_mount(dvp)) & MNT_RDONLY) ? EROFS : ENOENT;
+		return am->am_w == NULL ? EROFS : EJUSTRETURN;
 	}
 	/*
-	 * A name that is not there stays not there (the volume cannot change; a synthetic
-	 * directory added later purges its parent's entries): the name cache says so from now on,
-	 * instead of asking again -- iOS asks for missing files thousands of times after a boot.
+	 * A name that is not there is remembered by the name cache, instead of asked for again --
+	 * iOS asks for missing files thousands of times after a boot.  Whatever adds a name
+	 * purges its directory's entries (a synthetic directory, apfs_vnops_dir.inc).
 	 */
 	if (error == ENOENT && cnp->cn_nameiop == LOOKUP && (cnp->cn_flags & MAKEENTRY)) {
 		cache_enter(dvp, NULLVP, cnp);
@@ -431,7 +421,8 @@ apfs_vnop_getattr(struct vnop_getattr_args *ap)
 	VATTR_RETURN(vap, va_filerev, 0);
 	VATTR_RETURN(vap, va_gen, 0);
 	VATTR_RETURN(vap, va_type, vnode_vtype(vp));
-	VATTR_RETURN(vap, va_dataprotect_class, PROTECTION_CLASS_D);
+	VATTR_RETURN(vap, va_dataprotect_class, ino.pclass != 0 ? ino.pclass : PROTECTION_CLASS_D);
+	VATTR_RETURN(vap, va_document_id, ino.doc_id);
 
 	/* the times are nanoseconds since the Unix epoch */
 	if (VATTR_IS_ACTIVE(vap, va_access_time)) {
@@ -735,6 +726,9 @@ apfs_vnop_read(struct vnop_read_args *ap)
 	if (uio_offset(uio) < 0) {
 		return EINVAL;
 	}
+	if (am->am_w != NULL && !(APFS_VP(vp)->an_ino.bsd_flags & UF_COMPRESSED)) {
+		return apfs_wread(ap);
+	}
 	if (!am->am_ubc_read || !UBCINFOEXISTS(vp)) {
 		return apfs_read_direct(ap);
 	}
@@ -781,6 +775,9 @@ apfs_vnop_pagein(struct vnop_pagein_args *ap)
 
 	if (upl == NULL) {
 		return EINVAL;
+	}
+	if (am->am_w != NULL && !(APFS_VP(vp)->an_ino.bsd_flags & UF_COMPRESSED)) {
+		return apfs_wpagein(ap);
 	}
 	if (offset < 0 || (offset & PAGE_MASK_64) || (ap->a_size & PAGE_MASK) ||
 	    (upl_offset & PAGE_MASK)) {
@@ -1185,6 +1182,12 @@ const struct vnodeopv_entry_desc apfs_vnodeop_entries[] = {
 	{ .opve_op = &vnop_mnomap_desc, .opve_impl = (VOPFUNC)apfs_vnop_mnomap },
 	{ .opve_op = &vnop_pagein_desc, .opve_impl = (VOPFUNC)apfs_vnop_pagein },
 	{ .opve_op = &vnop_pageout_desc, .opve_impl = (VOPFUNC)apfs_vnop_pageout },
+	{ .opve_op = &vnop_blockmap_desc, .opve_impl = (VOPFUNC)apfs_vnop_blockmap },
+	{ .opve_op = &vnop_strategy_desc, .opve_impl = (VOPFUNC)apfs_vnop_strategy },
+	{ .opve_op = &vnop_blktooff_desc, .opve_impl = (VOPFUNC)apfs_vnop_blktooff },
+	{ .opve_op = &vnop_offtoblk_desc, .opve_impl = (VOPFUNC)apfs_vnop_offtoblk },
+	{ .opve_op = &vnop_renamex_desc, .opve_impl = (VOPFUNC)apfs_vnop_renamex },
+	{ .opve_op = &vnop_clonefile_desc, .opve_impl = (VOPFUNC)apfs_vnop_clonefile },
 	{ .opve_op = (struct vnodeop_desc *)NULL, .opve_impl = (VOPFUNC)NULL }
 };
 const struct vnodeopv_desc apfs_vnodeop_opv_desc = {

@@ -210,16 +210,12 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 	am->am_root_id = APFS_ROOT_DIR_INO_NUM;
 
 	vfs_setfsprivate(mp, am);
-	apfs_mount_set_rw_flags(mp, am);
+	vfs_setflags(mp, MNT_LOCAL);
 	vfs_setlocklocal(mp);
+	apfs_wmount_attach(am, dc);
 
 	sp = vfs_statfs(mp);
-	sp->f_bsize = sp->f_iosize = am->am_nx.block_size;
-	sp->f_blocks = annibale_container_total_bytes() / am->am_nx.block_size;
-	sp->f_bfree = sp->f_bavail = annibale_container_free_bytes() / am->am_nx.block_size;
-	sp->f_bused = am->am_vol.alloc_count;
-	sp->f_files = am->am_vol.num_files + am->am_vol.num_dirs;
-	sp->f_ffree = 0;
+	apfs_fill_statfs(am, sp);
 	/* ID-based VFS lookups use fsid.val[0], so each mounted volume needs its own ID. */
 	vfs_getnewfsid(mp);
 	strlcpy(sp->f_fstypename, "apfs", sizeof(sp->f_fstypename));
@@ -272,6 +268,7 @@ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
 	char *path;
 	vnode_t vp = NULLVP;
 	size_t len = 0;
+	int mode = FREAD;
 	uint32_t container = 0;
 	int volume = -1;
 	int error;
@@ -325,7 +322,8 @@ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
 	if (error == 0) {
 		bool shared = false;
 
-		error = VNOP_OPEN(vp, FREAD, ctx);
+		mode = vfs_isrdonly(mp) ? FREAD : FREAD | FWRITE;
+		error = VNOP_OPEN(vp, mode, ctx);
 		if (error == EBUSY && apfs_device_held(vnode_specrdev(vp))) {
 			/*
 			 * Mounted already -- by us, another container of it (the root's RAM disk and the
@@ -344,6 +342,7 @@ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
 			if (error == 0) {
 				APFS_MP(mp)->am_owns_devvp = true;
 				APFS_MP(mp)->am_shares_devvp = shared;
+				APFS_MP(mp)->am_open_mode = mode;
 				/* what mount(8) and df show as where it came from */
 				if (container == 1) {
 					strlcpy(vfs_statfs(mp)->f_mntfromname, "/dev/disk2s1", MAXPATHLEN);
@@ -361,7 +360,7 @@ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
 					snprintf(vfs_statfs(mp)->f_mntfromname, MAXPATHLEN, "%s%s", path, opts);
 				}
 			} else if (!shared) {
-				(void)VNOP_CLOSE(vp, FREAD, ctx);
+				(void)VNOP_CLOSE(vp, mode, ctx);
 			}
 		}
 		if (error != 0)
@@ -382,6 +381,10 @@ apfs_unmount(mount_t mp, int mntflags, vfs_context_t ctx)
 	if (error) {
 		return error;
 	}
+	error = apfs_wmount_detach(am);
+	if (error) {
+		printf("apfs: unmount of \"%s\": the last commit failed (%d)\n", am->am_vol.name, error);
+	}
 	if (apfs_the_mount == am) {
 		apfs_the_mount = NULL;
 	}
@@ -396,7 +399,7 @@ apfs_unmount(mount_t mp, int mntflags, vfs_context_t ctx)
 	vfs_setfsprivate(mp, NULL);
 	if (am->am_owns_devvp && am->am_devvp != NULLVP) {
 		if (!am->am_shares_devvp) {
-			(void)VNOP_CLOSE(am->am_devvp, FREAD, ctx);
+			(void)VNOP_CLOSE(am->am_devvp, am->am_open_mode, ctx);
 		}
 		vnode_put(am->am_devvp);
 	}

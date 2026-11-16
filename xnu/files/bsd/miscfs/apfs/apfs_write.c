@@ -1,81 +1,23 @@
 /*
- * Writing into APFS: the contents of an existing file, in place.
+ * Writing into APFS.  Two writers live here.
  *
- * The driver beside this file reads APFS and writes existing file blocks in place.
+ * The transaction engine (apfs_wbt.inc, apfs_wspace.inc, apfs_wtx.inc, apfs_wfs.inc,
+ * apfs_wops.inc, apfs_wxattr.inc, apfs_wclone.inc; the model is in apfs_wtx.h) is what a
+ * writable mount uses: copy-on-write B-trees, the space manager, the object maps and the
+ * checkpoint rings, with one open transaction made durable by apfs_wtx_commit().  The kernel's
+ * vnode layer (apfs_vnops_write.inc) and the host tool (tools/apfs, `apfs-tool do`) call it
+ * through apfs_write.h.
  *
- * What a write has to touch, and in what order
- * -------------------------------------------
- * APFS never overwrites a structure it has published.  A change is a transaction: fresh copies
- * of everything from the changed record up to the container superblock, written into free
- * space, and then one block -- a new container superblock in the checkpoint descriptor ring,
- * with a transaction identifier one larger -- that makes all of them live at once.  For a
- * single record of a single file that is, from the bottom up:
+ * apfs_write_in_place() below is older and much narrower: it replaces bytes inside a file that
+ * already exists without changing its length, its extents or any other structure, so no
+ * transaction is involved.  A power failure can leave a mixture of the old and new contents of
+ * that file and nothing else; every tree and checksum stays as it was.  Used by apfs_check=7
+ * (bsd/dev/annibale/annibale_apfs_check.c) and `apfs-tool write`.
  *
- *   1. the data blocks of the file                     (not in any tree; this file writes these)
- *   2. the leaf of the file-system tree holding the record, and every node above it to the root
- *      (apfs_btree_node_phys, virtual objects: a new block each)
- *   3. a new entry per new node in the volume's object map, keyed (oid, xid)  (apfs_omap_*)
- *      -- which is itself a B-tree of physical nodes, so its own path to the root as well
- *   4. the extent-reference tree, if the set of physical extents changed  (apfs_j_phys_ext_val)
- *   5. a new copy of the volume superblock, and an entry for it in the container's object map
- *      (apfs_superblock, apfs_omap_phys at nx_omap_oid)
- *   6. the space manager, for every block allocated and freed above: the chunk bitmaps
- *      (APFS_OBJECT_TYPE_SPACEMAN_BITMAP) in the internal pool, the chunk-info blocks that
- *      count their free blocks, the totals in the space manager itself, and the two free
- *      queues that hold freed blocks until no older checkpoint can want them
- *   7. the ephemeral objects -- the space manager and the reaper -- copied into the checkpoint
- *      data ring, and a checkpoint map (apfs_checkpoint_map_phys) in the descriptor ring that
- *      says where in the ring each of them landed
- *   8. the container superblock (apfs_nx_superblock) last, into the next block of the
- *      descriptor ring, with nx_next_xid raised and its Fletcher-64 covering the lot
+ * What the in-place writer refuses.  Every one of these is read off the volume before a byte
+ * goes out:
  *
- * Step 8 is the commit, and it is a commit because of how the reader finds the container:
- * apfs_nx_open() scans the whole descriptor ring and takes the superblock with the largest
- * transaction identifier that passes its checksum, passing over without a word anything that
- * does not (apfs_lib.c).  So up to and including a torn step 8 the previous checkpoint is still
- * the live one and nothing of steps 1-7 is reachable; after an intact step 8 all of it is.
- * That is the whole of APFS's crash safety and it is cheap -- but only if every one of steps
- * 1-7 went to blocks that the previous checkpoint does not use, which is what the space
- * manager is for, and the space manager is the part of APFS this driver does not model at all.
- *
- * What the reader here already understands, and what it does not
- * -------------------------------------------------------------
- * Understood: the object header and its Fletcher-64; the descriptor ring and picking the live
- * superblock out of it; both object maps, looked up by (oid, xid); B-tree nodes of every shape
- * the volumes use (virtual and physical children, fixed and variable key/value sizes, sealed
- * nodes with hashes); the file-system tree's records -- inodes, directory records, attributes,
- * data streams, file extents; the separate extent tree of a sealed volume; holes; and the
- * contents of compressed files.
- *
- * Not modelled, not even as a structure definition: the space manager and every part of it
- * (chunk bitmaps, chunk-info blocks and their blocks, the internal pool and its ring of bitmap
- * copies, the free queues) -- the word appears in apfs_format.h twice, both times as an object
- * type constant; the checkpoint data ring; the checkpoint map, which the header says outright
- * is skipped because only the space manager needs it; the snapshot metadata tree; the integrity
- * metadata and per-file hashes of a sealed volume.  Also absent is any notion of a dirty object,
- * an allocation, or a transaction: nothing in apfs_lib.c holds a block to be written later.
- *
- * So the smallest change to one metadata record needs the space manager, the checkpoint rings
- * and a transaction, which is most of a writable APFS.  That is the honest cost, and it is why
- * this file does something else.
- *
- * What this file does
- * -------------------
- * It replaces bytes inside a file that already exists, without changing its length, its extents
- * or any other structure.  Nothing in steps 2-8 above happens, because nothing in them has
- * anything to say about the bytes in a data block: the only blocks written are blocks that the
- * file's own extent records, and the extent-reference tree, both say belong to that one file.
- *
- * It is therefore safe against a power failure in the strong sense, and not by being atomic:
- * every structure of the container is exactly as it was, so the volume mounts, every tree and
- * every checksum still checks, and every other file is byte for byte what it was.  The one
- * thing a failure can leave behind is a mixture of the old and the new contents of the file
- * being written -- which is a loss the caller is in a position to notice and handle with
- * two slots and a checksum written last.
- *
- * What it refuses, and why.  Every one of these is read off the volume before a byte goes out:
- *
- *   the device cannot write                 dev.write is NULL, as it is at every mount
+ *   the device cannot write                 dev.write is NULL
  *   a sealed volume                         its integrity metadata holds a hash of each file's
  *                                           contents, and we do not update them
  *   a volume with snapshots                 a snapshot refers to these very blocks
@@ -84,33 +26,33 @@
  *   a compressed file                       its bytes are in an attribute or a resource fork,
  *                                           and its decmpfs header states the size
  *   past the end of the file                a write that grows a file changes its records
- *   a hole in the range                     filling one means allocating, which means step 6
+ *   a hole in the range                     filling one means allocating
  *   an extent whose extent-reference record does not begin at the same block, does not cover
  *       the whole extent, is not owned by this stream, or has more than one reference
  *                                           -- a clone, a snapshot or a tree we misread
  *   a block outside the container, or inside block zero, the checkpoint rings or the container's
  *       object map                          -- the bound that holds even if a tree was misread
  *
- * The bounds are deliberately three deep, after the fashion of the writes into the phone's
- * flash (bsd/dev/annibale_ufs.c): the file's own extents say which blocks are its contents, the
+ * The bounds are three deep, after the fashion of the writes into the phone's flash
+ * (bsd/dev/annibale_ufs.c): the file's own extents say which blocks are its contents, the
  * extent-reference tree says the same blocks are that stream's and nobody else's, and a plain
  * range check refuses anything near the container's own structures whatever the trees said.
- * Then every block is read back and compared before the next one goes out.
- *
- * What is left out that a filesystem would do: the file's modification time is not touched (a
- * stale mtime is a lie, but not damage, and setting it is a transaction), and in the kernel the
- * pages of the file in the unified buffer cache would have to be invalidated by the caller --
- * there is no caller in the kernel yet, which is why that is not done here.
+ * Then every block is read back and compared before the next one goes out.  The file's
+ * modification time is not touched, and the caller invalidates any cached pages of the file.
  */
 
 #include "apfs_write.h"
+#include "apfs_wtx.h"
+#ifdef KERNEL
+#include <kern/qsort.h>
+#endif
 
 /* ------------------------------------------------------------------ little-endian helpers */
 
 static inline uint16_t
 w_le16(const uint8_t *p)
 {
-	return (uint16_t)p[0] | (uint16_t)p[1] << 8;
+	return (uint16_t)(p[0] | p[1] << 8);
 }
 
 static inline uint32_t
@@ -146,17 +88,6 @@ w_put_le64(uint8_t *p, uint64_t v)
 {
 	w_put_le32(p, (uint32_t)v);
 	w_put_le32(p + 4, (uint32_t)(v >> 32));
-}
-
-static inline void
-w_seal_obj(uint8_t *blk, uint32_t bs, uint64_t oid, uint64_t xid, uint32_t otype, uint32_t subtype)
-{
-	w_put_le64(blk + 8, oid);
-	w_put_le64(blk + 16, xid);
-	w_put_le32(blk + 24, otype);
-	w_put_le32(blk + 28, subtype);
-	uint64_t cksum = apfs_fletcher64(blk + 8, bs - 8);
-	w_put_le64(blk, cksum);
 }
 
 static inline void
@@ -508,7 +439,10 @@ out:
 }
 
 
-#include "apfs_txn.inc"
-#include "apfs_write_ops.inc"
-#include "apfs_write_ops_dir.inc"
-#include "apfs_write_ops_xattr.inc"
+#include "apfs_wbt.inc"
+#include "apfs_wspace.inc"
+#include "apfs_wtx.inc"
+#include "apfs_wfs.inc"
+#include "apfs_wops.inc"
+#include "apfs_wxattr.inc"
+#include "apfs_wclone.inc"

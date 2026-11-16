@@ -48,6 +48,20 @@ apfs_ticks(void)
 }
 #endif
 
+/* Wall-clock time in nanoseconds since 1970, the unit of every APFS timestamp. */
+#ifdef KERNEL
+uint64_t apfs_now_ns(void);
+#else
+static inline uint64_t
+apfs_now_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_REALTIME, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+#endif
+
 #ifdef KERNEL
 #include <sys/param.h>
 #include <sys/errno.h>
@@ -95,10 +109,10 @@ apfs_ticks(void)
  * NULL: read() is used for those too (still without the lock, so read() must then be safe
  * that way as well).
  *
- * write() is for apfs_write.c and nothing else: whole blocks, and only ever blocks that
- * hold the contents of one file (apfs_write_in_place).  A device that leaves it NULL -- as
- * every mount of this driver does -- cannot be written to at all, which is what it was
- * before this field existed.
+ * write() is for the writing code (apfs_write.c) and nothing else: whole blocks.  A device
+ * that leaves it NULL cannot be written to at all.  flush() makes everything write() has
+ * returned for durable (the storage's own cache included); NULL when the device has no
+ * volatile cache to empty.
  */
 struct apfs_dev {
 	void     *ctx;
@@ -106,6 +120,7 @@ struct apfs_dev {
 	int     (*read)(void *ctx, uint64_t off, void *buf, size_t len);
 	int     (*read_data)(void *ctx, uint64_t off, void *buf, size_t len);
 	int     (*write)(void *ctx, uint64_t off, const void *buf, size_t len);
+	int     (*flush)(void *ctx);
 };
 
 /* A cached block's memory, given up while somebody may still be reading it (nx->retired) */
@@ -287,6 +302,18 @@ struct apfs_nx {
 	uint64_t          ra_batches, ra_pieces, ra_hits;  /* read-ahead: filled, and used */
 	struct apfs_omap_hit *omap_cache;       /* APFS_OMAP_CACHE of them, or NULL */
 	uint64_t          omap_hits, omap_misses;
+	/*
+	 * A transaction being built (apfs_write.c).  Its changed metadata blocks are found
+	 * through overlay() before the cache and the device, at addresses no committed
+	 * checkpoint uses; view_xid is the transaction's identifier, so that object-map
+	 * entries it added are found too (0: nx->xid).  While writable is set, a metadata
+	 * read never lets the caller's lock go: another operation must not run against a
+	 * half-changed tree.
+	 */
+	const uint8_t   *(*overlay)(void *ctx, uint64_t addr);
+	void             *overlay_ctx;
+	apfs_xid_t        view_xid;
+	bool              writable;
 };
 
 /* A volume inside the container. */
@@ -381,6 +408,9 @@ struct apfs_inode {
 	uint64_t size;                  /* the logical size, what stat reports */
 	uint64_t alloced_size;
 	uint32_t rdev;
+	uint32_t pclass;                /* the data protection class it was made with */
+	uint32_t write_gen;
+	uint32_t doc_id;                /* 0: none */
 	bool     has_dstream;
 	bool     is_sparse;
 };
@@ -464,10 +494,20 @@ int apfs_nx_open(struct apfs_nx *nx, const struct apfs_dev *dev);
 void apfs_nx_close(struct apfs_nx *nx);
 /* The hash APFS keeps with a name in its directory record (22 bits); false: the name cannot be hashed */
 bool apfs_name_hash(const char *name, size_t name_len, bool fold, uint32_t *hash);
+/* Whether two names are the same name on a volume (normalization, and case when fold) */
+bool apfs_names_equal(const char *a, size_t a_len, const char *b, size_t b_len, bool fold);
 /* Free the retired blocks' memory no operation that began at `oldest` or later can see (lock held) */
 void apfs_nx_reclaim(struct apfs_nx *nx, uint64_t oldest);
 /* Flush every cached block out (retired, with a caller's lock), so all is read again */
 void apfs_nx_cache_flush(struct apfs_nx *nx);
+/* A metadata block through the overlay and the cache; valid until the next block is fetched */
+int apfs_meta_block(struct apfs_nx *nx, uint64_t addr, const uint8_t **out);
+/* Drop the cached copy of a block that has been rewritten */
+void apfs_nx_cache_forget(struct apfs_nx *nx, uint64_t addr);
+/* Drop the cached object-map hit for one object of a map (its current root) */
+void apfs_omap_cache_forget(struct apfs_omap *omap, uint64_t oid);
+/* Drop every cached object-map hit */
+void apfs_omap_cache_clear(struct apfs_nx *nx);
 #ifndef KERNEL
 /* Every directory record of the volume, with the hash stored in its key (hashed keys only) */
 int apfs_dirrec_walk(struct apfs_vol *vol, int (*cb)(void *ctx, uint64_t dir_id, const char *name,

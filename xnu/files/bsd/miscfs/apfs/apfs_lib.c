@@ -374,6 +374,9 @@ nx_block(struct apfs_nx *nx, uint64_t addr, const uint8_t **out, bool verify)
 	if (addr > nx->max_addr) {
 		nx->max_addr = addr;
 	}
+	if (nx->overlay != NULL && (*out = nx->overlay(nx->overlay_ctx, addr)) != NULL) {
+		return 0;               /* changed by the open transaction (apfs_wtx.inc) */
+	}
 	b = cache_find(nx, addr);
 	if (b != NULL) {
 		if (verify && !b->checked) {
@@ -393,7 +396,7 @@ nx_block(struct apfs_nx *nx, uint64_t addr, const uint8_t **out, bool verify)
 		*out = b->data;
 		return 0;
 	}
-	if (nx->unlock != NULL && nx->dev.read_data != NULL && !nx->cheap_requests) {
+	if (nx->unlock != NULL && nx->dev.read_data != NULL && !nx->cheap_requests && !nx->writable) {
 		return nx_block_unlocked(nx, addr, out, verify);
 	}
 	victim = cache_victim(nx);
@@ -791,7 +794,7 @@ tree_node_addr(struct apfs_btree *tree, uint64_t oid, uint64_t *addr)
 		*addr = oid;
 		return 0;
 	}
-	return omap_find(tree->omap, oid, tree->nx->xid, addr);
+	return omap_find(tree->omap, oid, tree->nx->view_xid ? tree->nx->view_xid : tree->nx->xid, addr);
 }
 
 /* Read a tree's root and remember what its btree_info says about the whole tree. */
@@ -1505,7 +1508,7 @@ apfs_inode_get(struct apfs_vol *vol, uint64_t obj_id, struct apfs_inode *ino)
 	struct apfs_cursor cur;
 	struct apfs_rec rec;
 	const uint8_t *xf;
-	uint16_t xf_len;
+	uint16_t xf_len, xl;
 	int error;
 
 	memset(ino, 0, sizeof(*ino));
@@ -1523,6 +1526,7 @@ apfs_inode_get(struct apfs_vol *vol, uint64_t obj_id, struct apfs_inode *ino)
 	if (rec.val == NULL || rec.val_len < 92) {
 		return EIO;
 	}
+	xl = (uint16_t)(rec.val_len - 92);
 	ino->obj_id = obj_id;
 	ino->parent_id = le64(rec.val);
 	ino->private_id = le64(rec.val + 8);
@@ -1537,21 +1541,19 @@ apfs_inode_get(struct apfs_vol *vol, uint64_t obj_id, struct apfs_inode *ino)
 	ino->group = le32(rec.val + 76);
 	ino->mode = le16(rec.val + 80);
 	ino->is_sparse = (ino->internal_flags & APFS_INODE_IS_SPARSE) != 0;
-
+	ino->pclass = le32(rec.val + 60);
+	ino->write_gen = le32(rec.val + 64);
 	/* the size of the contents is in an extended field, not in the fixed part */
-	xf = rec.val + 92;
-	xf_len = (uint16_t)(rec.val_len - 92);
-	if (apfs_xfields_find(xf, xf_len, APFS_INO_EXT_TYPE_DSTREAM, &xf, &xf_len) == 0 &&
-	    xf_len >= 16) {
+	if (apfs_xfields_find(rec.val + 92, xl, APFS_INO_EXT_TYPE_DSTREAM, &xf, &xf_len) == 0 && xf_len >= 16) {
 		ino->size = le64(xf);
 		ino->alloced_size = le64(xf + 8);
 		ino->has_dstream = true;
 	}
-	xf = rec.val + 92;
-	xf_len = (uint16_t)(rec.val_len - 92);
-	if (apfs_xfields_find(xf, xf_len, APFS_INO_EXT_TYPE_RDEV, &xf, &xf_len) == 0 &&
-	    xf_len >= 4) {
+	if (apfs_xfields_find(rec.val + 92, xl, APFS_INO_EXT_TYPE_RDEV, &xf, &xf_len) == 0 && xf_len >= 4) {
 		ino->rdev = le32(xf);
+	}
+	if (apfs_xfields_find(rec.val + 92, xl, APFS_INO_EXT_TYPE_DOCUMENT_ID, &xf, &xf_len) == 0 && xf_len >= 4) {
+		ino->doc_id = le32(xf);
 	}
 	return 0;
 }

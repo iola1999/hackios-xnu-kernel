@@ -29,8 +29,9 @@
 
 static LCK_GRP_DECLARE(apfs_lck_grp, "apfs");
 
-/* Blocks are read from the device in pieces of this size. */
+/* Blocks are read from the device in pieces of this size; data, in requests of at most APFS_DATA_MAX. */
 #define APFS_META_CHUNK 4096
+#define APFS_DATA_MAX   (128 * 1024)
 
 /*
  * The device, as apfs_lib wants it.  Offsets and lengths are whole container blocks, and
@@ -79,7 +80,6 @@ apfs_dev_read(void *ctx, uint64_t off, void *buf, size_t len)
 	}
 	return 0;
 }
-#include "apfs_vfsops_write.inc"
 /*
  * A file's contents, straight into the caller's memory: one buffer header of our own and
  * one VNOP_STRATEGY a request, past the buffer cache.  apfs_lib calls this without the
@@ -603,7 +603,7 @@ apfs_node_vnode(struct apfs_mount *am, uint64_t obj_id, vnode_t dvp,
 	an->an_parent = ino.parent_id;
 	an->an_mode = ino.mode;
 	an->an_size = size;
-	an->an_ino = ino;       /* nothing here can change: the mount is read only */
+	an->an_ino = ino;
 	lck_rw_init(&an->an_rwlock, &apfs_lck_grp, LCK_ATTR_NULL);
 
 	bzero(&vfsp, sizeof(vfsp));
@@ -628,7 +628,19 @@ apfs_node_vnode(struct apfs_mount *am, uint64_t obj_id, vnode_t dvp,
 	}
 	vnode_settag(an->an_vp, VT_OTHER);
 
+	/*
+	 * Another thread may have made a vnode for the object meanwhile.  Two of them would mean
+	 * two page caches for one file, so the later one is thrown away and the search starts over.
+	 */
 	apfs_lock(am);
+	for (struct apfs_node *o = am->am_hash[b]; o != NULL; o = o->an_next) {
+		if (o->an_id == obj_id && o->an_attached) {
+			apfs_unlock(am);
+			vnode_recycle(an->an_vp);
+			vnode_put(an->an_vp);
+			return apfs_node_vnode(am, obj_id, dvp, cnp, vpp);
+		}
+	}
 	an->an_next = am->am_hash[b];
 	am->am_hash[b] = an;
 	an->an_attached = true;
@@ -989,5 +1001,6 @@ apfs_pool_start(void)
 
 /* ------------------------------------------------------------------ mount & vfsops */
 
+#include "apfs_vfsops_write.inc"
 #include "apfs_vfsops_mount.inc"
 #include "apfs_vfsops_sync.inc"
