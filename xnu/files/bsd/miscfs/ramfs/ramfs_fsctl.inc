@@ -125,13 +125,7 @@ ramfs_ioctl(struct vnop_ioctl_args *ap)
 		return ramfs_cas_bsdflags(RAMFS_NODE(ap->a_vp), (struct fsioc_cas_bsdflags *)ap->a_data);
 	}
 	if (ap->a_command == F_FULLFSYNC || ap->a_command == 85 /* F_BARRIERFSYNC */) {
-		struct ramfs_node *node = RAMFS_NODE(ap->a_vp);
-		int error = ramfs_sync_mapping(ap->a_vp, node);
-
-		if (error) {
-			return error;
-		}
-		return ramfs_disk_sync(node->rn_mount);
+		return ramfs_sync_mapping(ap->a_vp, RAMFS_NODE(ap->a_vp));
 	}
 	if (ap->a_command == RAMFS_APFSIOC_MARK_PURGEABLE || ap->a_command == RAMFS_APFSIOC_MAINTAIN_DIR_STATS) {
 		return 0;
@@ -142,15 +136,5 @@ ramfs_ioctl(struct vnop_ioctl_args *ap)
 static int
 ramfs_fsync(struct vnop_fsync_args *ap)
 {
-	struct ramfs_node *node = RAMFS_NODE(ap->a_vp);
-	struct ramfs_mount *rm = node->rn_mount;
-	int error = ramfs_sync_mapping(ap->a_vp, node);
-
-	if (error) {
-		return error;
-	}
-	if (rm != NULL && node->rn_ino == RAMFS_ROOT_INO && !rm->rm_seed_done) {
-		ramfs_disk_mark_seed_done(rm);
-	}
-	return ramfs_disk_sync(rm);
+	return ramfs_sync_mapping(ap->a_vp, RAMFS_NODE(ap->a_vp));
 }

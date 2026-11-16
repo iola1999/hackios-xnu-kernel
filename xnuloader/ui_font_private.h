@@ -573,7 +573,7 @@ static const struct ui_boot_milestone ui_boot_milestones[] = {
 	{ "adreno8: step 6:",                    58, "Adreno 830 GPU: starting GMU & clocks...",         0 },
 	{ "adreno8: step 14:",                   64, "Adreno 830 GPU: configuring SMMU & pagetables...", 0 },
 	{ "adreno8: step 20:",                   70, "Adreno 830 GPU: booting CP & preemption rings...", 0 },
-	{ "ramfs: loaded /private/var",          75, "Mounting persistent /private/var (ANNFS001)...",   0 },
+	{ "mounted the APFS data volume on /private/var", 75, "Mounting persistent /private/var (APFS)...", 0 },
 	{ "aadsp: SM8750 LPASS",                 80, "Starting SM8750 LPASS audio & Bluetooth...",       0 },
 	{ "devfs is mounted on /dev",            84, "Populating /dev nodes & preflight checks...",      0 },
 	{ "libignition:",                        87, "Mounting APFS System volume & Cryptex...",         0 },

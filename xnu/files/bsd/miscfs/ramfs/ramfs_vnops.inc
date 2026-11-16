@@ -370,7 +370,6 @@ ramfs_setattr(struct vnop_setattr_args *ap)
 	if (VATTR_IS_ACTIVE(vap, va_change_time)) {
 		node->rn_ctime = vap->va_change_time;
 		VATTR_SET_SUPPORTED(vap, va_change_time);
-		ramfs_disk_dirty_locked(rm);
 	} else {
 		ramfs_touch(node, false);
 	}
@@ -472,16 +471,11 @@ ramfs_write(struct vnop_write_args *ap)
 		ramfs_reserve_slots(rm, node, off / PAGE_SIZE);
 		lck_mtx_lock(&rm->rm_lock);
 		error = ramfs_store(node, off, bounce, len, &spare);
+		lck_mtx_unlock(&rm->rm_lock);
 		if (error) {
-			lck_mtx_unlock(&rm->rm_lock);
 			/* nothing of this piece was stored: hand it back to the caller's count */
 			uio_setoffset(uio, (off_t)off);
 			uio_setresid(uio, uio_resid(uio) + (user_ssize_t)len);
-			break;
-		}
-		error = ramfs_store_write_locked(node, off / PAGE_SIZE);
-		lck_mtx_unlock(&rm->rm_lock);
-		if (error) {
 			break;
 		}
 	}
@@ -779,9 +773,6 @@ ramfs_pageout(struct vnop_pageout_args *ap)
 		    (size_t)MIN((uint64_t)PAGE_SIZE, node->rn_size - (off + done)) : 0;
 		if (len != 0) {
 			error = ramfs_store(node, off + done, (const void *)(addr + done), len, &spare);
-			if (!error) {
-				error = ramfs_store_write_locked(node, index);
-			}
 		}
 		lck_mtx_unlock(&rm->rm_lock);
 		if (spare != NULL) {

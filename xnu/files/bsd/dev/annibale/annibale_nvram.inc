@@ -8,22 +8,19 @@
  *   +16 MiB   the panic log, at most 16 MiB (struct var_klog_head, then the text; written by
  *             osfmk/arm64/loader_return.c, read back through kern.annibale.panic_log)
  *
- * Without darwin_nvram, NVRAM lasts one run. A darwin_var still in ANNFS001
- * (bsd/miscfs/ramfs/ramfs_disk.inc) then keeps the panic log at 64 MiB and the backlight setting
- * in its superblock, and its mount reads them back; an APFS darwin_var keeps neither. Which file
- * system darwin_var holds, its block 0 says (an APFS container superblock has "NXSB" at byte 32),
- * read once at the end of the driver's start.
+ * Without darwin_nvram, NVRAM lasts one run and panic logs are not persisted across reboots.
+ * Block 0 of darwin_var is probed once at startup to confirm it holds an APFS container
+ * ("NXSB" at byte 32).
  */
 
 #define NVRAM_BANKS_MAX      (16ULL << 20)  /* the banks stay below the panic log */
 #define NVRAM_KLOG_AT        (16ULL << 20)
 #define NVRAM_KLOG_MAX       (16ULL << 20)
-#define VAR_ANNFS_KLOG_AT    (64ULL << 20)
 #define VAR_KLOG_MAGIC       0x474f4c4bU    /* 'KLOG' */
 #define VAR_KLOG_ARCHIVED    0x474f4c44U    /* 'DLOG' */
 #define VAR_KLOG_VERSION     1U
 
-/* as in loader_return.c and ramfs_disk.inc */
+/* as in loader_return.c */
 struct var_klog_head {
 	uint32_t magic;
 	uint32_t version;
@@ -51,32 +48,24 @@ var_probe(void)
 	if (ufs_read((uint32_t)ufs_darwin_var_part, 0, blk, 4096) == 0) {
 		var_apfs = memcmp(blk + 32, "NXSB", 4) == 0;
 		var_probed = true;
-		printf("ufs: darwin_var is %s; %s\n", var_apfs ? "an APFS container" : "not APFS (ANNFS001)",
+		printf("ufs: darwin_var is %s; %s\n",
+		    var_apfs ? "an APFS container" : "not an APFS container (run tools/apfs/annfs-to-apfs.py)",
 		    ufs_darwin_nvram_part >= 0 ? "darwin_nvram keeps NVRAM and the panic log" :
-		    var_apfs ? "no darwin_nvram: NVRAM and panic logs are not kept" :
-		    "no darwin_nvram: ANNFS001 keeps the panic log and the backlight setting");
+		    "no darwin_nvram: NVRAM and panic logs are not kept");
 	}
 	kfree_data(blk, 4096);
 }
 
-/* Where the panic log is: its partition and its offset there; false while that is not known. */
+/* Where the panic log is: its partition and its offset there; false without darwin_nvram. */
 static bool
 klog_place(uint32_t *part, uint64_t *at)
 {
-	if (!ufs_ready) {
+	if (!ufs_ready || ufs_darwin_nvram_part < 0) {
 		return false;
 	}
-	if (ufs_darwin_nvram_part >= 0) {
-		*part = (uint32_t)ufs_darwin_nvram_part;
-		*at = NVRAM_KLOG_AT;
-		return true;
-	}
-	if (var_probed && !var_apfs && ufs_darwin_var_part >= 0) {
-		*part = (uint32_t)ufs_darwin_var_part;
-		*at = VAR_ANNFS_KLOG_AT;
-		return true;
-	}
-	return false;
+	*part = (uint32_t)ufs_darwin_nvram_part;
+	*at = NVRAM_KLOG_AT;
+	return true;
 }
 
 /* loader_return.c: a panic log (struct var_klog_head and the text, whole blocks); polled with interrupts off. */
@@ -144,9 +133,8 @@ annibale_nvram_flush(void)
 /* ---- the panic log of the run before, for init to keep in /private/var/db/panic.log ---- */
 
 /*
- * kern.annibale.panic_log: reading gives the text of a panic log not yet kept (nothing if there
- * is none, or it is ANNFS001's at 64 MiB, which its mount keeps itself); writing anything marks
- * it kept.
+ * kern.annibale.panic_log: reading gives the text of a panic log not yet kept in darwin_nvram;
+ * writing anything marks it kept.
  */
 static int
 sysctl_var_panic_log SYSCTL_HANDLER_ARGS
@@ -158,7 +146,7 @@ sysctl_var_panic_log SYSCTL_HANDLER_ARGS
 	uint8_t *buf;
 	int error;
 
-	if (!klog_place(&part, &at) || (int)part == ufs_darwin_var_part) {
+	if (!klog_place(&part, &at)) {
 		return SYSCTL_OUT(req, NULL, 0);
 	}
 	buf = kalloc_data(4096, Z_WAITOK);

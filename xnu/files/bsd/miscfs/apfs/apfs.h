@@ -287,7 +287,4 @@ int  apfs_wpush_vnode(vnode_t vp, void *wait);   /* a vnode_iterate callback as 
 extern const struct vnodeopv_desc apfs_vnodeop_opv_desc;
 extern int (**apfs_vnodeop_p)(void *);
 
-uint64_t annibale_container_total_bytes(void);
-uint64_t annibale_container_free_bytes(void);
-
 #endif /* _MISCFS_APFS_APFS_H_ */

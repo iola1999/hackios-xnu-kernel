@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile production vnode operations with failing mapped-page and metadata I/O."""
+"""Compile production ramfs vnode operations with failing mapped-page sync."""
 from pathlib import Path
 import subprocess
 import tempfile
@@ -44,7 +44,7 @@ source = r'''
 struct fsioc_cas_bsdflags { uint32_t expected_flags, new_flags, actual_flags; };
 typedef int64_t user_ssize_t;
 enum vtype { VREG, VDIR };
-struct ramfs_mount { int rm_lock; bool rm_seed_done; };
+struct ramfs_mount { int rm_lock; };
 struct ramfs_node {
     struct ramfs_mount *rn_mount;
     enum vtype rn_type;
@@ -76,18 +76,14 @@ struct vnop_read_args { vnode_t a_vp; struct uio *a_uio; };
 struct vnop_write_args { vnode_t a_vp; struct uio *a_uio; int a_ioflag; };
 struct vnop_ioctl_args { vnode_t a_vp; unsigned long a_command; void *a_data; };
 struct vnop_fsync_args { vnode_t a_vp; };
-static int mapped_error, metadata_error;
-static unsigned mapped_calls, metadata_calls, changes, allocations;
+static int mapped_error;
+static unsigned mapped_calls, changes, allocations;
 static off_t ubc_getsize(vnode_t vp) { return (off_t)vp->rn_size; }
 static int ubc_msync(vnode_t vp, off_t begin, off_t end, void *resid, int flags) {
     assert(begin == 0 && end == (off_t)vp->rn_size && resid == NULL);
     assert(flags == (UBC_PUSHDIRTY | UBC_SYNC));
     mapped_calls++; return mapped_error;
 }
-static int ramfs_disk_sync(struct ramfs_mount *rm) {
-    assert(rm); metadata_calls++; return metadata_error;
-}
-static void ramfs_disk_mark_seed_done(struct ramfs_mount *rm) { rm->rm_seed_done = true; changes++; }
 #define lck_mtx_lock(p) ((void)(p))
 #define lck_mtx_unlock(p) ((void)(p))
 static void *page_alloc(void) { void *p = calloc(1, PAGE_SIZE); assert(p); allocations++; return p; }
@@ -111,7 +107,6 @@ static void ramfs_touch(struct ramfs_node *node, bool data) { (void)node; (void)
 static void ramfs_track(struct ramfs_node *node) { (void)node; }
 static vnode_t vnode_getparent(vnode_t vp) { (void)vp; return NULLVP; }
 static void vnode_put(vnode_t vp) { (void)vp; }
-static void ramfs_disk_dirty_locked(struct ramfs_mount *rm) { (void)rm; changes++; }
 static int ubc_setsize(vnode_t vp, off_t size) { assert(size == (off_t)vp->rn_size); return 0; }
 static bool ubc_pages_resident(vnode_t vp) { (void)vp; return false; }
 static void ramfs_refresh_cache(vnode_t vp, struct ramfs_node *n, uint64_t a, uint64_t b) {
@@ -130,9 +125,6 @@ static int ramfs_store(struct ramfs_node *n, uint64_t off, const void *data, siz
     if (off + len > n->rn_size) n->rn_size = off + len;
     changes++; return 0;
 }
-static int ramfs_store_write_locked(struct ramfs_node *n, uint64_t index) {
-    (void)n; assert(index == 0); return 0;
-}
 '''
 source += function((SRC / 'ramfs.c').read_text(), 'ramfs_sync_mapping')
 vnops = (SRC / 'ramfs_vnops.inc').read_text()
@@ -141,7 +133,7 @@ for name in ('ramfs_setattr', 'ramfs_read', 'ramfs_write'):
 source += (SRC / 'ramfs_fsctl.inc').read_text().replace('#include <sys/fsctl.h>\n', '')
 source += r'''
 static void exercise(unsigned operation, int error, bool mapped) {
-    struct ramfs_mount rm = { .rm_seed_done = true };
+    struct ramfs_mount rm = { 0 };
     struct ramfs_node node = {
         .rn_mount = &rm, .rn_type = VREG, .rn_ino = 3, .rn_size = 4,
         .rn_mapped_write = mapped, .data = "old!"
@@ -156,8 +148,8 @@ static void exercise(unsigned operation, int error, bool mapped) {
     struct vnop_write_args write = { &node, &uio, 0 };
     struct vnop_fsync_args fsync = { &node };
     struct vnop_ioctl_args ioctl = { &node, operation == 4 ? F_FULLFSYNC : 85 };
-    mapped_error = error; metadata_error = 0;
-    mapped_calls = metadata_calls = changes = 0;
+    mapped_error = error;
+    mapped_calls = changes = 0;
     int result;
     switch (operation) {
     case 0: result = ramfs_setattr(&set); break;
@@ -172,16 +164,11 @@ static void exercise(unsigned operation, int error, bool mapped) {
         assert(memcmp(&node, &original, sizeof(node)) == 0);
         assert(memcmp(data, original_data, sizeof(data)) == 0);
         assert(uio.offset == 0 && uio.resid == 4 && attr.supported == 0);
-        assert(changes == 0 && metadata_calls == 0);
+        assert(changes == 0);
     } else {
-        assert(metadata_calls == (operation >= 3 ? 1u : 0u));
         if (operation == 0) assert(node.rn_size == 2 && attr.supported == ATTR_va_data_size);
         if (operation == 1) assert(uio.resid == 0 && memcmp(data, "old!", 4) == 0);
         if (operation == 2) assert(uio.resid == 0 && memcmp(node.data, "new!", 4) == 0);
-    }
-    if (operation >= 3) {
-        mapped_error = 0; metadata_error = ENOSPC;
-        assert((operation == 3 ? ramfs_fsync(&fsync) : ramfs_ioctl(&ioctl)) == ENOSPC);
     }
 }
 int main(void) {

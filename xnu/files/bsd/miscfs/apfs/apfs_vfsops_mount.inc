@@ -229,6 +229,8 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 		strlcpy(sp->f_mntfromname, "/dev/disk2s1", sizeof(sp->f_mntfromname));
 	} else if (container == 2) {
 		strlcpy(sp->f_mntfromname, "/dev/disk3s1", sizeof(sp->f_mntfromname));
+	} else if (am->am_w != NULL) {
+		strlcpy(sp->f_mntfromname, "/dev/disk1s2", sizeof(sp->f_mntfromname));
 	} else if (sp->f_mntfromname[0] == '\0') {
 		strlcpy(sp->f_mntfromname, "/dev/disk1s1", sizeof(sp->f_mntfromname));
 	}
@@ -354,6 +356,8 @@ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
 					strlcpy(vfs_statfs(mp)->f_mntfromname, "/dev/disk2s1", MAXPATHLEN);
 				} else if (container == 2) {
 					strlcpy(vfs_statfs(mp)->f_mntfromname, "/dev/disk3s1", MAXPATHLEN);
+				} else if (APFS_MP(mp)->am_w != NULL || strcmp(path, "/dev/disk1s2") == 0) {
+					strlcpy(vfs_statfs(mp)->f_mntfromname, "/dev/disk1s2", MAXPATHLEN);
 				} else if (container == 0 && (volume == -1 || volume == 0)) {
 					strlcpy(vfs_statfs(mp)->f_mntfromname, "/dev/disk1s1", MAXPATHLEN);
 				} else if (vfs_statfs(mp)->f_mntfromname[0] == '\0' || container != 0 || volume >= 0) {

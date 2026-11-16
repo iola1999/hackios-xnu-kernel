@@ -63,7 +63,7 @@ def extract(source):
     state_end = block_end(source, source.index("{", state_start))
     state_end = source.index(";", state_end) + 1
     names = (
-        "range", "AppleARMBacklight::publish", "list_keys", "bl_print",
+        "millinits_to_slider16", "range", "AppleARMBacklight::publish", "list_keys", "bl_print",
         "bl_log", "bl_take", "AppleARMBacklight::setProperties",
         "MiniAppleARMBacklightFramebufferProperties",
     )
@@ -89,9 +89,16 @@ def mutations(source):
     )
     return {
         "dictionary_uses_fixed": replace(source, "plain_nits = nits != NULL;", "plain_nits = false;"),
-        "nvram_uses_plain": replace(source,
-            'nits = OSDynamicCast(OSNumber, dict->getObject("DisplayBrightnessNitsNVRAM"));',
-            'nits = OSDynamicCast(OSNumber, dict->getObject("DisplayBrightnessNitsNVRAM"));\n\t\t\tplain_nits = nits != NULL;'),
+        "nvram_treated_as_live_brightness": replace(
+            replace(source,
+                'OSNumber * nvram_nits = OSDynamicCast(OSNumber, dict->getObject("DisplayBrightnessNitsNVRAM"));',
+                "OSNumber * nvram_nits = NULL;"),
+            "plain_nits = nits != NULL;\n\t\t}",
+            'plain_nits = nits != NULL;\n\t\t}\n\t\tif (nits == NULL) {\n\t\t\tnits = OSDynamicCast(OSNumber, dict->getObject("DisplayBrightnessNitsNVRAM"));\n\t\t}'),
+        "nvram_overwrites_seeded": replace(source, "if (!bl.nvram_seeded && s16 > 0)", "if (s16 > 0)"),
+        "brightness_publishes_panel_range": replace(source,
+            "OSDictionary * brightness = range(0, 65536u, pos);",
+            "OSDictionary * brightness = range(kBLValueMin, kBLValueMax, value);"),
         "physical_priority_removed": source.replace('db_dict->getObject("NitsPhysical")', 'db_dict->getObject("TEMP")').replace(
             'db_dict->getObject("Nits")', 'db_dict->getObject("NitsPhysical")').replace(
             'db_dict->getObject("TEMP")', 'db_dict->getObject("Nits")'),

@@ -931,7 +931,8 @@ ufshc_write_polled(uint8_t lun, uint64_t offset, const uint8_t *src, uint64_t le
 		return EINVAL;
 	}
 	while (len > 0) {
-		uint32_t blocks = (uint32_t)MIN(len / BLOCK, (uint64_t)per);
+		uint32_t limit = per < 16u ? per : 16u;
+		uint32_t blocks = (uint32_t)MIN(len / BLOCK, (uint64_t)limit);
 		uint64_t started;
 		struct hc_cmd c;
 		int error;
@@ -943,6 +944,8 @@ ufshc_write_polled(uint8_t lun, uint64_t offset, const uint8_t *src, uint64_t le
 			__builtin_arm_yield();
 		}
 		hc_make_write(&c, lun, (uint8_t)hc_polled, (uint32_t)(offset / BLOCK), blocks);
+		c.upiu[17] = 0x08; /* FUA: commit directly to non-volatile flash before panic reset */
+		c.dw0 &= ~UTRD_INT;
 		memcpy(s->data, src, (size_t)blocks * BLOCK);
 		FlushPoC_DcacheRegion((vm_offset_t)s->data, (size_t)blocks * BLOCK);
 		error = hc_place(s, &c, blocks * BLOCK);
@@ -966,6 +969,30 @@ ufshc_write_polled(uint8_t lun, uint64_t offset, const uint8_t *src, uint64_t le
 		offset += (uint64_t)blocks * BLOCK;
 		src += (size_t)blocks * BLOCK;
 		len -= (uint64_t)blocks * BLOCK;
+	}
+	{
+		struct hc_cmd sc;
+		uint64_t started;
+
+		bzero(&sc, sizeof(sc));
+		sc.upiu[0] = UPIU_COMMAND;
+		sc.upiu[2] = lun;
+		sc.upiu[3] = (uint8_t)hc_polled;
+		sc.upiu[16] = 0x35; /* SYNCHRONIZE CACHE(10) */
+		sc.dw0 = UTRD_CT_UFS | UTRD_DD_NONE;
+		if (hc_place(s, &sc, 0) == 0 && hc_can_ring(bit)) {
+			hc_write(UFSHC_UTRLDBR, bit);
+			for (started = mach_absolute_time(); (hc_read(UFSHC_UTRLDBR) & bit) != 0;) {
+				if (hc_us_since(started) > POLLED_TIMEOUT_US) {
+					return ETIMEDOUT;
+				}
+				__builtin_arm_yield();
+			}
+			__asm__ volatile ("dsb sy" ::: "memory");
+			if (!hc_answer_ok(s, false)) {
+				return EIO;
+			}
+		}
 	}
 	return 0;
 }

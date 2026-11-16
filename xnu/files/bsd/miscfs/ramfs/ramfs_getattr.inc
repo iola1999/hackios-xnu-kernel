@@ -1,60 +1,41 @@
 /*
- * Volume attributes and Apple 128 GB APFS Container capacity calculation
- * shared between the Data volume (/private/var) and the System volume (/).
+ * Volume attributes for an in-memory ramfs mount (used for /private/preboot/jb-rw
+ * and memory-only boots without a darwin_var partition).
  */
-
-#define ANNIBALE_CONTAINER_BYTES   128000000000ULL
-#define ANNIBALE_SYSTEM_USED_BYTES 15571353600ULL
-
-uint64_t annibale_container_total_bytes(void);
-uint64_t annibale_container_free_bytes(void);
-
-uint64_t
-annibale_container_total_bytes(void)
-{
-	return ANNIBALE_CONTAINER_BYTES;
-}
-
-uint64_t
-annibale_container_free_bytes(void)
-{
-	uint64_t data_bytes = os_atomic_load(&ramfs_var_used_pages, relaxed) * (uint64_t)PAGE_SIZE;
-	uint64_t used_bytes = ANNIBALE_SYSTEM_USED_BYTES + data_bytes;
-
-	return used_bytes < ANNIBALE_CONTAINER_BYTES ? (ANNIBALE_CONTAINER_BYTES - used_bytes) : 0;
-}
 
 static void
 ramfs_fill_statfs(struct ramfs_mount *rm, struct vfsstatfs *sp)
 {
-	uint64_t total_pages = annibale_container_total_bytes() / PAGE_SIZE;
-	uint64_t free_pages = annibale_container_free_bytes() / PAGE_SIZE;
+	uint64_t total_pages = rm->rm_max_pages;
+	uint64_t used_pages = MIN(rm->rm_pages, total_pages);
+	uint64_t free_pages = total_pages - used_pages;
 
 	sp->f_bsize = PAGE_SIZE;
 	sp->f_iosize = PAGE_SIZE;
 	sp->f_blocks = total_pages;
 	sp->f_bfree = free_pages;
 	sp->f_bavail = free_pages;
-	sp->f_bused = total_pages - free_pages;
+	sp->f_bused = used_pages;
 	sp->f_files = rm->rm_max_pages;
 	sp->f_ffree = rm->rm_max_pages - MIN(rm->rm_nodes, rm->rm_max_pages);
 	strlcpy(sp->f_fstypename, "apfs", sizeof(sp->f_fstypename));
-	strlcpy(sp->f_mntfromname, "/dev/disk1s2", sizeof(sp->f_mntfromname));
+	strlcpy(sp->f_mntfromname, "ramfs", sizeof(sp->f_mntfromname));
 }
 
 static int
 ramfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
 {
 	struct ramfs_mount *rm = RAMFS_MP(mp);
-	uint64_t nodes, total_pages, free_pages, used_pages;
+	uint64_t nodes, pages, total_pages, free_pages, used_pages;
 
 	lck_mtx_lock(&rm->rm_lock);
 	nodes = rm->rm_nodes;
+	pages = rm->rm_pages;
 	lck_mtx_unlock(&rm->rm_lock);
 
-	total_pages = annibale_container_total_bytes() / PAGE_SIZE;
-	free_pages = annibale_container_free_bytes() / PAGE_SIZE;
-	used_pages = total_pages - free_pages;
+	total_pages = rm->rm_max_pages;
+	used_pages = MIN(pages, total_pages);
+	free_pages = total_pages - used_pages;
 
 	VFSATTR_RETURN(fsap, f_objcount, nodes);
 	VFSATTR_RETURN(fsap, f_bsize, PAGE_SIZE);
@@ -82,8 +63,7 @@ ramfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
 		    VOL_CAP_FMT_PATH_FROM_ID |
 		    VOL_CAP_FMT_CLONE_MAPPING |
 		    VOL_CAP_FMT_DOCUMENT_ID |
-		    VOL_CAP_FMT_WRITE_GENERATION_COUNT |
-		    (rm->rm_disk_backed ? (VOL_CAP_FMT_JOURNAL | VOL_CAP_FMT_JOURNAL_ACTIVE) : 0);
+		    VOL_CAP_FMT_WRITE_GENERATION_COUNT;
 		cap->capabilities[VOL_CAPABILITIES_INTERFACES] =
 		    VOL_CAP_INT_ADVLOCK |
 		    VOL_CAP_INT_FLOCK |

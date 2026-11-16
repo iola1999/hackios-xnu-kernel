@@ -159,6 +159,8 @@ static void reset()
     bl.last_v = kBLValueMax;
     bl.last_millinits = kBLMilliNitsMax;
     bl.initialized = true;
+    bl.nvram_seeded = true;
+    service.publish(bl.last_v, bl.last_millinits);
     host_now = 10000000000;
     host_touch = 0;
     lock_depth = 0;
@@ -188,11 +190,14 @@ static void applied(uint64_t millinits, uint64_t value)
     auto parameters = OSDynamicCast(OSDictionary, service.properties["IODisplayParameters"]);
     check(parameters != nullptr, "IODisplayParameters missing");
     auto brightness = OSDynamicCast(OSDictionary, parameters->getObject("brightness"));
+    auto raw = OSDynamicCast(OSDictionary, parameters->getObject("rawBrightness"));
     auto nits = OSDynamicCast(OSDictionary, parameters->getObject("BrightnessMilliNits"));
-    check(brightness != nullptr && nits != nullptr, "published ranges missing");
-    check(getNumber(brightness, "min") == 5 && getNumber(brightness, "max") == 6750, "panel range changed");
+    check(brightness != nullptr && raw != nullptr && nits != nullptr, "published ranges missing");
+    check(getNumber(brightness, "min") == 0 && getNumber(brightness, "max") == 65536, "slider range changed");
+    check(getNumber(raw, "min") == 5 && getNumber(raw, "max") == 6750, "panel range changed");
     check(getNumber(nits, "min") == 5000 && getNumber(nits, "max") == 400000, "nits range changed");
-    check(getNumber(brightness, "value") == value && getNumber(nits, "value") == millinits, "published state mismatch");
+    check(getNumber(brightness, "value") == millinits_to_slider16((uint32_t)millinits), "published slider mismatch");
+    check(getNumber(raw, "value") == value && getNumber(nits, "value") == millinits, "published state mismatch");
 }
 using Case = std::pair<std::string, std::function<void()>>;
 static std::vector<Case> cases()
@@ -226,7 +231,32 @@ static std::vector<Case> cases()
         }},
         {"fixed_large_no_overflow", [] { framebuffer(fixed("IOMFBBrightnessLevel", INT64_MAX)); applied(400000, 6750); }},
         {"fixed_multiply_overflow_boundary", [] { framebuffer(fixed("IOMFBBrightnessLevel", 18446744073709552ULL)); applied(400000, 6750); }},
-        {"nvram_is_fixed", [] { backlight(fixed("DisplayBrightnessNitsNVRAM", 7864320)); applied(120000, 1968); }},
+        {"nvram_does_not_change_live_panel_or_overwrite_restored", [] {
+            bl.last_v = 5972;
+            bl.last_millinits = 354468;
+            bl.nvram_seeded = true;
+            service.publish(bl.last_v, bl.last_millinits);
+            backlight(fixed("DisplayBrightnessNitsNVRAM", 9175040));
+            check(bl.last_v == 5972 && bl.last_millinits == 354468, "DisplayBrightnessNitsNVRAM changed restored brightness");
+            check(dcs_values.empty() && saves.empty(), "DisplayBrightnessNitsNVRAM touched DCS or overwrote NVRAM");
+            auto parameters = OSDynamicCast(OSDictionary, service.properties["IODisplayParameters"]);
+            auto brightness = OSDynamicCast(OSDictionary, parameters->getObject("brightness"));
+            check(getNumber(brightness, "value") == 60519, "published slider did not invert marketing table");
+        }},
+        {"nvram_seeds_only_when_unseeded", [] {
+            bl.nvram_seeded = false;
+            backlight(fixed("DisplayBrightnessNitsNVRAM", 9175040));
+            check(bl.last_v == 6750 && bl.last_millinits == 400000, "DisplayBrightnessNitsNVRAM changed boot panel state");
+            check(dcs_values.empty(), "DisplayBrightnessNitsNVRAM sent DCS command");
+            check(saves.size() == 1 && saves.back() == std::make_pair(2310u, 140000u), "unseeded NVRAM did not store initial level");
+            backlight(fixed("DisplayBrightnessNitsNVRAM", 7864320));
+            check(saves.size() == 1, "seeded NVRAM accepted second seed");
+        }},
+        {"marketing_inverse_matches_endpoints_and_midpoint", [] {
+            check(millinits_to_slider16(5000) == 0, "min millinits slider mismatch");
+            check(millinits_to_slider16(140000) == 32768, "mid millinits slider mismatch");
+            check(millinits_to_slider16(400000) == 65536, "max millinits slider mismatch");
+        }},
         {"dictionary_precedes_nvram", [] {
             auto request = nested("NitsPhysical", 120);
             number(request, "DisplayBrightnessNitsNVRAM", 13107200);

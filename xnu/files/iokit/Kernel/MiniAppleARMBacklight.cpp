@@ -78,6 +78,37 @@ fixed_nits(uint64_t millinits)
 	return (millinits << 16) / 1000;
 }
 
+/*
+ * Inverse of CoreBrightness's 11-point marketing table interpolation (23G90, 0x1e2746810):
+ * maps millinits back to the 0..65536 slider domain published in IODisplayParameters["brightness"].
+ */
+static uint32_t
+millinits_to_slider16(uint32_t millinits)
+{
+	const unsigned n = sizeof(kBLMarketingMilliNits) / sizeof(kBLMarketingMilliNits[0]);
+	const unsigned segments = n - 1;
+
+	if (millinits <= kBLMarketingMilliNits[0]) {
+		return 0;
+	}
+	if (millinits >= kBLMarketingMilliNits[segments]) {
+		return 65536u;
+	}
+	for (unsigned i = 0; i < segments; i++) {
+		uint32_t lo = kBLMarketingMilliNits[i];
+		uint32_t hi = kBLMarketingMilliNits[i + 1];
+
+		if (millinits <= hi && hi > lo) {
+			uint64_t span = hi - lo;
+			uint64_t num = ((uint64_t) i * span + (millinits - lo)) * 65536ULL;
+			uint64_t den = (uint64_t) segments * span;
+
+			return (uint32_t) ((num + den / 2) / den);
+		}
+	}
+	return 65536u;
+}
+
 /* The level the mixers were last given, in 1024ths (nits over kBLMilliNitsMax; full while the panel takes the value). */
 extern "C" {
 uint32_t annibale_backlight_level = kBLLevelFull;
@@ -85,8 +116,6 @@ uint64_t annibale_cpufreq_touched(void);
 bool annibale_backlight_load(uint32_t *panel_v_out, uint32_t *millinits_out);
 void annibale_backlight_save(uint32_t panel_v, uint32_t millinits);
 bool annibale_nvram_kept(void);                                             /* AnnibaleNVRAM.cpp */
-bool ramfs_backlight_load(uint32_t *panel_v_out, uint32_t *millinits_out);  /* bsd/miscfs/ramfs/ramfs_disk.inc */
-void ramfs_backlight_save(uint32_t panel_v, uint32_t millinits);
 }
 
 class AppleARMBacklight : public IOService
@@ -113,6 +142,7 @@ static struct {
 	uint32_t                unlogged;       /* requests since then, not printed yet */
 	bool                    initialized;    /* true once boot or user brightness has been applied */
 	bool                    slider_initialized; /* true once initial slider position is recorded */
+	bool                    nvram_seeded;   /* true once NVRAM holds a restored or saved level */
 	char                    line[320];      /* the last request, as it is printed */
 } bl;
 
@@ -129,20 +159,29 @@ range(uint64_t min, uint64_t max, uint64_t value)
 	return dict;
 }
 
-/* IODisplayParameters, whole and new each time: user space may be reading the one before. */
+/*
+ * IODisplayParameters, whole and new each time: user space may be reading the one before.
+ * Under useNewBacklightArchitecture, CoreBrightness's DisplayOpen (23G90, 0x1e27444a4) treats
+ * brightness as the 0..65536 normalized slider position mapped through backlight-marketing-table,
+ * while rawBrightness exposes the linear panel DBV range.
+ */
 void
 AppleARMBacklight::publish(uint64_t value, uint64_t millinits)
 {
-	OSDictionary * parameters = OSDictionary::withCapacity(2);
-	OSDictionary * brightness = range(kBLValueMin, kBLValueMax, value);
+	OSDictionary * parameters = OSDictionary::withCapacity(3);
+	uint64_t pos = millinits_to_slider16((uint32_t) millinits);
+	OSDictionary * brightness = range(0, 65536u, pos);
+	OSDictionary * raw = range(kBLValueMin, kBLValueMax, value);
 	OSDictionary * nits = range(kBLMilliNitsMin, kBLMilliNitsMax, millinits);
 
-	if (parameters != NULL && brightness != NULL && nits != NULL) {
+	if (parameters != NULL && brightness != NULL && raw != NULL && nits != NULL) {
 		parameters->setObject("brightness", brightness);
+		parameters->setObject("rawBrightness", raw);
 		parameters->setObject("BrightnessMilliNits", nits);
 		setProperty("IODisplayParameters", parameters);
 	}
 	OSSafeReleaseNULL(nits);
+	OSSafeReleaseNULL(raw);
 	OSSafeReleaseNULL(brightness);
 	OSSafeReleaseNULL(parameters);
 }
@@ -253,8 +292,9 @@ bl_log_later(thread_call_param_t, thread_call_param_t)
 
 /*
  * A request to either service, with bl.lock held. NITS_KEY (16.16) is taken if it is there, else
- * VALUE_KEY (a value of the brightness range, none for the framebuffer). DisplayBrightness's
- * NitsPhysical/Nits are nits (CoreBrightness 23G90, 0x1e273eb08); DisplayBrightnessNitsNVRAM is 16.16.
+ * VALUE_KEY (a value of the raw panel range, none for the framebuffer). DisplayBrightness's
+ * NitsPhysical/Nits are nits (CoreBrightness 23G90, 0x1e273eb08). DisplayBrightnessNitsNVRAM is
+ * iBoot's boot-logo NVRAM seed (0x1e274544c) and never changes live panel brightness.
  * Slider position records interaction; CoreBrightness supplies the mapped nits.
  * The result is a panel value, nits, and the level given to the mixers when it changes.
  */
@@ -282,9 +322,6 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 				nits = OSDynamicCast(OSNumber, db_dict->getObject("Nits"));
 			}
 			plain_nits = nits != NULL;
-		}
-		if (nits == NULL) {
-			nits = OSDynamicCast(OSNumber, dict->getObject("DisplayBrightnessNitsNVRAM"));
 		}
 	}
 	{
@@ -375,6 +412,7 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 	bl.initialized = true;
 	if (touch_recent || slider_moved) {
 		annibale_backlight_save((uint32_t) v, (uint32_t) millinits);
+		bl.nvram_seeded = true;
 		bl.service->setProperty("annibale-bl-restored", kOSBooleanTrue);
 	}
 	level = (uint32_t) (millinits * kBLLevelFull / kBLMilliNitsMax);
@@ -397,7 +435,11 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 	bl_log();
 }
 
-/* brightness and brightness-nits are taken, everything else is only logged; no request fails. */
+/*
+ * brightness, brightness-nits, and DisplayBrightness drive live panel brightness.
+ * DisplayBrightnessNitsNVRAM (AppleARMBacklight::setPropertiesGated, 0xfffffe00084b3d6c) only
+ * seeds NVRAM when no user level is stored yet, leaving the active panel and IODisplayParameters untouched.
+ */
 IOReturn
 AppleARMBacklight::setProperties(OSObject * properties)
 {
@@ -407,6 +449,37 @@ AppleARMBacklight::setProperties(OSObject * properties)
 		return kIOReturnBadArgument;
 	}
 	IOLockLock(bl.lock);
+	OSNumber * nvram_nits = OSDynamicCast(OSNumber, dict->getObject("DisplayBrightnessNitsNVRAM"));
+	if (nvram_nits != NULL &&
+	    dict->getObject("brightness-nits") == NULL &&
+	    dict->getObject("brightness") == NULL &&
+	    dict->getObject("DisplayBrightness") == NULL) {
+		char who[24] = "?";
+		size_t used;
+		int64_t s16 = (int64_t) nvram_nits->unsigned64BitValue();
+		bool seeded = false;
+
+		if (!bl.nvram_seeded && s16 > 0) {
+			uint64_t n16 = (uint64_t) s16;
+			uint64_t mn = (n16 < fixed_nits(kBLMilliNitsMax) ? n16 : fixed_nits(kBLMilliNitsMax)) * 1000 >> 16;
+			mn = mn < kBLMilliNitsMin ? kBLMilliNitsMin : mn > kBLMilliNitsMax ? kBLMilliNitsMax : mn;
+			uint64_t seed_v = kBLValueMin + (mn - kBLMilliNitsMin) * (kBLValueMax - kBLValueMin) /
+			    (kBLMilliNitsMax - kBLMilliNitsMin);
+			annibale_backlight_save((uint32_t) seed_v, (uint32_t) mn);
+			bl.nvram_seeded = true;
+			seeded = true;
+		}
+		proc_selfname(who, sizeof(who));
+		used = (size_t) snprintf(bl.line, sizeof(bl.line), "%s[%d] to the backlight:", who, proc_selfpid());
+		used = list_keys(bl.line, sizeof(bl.line), used < sizeof(bl.line) ? used : sizeof(bl.line), dict);
+		snprintf(bl.line + used, sizeof(bl.line) - used,
+		    "; NVRAM seed %s, keeping %llu.%03llu nits",
+		    seeded ? "stored" : "ignored (user brightness kept)",
+		    bl.last_millinits / 1000, bl.last_millinits % 1000);
+		bl_log();
+		IOLockUnlock(bl.lock);
+		return kIOReturnSuccess;
+	}
 	bl_take(dict, "brightness", "brightness-nits");
 	IOLockUnlock(bl.lock);
 	return kIOReturnSuccess;
@@ -440,9 +513,8 @@ MiniAppleARMBacklightFramebufferProperties(OSObject * properties)
 /*
  * The brightness across restarts, as AppleARMBacklight keeps it: NVRAM's backlight-level (the panel's
  * value, "%d") and backlight-nits (16.16 nits, "0x%08x"). They are in IODTNVRAM's dictionary at once and
- * in darwin_nvram after its next sync (AnnibaleNVRAM.cpp). While NVRAM is not written to darwin_nvram,
- * a darwin_var in ANNFS001 keeps the setting in its superblock (ramfs_backlight_*), as before
- * darwin_nvram existed. MiniFramebufferDCS.inc also reads it, for the panel at start.
+ * in darwin_nvram after its next sync (AnnibaleNVRAM.cpp). MiniFramebufferDCS.inc also reads it, for
+ * the panel at start.
  */
 static bool
 nvram_number(const char * name, uint64_t * out)
@@ -479,7 +551,7 @@ annibale_backlight_load(uint32_t * panel_v_out, uint32_t * millinits_out)
 
 	if (!nvram_number("backlight-level", &v) || !nvram_number("backlight-nits", &n16) || v == 0 || n16 == 0 ||
 	    v > 0xffffffffULL || n16 > 0xffffffffULL) {
-		return ramfs_backlight_load(panel_v_out, millinits_out);
+		return false;
 	}
 	if (panel_v_out != NULL) {
 		*panel_v_out = (uint32_t) v;
@@ -502,9 +574,6 @@ annibale_backlight_save(uint32_t panel_v, uint32_t millinits)
 
 	if (panel_v == 0 || millinits == 0) {
 		return;
-	}
-	if (!annibale_nvram_kept()) {
-		ramfs_backlight_save(panel_v, millinits);
 	}
 	if (panel_v == saved_v && millinits == saved_mn) {
 		return;
@@ -554,6 +623,7 @@ MiniAppleARMBacklightStart(IOService * provider)
 	}
 	bl.last_v = saved_v;
 	bl.last_millinits = saved_mn;
+	bl.nvram_seeded = restored;
 	boot_level = (uint32_t) (bl.last_millinits * kBLLevelFull / kBLMilliNitsMax);
 	boot_mixed = MiniIOMobileFramebufferDCS((uint32_t) bl.last_v) ? kBLLevelFull : boot_level;
 	if (boot_mixed != annibale_backlight_level) {

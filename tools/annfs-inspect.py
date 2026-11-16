@@ -19,7 +19,7 @@ import sys
 import zlib
 
 
-# Layout and acceptance rules: ramfs_disk.inc and ramfs_disk_restore.inc.
+# Layout and acceptance rules: frozen v3 ANNFS001 format (tools/apfs/cmd_annfs.c).
 PAGE_SIZE = 16384
 SECTOR_SIZE = 4096
 SUPER_BYTES = 4096

@@ -16,16 +16,17 @@ apfs_vget(mount_t mp, ino64_t ino, vnode_t *vpp, __unused vfs_context_t ctx)
 }
 
 extern uint64_t ufs_darwin_bytes;      /* bsd/dev/annibale/annibale_ufs.c */
+extern uint64_t ufs_darwin_var_bytes;
 
 /*
  * The space of the one container iOS expects: on an iPhone the system and data volumes share
  * it, so every volume reports the same total and free space.  Here they are two partitions,
  * darwin (the system volume) and darwin_var (the data volume's own container); free space is
- * the data container's.  Before the data volume is APFS the figures come from ANNFS
- * (ramfs_getattr.inc).
+ * the data container's.  Before the data volume is mounted, fall back to the UFS partition
+ * sizes when present, or the mounted container's own span on memory-only boots.
  */
 static void
-apfs_container_space(uint64_t *total_bytes, uint64_t *avail_bytes)
+apfs_container_space(struct apfs_mount *am, uint64_t *total_bytes, uint64_t *avail_bytes)
 {
 	struct apfs_mount *data;
 
@@ -39,8 +40,13 @@ apfs_container_space(uint64_t *total_bytes, uint64_t *avail_bytes)
 	}
 	lck_mtx_unlock(&apfs_pool_lock);
 	if (data == NULL) {
-		*total_bytes = annibale_container_total_bytes();
-		*avail_bytes = annibale_container_free_bytes();
+		if (ufs_darwin_bytes + ufs_darwin_var_bytes > 0) {
+			*total_bytes = ufs_darwin_bytes + ufs_darwin_var_bytes;
+			*avail_bytes = ufs_darwin_var_bytes;
+		} else {
+			*total_bytes = am->am_nx.block_count * am->am_nx.block_size;
+			*avail_bytes = 0;
+		}
 	}
 }
 
@@ -49,7 +55,7 @@ apfs_fill_statfs(struct apfs_mount *am, struct vfsstatfs *sp)
 {
 	uint64_t space, avail, bs = am->am_nx.block_size;
 
-	apfs_container_space(&space, &avail);
+	apfs_container_space(am, &space, &avail);
 	sp->f_bsize = sp->f_iosize = (uint32_t)bs;
 	sp->f_blocks = space / bs;
 	sp->f_bfree = sp->f_bavail = avail / bs;
@@ -66,7 +72,7 @@ apfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
 	uint64_t space, avail, bs = am->am_nx.block_size;
 	bool rw = am->am_w != NULL;
 
-	apfs_container_space(&space, &avail);
+	apfs_container_space(am, &space, &avail);
 	VFSATTR_RETURN(fsap, f_objcount, files);
 	VFSATTR_RETURN(fsap, f_bsize, (uint32_t)bs);
 	VFSATTR_RETURN(fsap, f_iosize, (size_t)bs);

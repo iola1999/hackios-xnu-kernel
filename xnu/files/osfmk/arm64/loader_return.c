@@ -205,6 +205,63 @@ static uint32_t loader_panic_sync_lock;          /* cpu_number() + 1 of the proc
 static uint32_t loader_panic_sync_seq;
 /* A panic has begun (loader_panic_log): only then is the log written (darwin_nvram) for init to keep. */
 static volatile bool loader_panicked;
+static uint32_t loader_first_panic_synced;
+
+/*
+ * Extract human-readable panic report slices from panic_info (skipping the binary
+ * compressed kcdata stackshot and NUL padding between eph_panic_log and eph_other_log),
+ * falling back to the raw [debug_buf_base, debug_buf_ptr) prefix before SavePanicInfo runs.
+ */
+static size_t
+loader_panic_extract_text(char *dst, size_t cap)
+{
+	size_t out = 0;
+
+	if (cap == 0) {
+		return 0;
+	}
+	if (panic_info != NULL && gPanicSize > sizeof(*panic_info) &&
+	    panic_info->eph_magic == EMBEDDED_PANIC_MAGIC &&
+	    panic_info->eph_panic_log_len > 0 &&
+	    panic_info->eph_panic_log_offset >= sizeof(*panic_info) &&
+	    panic_info->eph_panic_log_offset <= gPanicSize &&
+	    panic_info->eph_panic_log_len <= gPanicSize - panic_info->eph_panic_log_offset) {
+		const char *base = (const char *)panic_info;
+		size_t n1 = panic_info->eph_panic_log_len;
+
+		for (size_t i = 0; i < n1 && out < cap; i++) {
+			char ch = base[panic_info->eph_panic_log_offset + i];
+			if (ch != '\0') {
+				dst[out++] = ch;
+			}
+		}
+		if (panic_info->eph_other_log_len > 0 &&
+		    panic_info->eph_other_log_offset >= sizeof(*panic_info) &&
+		    panic_info->eph_other_log_offset <= gPanicSize &&
+		    panic_info->eph_other_log_len <= gPanicSize - panic_info->eph_other_log_offset) {
+			size_t n2 = panic_info->eph_other_log_len;
+
+			for (size_t i = 0; i < n2 && out < cap; i++) {
+				char ch = base[panic_info->eph_other_log_offset + i];
+				if (ch != '\0') {
+					dst[out++] = ch;
+				}
+			}
+		}
+		return out;
+	}
+	if (debug_buf_base != NULL && debug_buf_ptr > debug_buf_base) {
+		size_t raw = (size_t)(debug_buf_ptr - debug_buf_base);
+
+		for (size_t i = 0; i < raw && out < cap; i++) {
+			char ch = debug_buf_base[i];
+			if (ch != '\0') {
+				dst[out++] = ch;
+			}
+		}
+	}
+	return out;
+}
 
 void
 loader_panic_sync_ufs(const char *reason, uint32_t flags)
@@ -256,18 +313,15 @@ loader_panic_sync_ufs(const char *reason, uint32_t flags)
 		at += (size_t)n;
 	}
 
-	if (debug_buf_base != NULL && debug_buf_ptr > debug_buf_base) {
-		size_t pb_len = (size_t)(debug_buf_ptr - debug_buf_base);
-		int hn = snprintf(p + at, cap - at, "\n--- panic buffer (%lu bytes) ---\n", (unsigned long)pb_len);
-		if (hn > 0 && (size_t)hn < cap - at) {
-			at += (size_t)hn;
-		}
-		if (pb_len > cap - at - 1) {
-			pb_len = cap - at - 1;
-		}
-		if (pb_len > 0) {
-			memcpy(p + at, debug_buf_base, pb_len);
-			at += pb_len;
+	if ((debug_buf_base != NULL && debug_buf_ptr > debug_buf_base) ||
+	    (panic_info != NULL && panic_info->eph_magic == EMBEDDED_PANIC_MAGIC && panic_info->eph_panic_log_len > 0)) {
+		static const char hdr[] = "\n--- panic report ---\n";
+		size_t hdr_len = sizeof(hdr) - 1;
+
+		if (cap - at > hdr_len + 1) {
+			memcpy(p + at, hdr, hdr_len);
+			at += hdr_len;
+			at += loader_panic_extract_text(p + at, cap - at - 1);
 			p[at] = '\0';
 		}
 	}
@@ -323,7 +377,7 @@ loader_panic_log(const char *format, va_list *args, unsigned long caller)
 	char text[768];
 	va_list copy;
 
-	snprintf(text, sizeof(text), "\nPANIC caller 0x%lx: ", caller);
+	snprintf(text, sizeof(text), "\nPANIC (cpu %d) caller 0x%lx: ", cpu_number(), caller);
 	loader_log_line(text);
 	va_copy(copy, *args);
 	vsnprintf(text, sizeof(text), format, copy);
@@ -332,7 +386,14 @@ loader_panic_log(const char *format, va_list *args, unsigned long caller)
 	loader_log_putc('\n');
 
 	loader_panicked = true;
-	loader_panic_sync_ufs("panic_trap", 1);
+	/*
+	 * Only the first panicking CPU writes the early pre-backtrace checkpoint to UFS:
+	 * concurrent panicking CPUs must reach debug_fatal_panic_begin() within microseconds
+	 * so DebuggerXCallEnter does not time out waiting on a 264 KiB UFS write.
+	 */
+	if (os_atomic_cmpxchg(&loader_first_panic_synced, 0, 1, acq_rel)) {
+		loader_panic_sync_ufs("panic_trap", 1);
+	}
 }
 
 static void
@@ -629,11 +690,15 @@ loader_return(void)
 	if (!loader_return_entered) {
 		loader_log_append_msgbuf();
 	}
-	if (!loader_return_entered && debug_buf_base != NULL && debug_buf_ptr > debug_buf_base &&
-	    (size_t)(debug_buf_ptr - debug_buf_base) < 256 * 1024) {
-		loader_log_puts("\n--- panic buffer ---\n");
-		for (const char *c = debug_buf_base; c < debug_buf_ptr; c++) {
-			loader_log_putc(*c);
+	if (!loader_return_entered) {
+		size_t cap = sizeof(loader_panic_buf) / 2;
+		size_t n = loader_panic_extract_text(loader_panic_buf, cap);
+
+		if (n > 0) {
+			loader_log_puts("\n--- panic buffer ---\n");
+			for (size_t i = 0; i < n; i++) {
+				loader_log_putc(loader_panic_buf[i]);
+			}
 		}
 	}
 	/* After a panic: the log again, now with the panic buffer and the console's end, before storage quiesces */

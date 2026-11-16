@@ -455,8 +455,22 @@ void loader_return(void);
 int
 GenericARMPE::haltRestart(unsigned int type)
 {
-	IOLog("GenericARMPE::haltRestart(%u)\n", type);
 	hv_wdt_pet_NOW();
-	loader_return();
-	return 0;
+	switch (type) {
+	case kPEPanicSync:
+	case kPEPagingOff:
+	case kPEPanicBegin:
+	case kPEPanicEnd:
+	case kPEPanicDiagnosticsDone:
+	case kPEPanicDiagnosticsInProgress:
+		/*
+		 * Non-terminal panic progress notifications from debugger_collect_diagnostics
+		 * and SavePanicInfo: let XNU finish formatting the backtrace and panic header.
+		 */
+		return 0;
+	default:
+		kprintf("GenericARMPE::haltRestart(%u)\n", type);
+		loader_return();
+		return 0;
+	}
 }

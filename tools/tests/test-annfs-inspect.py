@@ -19,8 +19,64 @@ spec.loader.exec_module(annfs)
 
 
 def fixture_source():
-    disk = (ROOT / "xnu/files/bsd/miscfs/ramfs/ramfs_disk.inc").read_text()
-    definitions = disk[disk.index("#define ANNFS_MAGIC_STR"):disk.index("static struct ramfs_mount *")]
+    definitions = r'''
+#define ANNFS_MAGIC_STR          "ANNFS001"
+#define ANNFS_SUPER_BYTES        4096u
+#define ANNFS_SLOT_MAX           (32ULL << 20)
+#define ANNFS_DATA_OFFSET        (512ULL << 20)
+#define ANNFS_ALIGN8(n)          (((uint64_t)(n) + 7ULL) & ~7ULL)
+
+struct annfs_super {
+    char     magic[8];
+    uint32_t version;
+    uint32_t page_size;
+    uint64_t generation;
+    uint64_t payload_bytes;
+    uint64_t next_ino;
+    uint32_t node_count;
+    uint32_t payload_crc;
+    uint32_t super_crc;
+    uint32_t bl_magic;
+    uint32_t bl_panel_v;
+    uint32_t bl_millinits;
+    uint8_t  reserved[4096 - 64];
+};
+
+struct annfs_inode_rec {
+    uint64_t ino;
+    uint64_t size;
+    uint64_t parent_ino;
+    uint32_t type;
+    uint32_t mode;
+    uint32_t uid;
+    uint32_t gid;
+    uint32_t bsdflags;
+    uint32_t dataprotect_class;
+    uint32_t nlink;
+    uint32_t target_len;
+    uint32_t nblocks;
+    uint32_t nxattrs;
+    uint32_t ndirents;
+    uint32_t iflags;
+    uint32_t document_id;
+    uint32_t write_gen;
+    int64_t  atime_sec, atime_nsec;
+    int64_t  mtime_sec, mtime_nsec;
+    int64_t  ctime_sec, ctime_nsec;
+    int64_t  btime_sec, btime_nsec;
+};
+
+struct annfs_xattr_rec {
+    uint32_t namelen;
+    uint32_t size;
+};
+
+struct annfs_dirent_rec {
+    uint64_t child_ino;
+    uint32_t namelen;
+    uint32_t reserved;
+};
+'''
     return r'''
 #include <assert.h>
 #include <stddef.h>

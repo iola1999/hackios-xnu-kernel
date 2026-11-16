@@ -329,10 +329,9 @@ ufs_part_bytes(uint32_t part)
 
 /*
  * The orderly end of a run, from osfmk/arm64/loader_return.c, in the thread that is about to hand
- * control back: /private/var to /dev/ufs_darwin_var, whichever file system it is (the other one's
- * call does nothing), and NVRAM to darwin_nvram, as a restart does (IOPMrootDomain).
+ * control back: /private/var APFS data volume to /dev/ufs_darwin_var, and NVRAM to darwin_nvram,
+ * as a restart does (IOPMrootDomain).
  */
-extern int ramfs_disk_flush_all(void);
 extern int apfs_data_flush(void);
 extern boolean_t PESyncNVRAM(void);
 extern void AnnibaleNVRAMStart(void);
@@ -343,7 +342,7 @@ annibale_var_save_on_return(void)
 	if (!ufs_ready || ufs_darwin_var_part < 0) {
 		return;
 	}
-	int error = var_apfs ? apfs_data_flush() : ramfs_disk_flush_all();
+	int error = var_apfs ? apfs_data_flush() : 0;
 	if (error != 0) {
 		/* Shutdown must remain available after storage or pageout errors. */
 		printf("ufs: data-volume flush failed (%d); continuing shutdown; data may be unsaved\n", error);
@@ -946,7 +945,7 @@ annibale_ufs_init(void)
 		made++;
 	}
 	ufs_ready = true;
-	AnnibaleDiskStart(128000000000ULL);
+	AnnibaleDiskStart(ufs_darwin_bytes + ufs_darwin_var_bytes);
 	annibale_create_disk_nodes(ufs_bmajor, ufs_cmajor, ufs_darwin_part, ufs_darwin_var_part);
 	printf("ufs: %u partitions of the phone's storage as /dev/ufs_NAME and /dev/rufs_NAME, read only, "
 	    "through the loader's page at %llx and its %u KB buffer\n", made, pa, ufs_buffer_size >> 10);
