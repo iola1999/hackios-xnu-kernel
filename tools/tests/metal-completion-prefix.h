@@ -54,7 +54,7 @@ struct pipe_screen {
     void (*fence_reference)(struct pipe_screen *, struct pipe_fence_handle **, struct pipe_fence_handle *);
     bool (*fence_finish)(struct pipe_screen *, struct pipe_context *, struct pipe_fence_handle *, uint64_t);
 };
-struct rwa_device { struct pipe_context *pipe; struct pipe_screen *screen; struct pipe_fence_handle *pending; };
+struct rwa_device { struct pipe_context *pipe; struct pipe_screen *screen; struct pipe_fence_handle *pending; uint64_t submit_seq; };
 static struct pipe_fence_handle fences[32];
 static unsigned submitted, recorded, wait_entries, finish_entries, raw_destroyed, cb_destroyed;
 static unsigned texture_alive, device_alive, writebacks;

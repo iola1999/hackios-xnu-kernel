@@ -340,6 +340,10 @@ IOMobileFramebuffer::dirtyBand(RowJob * job)
 	job->by1 = job->py0 + (int32_t) ((int64_t) (last + 2) * span / job->sh) + 2;
 	job->by0 = job->by0 < job->py0 ? job->py0 : job->by0;
 	job->by1 = job->by1 > job->py1 ? job->py1 : job->by1;
-	job->allDirty = !known;
+	job->allDirty = !known || fAllChangedSeq > job->bufferSeq;
+	if (job->allDirty) {
+		job->by0 = job->py0;
+		job->by1 = job->py1;
+	}
 	return true;
 }

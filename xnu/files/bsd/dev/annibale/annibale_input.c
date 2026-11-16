@@ -34,6 +34,47 @@ SYSCTL_DECL(_kern_annibale);
 SYSCTL_INT(_kern_annibale, OID_AUTO, frames, CTLFLAG_RD, &annibale_frames_shown, 0,
     "frames put on the panel since boot");
 
+extern int annibale_fb_rec_arm(int value, int *current_out);
+extern void annibale_fb_rec_info(char *buf, size_t size);
+
+static int
+annibale_sysctl_rec_arm SYSCTL_HANDLER_ARGS
+{
+	int val = 0, error;
+
+	(void)oidp;
+	(void)arg1;
+	(void)arg2;
+	if (req->newptr == USER_ADDR_NULL) {
+		(void)annibale_fb_rec_arm(0, &val);
+		return SYSCTL_OUT(req, &val, sizeof(val));
+	}
+	error = SYSCTL_IN(req, &val, sizeof(val));
+	if (error != 0) {
+		return error;
+	}
+	return annibale_fb_rec_arm(val, NULL);
+}
+
+static int
+annibale_sysctl_rec_info SYSCTL_HANDLER_ARGS
+{
+	char line[128];
+
+	(void)oidp;
+	(void)arg1;
+	(void)arg2;
+	annibale_fb_rec_info(line, sizeof(line));
+	return SYSCTL_OUT(req, line, strlen(line) + 1);
+}
+
+SYSCTL_PROC(_kern_annibale, OID_AUTO, rec_arm, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    NULL, 0, annibale_sysctl_rec_arm, "I",
+    "arm screen recording for N seconds (0 disarms, <0 samples panel scanout)");
+SYSCTL_PROC(_kern_annibale, OID_AUTO, rec_info, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+    NULL, 0, annibale_sysctl_rec_info, "A",
+    "screen recording physical address, bytes, frames, width, height, active");
+
 extern void loader_log_line(const char *line);
 
 /*

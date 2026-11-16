@@ -1007,10 +1007,12 @@ struct gem_close { uint32_t handle, pad; };
 	NSUInteger _parentRelativeLevel;
 	NSUInteger _parentRelativeSlice;
 	MTLTextureSwizzleChannels _swizzle;
+	BOOL _hasSwizzle;
 }
 - (instancetype)initWithAnnibaleDevice:(AnnibaleMetalDevice *)device
 	texture:(struct rwa_texture *)texture shape:(const struct rwa_texture_shape *)shape
 	iosurface:(CFTypeRef)surface plane:(NSUInteger)plane;
+- (void)annibaleApplyDescriptorSwizzle:(id)descriptor;
 @property (readonly) struct rwa_texture *mesaTexture;
 /* The buffer a texture made by -[MTLBuffer newTextureWithDescriptor:offset:bytesPerRow:]
  * lies over: kept alive by the texture and answered by -buffer, as Metal does. */

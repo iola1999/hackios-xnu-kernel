@@ -79,7 +79,8 @@ struct adreno8_space_table {
 struct adreno8_gpu_space {
 	const char *name;
 	uint32_t context;
-	struct adreno8_space_table tables[1024];
+	/* 4 GiB at 4 KiB granule needs at most 1 L0 + 4 L1 + 2048 L2 = 2053 tables. */
+	struct adreno8_space_table tables[2064];
 	unsigned table_count;
 	uint16_t leaf_slot[2048];                 /* each 2 MB's level-2 table, as its index in tables[] + 1; 0: not looked up yet */
 	unsigned secure_tables;           /* pages already assigned to {HLOS read/write, CP_PIXEL read} */

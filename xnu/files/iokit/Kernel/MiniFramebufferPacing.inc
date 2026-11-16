@@ -171,6 +171,7 @@ IOMobileFramebuffer::settle(const uint8_t * swap, MiniIOSurface ** surfaces)
 	if (!fGraphics) {
 		return;
 	}
+	IOLockLock(fLock);
 	fSettling = true;
 	fRowHashRows = 0;
 	fBase = flip_target(fBase);
@@ -192,4 +193,5 @@ IOMobileFramebuffer::settle(const uint8_t * swap, MiniIOSurface ** surfaces)
 	fStatRowsTo = rowsTo;
 	fStatSettled++;
 	fStatSettleTime += mach_absolute_time() - began;
+	IOLockUnlock(fLock);
 }

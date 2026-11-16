@@ -186,6 +186,7 @@ static void fb_reply(const char *tag, const char *message)
     snprintf(model.message, sizeof(model.message), "%s", message);
 }
 static int64_t psci_reset_attempt(void) { model.resets++; return -7; }
+static int nvram_fastboot_set(void) { return 0; }
 static void print(const char *format, ...) { (void)format; }
 static void set_result(const char *state, uint64_t first, uint64_t second)
 {

@@ -65,10 +65,21 @@ rw_pipe_key(unsigned char key[CC_SHA256_DIGEST_LENGTH], NSData *vertex_air,
 		rw_pipe_add_bytes(&ctx, &linked[i].output, sizeof(linked[i].output));
 		rw_pipe_add_bytes(&ctx, &linked[i].num_nodes, sizeof(linked[i].num_nodes));
 		for (unsigned j = 0; j < linked[i].num_nodes; j++) {
-			rw_pipe_add_bytes(&ctx, linked[i].nodes[j].bitcode, linked[i].nodes[j].size);
-			rw_pipe_add_bytes(&ctx, linked[i].nodes[j].function,
-					  linked[i].nodes[j].function ? strlen(linked[i].nodes[j].function) : 0);
-			rw_pipe_add_bytes(&ctx, &linked[i].nodes[j].num_args, sizeof(linked[i].nodes[j].num_args));
+			const struct rwa_stitch_node *node = &linked[i].nodes[j];
+
+			rw_pipe_add_bytes(&ctx, node->bitcode, node->size);
+			rw_pipe_add_bytes(&ctx, node->function,
+					  node->function ? strlen(node->function) : 0);
+			rw_pipe_add_bytes(&ctx, &node->num_args, sizeof(node->num_args));
+			if (node->num_args != 0 && node->args != NULL) {
+				rw_pipe_add_bytes(&ctx, node->args,
+						  (size_t)node->num_args * sizeof(node->args[0]));
+			}
+			rw_pipe_add_bytes(&ctx, &node->num_after, sizeof(node->num_after));
+			if (node->num_after != 0 && node->after != NULL) {
+				rw_pipe_add_bytes(&ctx, node->after,
+						  (size_t)node->num_after * sizeof(node->after[0]));
+			}
 		}
 	}
 	CC_SHA256_Final(key, &ctx);

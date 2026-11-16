@@ -652,9 +652,13 @@ rw_image_uuid(const void *addr, char *out, size_t out_size)
 		rw_print("%s\n", why);
 		return nil;
 	}
-	return [[AnnibaleMetalTexture alloc] initWithAnnibaleDevice:self
-							 texture:texture
-							   shape:&shape iosurface:NULL plane:0];
+	AnnibaleMetalTexture *tex = [[AnnibaleMetalTexture alloc] initWithAnnibaleDevice:self
+									 texture:texture
+									   shape:&shape iosurface:NULL plane:0];
+	if ([(id)tex respondsToSelector:@selector(annibaleApplyDescriptorSwizzle:)]) {
+		[(id)tex performSelector:@selector(annibaleApplyDescriptorSwizzle:) withObject:descriptor];
+	}
+	return tex;
 }
 
 /* The sampler's own base class exists and owes its protocol nothing, so this is the cheapest

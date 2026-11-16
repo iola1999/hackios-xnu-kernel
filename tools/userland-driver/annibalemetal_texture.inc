@@ -123,6 +123,21 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 	_bufferBytesPerRow = bytesPerRow;
 }
 
+- (void)annibaleApplyDescriptorSwizzle:(id)descriptor
+{
+	if (descriptor == nil || ![descriptor respondsToSelector:@selector(swizzle)])
+		return;
+	MTLTextureSwizzleChannels sw = [(MTLTextureDescriptor *)descriptor swizzle];
+	_swizzle = sw;
+	_hasSwizzle = YES;
+	BOOL identity = sw.red == MTLTextureSwizzleRed && sw.green == MTLTextureSwizzleGreen &&
+			sw.blue == MTLTextureSwizzleBlue && sw.alpha == MTLTextureSwizzleAlpha;
+	if (!identity && mesa.texture_set_swizzle != NULL && _texture != NULL) {
+		mesa.texture_set_swizzle(_texture, (uint8_t)sw.red, (uint8_t)sw.green,
+					 (uint8_t)sw.blue, (uint8_t)sw.alpha);
+	}
+}
+
 /* The surface a texture read through a copy stands for (rw_surface_through_copy), so that
  * -iosurface answers it. */
 - (void)annibaleSetSurface:(CFTypeRef)surface plane:(NSUInteger)plane
@@ -301,8 +316,11 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 		rw_print("texture view: %s\n", why);
 		return nil;
 	}
-	if (mesa.texture_set_swizzle != NULL &&
-	    (swizzle.red || swizzle.green || swizzle.blue || swizzle.alpha)) {
+	BOOL identity = swizzle.red == MTLTextureSwizzleRed &&
+			swizzle.green == MTLTextureSwizzleGreen &&
+			swizzle.blue == MTLTextureSwizzleBlue &&
+			swizzle.alpha == MTLTextureSwizzleAlpha;
+	if (mesa.texture_set_swizzle != NULL && (!identity || _hasSwizzle)) {
 		mesa.texture_set_swizzle(view, (uint8_t)swizzle.red, (uint8_t)swizzle.green,
 					 (uint8_t)swizzle.blue, (uint8_t)swizzle.alpha);
 	}
@@ -323,6 +341,7 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 		texture->_parentRelativeLevel = levels.location;
 		texture->_parentRelativeSlice = slices.location;
 		texture->_swizzle = swizzle;
+		texture->_hasSwizzle = YES;
 	}
 	return texture;
 }
@@ -333,10 +352,7 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 				? 6 * MAX(_shape.array_length, 1) : MAX(_shape.array_length, 1);
 	return [self annibaleViewWithPixelFormat:format levels:levels slices:NSMakeRange(0, layers)
 					   type:_shape.type
-					swizzle:MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed,
-									     MTLTextureSwizzleGreen,
-									     MTLTextureSwizzleBlue,
-									     MTLTextureSwizzleAlpha)];
+					swizzle:[self swizzle]];
 }
 
 - (id)newTextureViewWithPixelFormat:(NSUInteger)format
@@ -398,10 +414,7 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 {
 	return [self newTextureViewWithPixelFormat:format textureType:type levels:levels
 					    slices:slices
-					   swizzle:MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed,
-										MTLTextureSwizzleGreen,
-										MTLTextureSwizzleBlue,
-										MTLTextureSwizzleAlpha)];
+					   swizzle:[self swizzle]];
 }
 
 - (id)newSharedTextureHandle { return nil; }   /* nothing here is shared between processes */
@@ -415,7 +428,7 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 
 - (MTLTextureSwizzleChannels)swizzle
 {
-	if (_swizzle.red != 0 || _swizzle.green != 0 || _swizzle.blue != 0 || _swizzle.alpha != 0)
+	if (_hasSwizzle)
 		return _swizzle;
 	return MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen,
 					     MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha);
@@ -544,6 +557,9 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 										    shape:&shape
 										iosurface:NULL plane:0];
 	[made annibaleSetBuffer:self offset:offset bytesPerRow:bytesPerRow];
+	if ([(id)made respondsToSelector:@selector(annibaleApplyDescriptorSwizzle:)]) {
+		[(id)made performSelector:@selector(annibaleApplyDescriptorSwizzle:) withObject:descriptor];
+	}
 	return made;
 }
 
@@ -588,9 +604,11 @@ rw_surface_through_copy(AnnibaleMetalDevice *device, MTLTextureDescriptor *d, vo
 	id buffer;
 	size_t row;
 
+	MTLTextureSwizzleChannels sw = [d swizzle];
 	row = selected->rowBytes;
-	key = [NSString stringWithFormat:@"%p %lu %lu %lux%lu", surface, (unsigned long)plane,
-	       (unsigned long)[d pixelFormat], (unsigned long)[d width], (unsigned long)[d height]];
+	key = [NSString stringWithFormat:@"%p %lu %lu %lux%lu %u,%u,%u,%u", surface, (unsigned long)plane,
+	       (unsigned long)[d pixelFormat], (unsigned long)[d width], (unsigned long)[d height],
+	       sw.red, sw.green, sw.blue, sw.alpha];
 	pthread_mutex_lock(&shared_lock);
 	if (shared == nil)
 		shared = [[NSMutableDictionary alloc] init];
@@ -745,9 +763,13 @@ rw_surface_through_copy(AnnibaleMetalDevice *device, MTLTextureDescriptor *d, vo
 				 shape.pixel_format, shape.usage, why);
 		return nil;
 	}
-	return [[AnnibaleMetalTexture alloc] initWithAnnibaleDevice:self
-							 texture:texture
-							   shape:&shape iosurface:s plane:p];
+	AnnibaleMetalTexture *surfTex = [[AnnibaleMetalTexture alloc] initWithAnnibaleDevice:self
+									    texture:texture
+									      shape:&shape iosurface:s plane:p];
+	if ([(id)surfTex respondsToSelector:@selector(annibaleApplyDescriptorSwizzle:)]) {
+		[(id)surfTex performSelector:@selector(annibaleApplyDescriptorSwizzle:) withObject:d];
+	}
+	return surfTex;
 }
 
 @end

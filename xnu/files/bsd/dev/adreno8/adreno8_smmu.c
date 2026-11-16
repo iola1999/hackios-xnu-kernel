@@ -448,10 +448,26 @@ adreno8_space_find_range(struct adreno8_gpu_space *space, uint32_t start, uint32
 	}
 	candidate = ((uint64_t)start + alignment - 1) & ~(uint64_t)(alignment - 1);
 	while (candidate + size <= end) {
-		uint32_t at;
-		for (at = 0; at < size; at += SMMU_GRANULE) {
-			uint64_t *entry = adreno8_space_entry(space, (uint32_t)candidate + at);
-			if (entry != NULL && *entry != 0) {
+		uint32_t at = 0;
+		while (at < size) {
+			uint64_t va = candidate + at;
+			uint64_t leaf_end = (va | ((1ULL << 21) - 1)) + 1;
+			uint32_t step = (uint32_t)((leaf_end - va < (uint64_t)(size - at)) ?
+			    (leaf_end - va) : (uint64_t)(size - at));
+			struct adreno8_space_table *leaf = adreno8_space_table(space, 2, (uint32_t)(va >> 21));
+			if (leaf == NULL) {
+				at += step;
+				continue;
+			}
+			const uint64_t *pte = (const uint64_t *)leaf->table;
+			uint32_t sub;
+			for (sub = 0; sub < step; sub += SMMU_GRANULE) {
+				if (pte[((va + sub) >> 12) & 0x1ff] != 0) {
+					break;
+				}
+			}
+			at += sub;
+			if (sub < step) {
 				break;
 			}
 		}

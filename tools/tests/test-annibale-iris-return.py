@@ -149,6 +149,8 @@ static void loader_log_append_msgbuf(void) { }
 static void loader_log_puts(const char *p) { (void)p; }
 static void loader_log_putc(char c) { (void)c; }
 static volatile bool loader_panicked = true;     /* the return after a panic: the log is saved */
+static char loader_panic_buf[64];
+static size_t loader_panic_extract_text(char *dst, size_t cap) { (void)dst; (void)cap; (void)debug_buf_base; (void)debug_buf_ptr; return 0; }
 static void loader_panic_sync_ufs(const char *reason, unsigned flags)
 {
     assert(!strcmp(reason, "loader_return") && flags == 1 && stopped == 1);

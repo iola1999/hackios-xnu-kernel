@@ -298,11 +298,17 @@ public:
 	bool            fColumnValid;
 	uint32_t *      fBlendRow;              /* ... and a row of the picture blended from two (fBlendRowSize pixels) */
 	uint32_t        fBlendRowSize;
+	IOBufferMemoryDescriptor * fRecDesc;
 	uint8_t *       fRecBase;
 	uint64_t        fRecSize, fRecUsed;
 	uint64_t        fFirstFrame, fRecFirst; /* when the first frame was shown, and the first recorded */
+	uint64_t        fRecDurationNs, fRecStartDelayNs;
 	bool            fRecDone;
 	bool            fRecWrapped;            /* (rec_ring) the memory has been full once: frames go over the oldest */
+	bool            fRecScanout;
+	int32_t         fLastBy0, fLastBy1;
+	uint32_t        fLastBufSeqBefore, fLastBufSeqAfter;
+	bool            fLastAllDirty;
 	/* fb_filter=2 (MiniFramebufferPacing.inc): drawing the frame again filtered; a layer of this frame drawn unfiltered */
 	bool            fSettling, fDrewNearest;
 	uint32_t        fStatSettled;           /* frames drawn again filtered, and how long that took together */
@@ -335,12 +341,16 @@ public:
 	uint64_t        fHelperGeneration;
 	unsigned        fHelpersBusy, fHelpersStarted;
 	uint32_t *      fHelperBlend[7];
-	void record(MiniIOSurface * s);
+	bool ensureRecBuffer(uint32_t wantMB);
+	void resetRecHeader(uint64_t durationNs, uint64_t startDelayNs, bool scanout);
+	void flushRecCache(void);
+	void recordFrame(const uint8_t * swap, MiniIOSurface * s, bool clearedBlack, bool drewPanel, uint64_t now);
 };
 
 OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
 
 #include "MiniFramebufferPacing.inc"
+#include "MiniFramebufferRecord.inc"
 
 /*
  * The modes of the display, the way CoreAnimation reads them (the properties TimingElements
@@ -465,30 +475,24 @@ IOMobileFramebuffer::start(IOService * provider)
 	IOLog("MiniIOMobileFramebuffer: display %ux%u on a panel of %ux%u (%u bytes per row)\n", fWidth, fHeight,
 	    fPanelWidth, fPanelHeight, fRowBytes);
 
+	gFBInstance = this;
 	if (gRecSeconds != 0) {
-		/* one piece of physical memory: the loader will send it over USB as it lies */
-		IOBufferMemoryDescriptor * memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
-		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, (mach_vm_size_t) gRecMegabytes << 20, ~0ULL);
+		if (ensureRecBuffer(gRecMegabytes)) {
+			struct rec_header * header = (struct rec_header *) fRecBase;
 
-		if (memory != NULL) {
-			struct rec_header * header = (struct rec_header *) memory->getBytesNoCopy();
-
-			fRecBase = (uint8_t *) header;
-			fRecSize = (uint64_t) gRecMegabytes << 20;
-			fRecUsed = sizeof(*header);
-			bzero(header, sizeof(*header));
-			memcpy(header->magic, "RWREC003", 8);
-			header->width = fWidth / REC_STEP;
-			header->height = fHeight / REC_STEP;
-			loader_recording[0] = memory->getPhysicalSegment(0, NULL);
-			loader_recording[1] = fRecUsed;
-			loader_recording[2] = (uint64_t) (uintptr_t) fRecBase;
-			IOLog("MiniIOMobileFramebuffer: recording %u s of the screen at %ux%u from second %u, into %u MB at %#llx%s\n",
-			    gRecSeconds, header->width, header->height, gRecStart, gRecMegabytes, loader_recording[0],
+			resetRecHeader((uint64_t) gRecSeconds * NSEC_PER_SEC, (uint64_t) gRecStart * NSEC_PER_SEC,
+			    gRecScanout != 0);
+			IOLog("MiniIOMobileFramebuffer: recording %u s of the screen at %ux%u from second %u, into %llu MB at %#llx%s\n",
+			    gRecSeconds, header->width, header->height, gRecStart, fRecSize >> 20, loader_recording[0],
 			    gRecRing ? ", the last of it kept (rec_ring)" : "");
 		} else {
 			IOLog("MiniIOMobileFramebuffer: no memory for a recording of %u MB\n", gRecMegabytes);
 		}
+	} else if (ensureRecBuffer(96)) {
+		fRecDone = true;
+		fRecDurationNs = 0;
+		IOLog("MiniIOMobileFramebuffer: reserved %llu MB runtime recording buffer at %#llx\n",
+		    fRecSize >> 20, loader_recording[0]);
 	}
 
 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
@@ -498,74 +502,6 @@ IOMobileFramebuffer::start(IOService * provider)
 	setName("disp0");
 	registerService();
 	return true;
-}
-
-/* Keep a small copy of the frame that is about to be shown (the surface is the whole screen). */
-void
-IOMobileFramebuffer::record(MiniIOSurface * s)
-{
-	struct rec_header * header = (struct rec_header *) fRecBase;
-	uint64_t now = mach_absolute_time(), since_first, since_start = 0, frame_size;
-	struct rec_frame * frame;
-	uint8_t * to;
-
-	if (fFirstFrame == 0) {
-		fFirstFrame = now;
-	}
-	if (fRecBase == NULL || fRecDone || s->info.width < fWidth || s->info.height < fHeight) {
-		return;
-	}
-	absolutetime_to_nanoseconds(now - fFirstFrame, &since_first);
-	if (since_first < (uint64_t) gRecStart * NSEC_PER_SEC) {
-		return;
-	}
-	if (fRecFirst == 0) {
-		uint64_t began;
-
-		fRecFirst = now;
-		absolutetime_to_nanoseconds(now, &began);
-		header->began = began;
-		IOLog("MiniIOMobileFramebuffer: the recording begins at %llu.%03llu s of the kernel's time (mach_absolute_time)\n",
-		    began / NSEC_PER_SEC, began / NSEC_PER_MSEC % 1000);
-	}
-	absolutetime_to_nanoseconds(now - fRecFirst, &since_start);
-	frame_size = sizeof(*frame) + (uint64_t) header->width * header->height * 3;
-	if (since_start > (uint64_t) gRecSeconds * NSEC_PER_SEC || (fRecUsed + frame_size > fRecSize && !gRecRing)) {
-		fRecDone = true;
-		IOLog("MiniIOMobileFramebuffer: recording finished: %u frames, %llu MB\n", header->frames, fRecUsed >> 20);
-		return;
-	}
-	if (fRecUsed + frame_size > fRecSize) {
-		/* (rec_ring) round again: over the oldest, which is the next one */
-		fRecUsed = sizeof(*header);
-		fRecWrapped = true;
-	}
-	frame = (struct rec_frame *) (fRecBase + fRecUsed);
-	frame->nanoseconds = since_start;
-	to = (uint8_t *) (frame + 1);
-	for (uint32_t y = 0; y < header->height; y++) {
-		const uint32_t * from = (const uint32_t *) (s->pixels() + (size_t) (y * REC_STEP + 1) * s->info.bytesPerRow);
-
-		for (uint32_t x = 0; x < header->width; x++) {
-			uint32_t pixel = from[x * REC_STEP + 1];        /* B G R A in memory */
-
-			*to++ = (uint8_t) (pixel >> 16);
-			*to++ = (uint8_t) (pixel >> 8);
-			*to++ = (uint8_t) pixel;
-		}
-	}
-	fRecUsed += frame_size;
-	if (!fRecWrapped) {
-		header->frames++;
-		loader_recording[1] = fRecUsed;
-	} else {
-		/* the memory full of frames: all of them are handed over, from the one after this */
-		header->oldest = (uint32_t) ((fRecUsed - sizeof(*header)) / frame_size);
-		if (header->oldest >= header->frames) {
-			header->oldest = 0;
-		}
-		loader_recording[1] = sizeof(*header) + (uint64_t) header->frames * frame_size;
-	}
 }
 
 MiniIOSurface *
@@ -592,8 +528,9 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	int32_t sx = src[0], sy = src[1], sw = src[2], sh = src[3];
 	int32_t dx = dst[0], dy = dst[1], dw = dst[2], dh = dst[3];
 	int32_t px0, py0, px1, py1, cx0, cx1;
+	unsigned targetBuf = flip.ready ? (unsigned) (flip.shown ^ 1) : 0;
 	bool filter = gFilter == 1 || (gFilter == 2 && (fSettling || fFilterFrame));
-	RowJob job;
+	RowJob job = {};
 
 	if (sw <= 0 || sh <= 0) {
 		sx = sy = 0;
@@ -654,11 +591,33 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	job.py1 = py1;
 	job.cx0 = cx0;
 	job.cx1 = cx1;
+	job.bufferSeq = fBufferSeq[targetBuf];
 	job.filter = filter;
 	job.unscaled = px1 - px0 == sw && py1 - py0 == sh && px0 >= 0 && (uint32_t) px1 <= fPanelWidth;
+	fLastBufSeqBefore = job.bufferSeq;
 	if (!dirtyBand(&job)) {
 		fStatUnchanged++;
 		return;
+	}
+	if (fSingleLayer && (cx0 > 0 || py0 > 0 || cx1 < (int32_t) fPanelWidth || py1 < (int32_t) fPanelHeight)) {
+		int32_t cy0 = py0 < 0 ? 0 : py0;
+		int32_t cy1 = (uint32_t) py1 > fPanelHeight ? (int32_t) fPanelHeight : py1;
+
+		for (int32_t y = 0; y < cy0; y++) {
+			bzero(fBase + (size_t) y * fRowBytes, (size_t) fPanelWidth * 4);
+		}
+		for (int32_t y = cy1; y < (int32_t) fPanelHeight; y++) {
+			bzero(fBase + (size_t) y * fRowBytes, (size_t) fPanelWidth * 4);
+		}
+		for (int32_t y = cy0; y < cy1; y++) {
+			if (cx0 > 0) {
+				bzero(fBase + (size_t) y * fRowBytes, (size_t) cx0 * 4);
+			}
+			if (cx1 < (int32_t) fPanelWidth) {
+				bzero(fBase + (size_t) y * fRowBytes + (size_t) cx1 * 4, (size_t) (fPanelWidth - cx1) * 4);
+			}
+		}
+		flip_whole();
 	}
 	/* which pixel of a source row each pixel of a panel row takes: worked out once per geometry */
 	{
@@ -680,10 +639,14 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	}
 	fDrewNearest = fDrewNearest || (gFilter == 2 && !fSettling && !fFilterFrame);
 	flip_band(&job.by0, &job.by1, job.py0, job.py1);
+	fLastBy0 = job.by0;
+	fLastBy1 = job.by1;
+	fLastAllDirty = job.allDirty;
 	fStatBandRows += (uint64_t) (job.by1 - job.by0);
 	if (fThreads <= 1 || fDiff || fHelpersStarted + 1 < fThreads) {
 		drawRows(&job, job.by0, job.by1, fBlendRow);
-		fBufferSeq[flip.ready ? (flip.shown ^ 1) : 0] = fRowSeq;
+		fBufferSeq[targetBuf] = fRowSeq;
+		fLastBufSeqAfter = fRowSeq;
 		return;
 	}
 	/* shared out: the helpers take their rows, this thread the first share, then waits for them */
@@ -699,7 +662,8 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 		IOLockSleep(fHelperLock, &fHelpersBusy, THREAD_UNINT);
 	}
 	IOLockUnlock(fHelperLock);
-	fBufferSeq[flip.ready ? (flip.shown ^ 1) : 0] = fRowSeq;
+	fBufferSeq[targetBuf] = fRowSeq;
+	fLastBufSeqAfter = fRowSeq;
 }
 
 /*
@@ -792,7 +756,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	uint64_t began = mach_absolute_time(), nanos, ready, copy_began, drawn, latched = 0;
 	uint32_t layers = 0, latch_swap = 0, latch_frame = 0;
 	MiniIOSurface * recorded = NULL;
-	bool report, has_latch;
+	bool report, has_latch, cleared_black = false, drew_panel;
 
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 		if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS)) {
@@ -842,6 +806,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		    swapWord(swap, SWAP_SURFACE(2)), swapWord(swap, SWAP_SURFACE(3)), set, swapWord(swap, SWAP_LAYERS_CLEARED));
 	}
 	fBase = flip_target(fBase);
+	fLastBy0 = fLastBy1 = -1;
+	fLastBufSeqBefore = fLastBufSeqAfter = fBufferSeq[flip.ready ? (flip.shown ^ 1) : 0];
+	fLastAllDirty = false;
 	has_latch = flip_latch(&latch_swap, &latched, &latch_frame);
 	if (has_latch || !flip.ready) {
 		uint64_t frame_at = has_latch ? latched : copy_began;
@@ -892,6 +859,11 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				flip_whole();
 				fAllChangedSeq = ++fRowSeq;
 				fBufferSeq[flip.ready ? (flip.shown ^ 1) : 0] = fRowSeq;
+				cleared_black = true;
+				fLastBy0 = 0;
+				fLastBy1 = (int32_t) fPanelHeight;
+				fLastBufSeqAfter = fRowSeq;
+				fLastAllDirty = true;
 			}
 			continue;
 		}
@@ -921,10 +893,11 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			}
 		}
 	}
+	drew_panel = flip.ready ? flip.drew : (layers != 0 || cleared_black);
 	flip_present(swapWord(swap, SWAP_ID));
 	drawn = mach_absolute_time();
-	if (recorded != NULL) {
-		record(recorded);
+	if (fGraphics) {
+		recordFrame(swap, recorded, cleared_black, drew_panel, drawn);
 	}
 	/* its pixels copied (and recorded): the swap after it may be handed over */
 	IOLockLock(fSwapLock);
