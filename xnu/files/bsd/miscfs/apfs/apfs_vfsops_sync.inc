@@ -103,6 +103,7 @@ apfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
 		cap->capabilities[VOL_CAPABILITIES_INTERFACES] =
 		    VOL_CAP_INT_ADVLOCK |
 		    VOL_CAP_INT_FLOCK |
+		    VOL_CAP_INT_EXTENDED_SECURITY |
 		    VOL_CAP_INT_EXTENDED_ATTR |
 		    (rw ? VOL_CAP_INT_CLONE | VOL_CAP_INT_RENAME_SWAP | VOL_CAP_INT_RENAME_EXCL : 0);
 		cap->valid[VOL_CAPABILITIES_FORMAT] =
@@ -124,6 +125,7 @@ apfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
 		cap->valid[VOL_CAPABILITIES_INTERFACES] =
 		    VOL_CAP_INT_ADVLOCK |
 		    VOL_CAP_INT_FLOCK |
+		    VOL_CAP_INT_EXTENDED_SECURITY |
 		    VOL_CAP_INT_EXTENDED_ATTR |
 		    VOL_CAP_INT_CLONE |
 		    VOL_CAP_INT_RENAME_SWAP |

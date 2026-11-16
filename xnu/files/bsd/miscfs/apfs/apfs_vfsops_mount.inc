@@ -211,6 +211,12 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 
 	vfs_setfsprivate(mp, am);
 	vfs_setflags(mp, MNT_LOCAL);
+	/*
+	 * ACLs, as on iOS: kept in the "com.apple.system.Security" attribute, which VFS reads and
+	 * writes itself once the mount has extended security.  Container directories are mode 000,
+	 * owned by -2, and reached only through their ACL entries.
+	 */
+	vfs_setextendedsecurity(mp);
 	vfs_setlocklocal(mp);
 	apfs_wmount_attach(am, dc);
 

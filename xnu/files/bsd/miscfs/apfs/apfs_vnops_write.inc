@@ -293,6 +293,24 @@ apfs_vnop_offtoblk(struct vnop_offtoblk_args *ap)
 
 /* ------------------------------------------------------------------ fsync and fsctl */
 
+/* The file has a decmpfs header: its contents are compressed (apfs_lib's cfile_header). */
+static bool
+apfs_has_decmpfs(struct apfs_mount *am, struct apfs_node *an)
+{
+	uint8_t hdr[16];
+	uint32_t magic = 0;
+	size_t n = 0;
+	int error;
+
+	apfs_lock_shared(am);
+	error = apfs_xattr_read(&am->am_vol, an->an_id, APFS_DECMPFS_XATTR_NAME, hdr, sizeof(hdr), &n);
+	apfs_unlock_shared(am);
+	if (error == 0 && n >= sizeof(hdr)) {
+		memcpy(&magic, hdr, sizeof(magic));
+	}
+	return magic == APFS_DECMPFS_MAGIC;
+}
+
 /* fsync(2): the file's pages on the device, and a commit if anything of it is not committed. */
 static int
 apfs_vnop_fsync(struct vnop_fsync_args *ap)
@@ -357,6 +375,8 @@ apfs_vnop_ioctl(struct vnop_ioctl_args *ap)
 		return apfs_wflush(am);
 	case FSIOC_CAS_BSDFLAGS: {
 		struct fsioc_cas_bsdflags *cas = (struct fsioc_cas_bsdflags *)ap->a_data;
+		/* VFS calls this without vnode_setattr; the decmpfs rule of apfs_vnop_setattr holds here too */
+		bool compressible = !(cas->new_flags & UF_COMPRESSED) || apfs_has_decmpfs(am, an);
 		int error = 0;
 
 		if (w == NULL) {
@@ -370,6 +390,9 @@ apfs_vnop_ioctl(struct vnop_ioctl_args *ap)
 
 			a.set = APFS_WA_FLAGS;
 			a.flags = cas->new_flags;
+			if (!compressible && !(cas->actual_flags & UF_COMPRESSED)) {
+				a.flags &= ~UF_COMPRESSED;
+			}
 			error = apfs_w_setattr(w, an->an_id, &a);
 			if (error == 0 && (a.flags & UF_TRACKED)) {
 				error = apfs_w_docid(w, an->an_id, &doc);
@@ -411,24 +434,6 @@ apfs_vnop_ioctl(struct vnop_ioctl_args *ap)
 }
 
 /* ------------------------------------------------------------------ attributes */
-
-/* The file has a decmpfs header: its contents are compressed (apfs_lib's cfile_header). */
-static bool
-apfs_has_decmpfs(struct apfs_mount *am, struct apfs_node *an)
-{
-	uint8_t hdr[16];
-	uint32_t magic = 0;
-	size_t n = 0;
-	int error;
-
-	apfs_lock_shared(am);
-	error = apfs_xattr_read(&am->am_vol, an->an_id, APFS_DECMPFS_XATTR_NAME, hdr, sizeof(hdr), &n);
-	apfs_unlock_shared(am);
-	if (error == 0 && n >= sizeof(hdr)) {
-		memcpy(&magic, hdr, sizeof(magic));
-	}
-	return magic == APFS_DECMPFS_MAGIC;
-}
 
 static int
 apfs_vnop_setattr(struct vnop_setattr_args *ap)

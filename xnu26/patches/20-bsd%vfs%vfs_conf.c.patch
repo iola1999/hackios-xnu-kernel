@@ -1,5 +1,5 @@
 diff --git a/bsd/vfs/vfs_conf.c b/bsd/vfs/vfs_conf.c
-index 0e23dd7c5e45..4c5e0fcf4943 100644
+index 0e23dd7c5e45..6b82814c7800 100644
 --- a/bsd/vfs/vfs_conf.c
 +++ b/bsd/vfs/vfs_conf.c
 @@ -103,13 +103,24 @@ extern  struct vfsops mockfs_vfsops;
@@ -28,7 +28,7 @@ index 0e23dd7c5e45..4c5e0fcf4943 100644
  };
  
  int fstypenumstart = FT_BINDFS + 1;
-@@ -193,6 +204,54 @@ static struct vfstable vfstbllist[] = {
+@@ -193,6 +204,55 @@ static struct vfstable vfstbllist[] = {
  	},
  #endif /* BINDFS */
  
@@ -53,16 +53,17 @@ index 0e23dd7c5e45..4c5e0fcf4943 100644
 +
 +#if APFS
 +	/*
-+	 * Apple File System, read only: the root and every image of this port's (the RAM
-+	 * disks are APFS containers).  Before mockfs, which accepts any root device: a device
-+	 * that is not APFS comes back EINVAL and vfs_mountroot() goes on to the next.
++	 * Apple File System.  No MNT_RDONLY here: mount_common() adds these flags to every
++	 * mount, and /private/var is mounted read-write; the root and the images ask for read
++	 * only.  Before mockfs, which accepts any root device: a device that is not APFS comes
++	 * back EINVAL and vfs_mountroot() goes on to the next.
 +	 */
 +	{
 +		.vfc_vfsops = &apfs_vfsops,
 +		.vfc_name = "apfs",
 +		.vfc_typenum = FT_APFS,
 +		.vfc_refcount = 0,
-+		.vfc_flags = MNT_LOCAL | MNT_RDONLY,
++		.vfc_flags = MNT_LOCAL,
 +		.vfc_mountroot = apfs_mountroot,
 +		.vfc_next = NULL,
 +		.vfc_reserved1 = 0,
@@ -83,7 +84,7 @@ index 0e23dd7c5e45..4c5e0fcf4943 100644
  #if MOCKFS
  	/* If we are configured for it, mockfs should always be the last standard entry (and thus the last FS we attempt mountroot with) */
  	{
-@@ -297,6 +356,15 @@ extern const struct vnodeopv_desc devfs_fdesc_vnodeop_opv_desc;
+@@ -297,6 +357,15 @@ extern const struct vnodeopv_desc devfs_fdesc_vnodeop_opv_desc;
  extern const struct vnodeopv_desc mockfs_vnodeop_opv_desc;
  #endif /* MOCKFS */
  
@@ -99,7 +100,7 @@ index 0e23dd7c5e45..4c5e0fcf4943 100644
  extern const struct vnodeopv_desc nullfs_vnodeop_opv_desc;
  extern const struct vnodeopv_desc bindfs_vnodeop_opv_desc;
  
-@@ -326,5 +394,11 @@ const struct vnodeopv_desc *vfs_opv_descs[] = {
+@@ -326,5 +395,11 @@ const struct vnodeopv_desc *vfs_opv_descs[] = {
  #if MOCKFS
  	&mockfs_vnodeop_opv_desc,
  #endif /* MOCKFS */
