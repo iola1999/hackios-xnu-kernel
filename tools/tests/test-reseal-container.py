@@ -78,6 +78,31 @@ class ContainerTests(unittest.TestCase):
             self.assertIn('payload.lz4 is unsupported', result.stderr)
             self.assertEqual(output.read_bytes(), b'preserve-existing-output')
 
+    def test_output_fills_the_partition_with_a_footer(self):
+        """The image ends in its own AVB footer and is a valid REFERENCE in turn (the release's loader shell)."""
+        with tempfile.TemporaryDirectory(prefix='reseal-test-') as directory:
+            root = Path(directory)
+            compressed = zlib.compressobj(wbits=31)
+            (root / 'kernel').write_bytes(compressed.compress(b'shim' + payload([(b'loader.efi', b'efi')])) +
+                                          compressed.flush() + b'DTB')
+            (root / 'ramdisk').write_bytes(b'ramdisk')
+            subprocess.run([sys.executable, reseal.MKBOOTIMG, '--kernel', str(root / 'kernel'), '--ramdisk',
+                            str(root / 'ramdisk'), '--header_version', '1', '-o', str(root / 'reference.img')],
+                           check=True)
+            (root / 'payload.bin').write_bytes(payload([(b'loader.efi', b'new efi'), (b'kernel', b'kernel')]))
+            output = root / 'boot.img'       # avbtool checks the digest of the file named after the partition
+            subprocess.run([sys.executable, str(TOOL), str(root / 'reference.img'), str(root / 'payload.bin'),
+                            '-o', str(output)], check=True, capture_output=True)
+            image = output.read_bytes()
+            self.assertEqual(len(image), reseal.BOOT_PARTITION_BYTES)
+            magic, _, _, size, vbmeta, _ = struct.unpack('>4sIIQQQ', image[-64:-28])
+            self.assertEqual(magic, b'AVBf')
+            self.assertEqual(image[vbmeta:vbmeta + 4], b'AVB0')
+            self.assertGreaterEqual(vbmeta, size)
+            self.assertEqual(reseal.split(image), (b'shim', b'DTB', b'ramdisk'))
+            subprocess.run([sys.executable, '-I', reseal.AVBTOOL, 'verify_image', '--image', str(output)],
+                           check=True, capture_output=True)
+
 
 if __name__ == '__main__':
     unittest.main()

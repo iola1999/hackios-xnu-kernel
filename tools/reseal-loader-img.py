@@ -15,6 +15,14 @@ stream is zlib's own wrapper at level 9, which is what reproduces the v8 stream 
 container (89,224 bytes) went in unpadded; the same steps without the padding give the v8 file
 back except the 20-byte header id, which v8 carries stale and LK does not check. This tool writes
 the id mkbootimg computes.
+
+The output fills the 96 MiB boot partition and ends in its own AVB hash footer (AOSP avbtool,
+prebuilt/avb/). fastboot writes only the bytes of an image, so a shorter image leaves the old
+footer at the end of the partition, and ABL looks for a vbmeta where that footer says. An unlocked
+phone boots past a vbmeta whose digest does not match; one the new image has overwritten makes ABL
+mark the slot unbootable and boot the other slot (item 7 of section 4 of the top-level
+docs/plan/device-boot-target-sop.md). The salt and the rollback index are the stock boot_a's,
+fixed so that the same inputs give the same image.
 """
 import argparse
 import hashlib
@@ -28,6 +36,11 @@ import zlib
 HERE = os.path.dirname(os.path.abspath(__file__))
 # AOSP's mkbootimg, the same file as Mu-Silicium's Resources/Scripts/mkbootimg.py
 MKBOOTIMG = os.path.join(HERE, '..', 'prebuilt', 'uefi', 'mkbootimg.py')
+# AOSP external/avb android-16.0.0_r4, unmodified (MIT licence in the file)
+AVBTOOL = os.path.join(HERE, '..', 'prebuilt', 'avb', 'avbtool.py')
+BOOT_PARTITION_BYTES = 96 << 20
+STOCK_SALT = 'b99ee1d9b485c77b089fc8f237c0fa43dacd3feb6b509d312fe095d3a77ac988'
+STOCK_ROLLBACK_INDEX = 1769904000
 
 
 def validate_container(container):
@@ -93,6 +106,10 @@ def main():
         subprocess.check_call([sys.executable, MKBOOTIMG, '--kernel', kernel, '--ramdisk', rd,
                                '--header_version', '1', '--os_version', '15.0.0',
                                '--os_patch_level', '2026-02', '-o', args.output])
+    subprocess.check_call([sys.executable, '-I', AVBTOOL, 'add_hash_footer', '--image', args.output,
+                           '--partition_size', str(BOOT_PARTITION_BYTES), '--partition_name', 'boot',
+                           '--hash_algorithm', 'sha256', '--salt', STOCK_SALT, '--algorithm', 'NONE',
+                           '--rollback_index', str(STOCK_ROLLBACK_INDEX), '--rollback_index_location', '0'])
     data = open(args.output, 'rb').read()
     print(f'{args.output}: {len(data)} bytes, sha256 {hashlib.sha256(data).hexdigest()}; '
           f'shim+FD {len(prefix)} bytes, container {len(container)} bytes, DTB {len(dtb)} bytes')
