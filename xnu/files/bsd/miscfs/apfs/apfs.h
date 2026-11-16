@@ -262,12 +262,23 @@ void apfs_unlock_exclusive(struct apfs_mount *am);
  */
 struct apfs_wtx *apfs_wtx_of(struct apfs_mount *am);
 daddr64_t apfs_wdevblock(struct apfs_mount *am, uint64_t addr, uint64_t in);
-void apfs_wmap_add(struct apfs_mount *am, uint64_t addr, uint64_t blocks);
+void apfs_wmap_add(struct apfs_mount *am, uint64_t addr, uint64_t blocks, uint64_t id, uint64_t off);
 void apfs_wio_start(struct apfs_mount *am, buf_t bp);
-void apfs_wdirty(struct apfs_mount *am);
+void apfs_wdirty(struct apfs_mount *am, bool here);
 void apfs_wnote(struct apfs_mount *am, uint64_t id);
-int  apfs_wcommit_locked(struct apfs_mount *am);
-int  apfs_wcommit(struct apfs_mount *am, bool push);
+/* What asked for a commit, counted in kern.apfs_wstats. */
+enum apfs_wwhy {
+	APFS_WHY_TICK,                  /* a second after the first change */
+	APFS_WHY_FSYNC,
+	APFS_WHY_IOSYNC,                /* a write with IO_SYNC */
+	APFS_WHY_FULLFSYNC,             /* F_FULLFSYNC, F_BARRIERFSYNC */
+	APFS_WHY_SYNC,                  /* VFS_SYNC: sync(2) and the like */
+	APFS_WHY_FULL,                  /* the transaction is at APFS_WDIRTY_MAX */
+	APFS_WHY_OTHER,                 /* mount, unmount, the end of a run */
+	APFS_WHY_N
+};
+int  apfs_wcommit_locked(struct apfs_mount *am, enum apfs_wwhy why);
+int  apfs_wcommit(struct apfs_mount *am, bool push, uint64_t upto, enum apfs_wwhy why);
 int  apfs_wflush(struct apfs_mount *am);         /* F_FULLFSYNC: a commit, or a flush */
 uint64_t apfs_wcommits(struct apfs_mount *am);  /* commits made since the mount */
 int  apfs_wpush_vnode(vnode_t vp, void *wait);   /* a vnode_iterate callback as well */

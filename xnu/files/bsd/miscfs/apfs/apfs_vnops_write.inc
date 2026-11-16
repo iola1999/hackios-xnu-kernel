@@ -57,7 +57,7 @@ apfs_timespec_ns(struct timespec ts)
 	if (__e == 0) {                                                 \
 	        apfs_node_refresh((am), (an));                          \
 	        apfs_node_refresh((am), (other));                       \
-	        apfs_wdirty(am);                                        \
+	        apfs_wdirty(am, true);                                  \
 	}                                                               \
 	apfs_unlock_exclusive(am);                                      \
 	__e;                                                            \
@@ -181,7 +181,7 @@ apfs_vnop_write(struct vnop_write_args *ap)
 		(void)apfs_wresize(vp, an, (uint64_t)MAX(old, uio_offset(uio)), 0);
 	}
 	if (error == 0 && (ioflag & IO_SYNC)) {
-		error = apfs_wcommit(am, false);
+		error = apfs_wcommit(am, false, an->an_wseq, APFS_WHY_IOSYNC);
 	}
 out:
 	lck_rw_unlock_exclusive(&an->an_rwlock);
@@ -228,17 +228,20 @@ apfs_vnop_blockmap(struct vnop_blockmap_args *ap)
 		return ENOTSUP;
 	}
 	if (ap->a_flags & VNODE_WRITE) {
+		bool grew = false;
+
 		apfs_lock_exclusive(am);
 		error = apfs_w_map(w, an->an_id, off, ap->a_size, false, &phys, &run);
 		if (error == 0 && phys == 0) {
 			error = apfs_w_map(w, an->an_id, off, ap->a_size, true, &phys, &run);
-			if (error == 0) {
-				apfs_node_refresh(am, an);
-				apfs_wdirty(am);
-			}
+			grew = error == 0;
 		}
 		if (error == 0 && phys != 0) {
-			apfs_wmap_add(am, phys, (MIN(run, (uint64_t)ap->a_size) + off % bs + bs - 1) / bs);
+			apfs_wmap_add(am, phys, (MIN(run, (uint64_t)ap->a_size) + off % bs + bs - 1) / bs, an->an_id, off);
+		}
+		if (grew) {             /* after apfs_wmap_add: no checkpoint names the blocks before they are sent */
+			apfs_node_refresh(am, an);
+			apfs_wdirty(am, false);
 		}
 		apfs_unlock_exclusive(am);
 	} else {
@@ -326,7 +329,7 @@ apfs_vnop_fsync(struct vnop_fsync_args *ap)
 	if (vnode_isreg(vp) && ubc_getsize(vp) > 0) {
 		(void)ubc_msync(vp, 0, ubc_getsize(vp), NULL, UBC_PUSHDIRTY | (wait ? UBC_SYNC : 0));
 	}
-	return wait && an->an_wseq > apfs_wcommits(am) ? apfs_wcommit(am, false) : 0;
+	return wait && an->an_wseq > apfs_wcommits(am) ? apfs_wcommit(am, false, an->an_wseq, APFS_WHY_FSYNC) : 0;
 }
 
 /* The nearest proper ancestor of an_id's directory that is a sync root, 0 if none (shared lock). */
@@ -399,7 +402,7 @@ apfs_vnop_ioctl(struct vnop_ioctl_args *ap)
 			}
 			if (error == 0) {
 				apfs_node_refresh(am, an);
-				apfs_wdirty(am);
+				apfs_wdirty(am, true);
 			}
 		}
 		apfs_unlock_exclusive(am);
@@ -538,7 +541,7 @@ apfs_vnop_setattr(struct vnop_setattr_args *ap)
 	}
 	if (error == 0) {
 		apfs_node_refresh(am, an);
-		apfs_wdirty(am);
+		apfs_wdirty(am, true);
 	}
 	apfs_unlock_exclusive(am);
 	return error;
@@ -672,10 +675,10 @@ apfs_vnop_inactive(struct vnop_inactive_args *ap)
 			ubc_setsize(vp, 0);
 		}
 		apfs_lock_exclusive(am);
-		if (apfs_wtx_of(am) != NULL && apfs_w_reap(apfs_wtx_of(am), an->an_id) == 0) {
-			apfs_wdirty(am);
-		}
 		an->an_orphan = false;
+		if (apfs_wtx_of(am) != NULL && apfs_w_reap(apfs_wtx_of(am), an->an_id) == 0) {
+			apfs_wdirty(am, true);
+		}
 		apfs_unlock_exclusive(am);
 		vnode_recycle(vp);
 	}

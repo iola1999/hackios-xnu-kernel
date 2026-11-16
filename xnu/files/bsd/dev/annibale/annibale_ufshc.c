@@ -165,6 +165,7 @@ static vm_offset_t hc_uefi_map_va;
 static struct hc_slot hc_slots[SLOTS];
 static uint32_t hc_nslots;                      /* slots 1..hc_nslots carry reads */
 static uint32_t hc_free;                        /* bit i: hc_slots[i] free */
+static uint32_t hc_polled;                      /* the slot after them: ufshc_write_polled's, never in hc_free */
 static volatile uint32_t hc_active_slots;
 static volatile uint32_t hc_pending_slots;
 static uint32_t hc_slot_buffer = SLOT_BUFFER_DEFAULT;
@@ -642,8 +643,8 @@ ufshc_probe(const struct ufshc_loader *loader, bool only)
 		hc_slot_buffer = SLOT_BUFFER_DEFAULT;
 	}
 	PE_parse_boot_argn("ufs_native_slots", &slots, sizeof(slots));
-	if (slots < 1 || slots > SLOTS - 1) {
-		slots = SLOTS - 1;
+	if (slots < 1 || slots > SLOTS - 2) {
+		slots = SLOTS - 2;              /* and slot slots + 1 for ufshc_write_polled */
 	}
 	PE_parse_boot_argn("ufs_native_leave", &hc_leave, sizeof(hc_leave));
 	PE_parse_boot_argn("ufs_native_hang", &hc_hang_after, sizeof(hc_hang_after));
@@ -745,7 +746,7 @@ ufshc_probe(const struct ufshc_loader *loader, bool only)
 		s->utrd = (volatile uint32_t *)(area + 32 * i);
 		s->ucd = (volatile uint32_t *)(area + loader->ucd_offset + i * loader->ucd_size);
 		s->ucd_pa = loader->area_pa + loader->ucd_offset + i * loader->ucd_size;
-		if (i >= 1 && i <= slots) {
+		if (i >= 1 && i <= slots + 1) {
 			vm_offset_t data = 0;
 
 			if (kmem_alloc_contig(kernel_map, &data, round_page(hc_slot_buffer), PAGE_MASK, 0, 0,
@@ -782,6 +783,7 @@ ufshc_probe(const struct ufshc_loader *loader, bool only)
 	}
 	hc_nslots = slots;
 	hc_free = (uint32_t)(((1ULL << (slots + 1)) - 1) & ~1ULL);       /* slots 1..n */
+	hc_polled = slots + 1;
 	hc_usable = true;
 	hc_say("ufs: native: usable: a list of %u slots at %llx (the loader's), reads in %u of them, %u KB each (the logical units reads may go to are set by annibale_ufs.c)%s\n",
 	    SLOTS, loader->area_pa, slots, hc_slot_buffer >> 10, hc_leave ? "; ufs_native_leave=1: the list is left in "

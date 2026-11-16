@@ -524,6 +524,15 @@ ufs_build_sg(buf_t bp, struct ufshc_sg *sg, uint32_t max_segs, uint32_t *out_seg
 	return 0;
 }
 
+/* This kernel's list is in and running, the loader does not want it back, and the slot is not rung. */
+static bool
+hc_can_ring(uint32_t bit)
+{
+	return hc_in && !hc_closed && !hc_dead && *hc_loader.take_back == 0 &&
+	       hc_read(UFSHC_UTRLBA) == hc_list_lo && hc_read(UFSHC_UTRLBAU) == hc_list_hi &&
+	       (hc_read(UFSHC_UTRLRSR) & 1) != 0 && (hc_read(UFSHC_UTRLDBR) & bit) == 0;
+}
+
 static int
 hc_ring(struct hc_slot *s)
 {
@@ -533,9 +542,7 @@ hc_ring(struct hc_slot *s)
 
 	lck_mtx_lock(&hc_lock);
 	istate = ml_set_interrupts_enabled(FALSE);
-	ok = hc_in && !hc_closed && !hc_dead && *hc_loader.take_back == 0 &&
-	    hc_read(UFSHC_UTRLBA) == hc_list_lo && hc_read(UFSHC_UTRLBAU) == hc_list_hi &&
-	    (hc_read(UFSHC_UTRLRSR) & 1) != 0 && (hc_read(UFSHC_UTRLDBR) & bit) == 0;
+	ok = hc_can_ring(bit);
 	if (ok) {
 		s->start_time = mach_absolute_time();
 		if (s->is_async) {
@@ -568,6 +575,16 @@ hc_hang(uint32_t slot)
 
 	hc_say("ufs: native: ufs_native_hang=%u: stopping the kernel with slot %u in flight\n", hc_hang_after, slot);
 	cpu_broadcast_xcall(&synch, TRUE, hc_spin_forever, NULL);
+}
+
+/* The slot's command came back done and answered well (a TEST UNIT READY may answer CHECK CONDITION). */
+static bool
+hc_answer_ok(struct hc_slot *s, bool tur)
+{
+	volatile const uint8_t *r = (volatile const uint8_t *)s->ucd + UCD_RESPONSE;
+
+	return (s->utrd[2] & 0xff) == OCS_SUCCESS && (r[0] & 0x3f) == UPIU_RESPONSE && r[3] == s->number &&
+	       r[6] == 0 && (r[7] == 0 || (tur && r[7] == 0x02));
 }
 
 static int
@@ -612,8 +629,7 @@ hc_complete(struct hc_slot *s, const char *what, bool tur)
 		os_atomic_add(&hc_wait_us, hc_us_since(started), relaxed);
 	}
 	ocs = s->utrd[2] & 0xff;
-	if (ocs != OCS_SUCCESS || (r[0] & 0x3f) != UPIU_RESPONSE || r[3] != s->number || r[6] != 0 ||
-	    (r[7] != 0 && !(tur && r[7] == 0x02))) {
+	if (!hc_answer_ok(s, tur)) {
 		hc_say("ufs: native: slot %u (%s): OCS %x, response %02x tag %02x, response %02x status %02x, "
 		    "sense key %x asc %02x ascq %02x\n", s->number, what, ocs, r[0], r[3], r[6], r[7],
 		    r[34 + 2] & 0x0f, r[34 + 12], r[34 + 13]);
@@ -855,6 +871,67 @@ ufshc_write(uint8_t lun, uint64_t offset, const uint8_t *src, uint64_t len)
 		}
 	}
 	return error;
+}
+
+#define POLLED_TIMEOUT_US   2000000
+
+/*
+ * A write with interrupts masked (loader_panic_sync_ufs, at a panic or in loader_return), where
+ * hc_lock cannot be taken and nothing may sleep.  Slot hc_polled is never in hc_free: it is rung
+ * on its own (a doorbell write sets only the bits written) and its doorbell polled.  Slots that
+ * other cores have in flight are left as they are.  A write a panic interrupted may still be in
+ * the slot: its buffer is refilled only after that command is done.
+ */
+int
+ufshc_write_polled(uint8_t lun, uint64_t offset, const uint8_t *src, uint64_t len)
+{
+	struct hc_slot *s = &hc_slots[hc_polled];
+	uint32_t bit = 1u << hc_polled, per = hc_slot_buffer / BLOCK;
+
+	if (!hc_usable || hc_polled == 0 || !hc_write_enabled) {
+		return ENXIO;
+	}
+	if (offset % BLOCK != 0 || len % BLOCK != 0 || (offset + len) / BLOCK > 0xffffffffULL) {
+		return EINVAL;
+	}
+	while (len > 0) {
+		uint32_t blocks = (uint32_t)MIN(len / BLOCK, (uint64_t)per);
+		uint64_t started;
+		struct hc_cmd c;
+		int error;
+
+		for (started = mach_absolute_time(); (hc_read(UFSHC_UTRLDBR) & bit) != 0;) {
+			if (hc_us_since(started) > POLLED_TIMEOUT_US) {
+				return ETIMEDOUT;
+			}
+			__builtin_arm_yield();
+		}
+		hc_make_write(&c, lun, (uint8_t)hc_polled, (uint32_t)(offset / BLOCK), blocks);
+		memcpy(s->data, src, (size_t)blocks * BLOCK);
+		FlushPoC_DcacheRegion((vm_offset_t)s->data, (size_t)blocks * BLOCK);
+		error = hc_place(s, &c, blocks * BLOCK);
+		if (error != 0) {
+			return error;
+		}
+		if (!hc_can_ring(bit)) {
+			return ENXIO;
+		}
+		hc_write(UFSHC_UTRLDBR, bit);
+		for (started = mach_absolute_time(); (hc_read(UFSHC_UTRLDBR) & bit) != 0;) {
+			if (hc_us_since(started) > POLLED_TIMEOUT_US) {
+				return ETIMEDOUT;
+			}
+			__builtin_arm_yield();
+		}
+		__asm__ volatile ("dsb sy" ::: "memory");
+		if (!hc_answer_ok(s, false)) {
+			return EIO;
+		}
+		offset += (uint64_t)blocks * BLOCK;
+		src += (size_t)blocks * BLOCK;
+		len -= (uint64_t)blocks * BLOCK;
+	}
+	return 0;
 }
 
 int

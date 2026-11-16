@@ -153,7 +153,7 @@ apfs_sync(mount_t mp, __unused int waitfor, __unused vfs_context_t ctx)
 		return 0;
 	}
 	vnode_iterate(mp, 0, apfs_wpush_vnode, NULL);
-	return apfs_wcommit(am, false);
+	return apfs_wcommit(am, false, 0, APFS_WHY_SYNC);
 }
 
 static int

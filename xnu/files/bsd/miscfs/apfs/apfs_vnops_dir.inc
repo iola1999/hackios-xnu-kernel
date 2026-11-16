@@ -106,7 +106,7 @@ apfs_wmake(vnode_t dvp, vnode_t *vpp, struct componentname *cnp, struct vnode_at
 	}
 	if (error == 0) {
 		apfs_node_refresh(am, dn);
-		apfs_wdirty(am);
+		apfs_wdirty(am, true);
 	}
 	apfs_unlock_exclusive(am);
 	if (error) {
@@ -225,7 +225,7 @@ apfs_wremove(vnode_t dvp, vnode_t vp, struct componentname *cnp, bool dir)
 			apfs_node_refresh(am, an);
 			an->an_orphan = an->an_ino.nchildren == 0;
 		}
-		apfs_wdirty(am);
+		apfs_wdirty(am, true);
 	}
 	apfs_unlock_exclusive(am);
 	if (error == 0) {
@@ -294,7 +294,7 @@ apfs_wrename(vnode_t fdvp, vnode_t fvp, struct componentname *fcnp, vnode_t tdvp
 			apfs_node_refresh(am, tn);
 			tn->an_orphan = !swap && !vnode_isdir(tvp) && tn->an_ino.nchildren == 0;
 		}
-		apfs_wdirty(am);
+		apfs_wdirty(am, true);
 	}
 	apfs_unlock_exclusive(am);
 	if (error == 0) {

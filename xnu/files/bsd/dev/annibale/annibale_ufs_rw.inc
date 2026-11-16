@@ -111,16 +111,11 @@ ufs_read(uint32_t part, uint64_t offset, uint8_t *dst, uint64_t len)
 	return ufs_read_mailbox(part, offset, dst, len);
 }
 
-/*
- * Whole blocks [offset, offset + len) of ufs_darwin_var, from src.
- * Writes are routed directly through ufshc_write to native hardware multi-slot queues
- * when ufs_native_on is active, or through the loader's Block I/O mailbox otherwise.
- */
+/* Writes go to darwin_var only, in whole blocks, inside the partition. */
 static int
-ufs_write(uint32_t part, uint64_t offset, const uint8_t *src, uint64_t len)
+ufs_write_allowed(uint32_t part, uint64_t offset, uint64_t len)
 {
-	uint64_t nbs, per;
-	int error = 0;
+	uint64_t nbs;
 
 	if (!ufs_ready || part >= ufs_parts || ufs_darwin_var_part < 0 || part != (uint32_t)ufs_darwin_var_part) {
 		ufs_write_refused++;
@@ -134,6 +129,24 @@ ufs_write(uint32_t part, uint64_t offset, const uint8_t *src, uint64_t len)
 		ufs_write_refused++;
 		return EROFS;
 	}
+	return 0;
+}
+
+/*
+ * Whole blocks [offset, offset + len) of ufs_darwin_var, from src.
+ * Writes are routed directly through ufshc_write to native hardware multi-slot queues
+ * when ufs_native_on is active, or through the loader's Block I/O mailbox otherwise.
+ */
+static int
+ufs_write(uint32_t part, uint64_t offset, const uint8_t *src, uint64_t len)
+{
+	uint64_t nbs, per;
+	int error = ufs_write_allowed(part, offset, len);
+
+	if (error != 0) {
+		return error;
+	}
+	nbs = ufs_page->part[part].block_size;
 	if (ufs_native_on && ufs_lun[part] != 0xff) {
 		return ufshc_write(ufs_lun[part], ufs_lun_offset[part] + offset, src, len);
 	}
@@ -467,11 +480,18 @@ annibale_ufs_var_io(bool write, uint64_t offset, void *buf, uint64_t len)
 {
 	int part = ufs_darwin_var_part;
 
-	if (!ml_get_interrupts_enabled()) {
-		return EBUSY;
-	}
 	if (!ufs_ready || part < 0 || (uint32_t)part >= ufs_parts) {
 		return ENXIO;
+	}
+	if (!ml_get_interrupts_enabled()) {
+		/* loader_panic_sync_ufs: no lock and no sleep, which only the native controller can do */
+		int error = write ? ufs_write_allowed((uint32_t)part, offset, len) : EBUSY;
+
+		if (error == 0 && !(ufs_native_on && ufs_lun[part] != 0xff)) {
+			error = EBUSY;
+		}
+		return error != 0 ? error :
+		       ufshc_write_polled(ufs_lun[part], ufs_lun_offset[part] + offset, (const uint8_t *)buf, len);
 	}
 	if (write) {
 		return ufs_write((uint32_t)part, offset, (const uint8_t *)buf, len);

@@ -11,8 +11,11 @@
  *
  * Data blocks are given to a file when its pages go to the device (vnop_blockmap), and a
  * commit waits for every data write mapped before it (wm_map, then wm_io) before it writes the
- * checkpoint.  So a checkpoint never names a block whose contents are still on their way, and
- * the engine frees data blocks only at the commit that took them away from their file
+ * checkpoint.  The cluster layer may send part of a mapping and the rest only after its next
+ * vnop_blockmap (cluster_io cuts a buffer at a page boundary), so the commit lets the exclusive
+ * lock go while mappings are unsent (apfs_wio_drain); it writes the checkpoint with the lock held
+ * and every mapping sent.  So a checkpoint never names a block whose contents are still on their
+ * way, and the engine frees data blocks only at the commit that took them away from their file
  * (wsp_free_later), by which time no write to them is outstanding: a block cannot be written
  * for its old file and its new one at once.
  */
@@ -28,6 +31,7 @@ static void apfs_fill_statfs(struct apfs_mount *am, struct vfsstatfs *sp);
 #define APFS_WDIRTY_MAX   4096          /* metadata blocks in one transaction */
 #define APFS_WCOMMIT_MS   1000
 #define APFS_WDRAIN_MS    2000          /* the longest a commit waits for data writes */
+#define APFS_WDRAIN_HELD_MS 20          /* then it lets the lock go while mappings are unsent */
 
 struct apfs_wmount {
 	struct apfs_wtx   *wm_wtx;
@@ -41,14 +45,18 @@ struct apfs_wmount {
 	struct {
 		uint64_t   addr, end;           /* container blocks [addr, end) */
 		uint64_t   left;                /* blocks of it not yet sent */
+		uint64_t   id, off;             /* for the slow-drain report: the file and the byte in it */
 	}                  wm_map[APFS_WMAP_MAX];
 	uint32_t           wm_nmap;
 	uint32_t           wm_io;               /* data writes sent and not yet done */
-	bool               wm_waiting;
+	uint32_t           wm_waiting;          /* threads in apfs_wio_drain */
 	uint64_t           wm_push[APFS_WPUSH_MAX];     /* object ids; under am_lock */
 	uint32_t           wm_npush;
 	bool               wm_push_all;         /* more files than wm_push holds */
 	uint64_t           wm_commits, wm_errors, wm_slow_drains;
+	uint64_t           wm_why[APFS_WHY_N];  /* commits made, by what asked for them */
+	uint64_t           wm_drain_ticks, wm_drain_max, wm_commit_max;    /* mach ticks */
+	uint64_t           wm_drain_free_ticks, wm_drain_held_max;         /* of the waits: lock let go, held */
 };
 
 /* The writable data volume, for the container's space (apfs_container_space); apfs_pool_lock. */
@@ -141,7 +149,7 @@ apfs_wdevblock(struct apfs_mount *am, uint64_t addr, uint64_t in)
 
 /* A mapping vnop_blockmap gave for writing; with the exclusive lock held. */
 void
-apfs_wmap_add(struct apfs_mount *am, uint64_t addr, uint64_t blocks)
+apfs_wmap_add(struct apfs_mount *am, uint64_t addr, uint64_t blocks, uint64_t id, uint64_t off)
 {
 	struct apfs_wmount *wm = am->am_w;
 	uint64_t deadline;
@@ -158,6 +166,8 @@ apfs_wmap_add(struct apfs_mount *am, uint64_t addr, uint64_t blocks)
 	wm->wm_map[wm->wm_nmap].addr = addr;
 	wm->wm_map[wm->wm_nmap].end = addr + blocks;
 	wm->wm_map[wm->wm_nmap].left = blocks;
+	wm->wm_map[wm->wm_nmap].id = id;
+	wm->wm_map[wm->wm_nmap].off = off;
 	wm->wm_nmap++;
 	lck_spin_unlock(&wm->wm_spin);
 }
@@ -219,46 +229,89 @@ apfs_wio_start(struct apfs_mount *am, buf_t bp)
 	buf_setfsprivate(bp, next_arg);
 }
 
-/* Before a checkpoint, with the exclusive lock held: every data write mapped so far is done. */
-static void
+/*
+ * Before a checkpoint, with the exclusive lock held: every data write mapped so far is sent and
+ * done.  A mapping still unsent after APFS_WDRAIN_HELD_MS may wait for a vnop_blockmap, so the
+ * lock is let go while it is waited for; sent writes finish without the lock.  Back with the
+ * lock held, which it may have let go; returns how long it was let go (mach ticks).
+ */
+static uint64_t
 apfs_wio_drain(struct apfs_mount *am)
 {
 	struct apfs_wmount *wm = am->am_w;
-	uint64_t deadline;
+	uint64_t deadline, held, free = 0, gone;
 
 	clock_interval_to_deadline(APFS_WDRAIN_MS, NSEC_PER_MSEC, &deadline);
+	clock_interval_to_deadline(APFS_WDRAIN_HELD_MS, NSEC_PER_MSEC, &held);
 	lck_spin_lock(&wm->wm_spin);
+	wm->wm_waiting++;
 	while (wm->wm_nmap > 0 || wm->wm_io > 0) {
-		wm->wm_waiting = true;
-		if (lck_spin_sleep_deadline(&wm->wm_spin, LCK_SLEEP_DEFAULT, (event_t)&wm->wm_io,
-		    THREAD_UNINT, deadline) == THREAD_TIMED_OUT) {
-			/* a mapping that was never sent (the cluster layer gave up on it) */
+		uint64_t now = mach_absolute_time();
+
+		if (now >= deadline) {
+			/* a mapping the cluster layer gave up on: its pages stay dirty and are mapped again */
 			printf("apfs: commit: %u mappings and %u data writes still out after %u ms\n",
 			    wm->wm_nmap, wm->wm_io, APFS_WDRAIN_MS);
+			for (uint32_t i = 0; i < wm->wm_nmap && i < 4; i++) {
+				printf("apfs:   file %llu at byte %llu: %llu of %llu blocks (from %llu) unsent\n",
+				    wm->wm_map[i].id, wm->wm_map[i].off, wm->wm_map[i].left,
+				    wm->wm_map[i].end - wm->wm_map[i].addr, wm->wm_map[i].addr);
+			}
 			wm->wm_nmap = 0;
 			wm->wm_slow_drains++;
 			break;
 		}
+		if (wm->wm_nmap == 0 || now < held) {
+			(void)lck_spin_sleep_deadline(&wm->wm_spin, LCK_SLEEP_DEFAULT, (event_t)&wm->wm_io,
+			    THREAD_UNINT, wm->wm_nmap > 0 ? held : deadline);
+			continue;
+		}
+		lck_spin_unlock(&wm->wm_spin);
+		gone = mach_absolute_time();
+		apfs_unlock_exclusive(am);
+		lck_spin_lock(&wm->wm_spin);
+		if (wm->wm_nmap > 0) {
+			(void)lck_spin_sleep_deadline(&wm->wm_spin, LCK_SLEEP_DEFAULT, (event_t)&wm->wm_io,
+			    THREAD_UNINT, deadline);
+		}
+		lck_spin_unlock(&wm->wm_spin);
+		apfs_lock_exclusive(am);
+		free += mach_absolute_time() - gone;
+		lck_spin_lock(&wm->wm_spin);
 	}
-	wm->wm_waiting = false;
+	wm->wm_waiting--;
 	lck_spin_unlock(&wm->wm_spin);
+	return free;
 }
 
 /* ------------------------------------------------------------------ commits */
 
 /* With the exclusive lock held. */
 int
-apfs_wcommit_locked(struct apfs_mount *am)
+apfs_wcommit_locked(struct apfs_mount *am, enum apfs_wwhy why)
 {
 	struct apfs_wmount *wm = am->am_w;
+	uint64_t t0, t1, t2, free;
 	int error;
 
 	wm->wm_armed = false;
 	if (!apfs_wtx_dirty(wm->wm_wtx)) {
 		return apfs_wtx_broken(wm->wm_wtx) ? EIO : 0;
 	}
-	apfs_wio_drain(am);
+	t0 = mach_absolute_time();
+	free = apfs_wio_drain(am);
+	t1 = mach_absolute_time();
+	wm->wm_drain_ticks += t1 - t0;
+	wm->wm_drain_max = MAX(wm->wm_drain_max, t1 - t0);
+	wm->wm_drain_free_ticks += free;
+	wm->wm_drain_held_max = MAX(wm->wm_drain_held_max, t1 - t0 - free);
+	if (!apfs_wtx_dirty(wm->wm_wtx)) {       /* committed by another thread while the lock was let go */
+		return apfs_wtx_broken(wm->wm_wtx) ? EIO : 0;
+	}
+	wm->wm_why[why]++;
 	error = apfs_wtx_commit(wm->wm_wtx);
+	t2 = mach_absolute_time();
+	wm->wm_commit_max = MAX(wm->wm_commit_max, t2 - t1);
 	if (error) {
 		wm->wm_errors++;
 		printf("apfs: commit of volume \"%s\" failed (%d): the volume is read only from now on\n",
@@ -323,9 +376,13 @@ apfs_wpush(struct apfs_mount *am)
 	}
 }
 
-/* push: send the written files' pages first (sync(2), the periodic commit) */
+/*
+ * push: send the written files' pages first (sync(2), the periodic commit).  upto: a commit is
+ * needed only while fewer than that many have been made (fsync of a file whose last change
+ * went out with commit `upto`; waiting for the lock, it may have); 0: whenever there are changes.
+ */
 int
-apfs_wcommit(struct apfs_mount *am, bool push)
+apfs_wcommit(struct apfs_mount *am, bool push, uint64_t upto, enum apfs_wwhy why)
 {
 	int error;
 
@@ -336,7 +393,7 @@ apfs_wcommit(struct apfs_mount *am, bool push)
 		apfs_wpush(am);
 	}
 	apfs_lock_exclusive(am);
-	error = apfs_wcommit_locked(am);
+	error = upto != 0 && am->am_w->wm_commits >= upto ? 0 : apfs_wcommit_locked(am, why);
 	apfs_unlock_exclusive(am);
 	return error;
 }
@@ -352,9 +409,9 @@ apfs_wflush(struct apfs_mount *am)
 	}
 	apfs_lock_exclusive(am);
 	if (apfs_wtx_dirty(am->am_w->wm_wtx)) {
-		error = apfs_wcommit_locked(am);
+		error = apfs_wcommit_locked(am, APFS_WHY_FULLFSYNC);
 	} else {
-		apfs_wio_drain(am);
+		(void)apfs_wio_drain(am);
 		error = am->am_nx.dev.flush != NULL ? am->am_nx.dev.flush(am->am_nx.dev.ctx) : 0;
 	}
 	apfs_unlock_exclusive(am);
@@ -370,7 +427,7 @@ apfs_wcommits(struct apfs_mount *am)
 static void
 apfs_wtick(thread_call_param_t p0, __unused thread_call_param_t p1)
 {
-	(void)apfs_wcommit((struct apfs_mount *)p0, true);
+	(void)apfs_wcommit((struct apfs_mount *)p0, true, 0, APFS_WHY_TICK);
 }
 
 /* The periodic commit, a second from now unless it is due already; with am_lock held. */
@@ -386,16 +443,26 @@ apfs_warm(struct apfs_wmount *wm)
 	}
 }
 
-/* After a change, with the exclusive lock held: the commit is due in a second, or now. */
+/*
+ * After a change, with the exclusive lock held: the commit is due in a second, or now.  A full
+ * transaction is committed here when `here` is set; the commit may let the lock go, so the
+ * caller's change must be complete.  vnop_blockmap passes false (its own mapping is sent only
+ * after it returns) and has wm_tick run at once instead.
+ */
 void
-apfs_wdirty(struct apfs_mount *am)
+apfs_wdirty(struct apfs_mount *am, bool here)
 {
 	struct apfs_wmount *wm = am->am_w;
 
-	if (apfs_wtx_dirty_blocks(wm->wm_wtx) > APFS_WDIRTY_MAX) {
-		(void)apfs_wcommit_locked(am);
-	} else if (apfs_wtx_dirty(wm->wm_wtx)) {
-		apfs_warm(wm);
+	if (apfs_wtx_dirty_blocks(wm->wm_wtx) <= APFS_WDIRTY_MAX) {
+		if (apfs_wtx_dirty(wm->wm_wtx)) {
+			apfs_warm(wm);
+		}
+	} else if (here) {
+		(void)apfs_wcommit_locked(am, APFS_WHY_FULL);
+	} else if (!wm->wm_closing) {
+		wm->wm_armed = true;
+		thread_call_enter(wm->wm_tick);
 	}
 }
 
@@ -451,7 +518,7 @@ apfs_wmount_attach(struct apfs_mount *am, struct apfs_devctx *dc)
 		am->am_w = wm;
 		error = apfs_w_reap_orphans(wm->wm_wtx);
 		if (error == 0) {
-			error = apfs_wcommit_locked(am);
+			error = apfs_wcommit_locked(am, APFS_WHY_OTHER);
 		}
 		if (error) {
 			apfs_wtx_detach(wm->wm_wtx);
@@ -492,7 +559,7 @@ apfs_wmount_detach(struct apfs_mount *am)
 	wm->wm_closing = true;
 	apfs_unlock(am);
 	thread_call_cancel_wait(wm->wm_tick);
-	error = apfs_wcommit(am, true);
+	error = apfs_wcommit(am, true, 0, APFS_WHY_OTHER);
 	lck_mtx_lock(&apfs_pool_lock);
 	if (apfs_data_mount == am) {
 		apfs_data_mount = NULL;
@@ -529,7 +596,7 @@ apfs_data_flush(void)
 		struct apfs_mount *am = vfs_fsprivate(mp);
 
 		vnode_iterate(mp, 0, apfs_wpush_vnode, am);
-		error = apfs_wcommit(am, false);
+		error = apfs_wcommit(am, false, 0, APFS_WHY_OTHER);
 		vfs_unbusy(mp);
 	}
 	return error;
@@ -540,7 +607,7 @@ static int
 sysctl_apfs_wstats SYSCTL_HANDLER_ARGS
 {
 #pragma unused(oidp, arg1, arg2)
-	char line[256] = "no writable APFS volume";
+	char line[512] = "no writable APFS volume";
 
 	lck_mtx_lock(&apfs_pool_lock);
 	if (apfs_data_mount != NULL) {
@@ -549,10 +616,18 @@ sysctl_apfs_wstats SYSCTL_HANDLER_ARGS
 
 		apfs_wtx_stats(wm->wm_wtx, &commits, &blocks, &ticks);
 		snprintf(line, sizeof(line), "\"%s\": %llu commits, %llu blocks written in %llu ms, %llu failed, "
-		    "%llu slow drains, %llu blocks free", apfs_data_mount->am_vol.name, (unsigned long long)commits,
-		    (unsigned long long)blocks, (unsigned long long)apfs_ticks_ms(ticks),
+		    "%llu slow drains, %llu blocks free; commits by tick %llu, fsync %llu, IO_SYNC %llu, "
+		    "full/barrier fsync %llu, sync %llu, full transaction %llu, other %llu; waits for data writes "
+		    "%llu ms in all (%llu with the lock let go), longest %llu ms, longest with the lock held %llu ms; "
+		    "longest commit %llu ms",
+		    apfs_data_mount->am_vol.name,
+		    (unsigned long long)commits, (unsigned long long)blocks, (unsigned long long)apfs_ticks_ms(ticks),
 		    (unsigned long long)wm->wm_errors, (unsigned long long)wm->wm_slow_drains,
-		    (unsigned long long)apfs_wtx_free_blocks(wm->wm_wtx));
+		    (unsigned long long)apfs_wtx_free_blocks(wm->wm_wtx),
+		    wm->wm_why[APFS_WHY_TICK], wm->wm_why[APFS_WHY_FSYNC], wm->wm_why[APFS_WHY_IOSYNC],
+		    wm->wm_why[APFS_WHY_FULLFSYNC], wm->wm_why[APFS_WHY_SYNC], wm->wm_why[APFS_WHY_FULL],
+		    wm->wm_why[APFS_WHY_OTHER], apfs_ticks_ms(wm->wm_drain_ticks), apfs_ticks_ms(wm->wm_drain_free_ticks),
+		    apfs_ticks_ms(wm->wm_drain_max), apfs_ticks_ms(wm->wm_drain_held_max), apfs_ticks_ms(wm->wm_commit_max));
 	}
 	lck_mtx_unlock(&apfs_pool_lock);
 	return SYSCTL_OUT(req, line, strlen(line) + 1);

@@ -198,8 +198,11 @@ loader_fault_log(const char *message, uint64_t pc, uint64_t lr, uint32_t esr, ui
 
 #define LOADER_PANIC_BUF_SIZE    (256 * 1024)
 static char loader_panic_buf[LOADER_PANIC_BUF_SIZE] __attribute__((aligned(4096)));
-static uint32_t loader_panic_sync_lock;
+static uint32_t loader_panic_sync_lock;          /* cpu_number() + 1 of the processor writing the log */
+#define LOADER_PANIC_SYNC_WAIT_NS (5ULL * NSEC_PER_SEC)  /* more than one ufshc_write_polled: 2 s for the slot, 2 s for the write */
 static uint32_t loader_panic_sync_seq;
+/* A panic has begun (loader_panic_log): only then does the log go to darwin_var for init to keep. */
+static volatile bool loader_panicked;
 
 void
 loader_panic_sync_ufs(const char *reason, uint32_t flags)
@@ -214,10 +217,28 @@ loader_panic_sync_ufs(const char *reason, uint32_t flags)
 	uint64_t write_len;
 	int n;
 
+	/*
+	 * All of A, I and F masked: with only I and F, code that masks interrupts itself
+	 * (ml_set_interrupts_enabled) asserts on the partial mask.  One processor at a time fills
+	 * loader_panic_buf and writes it: another one waits for it, and gives up if that write does not
+	 * end (the log then is that processor's).  A panic in this processor's own write takes it over,
+	 * since the write it interrupted never resumes.
+	 */
 	daif = __builtin_arm_rsr64("DAIF");
-	__builtin_arm_wsr("DAIFSet", DAIFSC_IRQF | DAIFSC_FIQF);
-	for (uint32_t tries = 0; !locked && tries < 1000000; tries++) {
-		locked = os_atomic_cmpxchg(&loader_panic_sync_lock, 0, 1, acquire);
+	__builtin_arm_wsr("DAIFSet", DAIFSC_STANDARD_DISABLE);
+	{
+		uint32_t me = (uint32_t)cpu_number() + 1, owner = 0;
+		uint64_t start = mach_absolute_time(), wait;
+
+		nanoseconds_to_absolutetime(LOADER_PANIC_SYNC_WAIT_NS, &wait);
+		while (!(locked = os_atomic_cmpxchgv(&loader_panic_sync_lock, 0, me, &owner, acquire)) && owner != me &&
+		    mach_absolute_time() - start < wait) {
+			__builtin_arm_yield();
+		}
+		if (!locked && owner != me) {
+			__builtin_arm_wsr64("DAIF", daif);
+			return;
+		}
 	}
 
 	clock_get_system_microtime(&secs, &usecs);
@@ -289,9 +310,7 @@ loader_panic_sync_ufs(const char *reason, uint32_t flags)
 		(void)annibale_ufs_var_io(true, annibale_var_klog_offset(), loader_panic_buf, write_len);
 	}
 
-	if (locked) {
-		os_atomic_store(&loader_panic_sync_lock, 0, release);
-	}
+	os_atomic_store(&loader_panic_sync_lock, 0, release);
 	__builtin_arm_wsr64("DAIF", daif);
 }
 
@@ -312,6 +331,7 @@ loader_panic_log(const char *format, va_list *args, unsigned long caller)
 	loader_log_line(text);
 	loader_log_putc('\n');
 
+	loader_panicked = true;
 	loader_panic_sync_ufs("panic_trap", 1);
 }
 
@@ -607,8 +627,10 @@ loader_return(void)
 			loader_log_putc(*c);
 		}
 	}
-	/* Synchronously flush final complete panic/crash log to darwin_var reserved sector before storage quiesce */
-	loader_panic_sync_ufs("loader_return", 1);
+	/* After a panic: the log again, now with the panic buffer and the console's end, before storage quiesces */
+	if (loader_panicked) {
+		loader_panic_sync_ufs("loader_return", 1);
+	}
 
 	annibale_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
 	adreno8_return_quiesce();       /* the GMU back in reset and its translation off without parking */
@@ -666,6 +688,7 @@ loader_return_timer(__unused thread_call_param_t p0, __unused thread_call_param_
 	}
 	PE_parse_boot_argn("return_panic", &as_panic, sizeof(as_panic));
 	if (as_panic) {
+		loader_panicked = true;
 		loader_panic_sync_ufs("return_panic_timer", 2);
 	}
 	if (!as_panic) {
@@ -809,9 +832,12 @@ hv_wdt_pet_NOW(void)
 static void
 hv_wdt_pet(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
+	static bool logged;
 	uint64_t deadline;
 
-	if (debug_buf_base != NULL && debug_buf_ptr > debug_buf_base) {
+	/* a panic that has not reached loader_return while this still runs: its log, once */
+	if (loader_panicked && !logged) {
+		logged = true;
 		loader_panic_sync_ufs("watchdog_panic", 2);
 	}
 
