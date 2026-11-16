@@ -412,6 +412,24 @@ apfs_vnop_ioctl(struct vnop_ioctl_args *ap)
 
 /* ------------------------------------------------------------------ attributes */
 
+/* The file has a decmpfs header: its contents are compressed (apfs_lib's cfile_header). */
+static bool
+apfs_has_decmpfs(struct apfs_mount *am, struct apfs_node *an)
+{
+	uint8_t hdr[16];
+	uint32_t magic = 0;
+	size_t n = 0;
+	int error;
+
+	apfs_lock_shared(am);
+	error = apfs_xattr_read(&am->am_vol, an->an_id, APFS_DECMPFS_XATTR_NAME, hdr, sizeof(hdr), &n);
+	apfs_unlock_shared(am);
+	if (error == 0 && n >= sizeof(hdr)) {
+		memcpy(&magic, hdr, sizeof(magic));
+	}
+	return magic == APFS_DECMPFS_MAGIC;
+}
+
 static int
 apfs_vnop_setattr(struct vnop_setattr_args *ap)
 {
@@ -460,6 +478,16 @@ apfs_vnop_setattr(struct vnop_setattr_args *ap)
 		VATTR_SET_SUPPORTED(vap, va_gid);
 	}
 	if (VATTR_IS_ACTIVE(vap, va_flags)) {
+		/*
+		 * As decmpfs_update_attributes: UF_COMPRESSED goes on only over a decmpfs header set
+		 * before it, and not with a new size in the same call.  (Else the file would read
+		 * and write as compressed while its bytes are plain: libarchive restores the flag
+		 * of every file of an IPA made on a Mac.)
+		 */
+		if ((vap->va_flags & UF_COMPRESSED) && !(an->an_ino.bsd_flags & UF_COMPRESSED) &&
+		    (VATTR_IS_ACTIVE(vap, va_data_size) || !apfs_has_decmpfs(am, an))) {
+			vap->va_flags &= ~UF_COMPRESSED;
+		}
 		a.set |= APFS_WA_FLAGS;
 		a.flags = vap->va_flags;
 		track = (vap->va_flags & UF_TRACKED) != 0;

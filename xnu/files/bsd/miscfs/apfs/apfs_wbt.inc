@@ -228,6 +228,43 @@ wn_fits(struct apfs_wtx *w, struct wtree *t, const struct wrec *r, uint32_t n, b
 	return used <= w->bs - WN_INFO;
 }
 
+/*
+ * ... and about as full each.  Packed front to back, every node but the last would be full,
+ * and the next record that lands in one splits it again: records that come in no particular
+ * order (inode numbers, names) then leave nodes nearly empty and the tree too deep.  start[]
+ * stays as it is if the even spread does not fit.
+ */
+static void
+wn_even(struct apfs_wtx *w, struct wtree *t, const struct wrec *r, uint32_t n, bool leaf, uint32_t groups,
+    uint32_t *start)
+{
+	uint32_t even[WTX_MAXGROUPS + 1], from = 0;
+	uint64_t left = 0;
+
+	for (uint32_t i = 0; i < n; i++) {
+		left += r[i].kl + r[i].vl + 8u;
+	}
+	for (uint32_t g = 0; g < groups; g++) {
+		uint64_t want = left / (groups - g), have = 0;
+		uint32_t take = 0;
+
+		/* at least one record each, and one left for each node after this one */
+		while (from + take < n - (groups - 1 - g) &&
+		    (take == 0 || g == groups - 1 || have + (r[from + take].kl + r[from + take].vl + 8u) / 2 <= want)) {
+			have += r[from + take].kl + r[from + take].vl + 8u;
+			take++;
+		}
+		if (!wn_fits(w, t, r + from, take, leaf)) {
+			return;
+		}
+		even[g] = from;
+		from += take;
+		left -= have;
+	}
+	even[groups] = n;
+	memcpy(start, even, (groups + 1) * sizeof(*start));
+}
+
 static void
 wn_header(struct apfs_wtx *w, struct wtree *t, uint8_t *blk, uint64_t addr, uint64_t oid, bool root)
 {
@@ -615,7 +652,7 @@ wt_store(struct apfs_wtx *w, struct wtree *t, struct wpath *p, int d, struct wre
 		return 0;
 	}
 
-	/* Too many: groups of what fits, front to back. */
+	/* Too many: as few nodes as what fits front to back takes ... */
 	uint32_t start[WTX_MAXGROUPS + 1], groups = 0, from = 0;
 
 	while (from < n) {
@@ -634,6 +671,7 @@ wt_store(struct apfs_wtx *w, struct wtree *t, struct wpath *p, int d, struct wre
 		from += take;
 	}
 	start[groups] = n;
+	wn_even(w, t, r, n, leaf, groups, start);
 	w->splits++;
 
 	struct wrec add[WTX_MAXGROUPS];
