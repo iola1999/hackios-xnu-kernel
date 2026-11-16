@@ -27,6 +27,10 @@ given the colour temperature that the tables above are picked by for it: its own
 wide camera under a warm white LED: its colour shading measured on a white sheet is TL84's table's to
 within 3 %, the 2550-2900 K one's is 12 % off in red).
 
+This phone (SM8750) has "Parameter Parser V5.2.1" files instead, read by v5_tables(): the colour matrix
+of the IPE (cc14_ipe_v2) and the same refPtV1. Its lens shading (lsc502) is laid out on another grid and
+not read: OUT.isp then has no lens shading ranges, and the processor shades nothing.
+
 OUT.isp: "RWCISP02"; the number of the matrices' light ranges and per range { lux index from, to (two
 floats), the number of temperature ranges, per range { CCT from, to, the matrix (9 floats) } }; the
 same for the lens shading, with per temperature range { CCT from, to, R, Gr, Gb, B grids (17 x 13 floats
@@ -86,16 +90,63 @@ def references(syms):
     return [(rg, bg, cct) for (rg, bg), cct in zip(points, REFERENCE_CCTS)]
 
 
+def v5_tables(data):
+    """(colour matrix tree, reference lights) of a V5.2.1 tuning file, as module() and references() give them
+
+    The file: a header, then sections by kind: 0 named symbols (60 bytes: id, name[32], six words, the
+    5th and 4th the size and pool offset of the module's header), 1 the data pool, 3 numbered values (16
+    bytes: id, pool offset, size, id of the same data). A module's header ends with the value of its tree,
+    whose nodes are { from, to (floats), children, value of the children's nodes, 0 or 1, value of a
+    leaf's data } (24 bytes). A module comes once for each use case; the first is the default one's.
+    """
+    words = lambda at, n: struct.unpack_from('<%dI' % n, data, at)
+    sections = {kind: (at, size) for kind, at, size in (words(0xa8 + 12 * i, 3) for i in range(words(0xa4, 1)[0]))}
+    pool = sections[1][0]
+    at, size = sections[3]
+    value = {sid: data[pool + ref:pool + ref + n] for sid, ref, n, _ in (words(a, 4) for a in range(at, at + size, 16))}
+    at, size = sections[0]
+    named = [(data[a + 4:a + 36].split(b'\0')[0].decode('latin1'), words(a + 36, 6)) for a in range(at, at + size, 60)]
+
+    def first(name):
+        f = next(f for n, f in named if n == name)
+        return data[pool + f[3]:pool + f[3] + f[4]]
+
+    def children(node):
+        return [struct.unpack_from('<2f4I', value[node[3]], 24 * i) for i in range(node[2])]
+
+    def depth(node):
+        return 0 if node[2] == 0 else 1 + depth(children(node)[0])
+
+    header = first('cc14_ipe_v2')
+    node = struct.unpack('<2f4I', value[struct.unpack_from('<I', header, len(header) - 4)[0]])
+    # The levels above the lux index and the colour temperature (DRC gain, exposure ratio, flash...) are
+    # taken where they hold 1, or else 0 (the flash off): a preview's, assumed from their ranges only.
+    while depth(node) > 2:
+        nodes = children(node)
+        node = next((n for n in nodes if n[0] <= 1 <= n[1]), next((n for n in nodes if n[0] <= 0 <= n[1]), nodes[0]))
+    ccm = [(lux[0], lux[1], [(c[0], c[1], struct.unpack_from('<9f', value[c[5]])) for c in children(lux)])
+           for lux in children(node)]
+    for _, _, ranges in ccm:
+        for _, _, m in ranges:
+            if any(abs(sum(m[3 * r:3 * r + 3]) - 1) > 0.02 for r in range(3)):
+                sys.exit('camtuning.py: a colour matrix of the file whose rows do not sum to 1')
+    return ccm, references({0: ('refPtV1', first('refPtV1'))})
+
+
 def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__)
     data = open(sys.argv[1], 'rb').read()
-    if not data.startswith(b'QTI Chromatix Header') or b'Parameter Parser V3.0.1' not in data[:0x60]:
+    if data.startswith(b'QTI Chromatix Header') and b'Parameter Parser V5.2.1' in data[:0x60]:
+        ccm, refs = v5_tables(data)
+        lsc = []
+    elif data.startswith(b'QTI Chromatix Header') and b'Parameter Parser V3.0.1' in data[:0x60]:
+        syms = symbols(data)
+        ccm = module(syms, 'cc13', 9)
+        lsc = module(syms, 'lsc34', 4 * GRID)
+        refs = references(syms)
+    else:
         sys.exit('camtuning.py: not a tuning file of the kind known here')
-    syms = symbols(data)
-    ccm = module(syms, 'cc13', 9)
-    lsc = module(syms, 'lsc34', 4 * GRID)
-    refs = references(syms)
 
     for what, tree in (('colour matrix', ccm), ('lens shading', lsc)):
         for lux_from, lux_to, ranges in tree:
