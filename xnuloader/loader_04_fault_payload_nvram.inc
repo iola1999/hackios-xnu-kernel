@@ -403,45 +403,122 @@ parse_payload(struct payload_info *pi, int verbose)
 /* NVRAM image                                                              */
 /*                                                                          */
 /* iBoot hands the kernel a copy of the NVRAM contents in CHRP format       */
-/* (iokit/Kernel/IONVRAMCHRPHandler.cpp). There is no NVRAM here, so build  */
-/* an image with a valid header and one empty "common" partition.           */
+/* (iokit/Kernel/IONVRAMCHRPHandler.cpp): the newest whole bank of the      */
+/* banks at the start of darwin_nvram, which the kernel's AnnibaleNVRAM     */
+/* writes back in turn. Without them, an image with a valid header and one  */
+/* empty "common" partition, kept for the run only.                         */
 
-static void
-nvram_chrp_header(uint8_t *h, uint8_t sig, uint32_t bytes, const char *name)
+#define NVRAM_BANKS 2u
+
+/* The CHRP header checksum: signature, length and name, folded to 8 bits */
+static uint8_t
+nvram_chrp_sum(const uint8_t *h)
 {
-	uint16_t blocks = (uint16_t)(bytes / 16), sum;
+	uint16_t sum = h[0];
 
-	memset(h, 0, 16);
-	h[0] = sig;
-	h[2] = (uint8_t)blocks;
-	h[3] = (uint8_t)(blocks >> 8);
-	memcpy(h + 4, name, str_len(name));
-	/* checksum over signature, length and name, folded to 8 bits */
-	sum = h[0];
 	for (int i = 2; i < 16; i++) {
 		sum += h[i];
 	}
 	while (sum > 0xff) {
 		sum = (sum & 0xff) + (sum >> 8);
 	}
-	h[1] = (uint8_t)sum;
+	return (uint8_t)sum;
+}
+
+static void
+nvram_chrp_header(uint8_t *h, uint8_t sig, uint32_t bytes, const char *name)
+{
+	uint16_t blocks = (uint16_t)(bytes / 16);
+
+	memset(h, 0, 16);
+	h[0] = sig;
+	h[2] = (uint8_t)blocks;
+	h[3] = (uint8_t)(blocks >> 8);
+	memcpy(h + 4, name, str_len(name));
+	h[1] = nvram_chrp_sum(h);
+}
+
+/* Adler-32 over everything after the checksum field itself (from the generation on) */
+static uint32_t
+nvram_adler(const uint8_t *image)
+{
+	uint32_t lo = 1, hi = 0;
+
+	for (uint32_t i = 20; i < NVRAM_BANK_SIZE; i++) {
+		lo = (lo + image[i]) % 65521;
+		hi = (hi + lo) % 65521;
+	}
+	return (hi << 16) | lo;
 }
 
 static void
 build_nvram_image(uint8_t *image)
 {
-	uint32_t lo = 1, hi = 0, generation = 1;
+	uint32_t generation = 1, adler;
 
 	memset(image, 0, NVRAM_BANK_SIZE);
 	nvram_chrp_header(image, 0x5a, 0x20, "nvram");                           /* Apple header: 32 bytes */
 	nvram_chrp_header(image + 0x20, 0x70, NVRAM_BANK_SIZE - 0x20, "common"); /* the rest: common partition */
 	memcpy(image + 20, &generation, 4);
-	/* Adler-32 over everything after the checksum field itself */
-	for (uint32_t i = 20; i < NVRAM_BANK_SIZE; i++) {
-		lo = (lo + image[i]) % 65521;
-		hi = (hi + lo) % 65521;
-	}
-	uint32_t adler = (hi << 16) | lo;
+	adler = nvram_adler(image);
 	memcpy(image + 16, &adler, 4);
 }
 
+/* A whole bank: the Apple header (signature, "nvram", its checksum) and the Adler-32 of the rest. */
+static int
+nvram_bank_whole(const uint8_t *bank, uint32_t *generation)
+{
+	uint32_t adler;
+
+	if (bank[0] != 0x5a || memcmp(bank + 4, "nvram", 5) != 0 || bank[1] != nvram_chrp_sum(bank)) {
+		return 0;
+	}
+	memcpy(&adler, bank + 16, 4);
+	memcpy(generation, bank + 20, 4);
+	return adler == nvram_adler(bank);
+}
+
+/*
+ * The image for the kernel into image: returns the bank it was read from and sets *banks to the
+ * number of banks for nvram-bank-count -- 1 without darwin_nvram, which tells the kernel to leave
+ * the partition alone (AnnibaleNVRAM.cpp).
+ */
+static uint32_t
+nvram_load(uint8_t *image, uint32_t *banks)
+{
+	int part = block_darwin_nvram_part;
+	uint32_t best = 0, best_gen = 0, found = 0;
+	uint64_t bs = part >= 0 ? block_shared.part[part].block_size : 0;
+	efi_block_io *bio = part >= 0 ? block_bios[part] : NULL;
+
+	build_nvram_image(image);
+	*banks = 1;
+	if (!block_enabled || bio == NULL || bs == 0 || NVRAM_BANK_SIZE % bs != 0 || !hc_list_is_uefis() ||
+	    block_shared.part[part].blocks * bs < NVRAM_BANKS * NVRAM_BANK_SIZE) {
+		print("nvram: no darwin_nvram: an empty image, for this run only\n");
+		return 0;
+	}
+	*banks = NVRAM_BANKS;
+	for (uint32_t b = 0; b < NVRAM_BANKS; b++) {
+		uint32_t gen = 0;
+		efi_status s = bio->read_blocks(bio, bio->media->media_id, (uint64_t)b * NVRAM_BANK_SIZE / bs,
+		    NVRAM_BANK_SIZE, block_buffer);
+
+		flush_dcache((uint64_t)(uintptr_t)block_buffer, (uint64_t)(uintptr_t)block_buffer + NVRAM_BANK_SIZE);
+		if (EFI_ERROR(s) || !nvram_bank_whole(block_buffer, &gen)) {
+			print("nvram: bank %d: %s\n", (uint64_t)b, EFI_ERROR(s) ? "not read" : "not a whole bank");
+			continue;
+		}
+		print("nvram: bank %d: generation %d\n", (uint64_t)b, (uint64_t)gen);
+		if (!found || gen > best_gen) {
+			memcpy(image, block_buffer, NVRAM_BANK_SIZE);
+			best = b;
+			best_gen = gen;
+			found = 1;
+		}
+	}
+	if (!found) {
+		print("nvram: darwin_nvram has no whole bank yet: an empty image\n");
+	}
+	return best;
+}

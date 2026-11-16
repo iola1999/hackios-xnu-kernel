@@ -27,7 +27,7 @@ int ufshc_switch_in(bool prove);
 int ufshc_switch_out(const char *why);
 bool ufshc_list_in(void);
 int ufshc_read(uint8_t lun, uint64_t offset, uint8_t *dst, uint64_t len);
-void ufshc_set_write_range(uint8_t lun, uint64_t start_lba, uint64_t end_lba);
+bool ufshc_add_write_range(uint8_t lun, uint64_t start_lba, uint64_t end_lba);
 int ufshc_write(uint8_t lun, uint64_t offset, const uint8_t *src, uint64_t len);
 int ufshc_write_polled(uint8_t lun, uint64_t offset, const uint8_t *src, uint64_t len);
 int ufshc_strategy_async(buf_t bp, uint8_t lun, uint64_t lun_offset, bool is_write);

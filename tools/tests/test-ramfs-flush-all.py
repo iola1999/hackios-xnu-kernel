@@ -58,10 +58,10 @@ static unsigned sync_calls, get_calls, warnings, mutations;
 static int metadata_error;
 static bool ufs_ready, mutate, recycle, growing;
 static int ufs_darwin_var_part;
-static bool var_apfs;                   /* annibale_var_tail.inc: darwin_var is APFS */
-static unsigned apfs_flushes, backlight_flushes;
+static bool var_apfs;                   /* annibale_nvram.inc: darwin_var is APFS */
+static unsigned apfs_flushes, nvram_syncs;
 static int apfs_data_flush(void) { apfs_flushes++; return 0; }
-static void var_backlight_flush(void) { backlight_flushes++; }
+static int PESyncNVRAM(void) { nvram_syncs++; return 1; }
 static void lck_mtx_lock(int *lock) { assert(*lock == 0); *lock = 1; }
 static void lck_mtx_unlock(int *lock) {
     assert(*lock == 1); *lock = 0;
@@ -135,7 +135,7 @@ static void setup(unsigned count) {
     mount_state.rm_disk_enabled = mount_state.rm_seed_done = true;
     mount_state.rm_next_ino = 128;
     ramfs_disk_rm = &mount_state;
-    ufs_ready = true; ufs_darwin_var_part = 0; var_apfs = false; apfs_flushes = backlight_flushes = 0;
+    ufs_ready = true; ufs_darwin_var_part = 0; var_apfs = false; apfs_flushes = nvram_syncs = 0;
     for (unsigned i = 0; i < 32; i++) vnodes[i].id = 100 + i;
     /* Deliberately unsorted inode numbers, all in one hash bucket. */
     for (unsigned j = 0; j < count; j++) {
@@ -210,13 +210,13 @@ int main(int argc, char **argv) {
         setup(11); metadata_error = ENOSPC;
         annibale_var_save_on_return(); assert(warnings == 1 && sync_calls == 1);
     } else if (!strcmp(name, "return_success")) {
-        setup(11); annibale_var_save_on_return(); assert(warnings == 0 && sync_calls == 1);
+        setup(11); annibale_var_save_on_return(); assert(warnings == 0 && sync_calls == 1 && nvram_syncs == 1);
     } else if (!strcmp(name, "return_no_ufs")) {
         setup(11); ufs_ready = false; annibale_var_save_on_return();
         assert(warnings == 0 && sync_calls == 0 && get_calls == 0);
     } else if (!strcmp(name, "return_apfs")) {
         setup(11); var_apfs = true; annibale_var_save_on_return();
-        assert(apfs_flushes == 1 && backlight_flushes == 1 && sync_calls == 0 && get_calls == 0);
+        assert(apfs_flushes == 1 && nvram_syncs == 1 && sync_calls == 0 && get_calls == 0);
     } else { assert(!"unknown case"); }
     released(); return 0;
 }

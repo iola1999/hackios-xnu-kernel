@@ -18,21 +18,47 @@ ufshc_dcache_clean_inval(vm_offset_t va, size_t length)
 }
 #endif
 
-static uint64_t hc_write_lba_start, hc_write_lba_end;
+/* The LBA ranges writes may go to: darwin_var and darwin_nvram, both on one logical unit. */
+#define HC_WRITE_RANGES 2
+static struct {
+	uint64_t start, end;
+} hc_write_range[HC_WRITE_RANGES];
+static unsigned hc_write_ranges;
 static uint8_t hc_write_lun;
 static bool hc_write_enabled;
 
-void
-ufshc_set_write_range(uint8_t lun, uint64_t start_lba, uint64_t end_lba)
+bool
+ufshc_add_write_range(uint8_t lun, uint64_t start_lba, uint64_t end_lba)
 {
+	bool added;
+
 	lck_mtx_lock(&hc_lock);
-	hc_write_lun = lun;
-	hc_write_lba_start = start_lba;
-	hc_write_lba_end = end_lba;
-	hc_write_enabled = (end_lba > start_lba);
+	added = end_lba > start_lba && hc_write_ranges < HC_WRITE_RANGES && (hc_write_ranges == 0 || lun == hc_write_lun);
+	if (added) {
+		hc_write_lun = lun;
+		hc_write_range[hc_write_ranges].start = start_lba;
+		hc_write_range[hc_write_ranges].end = end_lba;
+		hc_write_ranges++;
+		hc_write_enabled = true;
+	}
 	lck_mtx_unlock(&hc_lock);
-	hc_say("ufs: native: write range registered for LUN %u: LBA %llu..%llu (%llu GiB)\n",
-	    lun, start_lba, end_lba, (end_lba - start_lba) * BLOCK >> 30);
+	hc_say("ufs: native: write range %s for LUN %u: LBA %llu..%llu (%llu MiB)\n", added ? "registered" : "REFUSED",
+	    lun, start_lba, end_lba, (end_lba - start_lba) * BLOCK >> 20);
+	return added;
+}
+
+static bool
+hc_write_inside(uint8_t lun, uint64_t lba, uint64_t blocks)
+{
+	if (lun != hc_write_lun) {
+		return false;
+	}
+	for (unsigned i = 0; i < hc_write_ranges; i++) {
+		if (lba >= hc_write_range[i].start && lba + blocks <= hc_write_range[i].end) {
+			return true;
+		}
+	}
+	return false;
 }
 
 /* ---- the whitelist: the check every command passes before it goes into a slot ---- */
@@ -93,8 +119,8 @@ hc_refusal(const uint8_t *upiu, uint32_t dw0, uint32_t lun_mask, bool any_comman
 		if (!hc_write_enabled || lun != hc_write_lun) {
 			return "writes disabled or not targeted at writable logical unit";
 		}
-		if (lba < hc_write_lba_start || lba + blocks > hc_write_lba_end) {
-			return "write outside permitted darwin_var LBA range";
+		if (!hc_write_inside(lun, lba, blocks)) {
+			return "write outside the permitted LBA ranges (darwin_var, darwin_nvram)";
 		}
 		if ((cdb[1] & ~0x08) != 0) {
 			return "write CDB[1] has unsupported flags other than FUA";
@@ -285,8 +311,11 @@ hc_whitelist_selftest(void)
 
 		hc_write_enabled = true;
 		hc_write_lun = 0;
-		hc_write_lba_start = 10000;
-		hc_write_lba_end = 20000;
+		hc_write_range[0].start = 10000;
+		hc_write_range[0].end = 20000;
+		hc_write_range[1].start = 30000;
+		hc_write_range[1].end = 30008;
+		hc_write_ranges = 2;
 
 		hc_make_write(&c, 0, 1, 12000, 16);
 		right &= (hc_refusal(c.upiu, c.dw0, 1u << 0, false) == NULL);
@@ -305,6 +334,12 @@ hc_whitelist_selftest(void)
 		right &= (hc_refusal(c.upiu, c.dw0, 1u << 0, false) != NULL);
 
 		hc_make_write(&c, 0, 1, 19990, 20);  /* past end */
+		right &= (hc_refusal(c.upiu, c.dw0, 1u << 0, false) != NULL);
+
+		hc_make_write(&c, 0, 1, 30000, 8);   /* the second range */
+		right &= (hc_refusal(c.upiu, c.dw0, 1u << 0, false) == NULL);
+
+		hc_make_write(&c, 0, 1, 30004, 8);   /* past its end */
 		right &= (hc_refusal(c.upiu, c.dw0, 1u << 0, false) != NULL);
 
 		hc_make_write(&c, 1, 1, 12000, 16);  /* wrong LUN */
@@ -336,6 +371,7 @@ hc_whitelist_selftest(void)
 		right &= (hc_refusal(c.upiu, c.dw0, 1u << 0, false) != NULL);
 
 		hc_write_enabled = false;
+		hc_write_ranges = 0;
 	}
 	return right;
 }
@@ -956,7 +992,7 @@ ufshc_strategy_async(buf_t bp, uint8_t lun, uint64_t lun_offset, bool is_write)
 		return EINVAL;
 	}
 	if (is_write) {
-		if (lun != hc_write_lun || first_lba < hc_write_lba_start || first_lba + blocks > hc_write_lba_end) {
+		if (!hc_write_inside(lun, first_lba, blocks)) {
 			return EPERM;
 		}
 	}
@@ -1064,7 +1100,7 @@ ufshc_unmap(uint8_t lun, uint64_t lba, uint32_t blocks)
 	if (!hc_usable || !hc_in || hc_dead || hc_closed || !hc_write_enabled) {
 		return ENXIO;
 	}
-	if (lun != hc_write_lun || lba < hc_write_lba_start || lba + blocks > hc_write_lba_end) {
+	if (!hc_write_inside(lun, lba, blocks)) {
 		return EPERM;
 	}
 

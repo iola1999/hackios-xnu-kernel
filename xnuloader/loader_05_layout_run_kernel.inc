@@ -772,12 +772,12 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_prop_u32(&w, "production-cert", 1);
 	dt_prop_u32(&w, "development-cert", 0);
 	dt_prop_u32(&w, "embedded-panic-log-size", PANIC_LOG_SIZE);
-	/* An empty but well-formed NVRAM image: IOKit refuses to start without it. */
+	/* NVRAM from darwin_nvram, or an empty but well-formed image: IOKit refuses to start without one. */
 	static uint8_t nvram_image[NVRAM_BANK_SIZE];
-	build_nvram_image(nvram_image);
+	uint32_t nvram_banks, nvram_bank = nvram_load(nvram_image, &nvram_banks);
 	dt_prop_u32(&w, "nvram-bank-size", NVRAM_BANK_SIZE);
-	dt_prop_u32(&w, "nvram-bank-count", 1);
-	dt_prop_u32(&w, "nvram-current-bank", 0);
+	dt_prop_u32(&w, "nvram-bank-count", nvram_banks);
+	dt_prop_u32(&w, "nvram-current-bank", nvram_bank);
 	dt_prop(&w, "nvram-proxy-data", nvram_image, sizeof(nvram_image));
 	dt_begin(&w, "memory-map");
 	/*

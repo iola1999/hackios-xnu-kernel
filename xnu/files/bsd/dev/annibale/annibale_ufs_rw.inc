@@ -111,13 +111,14 @@ ufs_read(uint32_t part, uint64_t offset, uint8_t *dst, uint64_t len)
 	return ufs_read_mailbox(part, offset, dst, len);
 }
 
-/* Writes go to darwin_var only, in whole blocks, inside the partition. */
+/* Writes go to darwin_var and darwin_nvram only, in whole blocks, inside the partition. */
 static int
 ufs_write_allowed(uint32_t part, uint64_t offset, uint64_t len)
 {
 	uint64_t nbs;
 
-	if (!ufs_ready || part >= ufs_parts || ufs_darwin_var_part < 0 || part != (uint32_t)ufs_darwin_var_part) {
+	if (!ufs_ready || part >= ufs_parts ||
+	    ((int)part != ufs_darwin_var_part && (int)part != ufs_darwin_nvram_part)) {
 		ufs_write_refused++;
 		return EROFS;
 	}
@@ -475,17 +476,13 @@ annibale_ufs_var_info(uint64_t *size_bytes_out)
 
 extern boolean_t ml_get_interrupts_enabled(void);
 
-int
-annibale_ufs_var_io(bool write, uint64_t offset, void *buf, uint64_t len)
+/* Bytes of partition part; with interrupts off only a write, polled, through this kernel's own driver. */
+static int
+ufs_part_io(uint32_t part, bool write, uint64_t offset, void *buf, uint64_t len)
 {
-	int part = ufs_darwin_var_part;
-
-	if (!ufs_ready || part < 0 || (uint32_t)part >= ufs_parts) {
-		return ENXIO;
-	}
 	if (!ml_get_interrupts_enabled()) {
 		/* loader_panic_sync_ufs: no lock and no sleep, which only the native controller can do */
-		int error = write ? ufs_write_allowed((uint32_t)part, offset, len) : EBUSY;
+		int error = write ? ufs_write_allowed(part, offset, len) : EBUSY;
 
 		if (error == 0 && !(ufs_native_on && ufs_lun[part] != 0xff)) {
 			error = EBUSY;
@@ -494,9 +491,20 @@ annibale_ufs_var_io(bool write, uint64_t offset, void *buf, uint64_t len)
 		       ufshc_write_polled(ufs_lun[part], ufs_lun_offset[part] + offset, (const uint8_t *)buf, len);
 	}
 	if (write) {
-		return ufs_write((uint32_t)part, offset, (const uint8_t *)buf, len);
+		return ufs_write(part, offset, (const uint8_t *)buf, len);
 	}
-	return ufs_read((uint32_t)part, offset, (uint8_t *)buf, len);
+	return ufs_read(part, offset, (uint8_t *)buf, len);
+}
+
+int
+annibale_ufs_var_io(bool write, uint64_t offset, void *buf, uint64_t len)
+{
+	int part = ufs_darwin_var_part;
+
+	if (!ufs_ready || part < 0 || (uint32_t)part >= ufs_parts) {
+		return ENXIO;
+	}
+	return ufs_part_io((uint32_t)part, write, offset, buf, len);
 }
 
 int

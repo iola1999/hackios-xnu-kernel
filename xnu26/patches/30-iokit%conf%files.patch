@@ -1,8 +1,8 @@
 diff --git a/iokit/conf/files b/iokit/conf/files
-index c72c690d7c74..657e895328de 100644
+index c72c690d7c74..b91083851d1b 100644
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
-@@ -80,6 +80,16 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
+@@ -80,12 +80,24 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
  iokit/Kernel/IOGuardPageMemoryDescriptor.cpp		optional iokitcpp
  
  iokit/Kernel/IOPlatformExpert.cpp			optional iokitcpp
@@ -16,6 +16,14 @@ index c72c690d7c74..657e895328de 100644
 +iokit/Kernel/AnnibaleBattery.cpp			optional iokitcpp
 +iokit/Kernel/MiniAppleKeyStore.cpp			optional iokitcpp
 +iokit/Kernel/MiniIONetworkStack.cpp			optional iokitcpp
++iokit/Kernel/AnnibaleNVRAM.cpp			optional iokitcpp
  iokit/Kernel/IOPlatformIO.cpp				optional iokitcpp
  
  iokit/Kernel/IOCPU.cpp					optional iokitcpp
+ iokit/Kernel/IOPlatformActions.cpp			optional iokitcpp
+ 
+ iokit/Kernel/IONVRAM.cpp				optional iokitcpp
++iokit/Families/IONVRAM/IONVRAMController.cpp	optional iokitcpp
+ 
+ iokit/Kernel/IOExtensiblePaniclog.cpp   optional iokitcpp
+ 

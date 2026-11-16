@@ -17,14 +17,17 @@
  * request is logged, with all its keys: one line in kBLLogMS at most, and the last of a burst always.
  */
 
+#include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
+#include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOService.h>
 #include <libkern/c++/OSBoolean.h>
 #include <libkern/c++/OSCollectionIterator.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSNumber.h>
+#include <libkern/c++/OSString.h>
 #include <libkern/c++/OSSymbol.h>
 #include <kern/clock.h>
 #include <kern/thread_call.h>
@@ -81,6 +84,9 @@ uint32_t annibale_backlight_level = kBLLevelFull;
 uint64_t annibale_cpufreq_touched(void);
 bool annibale_backlight_load(uint32_t *panel_v_out, uint32_t *millinits_out);
 void annibale_backlight_save(uint32_t panel_v, uint32_t millinits);
+bool annibale_nvram_kept(void);                                             /* AnnibaleNVRAM.cpp */
+bool ramfs_backlight_load(uint32_t *panel_v_out, uint32_t *millinits_out);  /* bsd/miscfs/ramfs/ramfs_disk.inc */
+void ramfs_backlight_save(uint32_t panel_v, uint32_t millinits);
 }
 
 class AppleARMBacklight : public IOService
@@ -429,6 +435,100 @@ MiniAppleARMBacklightFramebufferProperties(OSObject * properties)
 	bl_take(dict, NULL, "IOMFBBrightnessLevel");
 	IOLockUnlock(bl.lock);
 	return kIOReturnSuccess;
+}
+
+/*
+ * The brightness across restarts, as AppleARMBacklight keeps it: NVRAM's backlight-level (the panel's
+ * value, "%d") and backlight-nits (16.16 nits, "0x%08x"). They are in IODTNVRAM's dictionary at once and
+ * in darwin_nvram after its next sync (AnnibaleNVRAM.cpp). While NVRAM is not written to darwin_nvram,
+ * a darwin_var in ANNFS001 keeps the setting in its superblock (ramfs_backlight_*), as before
+ * darwin_nvram existed. MiniFramebufferDCS.inc also reads it, for the panel at start.
+ */
+static bool
+nvram_number(const char * name, uint64_t * out)
+{
+	char text[24];
+	unsigned int len = sizeof(text), i = 0, base = 10;
+	uint64_t n = 0;
+
+	if (!PEReadNVRAMProperty(name, text, &len) || len == 0 || len > sizeof(text)) {
+		return false;
+	}
+	if (len > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+		base = 16;
+		i = 2;
+	}
+	for (; i < len && text[i] != 0; i++) {
+		char c = text[i];
+		unsigned int d = c >= '0' && c <= '9' ? (unsigned int)(c - '0') :
+		    c >= 'a' && c <= 'f' ? (unsigned int)(c - 'a' + 10) : c >= 'A' && c <= 'F' ? (unsigned int)(c - 'A' + 10) : 16;
+
+		if (d >= base || n > 0xffffffffULL) {
+			return false;
+		}
+		n = n * base + d;
+	}
+	*out = n;
+	return true;
+}
+
+bool
+annibale_backlight_load(uint32_t * panel_v_out, uint32_t * millinits_out)
+{
+	uint64_t v, n16;
+
+	if (!nvram_number("backlight-level", &v) || !nvram_number("backlight-nits", &n16) || v == 0 || n16 == 0 ||
+	    v > 0xffffffffULL || n16 > 0xffffffffULL) {
+		return ramfs_backlight_load(panel_v_out, millinits_out);
+	}
+	if (panel_v_out != NULL) {
+		*panel_v_out = (uint32_t) v;
+	}
+	if (millinits_out != NULL) {
+		*millinits_out = (uint32_t) ((n16 * 1000 + 32768) >> 16);
+	}
+	return true;
+}
+
+/* With bl.lock held. */
+void
+annibale_backlight_save(uint32_t panel_v, uint32_t millinits)
+{
+	static uint32_t saved_v, saved_mn;
+	IORegistryEntry * options;
+	OSDictionary * dict;
+	OSString * level = NULL, * nits = NULL;
+	char text[16];
+
+	if (panel_v == 0 || millinits == 0) {
+		return;
+	}
+	if (!annibale_nvram_kept()) {
+		ramfs_backlight_save(panel_v, millinits);
+	}
+	if (panel_v == saved_v && millinits == saved_mn) {
+		return;
+	}
+	options = IORegistryEntry::fromPath("/options", gIODTPlane);
+	dict = OSDictionary::withCapacity(2);
+	snprintf(text, sizeof(text), "%u", panel_v);
+	level = OSString::withCString(text);
+	snprintf(text, sizeof(text), "0x%08x", (uint32_t) ((((uint64_t) millinits << 16) + 500) / 1000));
+	nits = OSString::withCString(text);
+	if (options != NULL && dict != NULL && level != NULL && nits != NULL) {
+		dict->setObject("backlight-level", level);
+		dict->setObject("backlight-nits", nits);
+		if (options->setProperties(dict) == kIOReturnSuccess) {
+			saved_v = panel_v;
+			saved_mn = millinits;
+		} else {
+			IOLog("MiniAppleARMBacklight: NVRAM does not take backlight-level %s\n", level->getCStringNoCopy());
+		}
+	}
+	OSSafeReleaseNULL(nits);
+	OSSafeReleaseNULL(level);
+	OSSafeReleaseNULL(dict);
+	OSSafeReleaseNULL(options);
 }
 
 void

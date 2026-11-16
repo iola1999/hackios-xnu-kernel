@@ -64,8 +64,7 @@ extern void MiniIOMobileFramebufferPowerOff(void);
 boolean_t annibale_halting_poweroff = FALSE;
 extern void annibale_ufs_quiesce(void);
 extern void annibale_var_save_on_return(void);   /* bsd/dev/annibale_ufs.c: the data volume into the flash */
-extern int annibale_ufs_var_io(bool write, uint64_t offset, void *buf, uint64_t len);
-extern uint64_t annibale_var_klog_offset(void);   /* bsd/dev/annibale/annibale_var_tail.inc */
+extern int annibale_klog_write(const void *buf, uint64_t len);   /* bsd/dev/annibale/annibale_nvram.inc */
 extern uint32_t crc32(uint32_t crc, const void *buf, size_t len);
 void loader_checkpoint(uint64_t n);
 
@@ -201,7 +200,7 @@ static char loader_panic_buf[LOADER_PANIC_BUF_SIZE] __attribute__((aligned(4096)
 static uint32_t loader_panic_sync_lock;          /* cpu_number() + 1 of the processor writing the log */
 #define LOADER_PANIC_SYNC_WAIT_NS (5ULL * NSEC_PER_SEC)  /* more than one ufshc_write_polled: 2 s for the slot, 2 s for the write */
 static uint32_t loader_panic_sync_seq;
-/* A panic has begun (loader_panic_log): only then does the log go to darwin_var for init to keep. */
+/* A panic has begun (loader_panic_log): only then is the log written (darwin_nvram) for init to keep. */
 static volatile bool loader_panicked;
 
 void
@@ -306,9 +305,7 @@ loader_panic_sync_ufs(const char *reason, uint32_t flags)
 	kh->payload_crc = crc32(0, p, at);
 	kh->head_crc = crc32(0, kh, __builtin_offsetof(struct klog_head, head_crc));
 
-	if (annibale_var_klog_offset() != 0) {
-		(void)annibale_ufs_var_io(true, annibale_var_klog_offset(), loader_panic_buf, write_len);
-	}
+	(void)annibale_klog_write(loader_panic_buf, write_len);
 
 	os_atomic_store(&loader_panic_sync_lock, 0, release);
 	__builtin_arm_wsr64("DAIF", daif);

@@ -1,7 +1,8 @@
 /*
  * The phone's storage: one block device and one character device for every GPT partition of its
  * UFS (/dev/ufs_NAME and /dev/rufs_NAME, NAME as the partition table has it). Read only, except
- * for /dev/ufs_darwin_var and /dev/rufs_darwin_var where the iOS data volume lives.
+ * for /dev/ufs_darwin_var and /dev/rufs_darwin_var where the iOS data volume lives. The kernel
+ * itself also writes darwin_nvram, NVRAM and the panic log (annibale_nvram.inc).
  *
  * With ufs=2 on its command line the loader publishes a page (ufs_shared_pa=) with the table of
  * partitions, a request and an answer, and a buffer; when ufs_native=1 is enabled, reads and
@@ -146,7 +147,7 @@ static uint64_t ufs_native_fallbacks, ufs_mailbox_refused;
 static LCK_GRP_DECLARE(ufs_lck_grp, "annibale-ufs");
 static LCK_MTX_DECLARE(ufs_lock, &ufs_lck_grp);
 
-static int ufs_darwin_part = -1, ufs_darwin_var_part = -1;
+static int ufs_darwin_part = -1, ufs_darwin_var_part = -1, ufs_darwin_nvram_part = -1;
 uint64_t ufs_darwin_bytes, ufs_darwin_var_bytes;
 extern void AnnibaleDiskStart(uint64_t size_bytes);
 #include "annibale_disk_nodes.inc"
@@ -170,7 +171,7 @@ SYSCTL_QUAD(_kern_annibale, OID_AUTO, ufs_write_bytes, CTLFLAG_RD | CTLFLAG_LOCK
 SYSCTL_QUAD(_kern_annibale, OID_AUTO, ufs_write_errors, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_write_errors,
     "writes the loader refused or did not finish");
 SYSCTL_QUAD(_kern_annibale, OID_AUTO, ufs_write_refused, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_write_refused,
-    "writes refused here: not darwin_var, or past its end");
+    "writes refused here: not darwin_var or darwin_nvram, or past its end");
 SYSCTL_QUAD(_kern_annibale, OID_AUTO, darwin_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_darwin_bytes,
     "bytes in the darwin partition");
 SYSCTL_QUAD(_kern_annibale, OID_AUTO, darwin_var_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_darwin_var_bytes,
@@ -324,15 +325,17 @@ ufs_part_bytes(uint32_t part)
 }
 
 #include "annibale_ufs_rw.inc"
-#include "annibale_var_tail.inc"
+#include "annibale_nvram.inc"
 
 /*
  * The orderly end of a run, from osfmk/arm64/loader_return.c, in the thread that is about to hand
  * control back: /private/var to /dev/ufs_darwin_var, whichever file system it is (the other one's
- * call does nothing), and a backlight setting not written yet.
+ * call does nothing), and NVRAM to darwin_nvram, as a restart does (IOPMrootDomain).
  */
 extern int ramfs_disk_flush_all(void);
 extern int apfs_data_flush(void);
+extern boolean_t PESyncNVRAM(void);
+extern void AnnibaleNVRAMStart(void);
 
 void
 annibale_var_save_on_return(void)
@@ -345,9 +348,7 @@ annibale_var_save_on_return(void)
 		/* Shutdown must remain available after storage or pageout errors. */
 		printf("ufs: data-volume flush failed (%d); continuing shutdown; data may be unsaved\n", error);
 	}
-	if (var_apfs) {
-		var_backlight_flush();
-	}
+	(void)PESyncNVRAM();
 }
 
 /* ---- the check: the partitions there are images of, hashed as the loader hashes them ---- */
@@ -487,6 +488,23 @@ ufs_entry(const char *name)
 		}
 	}
 	return BLOCK_MAX_PARTS;
+}
+
+/* The LBAs of partition part (darwin_var, darwin_nvram) are let through to native writes. */
+static void
+ufs_native_writable(int part)
+{
+	uint64_t start_lba, end_lba;
+
+	if (part < 0 || ufs_lun[part] == 0xff) {
+		return;
+	}
+	start_lba = ufs_lun_offset[part] / 4096;
+	end_lba = start_lba + ufs_page->part[part].blocks;
+	if (ufshc_add_write_range(ufs_lun[part], start_lba, end_lba)) {
+		printf("ufs: /dev/ufs_%s (LUN %u, LBAs %llu..%llu) enabled for native hardware block writes\n",
+		    ufs_page->part[part].name, ufs_lun[part], start_lba, end_lba - 1);
+	}
 }
 
 /*
@@ -914,6 +932,10 @@ annibale_ufs_init(void)
 			ufs_darwin_var_part = (int)i;
 			ufs_darwin_var_bytes = ufs_part_bytes(i);
 		}
+		if (strcmp((const char *)ufs_page->part[i].name, "darwin_nvram") == 0 &&
+		    ufs_part_bytes(i) >= NVRAM_KLOG_AT + NVRAM_KLOG_MAX) {
+			ufs_darwin_nvram_part = (int)i;
+		}
 		snprintf(name, sizeof(name), "ufs_%s", ufs_page->part[i].name);
 		if (devfs_make_node(makedev(ufs_bmajor, i), DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "%s", name) == NULL) {
 			printf("ufs: no node for %s (the same name twice?)\n", name);
@@ -974,14 +996,8 @@ annibale_ufs_init(void)
 				loader_return();
 			}
 			ufs_native_on = true;
-			if (ufs_darwin_var_part >= 0 && ufs_lun[ufs_darwin_var_part] != 0xff) {
-				uint8_t lun = ufs_lun[ufs_darwin_var_part];
-				uint64_t start_lba = ufs_lun_offset[ufs_darwin_var_part] / 4096;
-				uint64_t end_lba = start_lba + ufs_page->part[ufs_darwin_var_part].blocks;
-				ufshc_set_write_range(lun, start_lba, end_lba);
-				printf("ufs: /dev/ufs_darwin_var (LUN %u, LBAs %llu..%llu) enabled for native hardware block writes\n",
-				    lun, start_lba, end_lba - 1);
-			}
+			ufs_native_writable(ufs_darwin_var_part);
+			ufs_native_writable(ufs_darwin_nvram_part);
 			compare = 0;
 			if (PE_parse_boot_argn("ufs_native_bench", &compare, sizeof(compare)) && compare != 0) {
 				ufs_native_bench();
@@ -995,7 +1011,8 @@ annibale_ufs_init(void)
 		}
 	}
 	annibale_ufs_sync_rtc();
-	var_tail_probe();
+	var_probe();
+	AnnibaleNVRAMStart();
 
 	if (PE_parse_boot_argn("ufs_bench", &check, sizeof(check)) && check != 0) {
 		/* right here, in bsd_init's thread, and then back to the loader: nothing else is wanted */

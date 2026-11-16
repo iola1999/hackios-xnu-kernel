@@ -10,9 +10,9 @@
  * with that driver's ReadBlocks into a buffer both can see. The kernel's side is
  * bsd/dev/annibale_ufs.c; it gets the page's address as ufs_shared_pa= on its command line.
  *
- * Reads, and writes into one place and nowhere else: darwin_var, the dedicated UFS partition
- * where the iOS data volume lives. No answer to the kernel can reach any other part of the
- * storage. The refusals are here, in the kernel (bsd/dev/annibale/annibale_ufs.c) and in UEFI's
+ * Reads, and writes into two places and nowhere else: darwin_var, the dedicated UFS partition
+ * where the iOS data volume lives, and darwin_nvram after it (NVRAM and the panic log). No answer
+ * to the kernel can reach any other part of the storage. The refusals are here, in the kernel (bsd/dev/annibale/annibale_ufs.c) and in UEFI's
  * own driver: a request has to pass all three.
  *
  * Each side writes its own cache lines only: the kernel the request, core 0 the answer (and the
@@ -113,6 +113,7 @@ static int block_probe_requested;       /* ufs_probe=1: block_io2_probe() at blo
 static efi_block_io *block_bios[BLOCK_MAX_PARTS];
 static int block_enabled;
 static int block_darwin_var_part = -1;  /* darwin_var's index in the table; -1: not listed this run */
+static int block_darwin_nvram_part = -1;        /* darwin_nvram's, the same way */
 static uint64_t block_writes, block_writes_refused, block_write_bytes;
 
 /* the bytes of a device path before its end node */
@@ -401,6 +402,7 @@ block_start(void)
 		return;
 	}
 	block_darwin_var_part = -1;
+	block_darwin_nvram_part = -1;
 	for (uint64_t i = 0; i < count && block_shared.parts + nunits < BLOCK_MAX_PARTS; i++) {
 		struct loader_block_part *bp = &block_shared.part[block_shared.parts];
 		efi_partition_info *info;
@@ -435,6 +437,9 @@ block_start(void)
 		    bp->name[4] == 'i' && bp->name[5] == 'n' && bp->name[6] == '_' && bp->name[7] == 'v' &&
 		    bp->name[8] == 'a' && bp->name[9] == 'r' && bp->name[10] == 0 && !bio->media->read_only) {
 			block_darwin_var_part = (int)(block_shared.parts - 1);
+		}
+		if (memcmp(bp->name, "darwin_nvram", sizeof("darwin_nvram")) == 0 && !bio->media->read_only) {
+			block_darwin_nvram_part = (int)(block_shared.parts - 1);
 		}
 		if (block_probe_requested && bp->name[0] == 'd' && bp->name[1] == 'a' && bp->name[2] == 'r' &&
 		    bp->name[3] == 'w' && bp->name[4] == 'i' && bp->name[5] == 'n' && bp->name[6] == 0) {
@@ -604,7 +609,8 @@ block_poll(void)
 			s = 0x800000000000000FULL;      /* EFI_ACCESS_DENIED */
 			bytes = 0;
 		} else if (op == BLOCK_OP_WRITE) {
-			if (block_darwin_var_part < 0 || part != (uint32_t)block_darwin_var_part || bio == NULL) {
+			if (bio == NULL || ((block_darwin_var_part < 0 || part != (uint32_t)block_darwin_var_part) &&
+			    (block_darwin_nvram_part < 0 || part != (uint32_t)block_darwin_nvram_part))) {
 				if (block_writes_refused++ < 8) {
 					print("ufs: a write of %d blocks from %d of %s: REFUSED\n", count, lba,
 					    block_shared.part[part].name);
