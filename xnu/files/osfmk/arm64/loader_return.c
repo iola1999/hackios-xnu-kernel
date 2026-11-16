@@ -65,11 +65,10 @@ boolean_t annibale_halting_poweroff = FALSE;
 extern void annibale_ufs_quiesce(void);
 extern void annibale_var_save_on_return(void);   /* bsd/dev/annibale_ufs.c: the data volume into the flash */
 extern int annibale_ufs_var_io(bool write, uint64_t offset, void *buf, uint64_t len);
+extern uint64_t annibale_var_klog_offset(void);   /* bsd/dev/annibale/annibale_var_tail.inc */
 extern uint32_t crc32(uint32_t crc, const void *buf, size_t len);
 void loader_checkpoint(uint64_t n);
 
-#define ANNFS_PANIC_OFFSET       (64ULL << 20)
-#define ANNFS_PANIC_SIZE         (16ULL << 20)
 #define KLOG_MAGIC               0x474f4c4bU     /* 'KLOG' */
 #define KLOG_VERSION             1U
 
@@ -286,7 +285,9 @@ loader_panic_sync_ufs(const char *reason, uint32_t flags)
 	kh->payload_crc = crc32(0, p, at);
 	kh->head_crc = crc32(0, kh, __builtin_offsetof(struct klog_head, head_crc));
 
-	(void)annibale_ufs_var_io(true, ANNFS_PANIC_OFFSET, loader_panic_buf, write_len);
+	if (annibale_var_klog_offset() != 0) {
+		(void)annibale_ufs_var_io(true, annibale_var_klog_offset(), loader_panic_buf, write_len);
+	}
 
 	if (locked) {
 		os_atomic_store(&loader_panic_sync_lock, 0, release);

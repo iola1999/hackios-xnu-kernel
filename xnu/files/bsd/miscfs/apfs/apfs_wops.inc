@@ -179,11 +179,17 @@ apfs_w_create(struct apfs_wtx *w, uint64_t dir, const char *name, size_t len,
 		i = apfs_alloc(sizeof(*i));
 		error = i == NULL ? ENOMEM : 0;
 	}
+	if (error == 0 && a->id != 0) {
+		/* a number the caller chose: one never handed out, and not an object's already */
+		error = a->id < APFS_MIN_USER_INO_NUM || a->id >= w->vol->next_obj_id ? EINVAL : wi_load(w, a->id, i);
+		error = error == ENOENT ? 0 : (error == 0 ? EEXIST : error);
+		memset(i, 0, sizeof(*i));
+	}
 	if (error) {
 		goto out;
 	}
 
-	i->id = w->vol->next_obj_id++;
+	i->id = a->id != 0 ? a->id : w->vol->next_obj_id++;
 	w_put_le64(i->f + WINO_PRIVATE, i->id);
 	w_put_le64(i->f + WINO_CRTIME, now);
 	w_put_le64(i->f + WINO_MTIME, now);

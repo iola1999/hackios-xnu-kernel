@@ -200,7 +200,7 @@ def main():
         raise SystemExit(77)
     apfs = subprocess.check_output(["git", "-C", str(ROOT), "show", f"{args.source_ref}:{APFS}"], text=True) if args.source_ref else (ROOT / APFS).read_text()
     mount = function(apfs, "apfs_mount_common")
-    identity = mount.split("sp->f_ffree = 0;", 1)[1].split('strlcpy(sp->f_fstypename, "apfs"', 1)[0]
+    identity = mount.split("apfs_fill_statfs(am, sp);", 1)[1].split('strlcpy(sp->f_fstypename, "apfs"', 1)[0]
     if args.allocation == "native":
         identity = "vfs_getnewfsid(mp);"
     source = PRELUDE

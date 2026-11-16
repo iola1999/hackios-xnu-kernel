@@ -324,12 +324,15 @@ ufs_part_bytes(uint32_t part)
 }
 
 #include "annibale_ufs_rw.inc"
+#include "annibale_var_tail.inc"
 
 /*
  * The orderly end of a run, from osfmk/arm64/loader_return.c, in the thread that is about to hand
- * control back: flush any dirty metadata and blocks of /private/var to /dev/ufs_darwin_var.
+ * control back: /private/var to /dev/ufs_darwin_var, whichever file system it is (the other one's
+ * call does nothing), and a backlight setting not written yet.
  */
 extern int ramfs_disk_flush_all(void);
+extern int apfs_data_flush(void);
 
 void
 annibale_var_save_on_return(void)
@@ -337,10 +340,13 @@ annibale_var_save_on_return(void)
 	if (!ufs_ready || ufs_darwin_var_part < 0) {
 		return;
 	}
-	int error = ramfs_disk_flush_all();
+	int error = var_apfs ? apfs_data_flush() : ramfs_disk_flush_all();
 	if (error != 0) {
 		/* Shutdown must remain available after storage or pageout errors. */
 		printf("ufs: data-volume flush failed (%d); continuing shutdown; data may be unsaved\n", error);
+	}
+	if (var_apfs) {
+		var_backlight_flush();
 	}
 }
 
@@ -989,6 +995,7 @@ annibale_ufs_init(void)
 		}
 	}
 	annibale_ufs_sync_rtc();
+	var_tail_probe();
 
 	if (PE_parse_boot_argn("ufs_bench", &check, sizeof(check)) && check != 0) {
 		/* right here, in bsd_init's thread, and then back to the loader: nothing else is wanted */

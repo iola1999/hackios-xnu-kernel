@@ -398,17 +398,32 @@ int
 wsp_alloc(struct apfs_wtx *w, uint64_t goal, uint64_t want, uint64_t *addr, uint64_t *got)
 {
 	struct wspace *sp = &w->sp;
+	uint64_t end = sp->block_count;
+	bool place = false;
 
 	if (want == 0 || sp->free_count == 0) {
 		return ENOSPC;
 	}
+#ifndef KERNEL
+	/*
+	 * apfs_w_adopt: the first allocation is the data's (we_map takes the blocks for a hole
+	 * before it changes a tree), the tree nodes after it are allocated as usual.
+	 */
+	if (w->place != 0) {
+		goal = w->place;
+		w->place = 0;
+		place = true;
+	} else if (w->alloc_end != 0 && w->alloc_end < end) {
+		end = w->alloc_end;
+	}
+#endif
 	/* right at the goal (where the caller's last run ended), if that block is free */
-	if (goal != 0 && goal < sp->block_count) {
+	if (goal != 0 && goal < end) {
 		struct wchunk *ch = &sp->chunks[goal / sp->per_chunk];
 		uint32_t at = (uint32_t)(goal - ch->addr), run = 0;
 
 		if (at < ch->blocks && ch->free > 0 && wsp_bitmap(w, ch) == 0) {
-			while (run < want && at + run < ch->blocks && !bit_get(ch->bitmap, at + run)) {
+			while (run < want && at + run < ch->blocks && goal + run < end && !bit_get(ch->bitmap, at + run)) {
 				run++;
 			}
 			if (run > 0) {
@@ -420,28 +435,32 @@ wsp_alloc(struct apfs_wtx *w, uint64_t goal, uint64_t want, uint64_t *addr, uint
 			}
 		}
 	}
+	if (place) {
+		return EEXIST;                  /* the blocks asked for are taken */
+	}
 	for (uint64_t step = 0; step < sp->chunk_count; step++) {
 		struct wchunk *ch = &sp->chunks[(sp->hint + step) % sp->chunk_count];
-		uint32_t at;
+		uint32_t at, blocks;
 		int error;
 
-		if (ch->free == 0) {
+		if (ch->free == 0 || ch->addr >= end) {
 			continue;
 		}
+		blocks = (uint32_t)(end - ch->addr < ch->blocks ? end - ch->addr : ch->blocks);
 		error = wsp_bitmap(w, ch);
 		if (error) {
 			return error;
 		}
-		at = wsp_first_free(ch->bitmap, 0, ch->blocks);
-		while (at < ch->blocks) {
+		at = wsp_first_free(ch->bitmap, 0, blocks);
+		while (at < blocks) {
 			uint32_t run = 1;
 
 			/* block 0 of the container is the superblock's own */
 			if (ch->addr + at == 0) {
-				at = wsp_first_free(ch->bitmap, at + 1, ch->blocks);
+				at = wsp_first_free(ch->bitmap, at + 1, blocks);
 				continue;
 			}
-			while (run < want && at + run < ch->blocks && !bit_get(ch->bitmap, at + run)) {
+			while (run < want && at + run < blocks && !bit_get(ch->bitmap, at + run)) {
 				run++;
 			}
 			wsp_mark(w, ch, at, run, true);

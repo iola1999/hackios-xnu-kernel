@@ -63,6 +63,7 @@ struct apfs_wnew {
 	const char *target;                 /* symbolic links: the target, link_len bytes */
 	size_t      target_len;
 	uint32_t    pclass;                 /* data protection class, 0 for the volume's default */
+	uint64_t    id;                     /* 0: the next free number; else one below it not in use */
 };
 
 int apfs_w_create(struct apfs_wtx *w, uint64_t dir, const char *name, size_t len,
@@ -136,5 +137,19 @@ int apfs_w_clone(struct apfs_wtx *w, uint64_t src, uint64_t dir, const char *nam
 
 /* The object's document id, assigned from the volume's counter the first time. */
 int apfs_w_docid(struct apfs_wtx *w, uint64_t id, uint32_t *docid);
+
+#ifndef KERNEL
+/*
+ * A volume built over data already on the disk (apfs_wadopt.inc; apfs-tool annfs).  Object
+ * numbers from `next` on are the volume's to hand out, those below are the caller's to give
+ * (apfs_wnew.id).  Nothing is allocated at or past block `end` but what apfs_w_adopt() names:
+ * blocks [phys, phys + blocks), free until then, become the file's from byte `off` on, within
+ * its length.  apfs_w_set_docid() gives an object the document id it had.
+ */
+void apfs_w_ids_from(struct apfs_wtx *w, uint64_t next);
+void apfs_w_alloc_below(struct apfs_wtx *w, uint64_t end);
+int  apfs_w_adopt(struct apfs_wtx *w, uint64_t id, uint64_t off, uint64_t phys, uint64_t blocks);
+int  apfs_w_set_docid(struct apfs_wtx *w, uint64_t id, uint32_t docid);
+#endif
 
 #endif /* _MISCFS_APFS_APFS_WRITE_H_ */

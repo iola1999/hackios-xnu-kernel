@@ -508,6 +508,33 @@ apfs_wmount_detach(struct apfs_mount *am)
 	return error;
 }
 
+/*
+ * Everything written to the data volume onto the device, files' pages included and waited for:
+ * the end of a run (bsd/dev/annibale/annibale_ufs.c, annibale_var_save_on_return).
+ */
+int apfs_data_flush(void);
+
+int
+apfs_data_flush(void)
+{
+	mount_t mp = NULL;
+	int error = 0;
+
+	lck_mtx_lock(&apfs_pool_lock);
+	if (apfs_data_mount != NULL && vfs_busy(apfs_data_mount->am_mp, LK_NOWAIT) == 0) {
+		mp = apfs_data_mount->am_mp;
+	}
+	lck_mtx_unlock(&apfs_pool_lock);
+	if (mp != NULL) {
+		struct apfs_mount *am = vfs_fsprivate(mp);
+
+		vnode_iterate(mp, 0, apfs_wpush_vnode, am);
+		error = apfs_wcommit(am, false);
+		vfs_unbusy(mp);
+	}
+	return error;
+}
+
 /* sysctl kern.apfs_wstats: what the writable volume has done since it was mounted. */
 static int
 sysctl_apfs_wstats SYSCTL_HANDLER_ARGS

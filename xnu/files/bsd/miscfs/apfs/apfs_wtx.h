@@ -148,6 +148,10 @@ struct apfs_wtx {
 
 	/* counters */
 	uint64_t         commits, commit_blocks, commit_ticks, cow_blocks, splits;
+
+	/* the host's converter only (apfs_wadopt.inc); always 0 in the kernel */
+	uint64_t         place;         /* the next allocation takes exactly this block on */
+	uint64_t         alloc_end;     /* nothing else is allocated at or past this block */
 };
 
 /* apfs_wtx.inc */

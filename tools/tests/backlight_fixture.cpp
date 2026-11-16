@@ -109,7 +109,7 @@ static bool MiniIOMobileFramebufferDCS(uint32_t value)
 static void MiniIOMobileFramebufferDim(uint32_t value) { dim_values.push_back(value); }
 static int MiniIOMobileFramebufferDimShown() { return -1; }
 static std::vector<std::pair<uint32_t, uint32_t>> saves;
-static void ramfs_backlight_save(uint32_t value, uint32_t millinits) { saves.emplace_back(value, millinits); }
+static void annibale_backlight_save(uint32_t value, uint32_t millinits) { saves.emplace_back(value, millinits); }
 static uint32_t annibale_backlight_level;
 static void setNumber(OSDictionary *dict, const char *key, uint64_t value)
 {

@@ -79,8 +79,8 @@ fixed_nits(uint64_t millinits)
 extern "C" {
 uint32_t annibale_backlight_level = kBLLevelFull;
 uint64_t annibale_cpufreq_touched(void);
-bool ramfs_backlight_load(uint32_t *panel_v_out, uint32_t *millinits_out);
-void ramfs_backlight_save(uint32_t panel_v, uint32_t millinits);
+bool annibale_backlight_load(uint32_t *panel_v_out, uint32_t *millinits_out);
+void annibale_backlight_save(uint32_t panel_v, uint32_t millinits);
 }
 
 class AppleARMBacklight : public IOService
@@ -368,7 +368,7 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 	bl.last_millinits = millinits;
 	bl.initialized = true;
 	if (touch_recent || slider_moved) {
-		ramfs_backlight_save((uint32_t) v, (uint32_t) millinits);
+		annibale_backlight_save((uint32_t) v, (uint32_t) millinits);
 		bl.service->setProperty("annibale-bl-restored", kOSBooleanTrue);
 	}
 	level = (uint32_t) (millinits * kBLLevelFull / kBLMilliNitsMax);
@@ -445,7 +445,7 @@ MiniAppleARMBacklightStart(IOService * provider)
 		IOLog("MiniAppleARMBacklight: cannot create the service\n");
 		return;
 	}
-	bool restored = ramfs_backlight_load(&saved_v, &saved_mn) &&
+	bool restored = annibale_backlight_load(&saved_v, &saved_mn) &&
 	    saved_v >= kBLValueMin && saved_v <= kBLValueMax &&
 	    saved_mn >= kBLMilliNitsMin && saved_mn <= kBLMilliNitsMax;
 	if (!restored) {

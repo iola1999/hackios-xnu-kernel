@@ -105,7 +105,7 @@ def mutations(source):
         "off_treated_as_min": replace(source, "if (s16 <= 0)", "if (false)"),
         "persist_idle": replace(source, "if (touch_recent || slider_moved)", "if (true)"),
         "persist_removed": replace(source,
-            "ramfs_backlight_save((uint32_t) v, (uint32_t) millinits);", "(void) v;"),
+            "annibale_backlight_save((uint32_t) v, (uint32_t) millinits);", "(void) v;"),
         "mid_brightness_guess_restored": replace(source, fixed,
             fixed + "\n\t\t\tif (n16 == fixed_nits(kBLMilliNitsMid)) millinits = kBLMilliNitsMin;"),
         "slider_linear_override_restored": replace(source,

@@ -394,7 +394,7 @@ dcs_look(void)
 	return NULL;
 }
 
-extern "C" bool ramfs_backlight_load(uint32_t *panel_v_out, uint32_t *millinits_out);
+extern "C" bool annibale_backlight_load(uint32_t *panel_v_out, uint32_t *millinits_out);
 
 /* The start's checks, with dcs.lock held. */
 static void
@@ -432,7 +432,7 @@ dcs_test(void)
 	dcs.state = gDcs >= 4 ? DCS_READY : DCS_OFF;
 	if (gDcs >= 4) {
 		uint32_t saved_v = DCS_PANEL_MAX;
-		if (!ramfs_backlight_load(&saved_v, NULL) || saved_v < 5 || saved_v > DCS_PANEL_MAX) {
+		if (!annibale_backlight_load(&saved_v, NULL) || saved_v < 5 || saved_v > DCS_PANEL_MAX) {
 			saved_v = DCS_PANEL_MAX;
 		}
 		dcs_write(saved_v, true);

@@ -446,3 +446,6 @@ out:
 #include "apfs_wops.inc"
 #include "apfs_wxattr.inc"
 #include "apfs_wclone.inc"
+#ifndef KERNEL
+#include "apfs_wadopt.inc"
+#endif
