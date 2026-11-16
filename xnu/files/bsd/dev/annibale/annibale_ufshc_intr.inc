@@ -72,11 +72,17 @@ ufshc_process_completions(void)
 			continue;
 		}
 
-		if ((hc_read(UFSHC_UTRLDBR) & (1u << i)) != 0) {
-			continue;
-		}
-
-		if ((os_atomic_and_orig(&hc_active_slots, ~(1u << i), acq_rel) & (1u << i)) == 0) {
+		/*
+		 * hc_ring() marks the slot active and then rings its doorbell, both under hc_lock.
+		 * Unlocked, a slot marked but not yet rung reads as done: it would complete with
+		 * OCS_INVALID and be given back while the controller still runs it (its DMA then
+		 * lands in freed pages).  Under hc_lock the slot is either rung or not marked.
+		 */
+		lck_mtx_lock(&hc_lock);
+		bool finished = (hc_read(UFSHC_UTRLDBR) & (1u << i)) == 0 &&
+		    (os_atomic_and_orig(&hc_active_slots, ~(1u << i), acq_rel) & (1u << i)) != 0;
+		lck_mtx_unlock(&hc_lock);
+		if (!finished) {
 			continue;
 		}
 
