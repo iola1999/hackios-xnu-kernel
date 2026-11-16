@@ -812,13 +812,14 @@ ui_boot_menu(void)
 		}
 
 		if (!user_interacted) {
+			int menu_secs = usb_connected ? 15 : 5;
 			uint64_t elapsed = now - start_time;
-			uint64_t total_ticks = 5 * freq;
+			uint64_t total_ticks = (uint64_t)menu_secs * freq;
 			if (elapsed >= total_ticks) {
 				choice = MENU_CHOICE_IOS;
 				break;
 			}
-			int sec_left = 5 - (int)(elapsed / freq);
+			int sec_left = menu_secs - (int)(elapsed / freq);
 			int pct_left = (int)((total_ticks - elapsed) * 100 / (total_ticks ? total_ticks : 1));
 			if (sec_left != countdown || pct_left / 5 != last_pct / 5) {
 				int redraw_text = (sec_left != countdown);

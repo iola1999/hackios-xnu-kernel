@@ -104,8 +104,11 @@ struct loader_live {
 	uint64_t inbox_size;            /* how many bytes it holds */
 	volatile uint64_t inbox_len;    /* the loader's to write: the length of the last file */
 	volatile uint64_t inbox_seq;    /* the loader's to write, after the file and inbox_len */
+	uint64_t magic5;                /* "XNULIVE5": active scanout framebuffer address follows */
+	volatile uint64_t scanout_pa;   /* physical address of the active scanout buffer, 0 for SCREEN.base */
 };
 extern struct loader_live loader_live;
+void loader_set_scanout_pa(uint64_t pa);
 
 void loader_panic_sync_ufs(const char *reason, uint32_t flags);
 
@@ -410,7 +413,16 @@ struct loader_live loader_live = {
 	.magic2 = 0x324556494c554e58ULL, .sound = loader_sound,
 	.magic3 = 0x334556494c554e58ULL,
 	.magic4 = 0x344556494c554e58ULL, .inbox = loader_inbox, .inbox_size = LOADER_INBOX_SIZE,
+	.magic5 = 0x354556494c554e58ULL,
 };
+
+void
+loader_set_scanout_pa(uint64_t pa)
+{
+	__asm__ volatile ("dmb ish" ::: "memory");
+	loader_live.scanout_pa = pa;
+	__asm__ volatile ("dc cvac, %0\ndsb ish" : : "r" ((uintptr_t)&loader_live.scanout_pa) : "memory");
+}
 
 /* The last file the host pushed and its sequence number, 0 before the first. */
 uint64_t

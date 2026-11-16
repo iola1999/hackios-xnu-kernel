@@ -32,15 +32,30 @@ PRELUDE = r'''
 #include <stdio.h>
 #include <string.h>
 #define NVRAM_BANK_SIZE 0x2000u
+#define KERNEL_LIVE_MAGIC2 0x324556494c554e58ULL
+#define KERNEL_LIVE_MAGIC3 0x334556494c554e58ULL
+#define KERNEL_LIVE_MAGIC4 0x344556494c554e58ULL
+#define KERNEL_LIVE_MAGIC5 0x354556494c554e58ULL
 #define EFI_ERROR(x) ((x) != 0)
 typedef uint64_t efi_status;
-typedef struct { uint32_t media_id; } efi_block_media;
+struct kernel_live {
+	uint64_t magic, heartbeat, log, log_len, log_ring_at, log_wrapped, log_head, log_ring;
+	uint64_t recording, stop, magic2, sound, magic3, cmd_seq;
+	char cmd[120];
+	uint64_t magic4, inbox, inbox_size, inbox_len, inbox_seq;
+	uint64_t magic5, scanout_pa;
+};
+typedef struct { uint32_t media_id; int read_only; } efi_block_media;
 typedef struct efi_block_io {
 	efi_block_media *media;
 	efi_status (*read_blocks)(struct efi_block_io *, uint32_t, uint64_t, uint64_t, void *);
+	efi_status (*write_blocks)(struct efi_block_io *, uint32_t, uint64_t, uint64_t, void *);
+	efi_status (*flush_blocks)(struct efi_block_io *);
 } efi_block_io;
 static struct { struct { uint32_t block_size; uint64_t blocks; } part[4]; } block_shared;
 static efi_block_io *block_bios[4];
+static const struct kernel_live *running_live;
+static int kernel_resources_held, firmware_fault, flushed_count;
 static int block_enabled = 1, block_darwin_nvram_part = -1, list_is_uefis = 1;
 static uint8_t block_buffer[4 << 20], disk[64 << 10];
 static unsigned str_len(const char *s) { return (unsigned)strlen(s); }
@@ -55,8 +70,23 @@ read_disk(efi_block_io *b, uint32_t m, uint64_t lba, uint64_t n, void *to)
 	memcpy(to, disk + lba * 4096, n);
 	return 0;
 }
+static efi_status
+write_disk(efi_block_io *b, uint32_t m, uint64_t lba, uint64_t n, void *from)
+{
+	(void)b; (void)m;
+	if ((lba * 4096 + n) > sizeof(disk)) return 1;
+	memcpy(disk + lba * 4096, from, n);
+	return 0;
+}
+static efi_status
+flush_disk(efi_block_io *b)
+{
+	(void)b;
+	flushed_count++;
+	return 0;
+}
 static efi_block_media media;
-static efi_block_io bio = { &media, read_disk };
+static efi_block_io bio = { &media, read_disk, write_disk, flush_disk };
 '''
 
 MAIN = r'''
@@ -65,8 +95,52 @@ main(int argc, char **argv)
 {
 	static uint8_t image[NVRAM_BANK_SIZE];
 	uint32_t banks = 0, bank;
-	FILE *f = fopen(argv[1], "rb");
+	FILE *f;
 
+	if (argc == 2 && strcmp(argv[1], "--self-extra") == 0) {
+		struct kernel_live live;
+		uint64_t fb = 0xfc800000ULL, len = 1156ULL * 2510ULL * 4ULL;
+
+		memset(disk, 0x55, 0x4000);
+		block_darwin_nvram_part = 0;
+		block_shared.part[0].block_size = 4096;
+		block_shared.part[0].blocks = sizeof(disk) / 4096;
+		block_bios[0] = &bio;
+		if (nvram_fastboot_consume() != 0) return 10;
+		if (nvram_fastboot_set() != 1 || flushed_count != 1) return 11;
+		for (int i = 0; i < 0x4000; i++) {
+			if (disk[i] != 0x55) return 12; /* CHRP banks [0, 0x4000) untouched */
+		}
+		if (nvram_fastboot_consume() != 1 || flushed_count != 2) return 13;
+		if (nvram_fastboot_consume() != 0) return 14;
+		kernel_resources_held = 1;
+		if (nvram_fastboot_set() != 0) return 15;
+		kernel_resources_held = 0;
+		firmware_fault = 1;
+		if (nvram_fastboot_set() != 0) return 16;
+		firmware_fault = 0;
+		list_is_uefis = 0;
+		if (nvram_fastboot_set() != 0) return 17;
+		list_is_uefis = 1;
+
+		memset(&live, 0, sizeof(live));
+		if (screenshot_base(NULL, fb, len) != fb) return 20;
+		if (screenshot_base(&live, fb, len) != fb) return 21;
+		live.magic2 = KERNEL_LIVE_MAGIC2;
+		live.magic3 = KERNEL_LIVE_MAGIC3;
+		live.magic4 = KERNEL_LIVE_MAGIC4;
+		live.magic5 = KERNEL_LIVE_MAGIC5;
+		live.scanout_pa = 0;
+		if (screenshot_base(&live, fb, len) != fb) return 22;
+		live.scanout_pa = 0xfd400000ULL;
+		if (screenshot_base(&live, fb, len) != 0xfd400000ULL) return 23;
+		live.scanout_pa = 0xfd400001ULL; /* unaligned */
+		if (screenshot_base(&live, fb, len) != fb) return 24;
+		live.scanout_pa = fb + SPLASH_REGION_BYTES - len + 4096ULL; /* out of splash bounds */
+		if (screenshot_base(&live, fb, len) != fb) return 25;
+		return 0;
+	}
+	f = fopen(argv[1], "rb");
 	if (f != NULL) {
 		fread(disk, 1, sizeof(disk), f);
 		fclose(f);
@@ -112,11 +186,12 @@ def check_image(img):
 
 def main():
     funcs = ''.join(function(SOURCE, n) for n in (
-        'nvram_chrp_sum', 'nvram_chrp_header', 'nvram_adler', 'build_nvram_image', 'nvram_bank_whole', 'nvram_load'))
-    define = re.search(r'#define NVRAM_BANKS [^\n]+', SOURCE).group(0)
+        'nvram_chrp_sum', 'nvram_chrp_header', 'nvram_adler', 'build_nvram_image', 'nvram_bank_whole', 'nvram_load',
+        'nvram_fastboot_set', 'nvram_fastboot_consume', 'screenshot_base'))
+    defines = '\n'.join(re.findall(r'#define (?:NVRAM_BANKS|NVRAM_FASTBOOT_AT|NVRAM_FASTBOOT_MAGIC|SPLASH_REGION_BYTES) [^\n]+', SOURCE))
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
-        (tmp / 't.c').write_text(PRELUDE + define + '\n' + funcs + MAIN)
+        (tmp / 't.c').write_text(PRELUDE + defines + '\n' + funcs + MAIN)
         subprocess.run(['cc', '-std=c11', '-Wall', '-Werror', '-Wno-unused-function', '-o', str(tmp / 't'),
                         str(tmp / 't.c')], check=True)
 
@@ -151,6 +226,8 @@ def main():
         bad[1] ^= 0xff
         r = run(old + bad)
         cases.append(('bad header checksum', r[:3] == (0, 2, 5)))
+        extra = subprocess.run([str(tmp / 't'), '--self-extra'], capture_output=True)
+        cases.append(('fastboot one-shot marker & screenshot_base bounds', extra.returncode == 0))
     failed = [name for name, ok in cases if not ok]
     for name, ok in cases:
         print(('PASS ' if ok else 'FAIL ') + name)

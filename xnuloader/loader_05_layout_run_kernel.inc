@@ -623,7 +623,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		own_root |= (starts_with(c, "rd=") || starts_with(c, "rootdev=")) && (c == pi.cmdline || c[-1] == ' ');
 	}
 	if (rd_size != 0 && !own_root) {
-		for (const char *c = "rd=md0 "; *c && n < BOOT_LINE_LENGTH - 1; c++) {
+		for (const char *c = "rootdev=md0 "; *c && n < BOOT_LINE_LENGTH - 1; c++) {
 			ba->commandLine[n++] = *c;
 		}
 	}

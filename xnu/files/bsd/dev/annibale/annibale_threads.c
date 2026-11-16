@@ -471,7 +471,7 @@ SYSCTL_PROC(_kern_annibale, OID_AUTO, outbox, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLF
  * driver applies its process's words when the process loads it, so a probe can be changed and the
  * process restarted ("restart NAME") without a new image. Empty until written; writing needs root.
  */
-static char annibale_env[1024];
+static char annibale_env[4096];
 SYSCTL_STRING(_kern_annibale, OID_AUTO, env, CTLFLAG_RW | CTLFLAG_LOCKED, annibale_env,
     sizeof(annibale_env), "settings for libannibalemetal, as PROCESS:NAME=VALUE words");
 

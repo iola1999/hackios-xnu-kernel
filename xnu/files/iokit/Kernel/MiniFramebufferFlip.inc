@@ -23,6 +23,7 @@
 extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern "C" boolean_t pmap_valid_address(uint64_t pa);
+extern "C" void loader_set_scanout_pa(uint64_t pa);
 
 static TUNABLE(uint32_t, gFlip, "fb_flip", 0);
 
@@ -268,6 +269,7 @@ flip_point(int which)
 		flip_wr(FLIP_CTL(flip.ctl) + FLIP_CTL_START, 1);
 	}
 	flip.shown = which;
+	loader_set_scanout_pa(flip.pa[which]);
 }
 
 #include "MiniFramebufferDim.inc"
@@ -418,12 +420,14 @@ MiniIOMobileFramebufferQuiesce(void)
 {
 	dim_quiesce();
 	if (!flip.ready || flip.shown == 0) {
+		loader_set_scanout_pa(0);
 		return;
 	}
 	flip_taken(40000, false);
 	memcpy(flip.va[0], flip.va[1], flip.bytes);
 	flip_point(0);
 	flip_taken(40000, false);
+	loader_set_scanout_pa(0);
 	flip.ready = false;
 }
 
@@ -449,6 +453,7 @@ MiniIOMobileFramebufferPowerOff(void)
 			bzero((void *) vinfo.v_baseaddr, (size_t) vinfo.v_rowbytes * vinfo.v_height);
 		}
 	}
+	loader_set_scanout_pa(0);
 }
 
 /*

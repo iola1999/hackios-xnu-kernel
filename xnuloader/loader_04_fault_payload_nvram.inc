@@ -522,3 +522,93 @@ nvram_load(uint8_t *image, uint32_t *banks)
 	}
 	return best;
 }
+
+#define NVRAM_FASTBOOT_AT    (NVRAM_BANKS * NVRAM_BANK_SIZE)
+#define NVRAM_FASTBOOT_MAGIC 0x31545341464e4e41ULL /* "ANNFAST1" */
+#define SPLASH_REGION_BYTES  0x2b00000ULL
+
+/*
+ * One-shot Fastboot entry marker in the block after the two CHRP NVRAM banks
+ * ([0x4000, 0x5000) of darwin_nvram, well below the panic log at 16 MiB).
+ * Written only when no kernel is live, held or faulted and UEFI owns the UFS
+ * transfer list; consumed and cleared once before the boot menu runs.
+ */
+static int
+nvram_fastboot_set(void)
+{
+	int part = block_darwin_nvram_part;
+	uint64_t bs = part >= 0 ? block_shared.part[part].block_size : 0;
+	efi_block_io *bio = part >= 0 ? block_bios[part] : NULL;
+	uint64_t magic = NVRAM_FASTBOOT_MAGIC;
+
+	if (running_live != NULL || kernel_resources_held || firmware_fault || !block_enabled ||
+	    bio == NULL || bio->media == NULL || bio->media->read_only || bs != 4096 ||
+	    !hc_list_is_uefis() || block_shared.part[part].blocks * bs < NVRAM_FASTBOOT_AT + bs) {
+		return 0;
+	}
+	memset(block_buffer, 0, bs);
+	memcpy(block_buffer, &magic, sizeof(magic));
+	if (EFI_ERROR(bio->write_blocks(bio, bio->media->media_id, NVRAM_FASTBOOT_AT / bs, bs, block_buffer))) {
+		return 0;
+	}
+	if (bio->flush_blocks != NULL) {
+		(void)bio->flush_blocks(bio);
+	}
+	return 1;
+}
+
+static int
+nvram_fastboot_consume(void)
+{
+	int part = block_darwin_nvram_part;
+	uint64_t bs = part >= 0 ? block_shared.part[part].block_size : 0;
+	efi_block_io *bio = part >= 0 ? block_bios[part] : NULL;
+	uint64_t magic = 0;
+
+	if (running_live != NULL || kernel_resources_held || firmware_fault || !block_enabled ||
+	    bio == NULL || bio->media == NULL || bs != 4096 || !hc_list_is_uefis() ||
+	    block_shared.part[part].blocks * bs < NVRAM_FASTBOOT_AT + bs) {
+		return 0;
+	}
+	if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, NVRAM_FASTBOOT_AT / bs, bs, block_buffer))) {
+		return 0;
+	}
+	flush_dcache((uint64_t)(uintptr_t)block_buffer, (uint64_t)(uintptr_t)block_buffer + bs);
+	memcpy(&magic, block_buffer, sizeof(magic));
+	if (magic != NVRAM_FASTBOOT_MAGIC) {
+		return 0;
+	}
+	if (!bio->media->read_only) {
+		memset(block_buffer, 0, bs);
+		(void)bio->write_blocks(bio, bio->media->media_id, NVRAM_FASTBOOT_AT / bs, bs, block_buffer);
+		if (bio->flush_blocks != NULL) {
+			(void)bio->flush_blocks(bio);
+		}
+	}
+	print("nvram: consumed one-shot Fastboot marker\n");
+	return 1;
+}
+
+static uint64_t
+screenshot_base(const struct kernel_live *live, uint64_t fb_base, uint64_t fb_bytes)
+{
+	uint64_t pa = fb_base;
+
+	if (fb_base == 0 || fb_bytes == 0 || fb_bytes > SPLASH_REGION_BYTES) {
+		return fb_base;
+	}
+	if (live != NULL && live->magic2 == KERNEL_LIVE_MAGIC2 && live->magic3 == KERNEL_LIVE_MAGIC3 &&
+	    live->magic4 == KERNEL_LIVE_MAGIC4 && live->magic5 == KERNEL_LIVE_MAGIC5) {
+		uint64_t candidate;
+
+		flush_dcache((uint64_t)(uintptr_t)&live->scanout_pa,
+		    (uint64_t)(uintptr_t)&live->scanout_pa + sizeof(live->scanout_pa));
+		candidate = *(const volatile uint64_t *)&live->scanout_pa;
+		if (candidate >= fb_base && (candidate & 0xfffULL) == 0 &&
+		    candidate - fb_base <= SPLASH_REGION_BYTES - fb_bytes) {
+			pa = candidate;
+		}
+	}
+	flush_dcache(pa, pa + fb_bytes);
+	return pa;
+}

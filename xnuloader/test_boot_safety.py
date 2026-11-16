@@ -187,7 +187,7 @@ static uint32_t ufs_crc32(const void *d, uint64_t n) { (void)d; (void)n; return 
 static efi_block_io *find_partition_named(const char16 *n, uint64_t l) { (void)n; (void)l; return NULL; }
 
 #include "loader_06a_screen_ui.inc"
-static void usb_poll_command(void) {}
+static void usb_poll_command(void) { fake_cntvct += 1920000ULL; }
 
 static int count_nonzero_in_band(const uint32_t *fb, int y0, int y1) {
     int nz = 0;
@@ -233,6 +233,19 @@ int main(void) {
     ui_init();
     if (count_nonzero_in_band(fb, 240, 670) < 10000) return 3;
     if (count_nonzero_in_band(fb, 1250, 2450) < 20000) return 4;
+
+    /* Unplugged menu expires in ~5 s (including 1.5 s pre-poll); USB-connected menu waits ~15 s. */
+    usb_connected = 0;
+    uint64_t t0 = fake_cntvct;
+    if (ui_boot_menu() != MENU_CHOICE_IOS) return 7;
+    uint64_t unplugged_secs = (fake_cntvct - t0) / 19200000ULL;
+    if (unplugged_secs < 6 || unplugged_secs > 8) return 8;
+
+    usb_connected = 1;
+    t0 = fake_cntvct;
+    if (ui_boot_menu() != MENU_CHOICE_IOS) return 9;
+    uint64_t plugged_secs = (fake_cntvct - t0) / 19200000ULL;
+    if (plugged_secs < 15 || plugged_secs > 17) return 10;
 
     free(fb);
     return 0;
@@ -364,6 +377,11 @@ class TestStandalonePackager(unittest.TestCase):
         res = subprocess.run(["python3", str(script), "--test"], capture_output=True, text=True)
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         self.assertIn("mkstandalone self-test: PASS", res.stdout)
+
+    def test_loader_default_root_bootarg_is_rootdev_not_rd(self):
+        source = (HERE / "loader_05_layout_run_kernel.inc").read_text()
+        self.assertIn('"rootdev=md0 "', source)
+        self.assertNotIn('"rd=md0 "', source)
 
 
 if __name__ == "__main__":

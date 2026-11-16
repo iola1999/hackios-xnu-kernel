@@ -778,13 +778,13 @@ fb_command(char *cmd)
 			}
 			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "oem screenshot")) {
-			/* stage the raw framebuffer; "getvar screen" gives its geometry */
+			/* stage the active scanout framebuffer; "getvar screen" gives its geometry */
 			if (SCREEN.base == 0) {
 				fb_reply("FAIL", "no display");
 				return;
 			}
-			staged_data = (const char *)(uintptr_t)SCREEN.base;
 			staged_len = (uint64_t)SCREEN.stride * SCREEN.height;
+			staged_data = (const char *)(uintptr_t)screenshot_base(running_live, SCREEN.base, staged_len);
 			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "oem stage ")) {
 			/* stage LENGTH bytes at ADDRESS (both hex) of the kernel's memory window, also while it
@@ -898,6 +898,8 @@ fb_command(char *cmd)
 					fb_reply("FAIL", "LK reboot target preparation failed");
 					return;
 				}
+			} else if (str_eq(cmd, "reboot-fastboot") || str_eq(cmd, "oem reboot-fastboot")) {
+				(void)nvram_fastboot_set();
 			}
 			fb_reply("OKAY", "");
 			if (PLAT == &platform_annibale || kernel_resources_held || firmware_fault) {
@@ -1100,11 +1102,12 @@ efi_main(efi_handle image, efi_system_table *st)
 	slot_detect();
 	/* Start USB peripheral before the boot menu so host tools can interrupt or attach at any time. */
 	(void)usb_start();
-	int menu_choice = ui_boot_menu();
+	int menu_choice = nvram_fastboot_consume() ? MENU_CHOICE_FASTBOOT : ui_boot_menu();
 	if (menu_choice == MENU_CHOICE_ANDROID) {
 		slot_set_active_other();
 		reboot();
 	} else if (menu_choice == MENU_CHOICE_FASTBOOT) {
+		slot_maintain_current();
 		(void)menu_enter_fastboot();
 		if (USB != NULL || usb_start()) {
 			flush_log();

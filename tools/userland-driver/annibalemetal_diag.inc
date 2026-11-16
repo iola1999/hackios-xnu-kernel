@@ -21,7 +21,7 @@
 __attribute__((constructor)) static void
 rw_runtime_env(void)
 {
-	char value[1024], *rest;
+	char value[4096], *rest;
 	size_t size = sizeof(value) - 1;
 	const char *self = getprogname();
 	size_t self_length = strlen(self);
