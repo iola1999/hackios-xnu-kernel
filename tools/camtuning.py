@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Make a camera's colour tuning, as libannibale-media's processor reads it (userland/src/camera_isp.c,
 isp_load_tuning), out of the camera's tuning file of Android's camera stack
-(/vendor/lib64/camera/com.qti.tuned.<name>.bin of the phone: the vendor's, kept in fw-camera/ and never in
+(/odm/lib64/camera/com.qti.tuned.<name>.bin of the phone: the vendor's, kept in fw-camera/ and never in
 the repository; so is what this makes of it).
 
 usage: camtuning.py TUNED.bin OUT.isp     (camtuning.py TUNED.bin -   lists what is there only)
