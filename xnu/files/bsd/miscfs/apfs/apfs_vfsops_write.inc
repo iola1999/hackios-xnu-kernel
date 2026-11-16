@@ -266,11 +266,16 @@ apfs_wio_drain(struct apfs_mount *am)
 			    THREAD_UNINT, wm->wm_nmap > 0 ? held : deadline);
 			continue;
 		}
+		/*
+		 * Back to the lock only once every mapping is sent: taken again earlier (a write done
+		 * while one is unsent), it would be let go again, each time behind the other threads
+		 * waiting for it.
+		 */
 		lck_spin_unlock(&wm->wm_spin);
 		gone = mach_absolute_time();
 		apfs_unlock_exclusive(am);
 		lck_spin_lock(&wm->wm_spin);
-		if (wm->wm_nmap > 0) {
+		while (wm->wm_nmap > 0 && mach_absolute_time() < deadline) {
 			(void)lck_spin_sleep_deadline(&wm->wm_spin, LCK_SLEEP_DEFAULT, (event_t)&wm->wm_io,
 			    THREAD_UNINT, deadline);
 		}
