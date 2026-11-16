@@ -21,7 +21,8 @@ Dual Partition Architecture:
 --split-nvram gives an existing install darwin_nvram: the last 32 MiB of darwin_var become their own
 partition. Only the GPT changes, so darwin_var must not use them: an APFS container that ends at least
 32 MiB before the partition does (tools/apfs/annfs-to-apfs.py builds it so); ANNFS001 uses the whole
-partition and is refused.
+partition and is refused. The primary and the backup table may differ in attribute bits (on the test
+phone the slot bits of a few _a/_b entries); each copy is changed on its own and keeps its bits.
 """
 import argparse
 import os
@@ -94,8 +95,13 @@ def entries_of(blob, h, base):
     return raw, parsed, at
 
 
-def check(name, head, tail, disk):
-    """Verify primary and backup GPT headers and partition tables."""
+def same_but_attrs(pe, be):
+    """The two tables list the same partitions; only attribute bits may differ."""
+    return len(pe) == len(be) and all({**a, 'attrs': 0} == {**b, 'attrs': 0} for a, b in zip(pe, be))
+
+
+def check(name, head, tail, disk, same=True):
+    """Verify primary and backup GPT headers and partition tables (same=False: tables may differ in attribute bits)."""
     ph = header_of(head[BS:2 * BS])
     bh = header_of(tail[7 * BS:8 * BS])
     praw, pe, _ = entries_of(head, ph, 0)
@@ -104,7 +110,7 @@ def check(name, head, tail, disk):
           crc(praw) == ph['entries_crc'] and crc(braw) == bh['entries_crc'] and
           ph['my'] == 1 and ph['alternate'] == disk - 1 and
           bh['my'] == disk - 1 and bh['alternate'] == 1 and
-          praw == braw and ph['last_usable'] == bh['last_usable'] and
+          (praw == braw if same else same_but_attrs(pe, be)) and ph['last_usable'] == bh['last_usable'] and
           ph['first_usable'] == bh['first_usable'])
     print(f'{name}: primary header crc {"right" if ph["crc_right"] else "WRONG"}, '
           f'table crc {"right" if crc(praw) == ph["entries_crc"] else "WRONG"}; '
@@ -123,20 +129,23 @@ def new_entry(es, type_guid, first, last, name):
     return e
 
 
-def write_tables(d, head, tail, ph, bh, disk, entries, table, changed_want, what):
-    """Seal table into both GPT copies, check them, write gpt-head.new and gpt-tail.new; the changed tail blocks."""
-    _, _, pat = entries_of(head, ph, 0)
+def write_tables(d, head, tail, ph, bh, disk, ptable, btable, changed_want, what):
+    """Seal the tables into the primary and the backup GPT, check them, write gpt-head.new and gpt-tail.new;
+    the changed tail blocks. Each copy may change only the entries in changed_want."""
+    _, pe, pat = entries_of(head, ph, 0)
     new_head = bytearray(head)
-    new_head[pat:pat + len(table)] = table
-    new_head[BS:2 * BS] = seal(head[BS:2 * BS], table)
-    _, _, bat = entries_of(tail, bh, disk - 8)
+    new_head[pat:pat + len(ptable)] = ptable
+    new_head[BS:2 * BS] = seal(head[BS:2 * BS], ptable)
+    _, be, bat = entries_of(tail, bh, disk - 8)
     new_tail = bytearray(tail)
-    new_tail[bat:bat + len(table)] = table
-    new_tail[7 * BS:8 * BS] = seal(tail[7 * BS:8 * BS], table)
+    new_tail[bat:bat + len(btable)] = btable
+    new_tail[7 * BS:8 * BS] = seal(tail[7 * BS:8 * BS], btable)
     new_head, new_tail = bytes(new_head), bytes(new_tail)
 
-    ok_new, _, _, new_entries = check(what, new_head, new_tail, disk)
-    changed = [i for i in range(len(entries)) if entries[i] != new_entries[i]]
+    ok_new, nph, nbh, _ = check(what, new_head, new_tail, disk, same=ptable == btable)
+    _, npe, _ = entries_of(new_head, nph, 0)
+    _, nbe, _ = entries_of(new_tail, nbh, disk - 8)
+    changed = sorted({i for i in range(len(pe)) if pe[i] != npe[i]} | {i for i in range(len(be)) if be[i] != nbe[i]})
     if not ok_new or changed != sorted(changed_want):
         sys.exit('userdata-dual-carve: generated table verification failed')
     out_head = os.path.join(d, 'gpt-head.new')
@@ -199,12 +208,15 @@ def split_nvram(d, head, tail, disk, ph, bh, entries):
           f'its APFS container {nx_block_size * nx_block_count / 2**30:.3f} GiB)')
     print(f'  {NVRAM_NAME}: LBA {last - NVRAM_BLOCKS + 1}..{last} (32 MiB, slot {slot}, sda{slot + 1})\n')
 
-    praw, _, _ = entries_of(head, ph, 0)
-    table = bytearray(praw)
     es = ph['entry_size']
-    struct.pack_into('<Q', table, v * es + 40, last - NVRAM_BLOCKS)
-    table[slot * es:(slot + 1) * es] = new_entry(es, NVRAM_TYPE, last - NVRAM_BLOCKS + 1, last, NVRAM_NAME)
-    changed_tail = write_tables(d, head, tail, ph, bh, disk, entries, bytes(table), {v, slot}, 'GPT with darwin_nvram')
+    nvram = new_entry(es, NVRAM_TYPE, last - NVRAM_BLOCKS + 1, last, NVRAM_NAME)
+    tables = []
+    for raw in (entries_of(head, ph, 0)[0], entries_of(tail, bh, disk - 8)[0]):
+        table = bytearray(raw)
+        struct.pack_into('<Q', table, v * es + 40, last - NVRAM_BLOCKS)
+        table[slot * es:(slot + 1) * es] = nvram
+        tables.append(bytes(table))
+    changed_tail = write_tables(d, head, tail, ph, bh, disk, tables[0], tables[1], {v, slot}, 'GPT with darwin_nvram')
 
     print('Execution Sequence on Device (adb root shell, Android):')
     print_gpt_writes(ph, disk, changed_tail, 1)
@@ -241,7 +253,7 @@ def main():
         sys.exit('userdata-dual-carve: header and tail files must be exactly 8 blocks (32768 bytes) each')
 
     disk = header_of(tail[7 * BS:8 * BS])['my'] + 1
-    ok, ph, bh, entries = check('initial GPT', head, tail, disk)
+    ok, ph, bh, entries = check('initial GPT', head, tail, disk, same=not args.split_nvram)
     if not ok:
         sys.exit('userdata-dual-carve: input GPT failed verification')
     if args.split_nvram:
@@ -329,7 +341,8 @@ def main():
     table[slot_root * es:(slot_root + 1) * es] = new_entry(es, APFS_CONTAINER, root_start, root_end, args.root_name)
     table[slot_var * es:(slot_var + 1) * es] = new_entry(es, APFS_CONTAINER, var_start, var_end, args.var_name)
     table[slot_nvram * es:(slot_nvram + 1) * es] = new_entry(es, NVRAM_TYPE, nvram_start, nvram_end, NVRAM_NAME)
-    changed_tail = write_tables(d, head, tail, ph, bh, disk, entries, bytes(table),
+    table = bytes(table)
+    changed_tail = write_tables(d, head, tail, ph, bh, disk, table, table,
                                 {u, slot_root, slot_var, slot_nvram}, 'new dual-boot GPT')
 
     print('Execution Sequence on Device (adb root shell in single Android session):')

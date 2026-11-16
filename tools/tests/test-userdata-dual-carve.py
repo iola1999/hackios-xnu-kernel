@@ -29,17 +29,20 @@ TABLE_BLOCKS = COUNT * ES // BS
 FIRST_USABLE, LAST_USABLE = 2 + TABLE_BLOCKS, DISK - 2 - TABLE_BLOCKS
 
 
-def gpt(parts):
-    """gpt-head.bin and gpt-tail.bin for parts: (slot, name, first, last)."""
-    table = bytearray(COUNT * ES)
-    for slot, name, first, last in parts:
-        at = slot * ES
-        table[at:at + 16] = carve.APFS_CONTAINER.bytes_le
-        table[at + 16:at + 32] = uuid.UUID(int=slot + 1).bytes_le
-        struct.pack_into('<QQQ', table, at + 32, first, last, 0)
-        table[at + 56:at + 56 + 2 * len(name)] = name.encode('utf-16le')
+def gpt(parts, backup_attrs=None):
+    """gpt-head.bin and gpt-tail.bin for parts: (slot, name, first, last); backup_attrs: {slot: attributes}
+    that only the backup table has."""
+    def table_of(attrs):
+        table = bytearray(COUNT * ES)
+        for slot, name, first, last in parts:
+            at = slot * ES
+            table[at:at + 16] = carve.APFS_CONTAINER.bytes_le
+            table[at + 16:at + 32] = uuid.UUID(int=slot + 1).bytes_le
+            struct.pack_into('<QQQ', table, at + 32, first, last, attrs.get(slot, 0))
+            table[at + 56:at + 56 + 2 * len(name)] = name.encode('utf-16le')
+        return table
 
-    def header(my, alternate, entries_lba):
+    def header(my, alternate, entries_lba, table):
         h = bytearray(BS)
         struct.pack_into('<8sIII', h, 0, b'EFI PART', 0x10000, 92, 0)
         struct.pack_into('<QQQQ', h, 24, my, alternate, FIRST_USABLE, LAST_USABLE)
@@ -48,13 +51,14 @@ def gpt(parts):
         struct.pack_into('<I', h, 16, zlib.crc32(h[:92]))
         return h
 
+    primary, backup = table_of({}), table_of(backup_attrs or {})
     head = bytearray(8 * BS)
-    head[BS:2 * BS] = header(1, DISK - 1, 2)
-    head[2 * BS:2 * BS + len(table)] = table
+    head[BS:2 * BS] = header(1, DISK - 1, 2, primary)
+    head[2 * BS:2 * BS + len(primary)] = primary
     tail = bytearray(8 * BS)
     at = (DISK - 1 - TABLE_BLOCKS - (DISK - 8)) * BS
-    tail[at:at + len(table)] = table
-    tail[7 * BS:] = header(DISK - 1, 1, DISK - 1 - TABLE_BLOCKS)
+    tail[at:at + len(backup)] = backup
+    tail[7 * BS:] = header(DISK - 1, 1, DISK - 1 - TABLE_BLOCKS, backup)
     return bytes(head), bytes(tail)
 
 
@@ -71,9 +75,9 @@ INSTALLED = [(0, 'boot', FIRST_USABLE, 1000), (33, 'userdata', 1001, 100 * GIB /
 
 
 class Carve(unittest.TestCase):
-    def run_tool(self, parts, *args, block0=None):
+    def run_tool(self, parts, *args, block0=None, backup_attrs=None):
         d = tempfile.mkdtemp(prefix='carve-')
-        head, tail = gpt(parts)
+        head, tail = gpt(parts, backup_attrs)
         Path(d, 'gpt-head.bin').write_bytes(head)
         Path(d, 'gpt-tail.bin').write_bytes(tail)
         if block0 is not None:
@@ -81,12 +85,28 @@ class Carve(unittest.TestCase):
         r = subprocess.run([sys.executable, str(SCRIPT), d, *args], capture_output=True, text=True)
         return r, d
 
-    def entries(self, d):
+    def entries(self, d, same=True):
         head = Path(d, 'gpt-head.new').read_bytes()
         tail = Path(d, 'gpt-tail.new').read_bytes()
-        ok, _, _, entries = carve.check('test', head, tail, DISK)
+        ok, _, _, entries = carve.check('test', head, tail, DISK, same=same)
         self.assertTrue(ok)
         return {e['name']: e for e in entries if e['type'].int != 0}
+
+    def test_split_keeps_backup_attributes(self):
+        var_blocks = LAST_USABLE - VAR_FIRST + 1
+        r, d = self.run_tool(INSTALLED, '--split-nvram', block0=apfs_block0(var_blocks - carve.NVRAM_BLOCKS),
+                             backup_attrs={0: 1 << 50})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.entries(d, same=False)
+        tail = Path(d, 'gpt-tail.new').read_bytes()
+        bh = carve.header_of(tail[7 * BS:])
+        _, be, _ = carve.entries_of(tail, bh, DISK - 8)
+        self.assertEqual(be[0]['attrs'], 1 << 50)
+        self.assertEqual(be[36]['name'], 'darwin_nvram')
+        head = Path(d, 'gpt-head.new').read_bytes()
+        _, pe, _ = carve.entries_of(head, carve.header_of(head[BS:2 * BS]), 0)
+        self.assertEqual(pe[0]['attrs'], 0)
+        self.assertEqual(pe[36], be[36])
 
     def test_split(self):
         var_blocks = LAST_USABLE - VAR_FIRST + 1
