@@ -12,6 +12,8 @@ extern "C" {
 #endif
 
 struct rwa_compute;
+struct rwa_bindings;
+struct rwa_buffer_bind;
 struct rwa_reflection_type;
 
 struct rwa_reflection_member {
@@ -67,6 +69,20 @@ __attribute__((visibility("default")))
 int rwa_compute_get_reflection(struct rwa_compute *compute,
                               const struct rwa_compute_reflection **out,
                               char *why, size_t why_size);
+
+__attribute__((visibility("default")))
+unsigned rwa_compute_imageblock_data_size(struct rwa_compute *compute);
+
+__attribute__((visibility("default")))
+int rwa_dispatch_nowait_imageblock(struct rwa_compute *compute,
+                                   const struct rwa_bindings *bindings,
+                                   const struct rwa_buffer_bind *table,
+                                   unsigned table_count,
+                                   const unsigned groups[3],
+                                   const unsigned group_size[3],
+                                   unsigned threadgroup_bytes,
+                                   const unsigned imageblock_size[2],
+                                   char *why, size_t why_size);
 
 #ifdef __cplusplus
 }

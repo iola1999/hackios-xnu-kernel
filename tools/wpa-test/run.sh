@@ -10,6 +10,7 @@ B=$ROOT/xnu-deps/build/wpa-test
 rm -rf "$B"
 mkdir -p "$B"
 "$HERE/reference.py" "${1:-1}" > "$B/cases.inc"
-${CC:-cc} -std=gnu11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all \
-	-I"$B" -I"$ROOT/wifi/lx/src" -o "$B/test" "$HERE/test_wpa.c"
+FLAGS="-std=gnu11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
+${CC:-cc} $FLAGS -I"$B" -I"$ROOT/wifi/lx/src" -c "$HERE/test_wpa.c" -o "$B/test_wpa.o"
+${CC:-cc} $FLAGS -o "$B/test" "$B/test_wpa.o"
 "$B/test"

@@ -316,6 +316,11 @@
 		}
 	}
 	if (compute == NULL) {
+		static unsigned compute_refused_logged;
+		if (__atomic_fetch_add(&compute_refused_logged, 1, __ATOMIC_RELAXED) < 64) {
+			rw_print("compute pipeline refused (%s): %s\n",
+			         [[function name] UTF8String] ?: "?", why);
+		}
 		/* The front end's own sentence, passed through rather than replaced: it says
 		 * which construct it refused, and an application can act on that. */
 		return [self fail:error with:[NSString stringWithUTF8String:why]];

@@ -15,12 +15,18 @@
 #define CCI0_SIZE               0x00001000UL
 #define CSID_LITE0_PHYS         0x0ad6d000UL    /* csid-lite980 (0xa00) + vfe-lite980 (0x2800) */
 #define CSID_LITE0_SIZE         0x00002800UL
+#define CAMNOC_RT_PHYS          0x0ad90000UL    /* cam980_cpas100_camnoc_info_rt (<0xad90000 0x6000>) */
+#define CAMNOC_RT_SIZE          0x00006000UL
 #define CSIPHY3_PHYS            0x0adaf000UL
 #define CSIPHY3_SIZE            0x00002000UL
 #define CSIPHY4_PHYS            0x0adb1000UL
 #define CSIPHY4_SIZE            0x00002000UL
 #define CAMCC_PHYS              0x0ade0000UL
 #define CAMCC_SIZE              0x00020000UL
+#define CAM_SPMI_CORE_PHYS      0x0c400000UL
+#define CAM_SPMI_CORE_SIZE      0x00003000UL
+#define CAM_SPMI_OBSRV_PHYS     0x0c440000UL
+#define CAM_SPMI_OBSRV_SIZE     0x00080000UL
 #define TLMM_PHYS               0x0f100000UL
 #define TLMM_SIZE               0x00102000UL
 #define APPS_SMMU_PHYS          0x15000000UL
@@ -165,6 +171,9 @@ static vm_offset_t cpas_base;
 static vm_offset_t camcc_base;
 static vm_offset_t cci0_base;
 static vm_offset_t csid_lite_base;
+static vm_offset_t camnoc_rt_base;
+static vm_offset_t cam_spmi_core;
+static vm_offset_t cam_spmi_obsrv;
 static vm_offset_t tlmm_base;
 static vm_offset_t cam_region_vbase;
 
@@ -177,6 +186,11 @@ static uint32_t cached_cpas_ver = 0;
 static uint32_t cached_cpas_cap = 0;
 static uint32_t cached_csid_ver = 0;
 static uint32_t cached_ife_ver = 0;
+static uint32_t boot_cam_bcm = 0;
+static uint32_t boot_cam_rt_mhz = 200u;
+static uint32_t boot_cam_probe = 1u;
+static uint32_t boot_cam_keep_stream = 1u;
+static bool cam_session_probed = false;
 static bool cci_ready = false;
 static bool cam_ife_lite_clks_on = false;
 static bool cam_hw_dma_verified = false;
@@ -326,6 +340,15 @@ cam_vote_rpmh_supplies(bool enable)
 		bool mmcx_ok = annibale_rpmh_arc_vote("mmcx.lvl", ANNIBALE_RPMPD_LEVEL_NOM);
 		bool mxc_ok = annibale_rpmh_arc_vote("mxc.lvl", ANNIBALE_RPMPD_LEVEL_NOM);
 		say("rpmh arc mmcx_return=%u mxc_return=%u\n", mmcx_ok ? 1u : 0u, mxc_ok ? 1u : 0u);
+		if (boot_cam_bcm != 0) {
+			/* MM0/SH0/MC0/ACV are shared with MDSS display in APPS DRV; never unvote on close. */
+			bool mm0 = annibale_rpmh_bcm_vote("MM0", 2100ULL * 1000000ULL, 0);
+			bool sh0 = annibale_rpmh_bcm_vote("SH0", 2100ULL * 1000000ULL, 0);
+			bool mc0 = annibale_rpmh_bcm_vote("MC0", 1600ULL * 1000000ULL, 0);
+			bool acv = annibale_rpmh_bcm_vote("ACV", 0, 0x8u);
+			say("rpmh bcm on mm0=%u sh0=%u mc0=%u acv=%u\n",
+			    mm0 ? 1u : 0u, sh0 ? 1u : 0u, mc0 ? 1u : 0u, acv ? 1u : 0u);
+		}
 	}
 	for (size_t i = 0; i < sizeof(cam_vrm_rails) / sizeof(cam_vrm_rails[0]); i++) {
 		size_t idx = enable ? i : (sizeof(cam_vrm_rails) / sizeof(cam_vrm_rails[0]) - 1u - i);
@@ -334,6 +357,127 @@ cam_vote_rpmh_supplies(bool enable)
 		    enable ? cam_vrm_rails[idx].mode : ANNIBALE_RPMH_MODE_NONE);
 		say("rpmh regulator=%s enable=%u returned=%u\n", cam_vrm_rails[idx].name,
 		    enable ? 1u : 0u, regulator_ok ? 1u : 0u);
+	}
+}
+
+static void
+cam_mux_front_se9_od(void)
+{
+	if (tlmm_base != 0) {
+		tlmm_config_pin(GPIO_SE9_I2C_SDA, 0, 3, 2, false, false);
+		tlmm_config_pin(GPIO_SE9_I2C_SCL, 0, 3, 2, false, false);
+	}
+}
+
+/* Read-only SPMI v7 observer snapshot for PM8010M L1M (0xC40), L3M (0xC42), L5M (0xC44). */
+static void
+cam_spmi_front_ldo_probe(const char *tag)
+{
+	if (cam_spmi_core == 0) {
+		cam_spmi_core = ml_io_map(CAM_SPMI_CORE_PHYS, CAM_SPMI_CORE_SIZE);
+		cam_spmi_obsrv = ml_io_map(CAM_SPMI_OBSRV_PHYS, CAM_SPMI_OBSRV_SIZE);
+	}
+	if (tlmm_base != 0) {
+		say("front_tlmm[%s] g4=%#x/%#x g5=%#x/%#x g7=%#x/%#x g93=%#x/%#x\n", tag,
+		    reg_rd(tlmm_base, 4u * 0x1000u), reg_rd(tlmm_base, 4u * 0x1000u + 4u),
+		    reg_rd(tlmm_base, 5u * 0x1000u), reg_rd(tlmm_base, 5u * 0x1000u + 4u),
+		    reg_rd(tlmm_base, 7u * 0x1000u), reg_rd(tlmm_base, 7u * 0x1000u + 4u),
+		    reg_rd(tlmm_base, 93u * 0x1000u), reg_rd(tlmm_base, 93u * 0x1000u + 4u));
+	}
+	if (cam_spmi_core == 0 || cam_spmi_obsrv == 0 ||
+	    (reg_rd(cam_spmi_core, 0u) & 0xf0000000u) != 0x70000000u) {
+		return;
+	}
+	static const uint16_t ppids[3] = { 0x0c40u, 0x0c42u, 0x0c44u };
+	uint32_t max_apid = reg_rd(cam_spmi_core, 4u) & 0x7ffu;
+	if (max_apid > 0x400u) {
+		max_apid = 0x400u;
+	}
+	for (size_t p = 0; p < 3u; p++) {
+		uint32_t apid = UINT32_MAX;
+		for (uint32_t n = 0; n < max_apid; n++) {
+			uint32_t entry = reg_rd(cam_spmi_core, 0x2000u + 4u * n);
+			if ((entry & (1u << 31)) != 0 && ((entry >> 8) & 0xfffu) == ppids[p]) {
+				apid = n;
+				break;
+			}
+		}
+		if (apid == UINT32_MAX) {
+			say("spmi_ldo[%s] ppid=%#x apid=missing\n", tag, ppids[p]);
+			continue;
+		}
+		vm_offset_t ch = cam_spmi_obsrv + 0x20UL * apid;
+		uint32_t st_reg = 0, cfg0 = 0, cfg1 = 0, s0 = 0, s1 = 0;
+		annibale_spmi_lock();
+		reg_wr(ch, 0x00u, (13u << 27) | (0x08u << 4) | 3u);
+		for (uint32_t t = 0; t < 500u; t++) {
+			s0 = reg_rd(ch, 0x08u);
+			if ((s0 & 0xfu) != 0) {
+				break;
+			}
+		}
+		if ((s0 & 1u) != 0) {
+			st_reg = reg_rd(ch, 0x18u);
+		}
+		reg_wr(ch, 0x00u, (1u << 27) | (0x40u << 4) | 7u);
+		for (uint32_t t = 0; t < 500u; t++) {
+			s1 = reg_rd(ch, 0x08u);
+			if ((s1 & 0xfu) != 0) {
+				break;
+			}
+		}
+		if ((s1 & 1u) != 0) {
+			cfg0 = reg_rd(ch, 0x18u);
+			cfg1 = reg_rd(ch, 0x1cu);
+		}
+		annibale_spmi_unlock();
+		say("spmi_ldo[%s] ppid=%#x apid=%u s=%#x/%#x st08=%#010x cfg40=%#010x cfg44=%#010x\n",
+		    tag, ppids[p], apid, s0, s1, st_reg, cfg0, cfg1);
+	}
+}
+
+static void
+cam_diag_bus_debug_enable(void)
+{
+	if (boot_cam_probe != 0 && csid_lite_base != 0) {
+		csid_wr(0x177cu, 0xb00u);
+	}
+}
+
+static void
+cam_diag_capture_probe(const char *tag)
+{
+	if (boot_cam_probe == 0 || cam_session_probed) {
+		return;
+	}
+	cam_session_probed = true;
+	if (cpas_base != 0) {
+		say("probe[%s] cpas 1c=%#x ec=%#x f0=%#x\n", tag,
+		    reg_rd(cpas_base, 0x1cu), reg_rd(cpas_base, 0xecu), reg_rd(cpas_base, 0xf0u));
+	}
+	if (camnoc_rt_base != 0) {
+		say("probe[%s] camnoc_rt err08=%#x 0c=%#x 10=%#x 18=%#x 20=%#x 30=%#x 248=%#x 300=%#x\n",
+		    tag, reg_rd(camnoc_rt_base, 0x08u), reg_rd(camnoc_rt_base, 0x0cu),
+		    reg_rd(camnoc_rt_base, 0x10u), reg_rd(camnoc_rt_base, 0x18u),
+		    reg_rd(camnoc_rt_base, 0x20u), reg_rd(camnoc_rt_base, 0x30u),
+		    reg_rd(camnoc_rt_base, 0x248u), reg_rd(camnoc_rt_base, 0x300u));
+		say("probe[%s] camnoc_rt1 qos=%#x/%#x/%#x niu=%#x/%#x/%#x rt3 niu=%#x/%#x\n",
+		    tag, reg_rd(camnoc_rt_base, 0x4088u), reg_rd(camnoc_rt_base, 0x408cu),
+		    reg_rd(camnoc_rt_base, 0x40a0u), reg_rd(camnoc_rt_base, 0x4820u),
+		    reg_rd(camnoc_rt_base, 0x4840u), reg_rd(camnoc_rt_base, 0x4848u),
+		    reg_rd(camnoc_rt_base, 0x4c20u), reg_rd(camnoc_rt_base, 0x4c40u));
+	}
+	if (csid_lite_base != 0) {
+		say("probe[%s] bus 1200=%#x 121c=%#x 1228=%#x 122c=%#x wm 1700=%#x 1704=%#x 170c=%#x 1714=%#x\n",
+		    tag, reg_rd(csid_lite_base, 0x1200u), reg_rd(csid_lite_base, 0x121cu),
+		    reg_rd(csid_lite_base, 0x1228u), reg_rd(csid_lite_base, 0x122cu),
+		    reg_rd(csid_lite_base, 0x1700u), reg_rd(csid_lite_base, 0x1704u),
+		    reg_rd(csid_lite_base, 0x170cu), reg_rd(csid_lite_base, 0x1714u));
+		say("probe[%s] wm_dbg 1770=%#x 177c=%#x 1780=%#x 1784=%#x 1790=%#x 1794=%#x 1798=%#x 179c=%#x\n",
+		    tag, reg_rd(csid_lite_base, 0x1770u), reg_rd(csid_lite_base, 0x177cu),
+		    reg_rd(csid_lite_base, 0x1780u), reg_rd(csid_lite_base, 0x1784u),
+		    reg_rd(csid_lite_base, 0x1790u), reg_rd(csid_lite_base, 0x1794u),
+		    reg_rd(csid_lite_base, 0x1798u), reg_rd(csid_lite_base, 0x179cu));
 	}
 }
 
@@ -701,6 +845,8 @@ probe_sensors_all(bool can_touch_cci0)
 	}
 
 	if (tlmm_base != 0) {
+		cam_mux_front_se9_od();
+		cam_spmi_front_ldo_probe("open-probe");
 		od_i2c_sda(GPIO_SE9_I2C_SDA, true);
 		(void)od_i2c_scl_high(GPIO_SE9_I2C_SCL);
 		delay_for_interval(50, NSEC_PER_USEC);
@@ -710,6 +856,10 @@ probe_sensors_all(bool can_touch_cci0)
 			front_chip_id = id;
 			front_slave_addr = SENSOR_SLAVE7;
 			say("QUPv3 SE9 I2C front sensor matched at 0x%02x: chip_id=0x%04x\n", SENSOR_SLAVE7, id);
+		} else {
+			say("QUPv3 SE9 I2C front probe NACK/mismatch (sda=%u scl=%u)\n",
+			    tlmm_get_in(GPIO_SE9_I2C_SDA) ? 1u : 0u,
+			    tlmm_get_in(GPIO_SE9_I2C_SCL) ? 1u : 0u);
 		}
 	}
 }

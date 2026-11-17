@@ -261,3 +261,36 @@ annibale_rpmh_arc_vote(const char *name, uint32_t min_level)
 	}
 	return annibale_rpmh_tcs_send(&addr, &selector, 1u);
 }
+
+bool
+annibale_rpmh_bcm_vote(const char *name, uint64_t bw_bytes_per_sec, uint32_t raw_vote)
+{
+	const uint8_t *data = NULL;
+	uint32_t len = 0, addr, unit, cmd;
+
+	addr = annibale_cmd_db_lookup(name, &data, &len);
+	if (addr == 0) {
+		return false;
+	}
+	if (raw_vote != 0) {
+		cmd = 0x60000000u | (raw_vote & 0x3fff3fffu);
+		return annibale_rpmh_tcs_send(&addr, &cmd, 1u);
+	}
+	if (bw_bytes_per_sec == 0) {
+		/* Unvote carries COMMIT without VALID so RPMh retires this DRV's BCM request. */
+		cmd = 0x40000000u;
+		return annibale_rpmh_tcs_send(&addr, &cmd, 1u);
+	}
+	if (data == NULL || len < 8u) {
+		return false;
+	}
+	unit = (uint32_t)data[0] | ((uint32_t)data[1] << 8) |
+	    ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
+	if (unit == 0) {
+		return false;
+	}
+	uint64_t vote64 = (bw_bytes_per_sec + (uint64_t)unit - 1ULL) / (uint64_t)unit;
+	uint32_t vote = vote64 < 1ULL ? 1u : (vote64 > 0x3fffULL ? 0x3fffu : (uint32_t)vote64);
+	cmd = 0x60000000u | (vote << 14) | vote;
+	return annibale_rpmh_tcs_send(&addr, &cmd, 1u);
+}

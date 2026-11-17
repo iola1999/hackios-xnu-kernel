@@ -377,16 +377,40 @@ struct ann_format {
 static const struct ann_format ann_formats[] = {
 	{  10, 'A008', 1, 0, "MTLPixelFormatR8Unorm" },
 	{  11, 'A008', 1, 0, "MTLPixelFormatR8Unorm_sRGB" },
+	{  12, 'A008', 1, 0, "MTLPixelFormatR8Snorm" },
+	{  13, 'A008', 1, 0, "MTLPixelFormatR8Uint" },
+	{  14, 'A008', 1, 0, "MTLPixelFormatR8Sint" },
+	{  20, 'L016', 2, 0, "MTLPixelFormatR16Unorm" },
+	{  22, 'L016', 2, 0, "MTLPixelFormatR16Snorm" },
+	{  23, 'L016', 2, 0, "MTLPixelFormatR16Uint" },
+	{  24, 'L016', 2, 0, "MTLPixelFormatR16Sint" },
 	{  25, 'L00h', 2, 0, "MTLPixelFormatR16Float" },
 	{  30, 'LA08', 2, 0, "MTLPixelFormatRG8Unorm" },
+	{  32, 'LA08', 2, 0, "MTLPixelFormatRG8Snorm" },
+	{  33, 'LA08', 2, 0, "MTLPixelFormatRG8Uint" },
+	{  34, 'LA08', 2, 0, "MTLPixelFormatRG8Sint" },
+	{  60, '2C0h', 4, 0, "MTLPixelFormatRG16Unorm" },
+	{  62, '2C0h', 4, 0, "MTLPixelFormatRG16Snorm" },
+	{  63, '2C0h', 4, 0, "MTLPixelFormatRG16Uint" },
+	{  64, '2C0h', 4, 0, "MTLPixelFormatRG16Sint" },
 	{  65, '2C0h', 4, 0, "MTLPixelFormatRG16Float" },
 	{  70, 'RGBA', 4, 0, "MTLPixelFormatRGBA8Unorm" },
 	{  71, 'RGBA', 4, 0, "MTLPixelFormatRGBA8Unorm_sRGB" },
+	{  72, 'RGBA', 4, 0, "MTLPixelFormatRGBA8Snorm" },
+	{  73, 'RGBA', 4, 0, "MTLPixelFormatRGBA8Uint" },
+	{  74, 'RGBA', 4, 0, "MTLPixelFormatRGBA8Sint" },
 	{  80, 'BGRA', 4, 0, "MTLPixelFormatBGRA8Unorm" },
 	{  81, 'BGRA', 4, 0, "MTLPixelFormatBGRA8Unorm_sRGB" },
 	{  90, 'R10k', 4, 0, "a ten-bit RGB format" },
 	{  94, 'BGRA', 4, 0, "a ten-bit RGB format" },
+	{ 110, 'RGhA', 8, 0, "MTLPixelFormatRGBA16Unorm" },
+	{ 112, 'RGhA', 8, 0, "MTLPixelFormatRGBA16Snorm" },
+	{ 113, 'RGhA', 8, 0, "MTLPixelFormatRGBA16Uint" },
+	{ 114, 'RGhA', 8, 0, "MTLPixelFormatRGBA16Sint" },
 	{ 115, 'RGhA', 8, 0, "MTLPixelFormatRGBA16Float" },
+	{ 123, 'RGfA', 16, 0, "MTLPixelFormatRGBA32Uint" },
+	{ 124, 'RGfA', 16, 0, "MTLPixelFormatRGBA32Sint" },
+	{ 125, 'RGfA', 16, 0, "MTLPixelFormatRGBA32Float" },
 	{ 550, 'BGRA', 4, 0, "a ten-bit XR format" },
 	{ 551, 'BGRA', 4, 0, "a ten-bit XR format" },
 	{ 552, 'BGRA', 4, 0, "a ten-bit XR format" },
@@ -449,17 +473,17 @@ ann_format_of_metal(unsigned metal_pixel_format, uint32_t *fourcc, unsigned *byt
 	 * moment one of them changes, and this very sentence had 90 in the wrong half of it
 	 * before the table was read again.
 	 */
-	char served[160] = "", refused[160] = "";
+	char served[384] = "", refused[160] = "";
 	size_t sn = 0, rn = 0;
 
 	for (size_t i = 0; i < sizeof(ann_formats) / sizeof(ann_formats[0]); i++) {
 		char *into = ann_formats[i].substituted ? refused : served;
 		size_t *at = ann_formats[i].substituted ? &rn : &sn;
-		int wrote = snprintf(into + *at, (ann_formats[i].substituted ? sizeof(refused)
-								            : sizeof(served)) - *at,
-		    "%s%u", *at ? ", " : "", ann_formats[i].metal);
+		size_t cap = ann_formats[i].substituted ? sizeof(refused) : sizeof(served);
+		int wrote = *at < cap ? snprintf(into + *at, cap - *at,
+		    "%s%u", *at ? ", " : "", ann_formats[i].metal) : 0;
 
-		if (wrote > 0) {
+		if (wrote > 0 && (size_t)wrote < cap - *at) {
 			*at += (size_t)wrote;
 		}
 	}
@@ -507,14 +531,16 @@ ann_surface_plane(void *iosurface, unsigned long plane, const struct ann_texture
 	uint32_t fourcc = format(iosurface), expected;
 	unsigned bpp, view_bpp;
 	if ((fourcc == '420v' || fourcc == '420f') && planes == 2) {
-		unsigned pixel_format = plane == 0 ? 10 : 30;
-		if (want->pixel_format != pixel_format && want->pixel_format != 80) {
-			ann_say(why, why_size, "NV12 plane %lu requires Metal format %u or packed BGRA8; requested %u",
-			    plane, pixel_format, want->pixel_format);
+		unsigned pf = want->pixel_format;
+		bool native_p0 = plane == 0 && (pf == 10 || pf == 12 || pf == 13 || pf == 14);
+		bool native_p1 = plane == 1 && (pf == 30 || pf == 32 || pf == 33 || pf == 34);
+		if (!native_p0 && !native_p1 && pf != 80 && pf != 123) {
+			ann_say(why, why_size, "NV12 plane %lu requires Metal format %u/uint or packed BGRA8/RGBA32Uint; requested %u",
+			    plane, plane == 0 ? 10u : 30u, pf);
 			return -1;
 		}
 		bpp = plane == 0 ? 1 : 2;
-		view_bpp = want->pixel_format == 80 ? 4 : bpp;
+		view_bpp = pf == 123 ? 16 : (pf == 80 ? 4 : bpp);
 	} else if (fourcc == '_RB4' && planes == 2) {
 		/* RGB8_444_2P: plane 0 is G (R8), plane 1 is B, R (RG8), both full size. */
 		unsigned pixel_format = plane == 0 ? 10 : 30;
@@ -526,20 +552,31 @@ ann_surface_plane(void *iosurface, unsigned long plane, const struct ann_texture
 		bpp = plane == 0 ? 1 : 2;
 		view_bpp = bpp;
 	} else if ((fourcc == 'x420' || fourcc == 'xf20' || fourcc == 'x422' || fourcc == 'xf22') && planes == 2) {
-		unsigned pixel_format = plane == 0 ? 20 : 60;
-		if (want->pixel_format != pixel_format && !(plane == 0 && want->pixel_format == 60)) {
+		unsigned pf = want->pixel_format;
+		bool native_p0 = plane == 0 && (pf == 20 || pf == 22 || pf == 23 || pf == 24 || pf == 25);
+		bool native_p1 = plane == 1 && (pf == 60 || pf == 62 || pf == 63 || pf == 64 || pf == 65);
+		bool packed_p0 = plane == 0 && (pf == 60 || pf == 63);
+		if (!native_p0 && !native_p1 && !packed_p0 && pf != 123) {
 			ann_say(why, why_size, "P010 plane %lu requires Metal format %u%s; requested %u",
-			    plane, pixel_format, plane == 0 ? " or packed RG16" : "", want->pixel_format);
+			    plane, plane == 0 ? 20u : 60u, plane == 0 ? " or packed RG16/RGBA32Uint" : "", pf);
 			return -1;
 		}
 		bpp = plane == 0 ? 2 : 4;
-		view_bpp = want->pixel_format == 60 ? 4 : bpp;
+		view_bpp = pf == 123 ? 16 : (packed_p0 ? 4 : bpp);
 	} else if (planes > 1) {
 		ann_say(why, why_size, "unsupported planar surface FourCC %#x with %zu planes", fourcc, planes);
 		return -1;
 	} else if (ann_format_of_metal(want->pixel_format, &expected, &bpp, why, why_size) != 0) {
 		return -1;
-	} else if (fourcc != expected && !(want->pixel_format == 25 && fourcc == '1C0h')) {
+	} else if (want->pixel_format == 123 &&
+	    (fourcc == 'BGRA' || fourcc == 'RGBA' || fourcc == 'A008' ||
+	    fourcc == 'L008' || fourcc == 'LA08' || fourcc == 'RGhA')) {
+		/* VTMetalTransferSession (VTMTSComputeFunction) binds 16-byte RGBA32Uint views over linear planes. */
+		bpp = (unsigned)element(iosurface, plane);
+		view_bpp = 16;
+	} else if (fourcc != expected &&
+	    !((expected == 'A008' && fourcc == 'L008') ||
+	      ((expected == 'L016' || expected == 'L00h') && (fourcc == 'L00h' || fourcc == '1C0h' || fourcc == 'L016')))) {
 		ann_say(why, why_size, "surface FourCC %#x does not match Metal format %u "
 		    "(expected %#x; plane %lu, %zux%zu, element %zu, row %zu, offset %zu, alloc %zu)",
 		    fourcc, want->pixel_format, expected, plane, width(iosurface, plane),
@@ -552,10 +589,11 @@ ann_surface_plane(void *iosurface, unsigned long plane, const struct ann_texture
 	size_t w = width(iosurface, plane), h = height(iosurface, plane);
 	size_t stride = row(iosurface, plane), begin = offset(iosurface, plane);
 	uintptr_t pixels = (uintptr_t)address(iosurface, plane);
-	/* Affine output uses BGRA8/RG16 row views. The IOSurface element size and physical
-	 * plane bounds still describe the original storage. */
+	/* Affine and VTMetalTransferSession use packed BGRA8/RG16/RGBA32Uint row views.
+	 * The IOSurface element size and physical plane bounds still describe the original storage. */
 	if (w == 0 || h == 0 || w > UINT32_MAX || h > UINT32_MAX || stride > UINT32_MAX ||
 	    begin > UINT32_MAX || pixels == 0 || pixels < begin || element(iosurface, plane) != bpp ||
+	    stride % view_bpp != 0 ||
 	    want->width == 0 || want->height == 0 || want->width > w || want->height > h ||
 	    (uint64_t)want->width * view_bpp > (uint64_t)w * bpp ||
 	    want->type != 2 || want->depth != 1 || want->array_length != 1 ||

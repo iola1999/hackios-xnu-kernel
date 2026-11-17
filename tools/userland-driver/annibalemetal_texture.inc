@@ -671,7 +671,7 @@ rw_surface_through_copy(AnnibaleMetalDevice *device, MTLTextureDescriptor *d, vo
 	case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGBA32Sint: case MTLPixelFormatRGBA32Float:
 		return MAX(alignment, 256);
 	default:
-		return alignment;
+		return alignment ? MAX(alignment, 64) : 0;
 	}
 }
 

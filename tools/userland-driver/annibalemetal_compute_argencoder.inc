@@ -7,6 +7,7 @@
 	id _samplers[RW_MAX_BUFFERS];
 	unsigned _highest, _highestTexture, _highestSampler;
 	unsigned _threadgroupBytes;
+	unsigned _imageblockSize[2];
 	BOOL _ended, _complained, _warnedLodClamp;
 }
 
@@ -148,6 +149,8 @@
 	work->size[1] = (unsigned)size.height;
 	work->size[2] = (unsigned)size.depth;
 	work->threadgroupBytes = _threadgroupBytes;
+	work->imageblockSize[0] = _imageblockSize[0];
+	work->imageblockSize[1] = _imageblockSize[1];
 	[_commandBuffer recordWork:work];
 	[work release];
 }
@@ -306,9 +309,8 @@
 }
 - (void)setImageblockWidth:(NSUInteger)width height:(NSUInteger)height
 {
-	(void)width; (void)height;
-	RW_ONCE("imageblocks are not implemented; this kernel's imageblock "
-		"size is ignored\n");
+	_imageblockSize[0] = (unsigned)width;
+	_imageblockSize[1] = (unsigned)height;
 }
 /* An entry for this exists in _MTLCommandEncoder and it is one of Apple's abstract ones
  * (tools/metal/protometh.py --verdicts), so inheriting it is an abort rather than a

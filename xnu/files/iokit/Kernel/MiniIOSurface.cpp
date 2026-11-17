@@ -57,8 +57,16 @@ enum {
 	kSurfaceMethodSetIndexedTimestamp = 33,
 	kSurfaceMethodLookupFromPort    = 34,
 	kSurfaceMethodCreatePort        = 35,
+	kSurfaceMethodCreateSharedEvent = 36,
+	kSurfaceMethodOpenSharedEvent   = 38,
+	kSurfaceMethodNotifyEventListener = 39,
+	kSurfaceMethodAddEventListener  = 40,
+	kSurfaceMethodRemoveEventListener = 41,
 	kSurfaceMethodDetachModeCode    = 43,
 	kSurfaceMethodSetOwnershipIdentity = 44,
+	kSurfaceMethodCreateMemoryPool  = 46,
+	kSurfaceMethodEnsureMemoryPool  = 47,
+	kSurfaceMethodFlushMemoryPool   = 48,
 	kSurfaceMethodSetCoreVideoBridgedKeys = 54, /* 23G90 */
 	kSurfaceMethodQueryTransactionList = 58,
 };
@@ -71,6 +79,8 @@ enum {
 	kSurfaceTrapUnlock              = 3,
 	kSurfaceTrapDetach              = 4,    /* the client is about to release: forget it has the surface */
 	kSurfaceTrapRelease             = 5,
+	kSurfaceTrapWaitSharedEvent     = 6,
+	kSurfaceTrapSignalSharedEvent   = 7,
 	kSurfaceTrapRemoveCoreVideoBridgedValues = 8,
 	kSurfaceTrapRemoveBulkAttachments = 9,
 	kSurfaceTrapCount
@@ -846,6 +856,10 @@ IOCoreSurfaceRoot::start(IOService * provider)
 	return true;
 }
 
+class IOSurfaceSharedEventRight;
+struct minisurf_event_listener;
+static void minisurfSharedEventInit(void);
+
 void
 MiniIOSurfaceStart(IOService * provider)
 {
@@ -853,6 +867,7 @@ MiniIOSurfaceStart(IOService * provider)
 
 	gSurfaceLock = IOLockAlloc();
 	gSurfaceKeptLock = IOLockAlloc();
+	minisurfSharedEventInit();
 	if (!PE_parse_boot_arg_str("surftrace_of", gSurfaceTraceOf, sizeof(gSurfaceTraceOf))) {
 		gSurfaceTraceOf[0] = 0;
 	}
@@ -891,18 +906,30 @@ class IOSurfaceRootUserClient : public IOUserClient
 	uint32_t                        fRefCapacity;
 	minisurf_abi                    fABI;
 	OSArray *                       fCoreVideoBridgedKeys;
+	IOMemoryMap *                   fSharedEventMap;
+	struct minisurf_event_listener * fEventListeners;
 	IOExternalTrap                  fTraps[kSurfaceTrapCount];
 
 	struct minisurf_client_ref * findRef(uint32_t sid, bool detached);
 	struct minisurf_client_ref * addRef(MiniIOSurface * surface, IOReturn * error);
 	void dropRef(struct minisurf_client_ref * ref);
 	IOReturn returnSurface(struct minisurf_client_ref * ref, bool known, IOExternalMethodArguments * args);
+	IOMemoryMap * ensureSharedEventMap(void);
+	IOSurfaceSharedEventRight * copySharedEventRight(mach_port_name_t portName);
+	void dropEventListeners(uint64_t listenerID, bool all);
 
 	IOReturn methodInit(IOExternalMethodArguments * args);
 	IOReturn methodCreate(IOExternalMethodArguments * args);
 	IOReturn methodLookup(IOExternalMethodArguments * args);
 	IOReturn methodLookupFromPort(IOExternalMethodArguments * args);
 	IOReturn methodCreatePort(IOExternalMethodArguments * args);
+	IOReturn methodCreateSharedEvent(IOExternalMethodArguments * args);
+	IOReturn methodOpenSharedEvent(IOExternalMethodArguments * args);
+	IOReturn methodNotifyEventListener(IOExternalMethodArguments * args);
+	IOReturn methodAddEventListener(IOExternalMethodArguments * args);
+	IOReturn methodRemoveEventListener(IOExternalMethodArguments * args);
+	IOReturn methodCreateMemoryPool(IOExternalMethodArguments * args);
+	IOReturn methodMemoryPoolCommand(IOExternalMethodArguments * args);
 	IOReturn methodSetValue(IOExternalMethodArguments * args, const uint8_t * in, size_t inSize);
 	IOReturn methodCopyValue(IOExternalMethodArguments * args, const uint8_t * in, size_t inSize);
 	IOReturn methodRemoveValue(IOExternalMethodArguments * args, const uint8_t * in, size_t inSize);
@@ -915,6 +942,8 @@ class IOSurfaceRootUserClient : public IOUserClient
 	IOReturn trapUnlock(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
 	IOReturn trapDetach(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
 	IOReturn trapRelease(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
+	IOReturn trapWaitSharedEvent(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
+	IOReturn trapSignalSharedEvent(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
 	IOReturn trapRemoveCoreVideoBridgedValues(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
 	IOReturn trapRemoveBulkAttachments(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
 	IOReturn lockCommon(uint32_t sid, uint32_t options, user_addr_t seedOut);
@@ -929,6 +958,8 @@ public:
 	    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
 	virtual IOExternalTrap * getTargetAndTrapForIndex(IOService ** targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
 	static mach_port_name_t makeSendRight(task_t task, MiniIOSurface * surface);
+	static IOReturn waitSharedEventInTask(task_t task, mach_port_name_t portName, uint64_t target, uint64_t timeoutMS);
+	static IOReturn signalSharedEventInTask(task_t task, mach_port_name_t portName, uint64_t value);
 };
 
 OSDefineMetaClassAndStructors(IOSurfaceRootUserClient, IOUserClient);
@@ -942,6 +973,8 @@ IOSurfaceRootUserClient::initWithTask(task_t owningTask, void * securityID, UInt
 	fTask = owningTask;
 	fABI = MINISURF_UNCLAIMED;
 	fCoreVideoBridgedKeys = NULL;
+	fSharedEventMap = NULL;
+	fEventListeners = NULL;
 	return true;
 }
 
@@ -958,6 +991,8 @@ IOSurfaceRootUserClient::start(IOService * provider)
 	fTraps[kSurfaceTrapUnlock].func = (IOTrap) & IOSurfaceRootUserClient::trapUnlock;
 	fTraps[kSurfaceTrapDetach].func = (IOTrap) & IOSurfaceRootUserClient::trapDetach;
 	fTraps[kSurfaceTrapRelease].func = (IOTrap) & IOSurfaceRootUserClient::trapRelease;
+	fTraps[kSurfaceTrapWaitSharedEvent].func = (IOTrap) & IOSurfaceRootUserClient::trapWaitSharedEvent;
+	fTraps[kSurfaceTrapSignalSharedEvent].func = (IOTrap) & IOSurfaceRootUserClient::trapSignalSharedEvent;
 	fTraps[kSurfaceTrapRemoveCoreVideoBridgedValues].func = (IOTrap) & IOSurfaceRootUserClient::trapRemoveCoreVideoBridgedValues;
 	fTraps[kSurfaceTrapRemoveBulkAttachments].func = (IOTrap) & IOSurfaceRootUserClient::trapRemoveBulkAttachments;
 	for (unsigned i = 0; i < kSurfaceTrapCount; i++) {
@@ -969,6 +1004,7 @@ IOSurfaceRootUserClient::start(IOService * provider)
 IOReturn
 IOSurfaceRootUserClient::clientClose(void)
 {
+	dropEventListeners(0, true);
 	IOLockLock(gSurfaceLock);
 	while (fRefCount != 0) {
 		dropRef(&fRefs[fRefCount - 1]);
@@ -983,6 +1019,8 @@ IOSurfaceRootUserClient::clientClose(void)
 void
 IOSurfaceRootUserClient::free(void)
 {
+	dropEventListeners(0, true);
+	OSSafeReleaseNULL(fSharedEventMap);
 	if (fRefs != NULL) {
 		if (gSurfaceLock != NULL) {
 			IOLockLock(gSurfaceLock);
@@ -1077,5 +1115,7 @@ IOSurfaceRootUserClient::dropRef(struct minisurf_client_ref * ref)
 }
 
 #include "MiniIOSurfaceABI.inc"
+
+#include "MiniIOSurfaceSharedEvent.inc"
 
 #include "MiniIOSurfaceUserClient.inc"

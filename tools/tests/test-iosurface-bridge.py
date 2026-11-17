@@ -95,10 +95,12 @@ struct minisurf_client_ref { MiniIOSurface *surface; };
 struct IOUserClient { void free() {} };
 struct IOSurfaceRootUserClient : IOUserClient {
     minisurf_abi fABI=MINISURF_ABI26; OSArray *fCoreVideoBridgedKeys=nullptr;
+    OSObject *fSharedEventMap=nullptr;
     minisurf_client_ref *fRefs=nullptr, ref; unsigned fRefCount=0,fRefCapacity=0;
     explicit IOSurfaceRootUserClient(MiniIOSurface *surface) : ref{surface} {}
     minisurf_client_ref *findRef(uint32_t sid,bool) { assert(locked); return sid==17?&ref:nullptr; }
     void dropRef(minisurf_client_ref *) { assert(false); }
+    void dropEventListeners(uint64_t, bool) { OSSafeReleaseNULL(fSharedEventMap); }
     void free();
     IOReturn methodSetCoreVideoBridgedKeys(const uint8_t *, size_t);
     IOReturn trapRemoveCoreVideoBridgedValues(void *,void *,void *,void *,void *,void *);

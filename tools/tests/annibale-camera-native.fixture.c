@@ -36,8 +36,10 @@ static void *kernel_map, *cam_lock;
 static uint16_t front_chip_id, wide_chip_id;
 static uint8_t front_slave_addr, wide_slave_addr, wide_bus_mode;
 static uint32_t cached_csid_ver, cached_ife_ver, cam_hw_mmio, current_sensor;
+static uint32_t boot_cam_keep_stream;
 static uint64_t cam_frame_seq;
-static bool cam_is_open, cam_hw_dma_verified, cam_sensor_streaming, cci_ready;
+static bool cam_is_open, cam_hw_dma_verified, cam_sensor_streaming, cci_ready, cam_session_probed;
+static bool cam_native_phy_configured;
 static uint32_t regs[0x2800 / 4];
 static uint32_t top_clear, buf_clear, rx_clear, path_clear;
 static uint64_t physical;
@@ -58,7 +60,7 @@ static uint32_t reg_rd(vm_offset_t base, uint32_t offset)
 {
     if (base != csid_lite_base) return 0;
     CHECK(offset < sizeof(regs));
-    if (offset == 0x08c && cam_sensor_streaming && !delivered) fake_dma();
+    if (offset == 0x08c && cam_sensor_streaming && regs[0x1700 / 4] == 1 && !delivered) fake_dma();
     if (invalid_status && cam_sensor_streaming && offset == 0x08c) return UINT32_MAX;
     if (stuck_fifo && address_writes && offset == 0x1798) return 1;
     return regs[offset / 4];
@@ -82,7 +84,8 @@ static void reg_wr(vm_offset_t base, uint32_t offset, uint32_t value)
     }
     if (offset == 0x010) {
         resets++;
-        if (!fail_global_reset && !(missing_finish_reset && resets > 1)) regs[0x07c / 4] |= 1;
+        bool no_eof = (value == 1 && !cam_sensor_streaming && regs[0x500 / 4] == 0);
+        if (!fail_global_reset && !no_eof && !(missing_finish_reset && resets > 1)) regs[0x07c / 4] |= 1;
     }
     if (offset == 0x1704) {
         CHECK(!delivered);
@@ -136,6 +139,9 @@ static bool cam_native_phy_down(void)
     phy_stops++; phy_owned = false; return true;
 }
 static bool cam_native_sensor_power(bool up __unused) { return true; }
+static bool cam_native_apply_exposure_regs(void) { return true; }
+static void cam_diag_bus_debug_enable(void) { }
+static void cam_diag_capture_probe(const char *tag __unused) { }
 static bool cam_native_register_table(uint32_t table, uint32_t count)
 {
     CHECK(table < 4 && count);
@@ -150,7 +156,8 @@ static bool cam_smmu_configure_bypass(void) { smmu_owned = true; return true; }
 static bool cam_smmu_route(bool allow)
 {
     CHECK(!allow && smmu_owned);
-    CHECK(regs[0x200 / 4] == 0 && regs[0x500 / 4] == 0 && regs[0x1700 / 4] == 0);
+    CHECK((cam_sensor_streaming ? regs[0x200 / 4] != 0 : regs[0x200 / 4] == 0) &&
+          regs[0x500 / 4] == 0 && regs[0x1700 / 4] == 0);
     CHECK(regs[0x1798 / 4] == 0 && resets >= 2);
     route_stops++;
     return !fail_smmu_stop;
@@ -232,7 +239,8 @@ static void reset_fixture(void)
     cam_is_open = power_up_ok = true; cam_hw_mmio = 1; current_sensor = 2;
     front_chip_id = 0x2042; front_slave_addr = 0x10;
     cached_csid_ver = 0x30000004; cached_ife_ver = 0x20050000;
-    cam_sensor_streaming = cam_hw_dma_verified = false;
+    cam_sensor_streaming = cam_hw_dma_verified = cam_native_phy_configured = false;
+    boot_cam_keep_stream = 0;
     cam_native_initialized = cam_native_sensor_powered = cam_native_submitted = false;
     cam_native_path_configured = cam_native_reset_failed = false;
     cam_native_dma_bytes = 0;
@@ -376,6 +384,43 @@ int main(void)
     reset_fixture(); CHECK(annibale_cam_open(0, 0, 0, NULL) == EBUSY); cases++;
     reset_fixture(); cam_is_open = false; power_up_ok = false;
     CHECK(annibale_cam_open(0, 0, 0, NULL) == EIO && region_frees == 1); cases++;
+
+    /* Verify rear wide mode 24 (2560x1920) exposure defaults, clamping, and frame black level. */
+    reset_fixture();
+    profile_data.sensor = 1; profile_data.mode = 24;
+    profile_data.width = 2560; profile_data.height = 1920; profile_data.stride = 3200;
+    cam_native_exposure_defaults(&profile_data);
+    CHECK(cam_native_frame_lines == 6250u && cam_native_exposure_lines == 6218u && cam_native_gain == 256u);
+    CHECK(cam_native_exposure_set(&profile_data, 3000u, 1024u, 6250u));
+    struct annibale_camera_frame back_frame = {0};
+    cam_native_frame_exposure(&profile_data, &back_frame);
+    CHECK(back_frame.black == 64u && back_frame.exposure_lines == 3000u && back_frame.line_ns == 5333u);
+    CHECK(back_frame.gain == 1024u && back_frame.gain_unity == 256u && back_frame.gain_max == 4096u);
+    cam_native_exposure_reset();
+    cases++;
+
+    /* Verify continuous MIPI RX keep-stream across 3 front D-PHY frames and clean close. */
+    reset_fixture();
+    boot_cam_keep_stream = 1;
+    for (unsigned f = 0; f < 3; f++) {
+        delivered = false;
+        cam_native_capture();
+        check_success();
+        CHECK(cam_sensor_streaming && regs[0x200 / 4] != 0 && regs[0x204 / 4] != 0);
+        CHECK(table_writes[2] == 1 && table_writes[3] == 0);
+    }
+    CHECK(annibale_cam_close(0, 0, 0, NULL) == 0);
+    CHECK(!cam_sensor_streaming && regs[0x200 / 4] == 0 && table_writes[3] == 1 && region_frees == 1);
+    /* Verify re-open and capture succeed immediately after keep-stream close. */
+    cam_region_vbase = (vm_offset_t)region;
+    completed_frames = cache_flushes = 0;
+    CHECK(annibale_cam_open(0, 0, 0, NULL) == 0);
+    cam_profile = &profile_data;
+    delivered = false;
+    cam_native_capture();
+    check_success();
+    CHECK(annibale_cam_close(0, 0, 0, NULL) == 0);
+    cases++;
     printf("%u native capture/read/close scenarios passed\n", cases);
     return 0;
 }

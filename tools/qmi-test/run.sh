@@ -10,5 +10,8 @@ rm -rf "$B"
 mkdir -p "$B/inc/sys"
 ln -s "$K/bsd/sys/annibale_qmi.h" "$K/bsd/sys/annibale_qrtr.h" "$B/inc/sys/"
 FLAGS="-std=gnu11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -pthread"
-${CC:-cc} $FLAGS -I"$B/inc" -o "$B/test" "$HERE/test_qmi.c" "$HERE/test_encode.c" "$HERE/test_router.c" "$K/bsd/dev/annibale/annibale_qmi.c"
+for src in "$HERE/test_qmi.c" "$HERE/test_encode.c" "$HERE/test_router.c" "$K/bsd/dev/annibale/annibale_qmi.c"; do
+	${CC:-cc} $FLAGS -I"$B/inc" -c "$src" -o "$B/$(basename "$src" .c).o"
+done
+${CC:-cc} $FLAGS -o "$B/test" "$B"/*.o
 "$B/test"

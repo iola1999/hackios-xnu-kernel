@@ -17,6 +17,7 @@
 #include <libkern/c++/OSNumber.h>
 
 void MiniIOSurfaceStart(IOService * provider);
+void MiniM2ScalerStart(IOService * provider);
 void MiniIOMobileFramebufferStart(IOService * provider);
 void MiniAppleARMBacklightStart(IOService * provider);
 void MiniAppleKeyStoreStart(void);

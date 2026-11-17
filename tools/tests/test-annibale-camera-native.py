@@ -56,6 +56,7 @@ def main():
         "stale-buffer": ("!cam_poll(csid_lite_base, CAM980_BUF_STATUS, CAM980_RDI0_DONE, 0, 5000u)", "false"),
         "stale-reset": ("!cam_poll(csid_lite_base, CAM980_TOP_STATUS, 1u, 0, 5000u)", "false"),
         "reset-completion": ("if (!cam_native_reset(false)) {", "if (false) {"),
+        "release-immediate-reset": ("if (!cam_native_reset(true)) {", "if (!cam_native_reset(false)) {"),
         "dma-range": ("cam_native_dma_bytes > (1ULL << 36) - first", "false"),
         "contiguity": ("kvtophys(cam_region_vbase + offset) != first + offset", "false"),
     }

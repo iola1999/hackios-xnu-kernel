@@ -428,8 +428,31 @@ rw_work_time(int kind, uint64_t began)
 }
 - (id)resourceStateCommandEncoder { return nil; }
 - (id)accelerationStructureCommandEncoder { return nil; }
-- (void)encodeSignalEvent:(id)event value:(uint64_t)value { (void)event; (void)value; }
-- (void)encodeWaitForEvent:(id)event value:(uint64_t)value { (void)event; (void)value; }
+- (void)encodeSignalEvent:(id)event value:(uint64_t)value
+{
+	if (event == nil) {
+		return;
+	}
+	AnnibaleMetalWork *work = [[AnnibaleMetalWork alloc] init];
+	work->copyKind = RW_COPY_SIGNAL_EVENT;
+	work->sharedEvent = event;
+	work->sharedEventValue = value;
+	[self recordWork:work];
+	[work release];
+}
+
+- (void)encodeWaitForEvent:(id)event value:(uint64_t)value
+{
+	if (event == nil) {
+		return;
+	}
+	AnnibaleMetalWork *work = [[AnnibaleMetalWork alloc] init];
+	work->copyKind = RW_COPY_WAIT_EVENT;
+	work->sharedEvent = event;
+	work->sharedEventValue = value;
+	[self recordWork:work];
+	[work release];
+}
 
 - (id)computeCommandEncoderWithDispatchType:(NSUInteger)type
 {

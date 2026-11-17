@@ -110,6 +110,8 @@ static bool tlmm_get_in(uint32_t pin) { return ((pin==4?front_word:rear_word) >>
 static bool od_i2c_start(uint32_t sda, uint32_t scl) { (void)sda; (void)scl; return (int)start_count++ != start_fail; }
 static bool od_i2c_tx_byte(uint32_t sda, uint32_t scl, uint8_t b) { (void)sda; (void)scl; tx_trace[tx_count % 8]=b; if(tx_count % 4==3) gpio_clock=gpio_bit=0; return (int)tx_count++ != tx_fail; }
 static void od_i2c_stop(uint32_t sda, uint32_t scl) { (void)sda; (void)scl; stops++; }
+static void cam_mux_front_se9_od(void) { }
+static void cam_spmi_front_ldo_probe(const char *tag) { (void)tag; }
 static void reset(void) {
     cci_ready=true; init_ok=true; clear_pending=clear_pairs=0;
     started=writes=data_reads=stale_reads=status_reads=delays=0;

@@ -152,6 +152,9 @@ static struct {
     __typeof__(&rwa_texture_rgb2p_pass) texture_rgb2p_pass;
     __typeof__(&rwa_texture_destroy) texture_destroy;
     __typeof__(&rwa_dispatch_nowait) dispatch_nowait;
+    int (*dispatch_nowait_imageblock)(struct rwa_compute *, const struct rwa_bindings *,
+        const struct rwa_buffer_bind *, unsigned, const unsigned *, const unsigned *,
+        unsigned, const unsigned *, char *, size_t);
     __typeof__(&rwa_dispatch_threadgroup) dispatch_threadgroup;
     __typeof__(&rwa_dispatch_buffers) dispatch_buffers;
     __typeof__(&rwa_dispatch) dispatch;

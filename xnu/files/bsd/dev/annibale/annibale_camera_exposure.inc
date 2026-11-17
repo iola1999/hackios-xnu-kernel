@@ -2,7 +2,7 @@
  * Sensor exposure, analog gain, and frame metadata helpers for SM8750 native camera modes:
  *   - Front sensor (sensor=2, OV20B40 mode 4, 2592x1458@30):
  *     FLL=3333, vertOffset=4, line_ns=10000, gain_unity=256, gain_max=4088, black=64 (10-bit)
- *   - Rear wide sensor (sensor=1, OVX8000/OV50E40 mode 24, 4096x3072@30):
+ *   - Rear wide sensor (sensor=1, OVX8000/OV50E40 mode 24, 2560x1920@30):
  *     FLL=6250, vertOffset=32, line_ns=5333, gain_unity=256, gain_max=4096, black=64 (10-bit)
  */
 #ifndef ANNIBALE_CAMERA_EXPOSURE_INC
@@ -47,7 +47,7 @@ static bool
 cam_native_is_ovx8000_m24(const struct annibale_camera_profile *p)
 {
 	return p != NULL && p->sensor == 1u && p->mode == 24u &&
-	       p->width == 4096u && p->height == 3072u;
+	       p->width == 2560u && p->height == 1920u;
 }
 
 static void

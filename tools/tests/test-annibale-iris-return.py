@@ -161,6 +161,7 @@ static void adreno8_return_quiesce(void) { }
 static void annibale_wifi_quiesce(void) { }
 static void annibale_haptic_quiesce(void) { }
 static void annibale_torch_quiesce(void) { }
+static bool annibale_camera_return_quiesce(void) { return !named("camera_unquiesced"); }
 static void MiniIOMobileFramebufferPowerOff(void) { display_calls++; }
 static void MiniIOMobileFramebufferQuiesce(void) { display_calls++; }
 static void hv_wdt_pet_NOW(void) { }
@@ -196,7 +197,7 @@ int main(int argc, char **argv)
     registers[0xc2cu / 4u] = registers[0xc30u / 4u] = 0x351u;
     registers[209u * 4096u / 4u] = 0x27u;
     bool expected = true;
-    if (named("never_started")) {
+    if (named("never_started") || named("camera_unquiesced")) {
         g_iris.pas_shutdown_required = g_iris.pas_authed = false;
         g_iris.smmu_owned = g_iris.smmu_ready = false;
         g_iris.dma_shutdown_unconfirmed = false;
@@ -229,7 +230,7 @@ int main(int argc, char **argv)
         named("sctlr_rejected") || named("tlb_timeout")) expected = false;
     auth_case = !strncmp(case_name, "auth_", 5);
     bool want_shutdown = !named("never_started") && !named("smmu_only") &&
-        !named("previously_shutdown");
+        !named("previously_shutdown") && !named("camera_unquiesced");
     if (auth_case) {
         g_iris.pas_authed = g_iris.pas_shutdown_required = false;
         g_iris.dma_shutdown_unconfirmed = false;
@@ -244,13 +245,14 @@ int main(int argc, char **argv)
         assert(g_iris.dma_shutdown_unconfirmed == want_shutdown);
     }
     bool want_dma_retained = g_iris.dma_shutdown_unconfirmed || want_shutdown;
-    bool want_normal_return = expected && !want_dma_retained;
+    bool want_cam_retained = named("camera_unquiesced");
+    bool want_normal_return = expected && !want_dma_retained && !want_cam_retained;
     bool original_required = g_iris.pas_shutdown_required;
     memcpy(initial, registers, sizeof(registers));
     loader_return();
     assert(stopped == 1 && save_calls == 1 && display_calls == 1);
     assert(return_reason == (want_normal_return ? 0u : 3u));
-    assert(return_code == (want_normal_return ? 0u : 9u));
+    assert(return_code == (want_normal_return ? 0u : (want_cam_retained ? 10u : 9u)));
     assert(shutdown_calls == (want_shutdown ? 1u : 0u));
     assert(g_iris.dma_shutdown_unconfirmed == want_dma_retained);
     assert(g_iris.table_count == 1 && g_iris.tables[0].kva == (uintptr_t)retained);
@@ -264,7 +266,8 @@ int main(int argc, char **argv)
     } else {
         assert(!g_iris.pas_shutdown_required && !g_iris.pas_authed);
         assert(g_iris.smmu_owned == !expected);
-        if (expected && !named("never_started") && !named("previously_shutdown")) {
+        if (expected && !named("never_started") && !named("previously_shutdown") &&
+            !named("camera_unquiesced")) {
             assert(registers[0x82cu / 4u] == 0x80001940u);
             assert(registers[0x830u / 4u] == 0x80001947u);
             assert(registers[0xc2cu / 4u] == 0x20300u);
@@ -272,7 +275,7 @@ int main(int argc, char **argv)
             assert((registers[209u * 4096u / 4u] & 1u) == 0);
         }
     }
-    if (named("never_started") || named("previously_shutdown")) assert(mmio_writes == 0);
+    if (named("never_started") || named("previously_shutdown") || named("camera_unquiesced")) assert(mmio_writes == 0);
     if (named("second_return")) {
         unsigned previous_writes = mmio_writes;
         assert(!annibale_iris_return_quiesce());
@@ -301,7 +304,8 @@ CASES = ['never_started', 'smmu_only', 'pending_auth', 'authed_only', 'success',
          'fault_non_pixel', 'fault_pixel', 'smr_non_pixel', 'smr_pixel',
          'wrong_route', 'bad_mapping', 'bad_geometry', 'sctlr_invalid',
          'sctlr_rejected', 'tlb_timeout', 'tlb_delayed', 'auth_success',
-         'auth_init_fail', 'auth_mem_fail', 'auth_transport_fail', 'auth_firmware_fail']
+         'auth_init_fail', 'auth_mem_fail', 'auth_transport_fail', 'auth_firmware_fail',
+         'camera_unquiesced']
 
 
 def function(source, name):
@@ -380,9 +384,9 @@ def verify(args, directory):
         name = 'auth_request_unrecorded'
         results['variants'][name] = run(args.source_root, modified, returning, directory / name)
         if all(c['passed'] for c in results['variants'][name]): failures.append(name + '_accepted')
-        old = 'loader_jump(iris_quiesced ? 0 : 3, iris_quiesced ? 0 : 9);'
+        old = 'loader_jump((iris_quiesced && cam_quiesced) ? 0 : 3,\n\t    !iris_quiesced ? 9 : (cam_quiesced ? 0 : 10));'
         if returning.count(old) != 1: raise AssertionError('Loader reason boundary changed')
-        modified = returning.replace(old, '(void)iris_quiesced; loader_jump(0, 0);')
+        modified = returning.replace(old, '(void)iris_quiesced; (void)cam_quiesced; loader_jump(0, 0);')
         name = 'discard_resource_failure'
         results['variants'][name] = run(args.source_root, hardware, modified, directory / name)
         if all(c['passed'] for c in results['variants'][name]): failures.append(name + '_accepted')

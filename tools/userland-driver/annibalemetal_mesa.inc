@@ -41,6 +41,8 @@ static struct {
 	__typeof__(&rwa_compute_create_stitched) compute_create_stitched;
 	void (*compute_destroy)(struct rwa_compute *);
 	__typeof__(&rwa_compute_get_reflection) compute_get_reflection;
+	__typeof__(&rwa_compute_imageblock_data_size) compute_imageblock_data_size;
+	__typeof__(&rwa_dispatch_nowait_imageblock) dispatch_nowait_imageblock;
 	struct rwa_texture *(*texture_create)(struct rwa_device *,
 					      const struct rwa_texture_shape *, char *, size_t);
 	int (*texture_write)(struct rwa_texture *, unsigned, unsigned, const unsigned[3],
@@ -150,6 +152,8 @@ mesa_available(void)
 	*(void **)&mesa.compute_create_stitched = dlsym(mesa.handle, "rwa_compute_create_stitched");
 	*(void **)&mesa.compute_destroy = dlsym(mesa.handle, "rwa_compute_destroy");
 	*(void **)&mesa.compute_get_reflection = dlsym(mesa.handle, "rwa_compute_get_reflection");
+	*(void **)&mesa.compute_imageblock_data_size = dlsym(mesa.handle, "rwa_compute_imageblock_data_size");
+	*(void **)&mesa.dispatch_nowait_imageblock = dlsym(mesa.handle, "rwa_dispatch_nowait_imageblock");
 	*(void **)&mesa.texture_create = dlsym(mesa.handle, "rwa_texture_create");
 	*(void **)&mesa.texture_write = dlsym(mesa.handle, "rwa_texture_write");
 	*(void **)&mesa.texture_read = dlsym(mesa.handle, "rwa_texture_read");

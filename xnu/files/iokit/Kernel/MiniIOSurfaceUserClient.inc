@@ -309,6 +309,21 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 		return methodLookupFromPort(args);
 	case kSurfaceMethodCreatePort:
 		return methodCreatePort(args);
+	case kSurfaceMethodCreateSharedEvent:
+		return methodCreateSharedEvent(args);
+	case kSurfaceMethodOpenSharedEvent:
+		return methodOpenSharedEvent(args);
+	case kSurfaceMethodNotifyEventListener:
+		return methodNotifyEventListener(args);
+	case kSurfaceMethodAddEventListener:
+		return methodAddEventListener(args);
+	case kSurfaceMethodRemoveEventListener:
+		return methodRemoveEventListener(args);
+	case kSurfaceMethodCreateMemoryPool:
+		return methodCreateMemoryPool(args);
+	case kSurfaceMethodEnsureMemoryPool:
+	case kSurfaceMethodFlushMemoryPool:
+		return methodMemoryPoolCommand(args);
 
 	case kSurfaceMethodSetValue:
 	case kSurfaceMethodCopyValue:

@@ -419,10 +419,17 @@ rw_bind_slot(id *slots, unsigned *count, id object, NSUInteger index)
 	memcpy(work->vertexTextures, _vertexTextures, _vertexTextureCount * sizeof(id));
 	work->vertexSamplerCount = _vertexSamplerCount;
 	memcpy(work->vertexSamplers, _vertexSamplers, _vertexSamplerCount * sizeof(id));
+	id firstColor = nil;
+	for (unsigned i = 0; i < _colorCount; i++) {
+		if (_color[i] != nil) {
+			firstColor = _color[i];
+			break;
+		}
+	}
 	rw_pipeline_note(_pipeline, _colorCount, _depth != nil ? 1u : 0u,
-	                 _colorCount > 0 ? (unsigned)[_color[0] width] : 0u,
-	                 _colorCount > 0 ? (unsigned)[_color[0] height] : 0u,
-	                 _colorCount > 0 ? (unsigned)[_color[0] sampleCount] : 0u);
+	                 firstColor != nil ? (unsigned)[firstColor width] : 0u,
+	                 firstColor != nil ? (unsigned)[firstColor height] : 0u,
+	                 firstColor != nil ? (unsigned)[firstColor sampleCount] : 0u);
 	[_commandBuffer recordWork:work];
 	[work release];
 }

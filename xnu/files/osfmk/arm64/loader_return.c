@@ -59,6 +59,7 @@ extern void annibale_wifi_quiesce(void);
 extern void annibale_haptic_quiesce(void);
 extern void annibale_torch_quiesce(void);
 extern bool annibale_iris_return_quiesce(void);
+extern bool annibale_camera_return_quiesce(void);
 extern void MiniIOMobileFramebufferQuiesce(void);   /* iokit/Kernel/MiniFramebufferFlip.inc */
 extern void MiniIOMobileFramebufferPowerOff(void);
 boolean_t annibale_halting_poweroff = FALSE;
@@ -709,6 +710,7 @@ loader_return(void)
 	annibale_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
 	adreno8_return_quiesce();       /* the GMU back in reset and its translation off without parking */
 	bool iris_quiesced = annibale_iris_return_quiesce();
+	bool cam_quiesced = annibale_camera_return_quiesce();
 	annibale_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
 	annibale_haptic_quiesce();      /* or the PMIC's haptics block of the other phone, if it was configured */
 	annibale_torch_quiesce();       /* or the other phone's, lit on its PMIC's flash module */
@@ -720,7 +722,8 @@ loader_return(void)
 
 	hv_wdt_pet_NOW();
 	/* reason 3 keeps loader memory held even if every kernel CPU is off. */
-	loader_jump(iris_quiesced ? 0 : 3, iris_quiesced ? 0 : 9);
+	loader_jump((iris_quiesced && cam_quiesced) ? 0 : 3,
+	    !iris_quiesced ? 9 : (cam_quiesced ? 0 : 10));
 }
 
 /* Bring-up aid: stop here if the loader asked for checkpoint n. */

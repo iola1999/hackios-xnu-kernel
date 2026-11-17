@@ -10,7 +10,14 @@
 
 enum RWCopyKind { RW_COPY_NONE, RW_COPY_BUFFER, RW_COPY_TEXTURE, RW_COPY_MIPMAP,
 	                   RW_COPY_BUFFER_TEXTURE, RW_COPY_ERROR, RW_COPY_CLEAR,
-	                   RW_COPY_RGB2P_BEGIN, RW_COPY_RGB2P_END, RW_COPY_FILL };
+	                   RW_COPY_RGB2P_BEGIN, RW_COPY_RGB2P_END, RW_COPY_FILL,
+	                   RW_COPY_SIGNAL_EVENT, RW_COPY_WAIT_EVENT };
+
+@protocol AnnibaleSharedEventSPI <NSObject>
+- (uint64_t)signaledValue;
+- (void)setSignaledValue:(uint64_t)value;
+- (BOOL)waitUntilSignaledValue:(uint64_t)value timeoutMS:(uint64_t)timeoutMS;
+@end
 
 #define RW_BLIT_TEXTURE RW_COPY_TEXTURE
 
@@ -83,6 +90,9 @@ enum RWCopyKind { RW_COPY_NONE, RW_COPY_BUFFER, RW_COPY_TEXTURE, RW_COPY_MIPMAP,
 	unsigned vertexTextureCount, vertexSamplerCount;
 	unsigned groups[3], size[3];
 	unsigned threadgroupBytes;   /* -setThreadgroupMemoryLength: for threadgroup buffer 0 */
+	unsigned imageblockSize[2];  /* -setImageblockWidth:height:, or {0, 0} */
+	id sharedEvent;              /* -encodeSignalEvent:value: / -encodeWaitForEvent:value: */
+	uint64_t sharedEventValue;
 }
 /* Call once the encoder has finished filling this immutable work item. */
 - (void)retainResources;

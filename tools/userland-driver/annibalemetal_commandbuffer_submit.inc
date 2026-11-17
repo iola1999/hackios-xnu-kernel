@@ -5,9 +5,88 @@
 	uint64_t started = mach_absolute_time();
 	uint64_t refresh_us = 0, encode_us = 0, flush_us = 0;
 	struct rwa_fence *submission_fence = NULL;
+	static dispatch_queue_t defer_q;
+	static dispatch_once_t defer_once;
+	static unsigned defer_pending;
+	static _Thread_local BOOL on_defer_q;
+
+	if (!on_defer_q && __atomic_load_n(&_phase, __ATOMIC_ACQUIRE) == RW_CB_PHASE_RECORDING) {
+		BOOL needs_defer = __atomic_load_n(&defer_pending, __ATOMIC_ACQUIRE) != 0;
+		for (NSUInteger i = 0; !needs_defer && i < [_work count]; i++) {
+			AnnibaleMetalWork *w = [_work objectAtIndex:i];
+			if (w->copyKind != RW_COPY_WAIT_EVENT ||
+			    ![w->sharedEvent respondsToSelector:@selector(signaledValue)] ||
+			    [(id<AnnibaleSharedEventSPI>)w->sharedEvent signaledValue] >= w->sharedEventValue) {
+				continue;
+			}
+			BOOL signaled_earlier = NO;
+			for (NSUInteger j = 0; j < i; j++) {
+				AnnibaleMetalWork *prev = [_work objectAtIndex:j];
+				if (prev->copyKind == RW_COPY_SIGNAL_EVENT &&
+				    prev->sharedEvent == w->sharedEvent &&
+				    prev->sharedEventValue >= w->sharedEventValue) {
+					signaled_earlier = YES;
+					break;
+				}
+			}
+			if (!signaled_earlier) {
+				needs_defer = YES;
+			}
+		}
+		if (needs_defer) {
+			pthread_mutex_lock(&rw_commit_lock);
+			if (__atomic_load_n(&_phase, __ATOMIC_ACQUIRE) != RW_CB_PHASE_RECORDING) {
+				pthread_mutex_unlock(&rw_commit_lock);
+				return;
+			}
+			__atomic_store_n(&_status, RW_CB_COMMITTED, __ATOMIC_RELEASE);
+			__atomic_store_n(&_phase, RW_CB_PHASE_COMMITTED, __ATOMIC_RELEASE);
+			[self annibaleReturnSlot];
+			__atomic_add_fetch(&defer_pending, 1, __ATOMIC_ACQ_REL);
+			pthread_mutex_unlock(&rw_commit_lock);
+			dispatch_once(&defer_once, ^{
+				defer_q = dispatch_queue_create("annibale.metal.eventwait", DISPATCH_QUEUE_SERIAL);
+			});
+			AnnibaleMetalCommandBuffer *retained = [self retain];
+			dispatch_async(defer_q, ^{
+				@autoreleasepool {
+					on_defer_q = YES;
+					[retained commit];
+					on_defer_q = NO;
+					__atomic_sub_fetch(&defer_pending, 1, __ATOMIC_ACQ_REL);
+					[retained release];
+				}
+			});
+			return;
+		}
+	}
+	if (on_defer_q) {
+		for (NSUInteger i = 0; i < [_work count]; i++) {
+			AnnibaleMetalWork *w = [_work objectAtIndex:i];
+			if (w->copyKind != RW_COPY_WAIT_EVENT ||
+			    ![w->sharedEvent respondsToSelector:@selector(waitUntilSignaledValue:timeoutMS:)]) {
+				continue;
+			}
+			BOOL signaled_earlier = NO;
+			for (NSUInteger j = 0; j < i; j++) {
+				AnnibaleMetalWork *prev = [_work objectAtIndex:j];
+				if (prev->copyKind == RW_COPY_SIGNAL_EVENT &&
+				    prev->sharedEvent == w->sharedEvent &&
+				    prev->sharedEventValue >= w->sharedEventValue) {
+					signaled_earlier = YES;
+					break;
+				}
+			}
+			if (!signaled_earlier) {
+				[(id<AnnibaleSharedEventSPI>)w->sharedEvent
+				    waitUntilSignaledValue:w->sharedEventValue timeoutMS:5000];
+			}
+		}
+	}
 
 	pthread_mutex_lock(&rw_commit_lock);
-	if (__atomic_load_n(&_phase, __ATOMIC_ACQUIRE) != RW_CB_PHASE_RECORDING) {
+	if (__atomic_load_n(&_phase, __ATOMIC_ACQUIRE) !=
+	    (on_defer_q ? RW_CB_PHASE_COMMITTED : RW_CB_PHASE_RECORDING)) {
 		pthread_mutex_unlock(&rw_commit_lock);
 		return;
 	}
@@ -99,6 +178,10 @@
 			}
 		}
 
+		if (work->copyKind == RW_COPY_SIGNAL_EVENT ||
+		    work->copyKind == RW_COPY_WAIT_EVENT) {
+			continue;
+		}
 		if (work->copyKind != RW_COPY_NONE) {
 			if (rw_run_copy(work, why, sizeof(why)) != 0) {
 				[self failWith:why];
@@ -193,7 +276,14 @@
 		 * kernel-12377-cmd43-bo19 the waiting dispatch took 1.4 to 3.2 ms each, 16 to 52 of
 		 * them per 64 command buffers. ANNIBALE_SYNC_DRAWS keeps the wait, which names the
 		 * dispatch the GPU did not finish. */
-		int rc = mesa.dispatch_nowait != NULL && !rw_sync_draws()
+		bool has_ib = (work->imageblockSize[0] != 0 || work->imageblockSize[1] != 0) &&
+			      mesa.dispatch_nowait_imageblock != NULL;
+		int rc = has_ib
+			    ? mesa.dispatch_nowait_imageblock([work->pipeline compute], &bindings,
+							      table, work->count, work->groups,
+							      work->size, work->threadgroupBytes,
+							      work->imageblockSize, why, sizeof(why))
+			    : mesa.dispatch_nowait != NULL && !rw_sync_draws()
 			    ? mesa.dispatch_nowait([work->pipeline compute], &bindings, table,
 						   work->count, work->groups, work->size,
 						   work->threadgroupBytes, why, sizeof(why))
@@ -208,6 +298,9 @@
 						    work->size, why, sizeof(why))
 			    : mesa.dispatch([work->pipeline compute], &bindings, work->groups,
 					    work->size, why, sizeof(why));
+		if (rc == 0 && has_ib && rw_sync_draws() && mesa.finish != NULL) {
+			rc = mesa.finish([[_queue device] mesaDevice], why, sizeof(why));
+		}
 		rw_work_time(RW_WORK_DISPATCH, work_began);
 		if (rc != 0) {
 			rw_print("the dispatch failed: %s\n", why);

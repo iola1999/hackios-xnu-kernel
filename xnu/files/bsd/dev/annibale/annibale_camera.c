@@ -201,6 +201,7 @@ cam_hardware_power_up(void)
 		camcc_base = ml_io_map(CAMCC_PHYS, CAMCC_SIZE);
 		cci0_base = ml_io_map(CCI0_PHYS, CCI0_SIZE);
 		csid_lite_base = ml_io_map(CSID_LITE0_PHYS, CSID_LITE0_SIZE);
+		camnoc_rt_base = ml_io_map(CAMNOC_RT_PHYS, CAMNOC_RT_SIZE);
 		tlmm_base = ml_io_map(TLMM_PHYS, TLMM_SIZE);
 	}
 	if (gcc_base == 0 || mclkcc_base == 0 || cpas_base == 0 || camcc_base == 0 ||
@@ -312,7 +313,7 @@ cam_hardware_power_up(void)
 	    titan_top_on ? 1u : 0u, cpas_ahb_ok ? 1u : 0u, core_ahb_ok ? 1u : 0u,
 	    cci0_clk_ok ? 1u : 0u, cam_ife_lite_clks_on ? 1u : 0u);
 
-	/* 5. Read CAM-CPAS (0x0ac04000, read-only HW_VERSION / HW_CAPABILITY) once clocked */
+	/* 5. Read CAM-CPAS (0x0ac04000, HW_VERSION / HW_CAPABILITY) once clocked */
 	if (cpas_base != 0 && titan_top_on && cpas_ahb_ok && core_ahb_ok) {
 		cached_cpas_ver = reg_rd(cpas_base, 0x00u);
 		cached_cpas_cap = reg_rd(cpas_base, 0x04u);
@@ -412,6 +413,7 @@ annibale_cam_open(dev_t dev __unused, int flags __unused, int devtype __unused, 
 		return EIO;
 	}
 	cam_is_open = true;
+	cam_session_probed = false;
 	cam_frame_seq = 0;
 	lck_mtx_unlock(cam_lock);
 	return 0;
@@ -788,6 +790,136 @@ annibale_cam_diag_thread(void *param __unused, wait_result_t res __unused)
 	thread_terminate(current_thread());
 }
 
+static void
+cam_return_spin_us(uint32_t us)
+{
+	uint64_t interval = 0;
+	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &interval);
+	uint64_t deadline = mach_absolute_time() + interval;
+	while (mach_absolute_time() < deadline) {
+	}
+}
+
+static bool
+cam_return_poll(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t expected, uint32_t us)
+{
+	for (uint32_t elapsed = 0; elapsed <= us; elapsed += 10u) {
+		uint32_t v = reg_rd(base, off);
+		if (v != UINT32_MAX && (v & mask) == expected) {
+			return true;
+		}
+		cam_return_spin_us(10u);
+	}
+	return false;
+}
+
+bool annibale_camera_return_quiesce(void);
+
+bool
+annibale_camera_return_quiesce(void)
+{
+	/* Other CPUs are stopped; use lockless MMIO and spin delays only. */
+	if (cam_hw_mmio == 0 ||
+	    (cpas_base == 0 && cam_smmu_slot == 0xffu && cam_smmu_bank == 0xffu)) {
+		return true;
+	}
+	if (cam_capture.state == ANNIBALE_CAM_CAPTURE_HELD ||
+	    cam_native_reset_failed || cam_smmu_sync_failed) {
+		return false;
+	}
+	if (cam_native_submitted || cam_native_path_configured) {
+		if (csid_lite_base == 0 || !cam_ife_lite_clks_on) {
+			return false;
+		}
+		csid_wr(CAM980_TOP_CLEAR, 1u);
+		csid_wr(CAM980_IRQ_COMMAND, 1u);
+		if (!cam_return_poll(csid_lite_base, CAM980_TOP_STATUS, 1u, 0, 5000u)) {
+			return false;
+		}
+		csid_wr(CAM980_TOP_MASK, 1u);
+		csid_wr(CAM980_RX_CFG0, 0);
+		csid_wr(CAM980_RX_CFG1, 0);
+		csid_wr(CAM980_RESET_CONFIG, 0x11u);
+		csid_wr(CAM980_RESET_COMMAND, 2u);
+		if (!cam_return_poll(csid_lite_base, CAM980_TOP_STATUS, 1u, 1u, 50000u)) {
+			cam_native_reset_failed = true;
+			return false;
+		}
+		csid_wr(CAM980_TOP_CLEAR, 1u);
+		csid_wr(CAM980_IRQ_COMMAND, 1u);
+		csid_wr(CAM980_PATH_CFG0, 0);
+		csid_wr(CAM980_WM_CFG, 0);
+		if (reg_rd(csid_lite_base, CAM980_RX_CFG0) != 0 ||
+		    reg_rd(csid_lite_base, CAM980_PATH_CFG0) != 0 ||
+		    reg_rd(csid_lite_base, CAM980_WM_CFG) != 0 ||
+		    !cam_return_poll(csid_lite_base, CAM980_WM_FIFO, UINT32_MAX, 0, 50000u)) {
+			return false;
+		}
+		cam_native_submitted = false;
+		cam_native_path_configured = false;
+	}
+	if (cam_smmu_slot != 0xffu) {
+		if (cam_smmu_base == 0) {
+			return false;
+		}
+		uint32_t fault = CAM_SMMU_NSH | CAM_SMMU_FAULT;
+		reg_wr(cam_smmu_base, CAM_SMMU_S2CR(cam_smmu_slot), fault);
+		if (reg_rd(cam_smmu_base, CAM_SMMU_S2CR(cam_smmu_slot)) != fault) {
+			return false;
+		}
+		reg_wr(cam_smmu_base, CAM_SMMU_TLBGSYNC, 0);
+		if (!cam_return_poll(cam_smmu_base, CAM_SMMU_TLBGSTATUS, 1u, 0, 10000u)) {
+			cam_smmu_sync_failed = true;
+			return false;
+		}
+		reg_wr(cam_smmu_base, CAM_SMMU_SMR(cam_smmu_slot), 0);
+		if (reg_rd(cam_smmu_base, CAM_SMMU_SMR(cam_smmu_slot)) != 0) {
+			return false;
+		}
+		reg_wr(cam_smmu_base, CAM_SMMU_TLBGSYNC, 0);
+		if (!cam_return_poll(cam_smmu_base, CAM_SMMU_TLBGSTATUS, 1u, 0, 10000u)) {
+			cam_smmu_sync_failed = true;
+			return false;
+		}
+		cam_smmu_slot = 0xffu;
+		cam_smmu_ready = false;
+	}
+	if (cam_smmu_bank != 0xffu && cam_smmu_base != 0) {
+		reg_wr(cam_smmu_base, cam_smmu_cb_offset + CAM_SMMU_SCTLR, 0);
+		if ((reg_rd(cam_smmu_base, cam_smmu_cb_offset + CAM_SMMU_SCTLR) & 1u) != 0) {
+			return false;
+		}
+		reg_wr(cam_smmu_base, cam_smmu_cb_offset + CAM_SMMU_TLBIASID, cam_smmu_bank);
+		reg_wr(cam_smmu_base, cam_smmu_cb_offset + CAM_SMMU_TLBSYNC, 0);
+		if (!cam_return_poll(cam_smmu_base, cam_smmu_cb_offset + CAM_SMMU_TLBSTATUS, 1u, 0, 10000u)) {
+			cam_smmu_sync_failed = true;
+			return false;
+		}
+	}
+	if (tlmm_base != 0) {
+		tlmm_set_out(GPIO_WIDE_RESET, false);
+		tlmm_set_out(GPIO_FRONT_RESET, false);
+		tlmm_set_out(GPIO_WIDE_VANA, false);
+	}
+	if (mclkcc_base != 0 && gcc_base != 0 &&
+	    (reg_rd(gcc_base, GCC_CAM_BIST_MCLK_AHB_CBCR) & (1u << 31)) == 0) {
+		reg_wr(mclkcc_base, MCLKCC_MCLK1_CBCR, reg_rd(mclkcc_base, MCLKCC_MCLK1_CBCR) & ~1u);
+		reg_wr(mclkcc_base, MCLKCC_MCLK4_CBCR, reg_rd(mclkcc_base, MCLKCC_MCLK4_CBCR) & ~1u);
+	}
+	if (camcc_base != 0 && gcc_base != 0 &&
+	    (reg_rd(gcc_base, GCC_CAMERA_AHB_CBCR) & (1u << 31)) == 0) {
+		reg_wr(camcc_base, CAMCC_TITAN_TOP_GDSC,
+		    reg_rd(camcc_base, CAMCC_TITAN_TOP_GDSC) | GDSC_SW_COLLAPSE);
+	}
+	cam_is_open = false;
+	cam_sensor_streaming = false;
+	cam_ife_lite_clks_on = false;
+	if (cam_capture.state == ANNIBALE_CAM_CAPTURE_RUNNING) {
+		cam_capture.state = ANNIBALE_CAM_CAPTURE_STOPPED;
+	}
+	return true;
+}
+
 void
 annibale_camera_init(void)
 {
@@ -799,6 +931,10 @@ annibale_camera_init(void)
 
 	int cam_arg = -1;
 	(void)PE_parse_boot_argn("cam_hw", &cam_hw_mmio, sizeof(cam_hw_mmio));
+	(void)PE_parse_boot_argn("cam_bcm", &boot_cam_bcm, sizeof(boot_cam_bcm));
+	(void)PE_parse_boot_argn("cam_rt_mhz", &boot_cam_rt_mhz, sizeof(boot_cam_rt_mhz));
+	(void)PE_parse_boot_argn("cam_probe", &boot_cam_probe, sizeof(boot_cam_probe));
+	(void)PE_parse_boot_argn("cam_keep_stream", &boot_cam_keep_stream, sizeof(boot_cam_keep_stream));
 	if (PE_parse_boot_argn("cam", &cam_arg, sizeof(cam_arg))) {
 		if (cam_arg == 0) {
 			say("cam=0: camera driver disabled by boot-arg\n");

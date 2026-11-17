@@ -911,6 +911,7 @@ struct gem_close { uint32_t handle, pad; };
 	AnnibaleMetalDevice *_owner;
 	struct rwa_compute *_compute;
 	struct rwa_compute_info _info;
+	unsigned _imageblockDataSize;
 }
 @end
 
@@ -1092,6 +1093,7 @@ struct gem_close { uint32_t handle, pad; };
 #include "annibalemetal_device.inc"
 #include "annibalemetal_device_caps.inc"
 #include "annibalemetal_heap.inc"   /* -newHeapWithDescriptor: and the two size answers */
+#include "annibalemetal_residency.inc"
 #include "annibalemetal_buffer_pipeline.inc"
 #include "annibalemetal_work.inc"
 #include "annibalemetal_blit.inc"

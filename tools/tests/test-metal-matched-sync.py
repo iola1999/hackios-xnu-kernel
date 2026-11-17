@@ -91,6 +91,7 @@ static struct {
  int (*texture_thumbnail)(struct rwa_texture *,unsigned,unsigned,uint8_t *);
  void (*buffer_textures_refresh)(struct rwa_device *);
  __typeof__(&dispatch_async_mock) dispatch_nowait,dispatch_threadgroup;
+ int (*dispatch_nowait_imageblock)(struct rwa_compute *,const struct rwa_bindings *,const struct rwa_buffer_bind *,unsigned,const unsigned *,const unsigned *,unsigned,const unsigned *,char *,size_t);
  int (*dispatch_buffers)(struct rwa_compute *,const struct rwa_bindings *,const struct rwa_buffer_bind *,unsigned,const unsigned *,const unsigned *,char *,size_t);
  int (*dispatch)(struct rwa_compute *,const struct rwa_bindings *,const unsigned *,const unsigned *,char *,size_t);
 } mesa={.flush=flush,.finish=finish,.texture_thumbnail=thumbnail,

@@ -251,7 +251,8 @@ cam_native_clocks_up(void)
 		return false;
 	}
 	/* camcc-sun's first CAMNOC RT rate is 200 MHz; BCM payload uses MHz and both valid/commit bits. */
-	uint32_t bandwidth = 0x60000000u | 200u;
+	uint32_t rt_mhz = MIN(MAX(boot_cam_rt_mhz, 100u), 600u);
+	uint32_t bandwidth = 0x60000000u | rt_mhz;
 	cam_native_crm_changes |= 2u;
 	if (!cam_native_crm_vote(CAM_CRM_RT_SW, CAM_CRM_RT_IRQ,
 	    bandwidth | (1u << 31), bandwidth, bandwidth)) {
@@ -386,42 +387,58 @@ cam_native_sensor_power(bool up)
 		}
 		delay_for_interval(power[i].delay_ms, NSEC_PER_MSEC);
 	}
+	if (!back && up) {
+		cam_mux_front_se9_od();
+		cam_spmi_front_ldo_probe("front-seq-up");
+	}
+	return true;
+}
+
+static bool
+cam_native_apply_exposure_regs(void)
+{
+	if (cam_native_exposure_lines == 0 || cam_native_gain == 0 ||
+	    (!cam_native_is_ov20b_m4(cam_profile) && !cam_native_is_ovx8000_m24(cam_profile))) {
+		return true;
+	}
+	uint32_t fll = cam_native_frame_lines;
+	uint32_t lines = cam_native_exposure_lines;
+	/* OV20B40 0x3500..0x3502 stores integration lines in Q4 fixed-point ([3:0] fractional). */
+	uint32_t raw_exp = cam_native_is_ov20b_m4(cam_profile) ? (lines << 4u) : lines;
+	uint32_t gain = cam_native_gain;
+	const struct {
+		uint16_t reg;
+		uint8_t val;
+	} exp_ops[7] = {
+		{ 0x380eu, (uint8_t)((fll >> 8) & 0xffu) },
+		{ 0x380fu, (uint8_t)(fll & 0xffu) },
+		{ 0x3500u, (uint8_t)((raw_exp >> 16) & 0xffu) },
+		{ 0x3501u, (uint8_t)((raw_exp >> 8) & 0xffu) },
+		{ 0x3502u, (uint8_t)(raw_exp & 0xffu) },
+		{ 0x3508u, (uint8_t)((gain >> 8) & 0x7fu) },
+		{ 0x3509u, (uint8_t)(gain & 0xffu) },
+	};
+	for (size_t k = 0; k < 7u; k++) {
+		bool exp_ok = cam_profile->sensor == 1u ?
+		    wide_bus_write(wide_slave_addr, (uint8_t)(exp_ops[k].reg >> 8),
+		    (uint8_t)exp_ops[k].reg, exp_ops[k].val, 3u) :
+		    od_i2c_write_bytes(GPIO_SE9_I2C_SDA, GPIO_SE9_I2C_SCL, front_slave_addr,
+		    (uint8_t)(exp_ops[k].reg >> 8), (uint8_t)exp_ops[k].reg,
+		    exp_ops[k].val, 3u);
+		if (!exp_ok) {
+			say("sensor %u exposure register %#x failed\n",
+			    cam_profile->sensor, exp_ops[k].reg);
+			return false;
+		}
+	}
 	return true;
 }
 
 static bool
 cam_native_register_table(uint32_t table, uint32_t count)
 {
-	if (table == 2u && cam_native_exposure_lines != 0 && cam_native_gain != 0 &&
-	    (cam_native_is_ov20b_m4(cam_profile) || cam_native_is_ovx8000_m24(cam_profile))) {
-		uint32_t fll = cam_native_frame_lines;
-		uint32_t lines = cam_native_exposure_lines;
-		uint32_t gain = cam_native_gain;
-		const struct {
-			uint16_t reg;
-			uint8_t val;
-		} exp_ops[7] = {
-			{ 0x380eu, (uint8_t)((fll >> 8) & 0xffu) },
-			{ 0x380fu, (uint8_t)(fll & 0xffu) },
-			{ 0x3500u, (uint8_t)((lines >> 16) & 0xffu) },
-			{ 0x3501u, (uint8_t)((lines >> 8) & 0xffu) },
-			{ 0x3502u, (uint8_t)(lines & 0xffu) },
-			{ 0x3508u, (uint8_t)((gain >> 8) & 0x7fu) },
-			{ 0x3509u, (uint8_t)(gain & 0xffu) },
-		};
-		for (size_t k = 0; k < 7u; k++) {
-			bool exp_ok = cam_profile->sensor == 1u ?
-			    wide_bus_write(wide_slave_addr, (uint8_t)(exp_ops[k].reg >> 8),
-			    (uint8_t)exp_ops[k].reg, exp_ops[k].val, 3u) :
-			    od_i2c_write_bytes(GPIO_SE9_I2C_SDA, GPIO_SE9_I2C_SCL, front_slave_addr,
-			    (uint8_t)(exp_ops[k].reg >> 8), (uint8_t)exp_ops[k].reg,
-			    exp_ops[k].val, 3u);
-			if (!exp_ok) {
-				say("sensor %u exposure register %#x failed\n",
-				    cam_profile->sensor, exp_ops[k].reg);
-				return false;
-			}
-		}
+	if (table == 2u && !cam_native_apply_exposure_regs()) {
+		return false;
 	}
 	const struct annibale_camera_register *entries = cam_profile_registers(table);
 	for (uint32_t i = 0; i < count; i++) {

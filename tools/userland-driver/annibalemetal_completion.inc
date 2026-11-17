@@ -154,6 +154,15 @@ static void *rw_completion_main(void *unused);
 		mesa.buffer_textures_writeback(device);
 		writeback_us = rw_now_us() - writeback_began;
 	}
+	if (!wait_failed) {
+		for (AnnibaleMetalWork *work in _work) {
+			if (work->copyKind == RW_COPY_SIGNAL_EVENT &&
+			    [work->sharedEvent respondsToSelector:@selector(setSignaledValue:)]) {
+				[(id<AnnibaleSharedEventSPI>)work->sharedEvent
+				    setSignaledValue:work->sharedEventValue];
+			}
+		}
+	}
 	pthread_mutex_lock(&rw_completion_lock);
 	__atomic_store_n(&_status, _failed ? RW_CB_ERROR : RW_CB_COMPLETED, __ATOMIC_RELEASE);
 	completed = _completed;

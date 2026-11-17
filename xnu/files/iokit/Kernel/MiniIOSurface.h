@@ -116,6 +116,8 @@ MiniIOSurface * MiniIOSurfaceCreateSimple(uint32_t width, uint32_t height, uint3
 void            MiniIOSurfaceDrop(MiniIOSurface * surface);
 /* A Mach send right for the surface in the task (what IOSurfaceCreateMachPort gives); 0 on failure. */
 mach_port_name_t MiniIOSurfaceMakeSendRight(task_t task, MiniIOSurface * surface);
+IOReturn        MiniIOSurfaceWaitSharedEvent(task_t task, mach_port_name_t portName, uint64_t target, uint64_t timeoutMS);
+IOReturn        MiniIOSurfaceSignalSharedEvent(task_t task, mach_port_name_t portName, uint64_t value);
 
 
 #endif /* _IOKIT_MINIIOSURFACE_H */

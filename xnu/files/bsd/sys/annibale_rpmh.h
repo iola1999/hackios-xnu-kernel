@@ -33,6 +33,7 @@ uint32_t annibale_cmd_db_lookup(const char *name, const uint8_t **data_out, uint
 bool annibale_rpmh_tcs_send(const uint32_t *addrs, const uint32_t *vals, unsigned count);
 bool annibale_rpmh_regulator(const char *name, uint32_t mv, bool enable, uint32_t mode);
 bool annibale_rpmh_arc_vote(const char *name, uint32_t min_level);
+bool annibale_rpmh_bcm_vote(const char *name, uint64_t bw_bytes_per_sec, uint32_t raw_vote);
 
 #endif /* KERNEL */
 

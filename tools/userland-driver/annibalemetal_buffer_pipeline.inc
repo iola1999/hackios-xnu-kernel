@@ -266,6 +266,8 @@
 	_owner = [device retain];
 	_compute = compute;
 	_info = *info;
+	_imageblockDataSize = mesa.compute_imageblock_data_size != NULL
+	    ? mesa.compute_imageblock_data_size(compute) : 0;
 	/* and the same for a kernel with a set, for the same reason */
 	if (_info.argbuf_mask != 0) {
 		RW_ONCE("a compute pipeline declares argument buffers at Metal buffer indices "
@@ -293,6 +295,14 @@
 - (NSUInteger)maxTotalThreadsPerThreadgroup { return _info.max_threads_per_group; }
 - (NSUInteger)threadExecutionWidth          { return _info.thread_execution_width; }
 - (NSUInteger)staticThreadgroupMemoryLength { return _info.static_shared_bytes; }
+- (NSUInteger)imageblockMemoryLengthForDimensions:(MTLSize)dimensions
+{
+	if (_imageblockDataSize == 0)
+		return 0;
+	NSUInteger w = MAX(dimensions.width, (NSUInteger)1);
+	NSUInteger h = MAX(dimensions.height, (NSUInteger)1);
+	return (w * h * (NSUInteger)_imageblockDataSize + 15) & ~(NSUInteger)15;
+}
 
 - (id)device { return _owner; }
 
