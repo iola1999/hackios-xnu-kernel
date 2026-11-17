@@ -114,7 +114,7 @@ static const uint32_t s6_parent_hz[8] = { 19200000, 600000000, 0, 0, 0, 0, 30000
 static vm_offset_t gcc, tlmm, se;
 static uint32_t se_hz, se_clock_select;
 static uint32_t current_baud = BT_BAUD;
-static uint8_t rx_buf[4096];
+static uint8_t rx_buf[BT_UART_RX_BYTES];
 static uint32_t rx_len;
 
 uint32_t

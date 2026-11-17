@@ -48,6 +48,7 @@ static uint32_t bt_ring_in, bt_ring_out, bt_rx_lost;
 static lck_mtx_t *bt_ring_lock;
 static struct selinfo bt_sel;
 static int bt_serving;
+static volatile int bt_ended;           /* the bring-up thread finished without serving: nothing will come */
 static bool bt_ibs_asleep;
 static volatile uint32_t bt_irq_event;
 
@@ -442,7 +443,7 @@ bt_kctl_connect(kern_ctl_ref ref __unused, struct sockaddr_ctl *sac, void **unit
 {
 	int waited;
 
-	for (waited = 0; !bt_serving && waited < 40000; waited += 50) {
+	for (waited = 0; !bt_serving && !bt_ended && waited < 40000; waited += 50) {
 		ms(50);
 	}
 	bt_kctl_unit = sac->sc_unit;
@@ -872,7 +873,7 @@ bt_dev_open(dev_t dev __unused, int flags, int devtype __unused, struct proc *p 
 		bt_opens++;
 		bt_say("bt: /dev/uart.bluetooth opened (flags %#x; chip %s)\n", flags, bt_serving ? "up" : "not up yet");
 	}
-	for (waited = 0; !bt_serving && waited < 40000; waited += 50) {
+	for (waited = 0; !bt_serving && !bt_ended && waited < 40000; waited += 50) {
 		ms(50);
 	}
 	return bt_serving ? 0 : ENXIO;
@@ -1021,6 +1022,22 @@ annibale_bt_ios_early(void)
 	AnnibaleBTStart("uart.bluetooth", NULL);
 	btsk_start();
 	bt_kctl_register();
+}
+
+/*
+ * The bring-up thread has finished. bluetoothd holds its stack mutex while it opens the transport, and its
+ * watchdog aborts the daemon when that lock is held through two of its periods (31 s in the 2026-11-18 log), so
+ * an open that waits the full 40 s for a chip the bring-up has given up on ends in an abort and a respawn, with
+ * every synchronous XPC client of bluetoothd blocked meanwhile. Once the thread is done without serving, opens
+ * and connects answer ENXIO at once.
+ */
+void
+annibale_bt_ios_ended(void)
+{
+	if (!bt_serving) {
+		bt_ended = 1;
+		bt_say("bt: bring-up ended without the chip; /dev/uart.bluetooth and the control socket answer ENXIO\n");
+	}
 }
 
 void

@@ -290,6 +290,7 @@ public:
 	bool            fSingleLayer;           /* this frame is one surface, in the bottom layer */
 	uint32_t        fStatUnchanged;         /* frames with no row changed, not drawn */
 	uint64_t        fStatBandRows;          /* panel rows drawn */
+	uint64_t        fStatChangedRows;       /* source rows that actually changed (not the first..last span) */
 	int32_t         fStatRowsFrom, fStatRowsTo;     /* the source rows that changed, first and last */
 	/* the screen recording, if one was asked for */
 	uint32_t *      fColumn;                /* drawLayer(): source column for every panel column */
@@ -472,6 +473,7 @@ IOMobileFramebuffer::start(IOService * provider)
 	fDiff = gDiff != 0;
 	fDiffLeft = fDiffTop = ~0u;
 	fStatRowsFrom = fStatRowsTo = -1;
+	fStatChangedRows = 0;
 	IOLog("MiniIOMobileFramebuffer: display %ux%u on a panel of %ux%u (%u bytes per row)\n", fWidth, fHeight,
 	    fPanelWidth, fPanelHeight, fRowBytes);
 
@@ -949,8 +951,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		    fStatHeld, fStatLost, fStatSwapsLate);
 		if (gRows) {
 			IOLog("MiniIOMobileFramebuffer: %u of the frames had no row changed; %llu panel rows drawn a frame; "
-			    "source rows %d to %d changed; %u drawn whole unhashed\n", fStatUnchanged, fStatBandRows / fStatFrames,
-			    fStatRowsFrom, fStatRowsTo, fStatUnhashed);
+			    "source rows %d to %d changed, %llu source rows a frame; %u drawn whole unhashed\n",
+			    fStatUnchanged, fStatBandRows / fStatFrames, fStatRowsFrom, fStatRowsTo,
+			    fStatChangedRows / fStatFrames, fStatUnhashed);
 		}
 		if (gFilter == 2) {
 			absolutetime_to_nanoseconds(fStatSettleTime, &beat);
@@ -961,6 +964,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 		fStatUnchanged = fStatUnhashed = 0;
 		fStatBandRows = 0;
+		fStatChangedRows = 0;
 		fStatRowsFrom = fStatRowsTo = -1;
 		fStatSwapsLate = 0;
 		for (different = 0; different < 8 && fStatSurfaces[different] != 0; different++) {

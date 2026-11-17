@@ -14,6 +14,7 @@
 #define bt_say mhi_pcie_say
 
 #define BT_BAUD                 115200u
+#define BT_UART_RX_BYTES        4096u   /* annibale_bt_uart.c's receive buffer */
 #define BT_BAUD_HIGH            3000000u
 
 /* clocks, pins and the engine's own checks (protocol, FIFO interface); false after saying why */
@@ -40,6 +41,8 @@ bool annibale_bt_hci_set_baudrate(uint32_t baud);
 /* bt=4 (annibale_bt_ios.c): /dev/uart.bluetooth, com.apple.uart.sk.bluetooth and the Skywalk nexus for bluetoothd */
 void annibale_bt_ios_early(void);
 void annibale_bt_ios_serve(const uint8_t addr[6]);
+/* the bring-up thread is done; without annibale_bt_ios_serve() before it, opens and connects fail at once with ENXIO */
+void annibale_bt_ios_ended(void);
 void annibale_bt_uart_isr(void *ctx, uint32_t intid);
 
 #endif

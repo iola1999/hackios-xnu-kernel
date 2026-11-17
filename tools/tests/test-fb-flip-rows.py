@@ -104,6 +104,7 @@ public:
     uint64_t fBandAt = 0;
     uint32_t fWholeFrames = 0, fUnhashed = 0, fStatUnhashed = 0, fStatUnchanged = 0;
     uint64_t fStatBandRows = 0;
+    uint64_t fStatChangedRows = 0;
     int32_t fStatRowsFrom = -1, fStatRowsTo = -1;
     uint32_t *fColumn = NULL;
     uint16_t *fColumnWeight = NULL;
@@ -266,6 +267,19 @@ int main(void) {
     step(fullSrc, insetDst, 16, "inset-f1");
     fill_band(&surf, 30, 50, 0xffabcdefu);
     step(fullSrc, insetDst, 16, "inset-f2");
+
+    /* 5. A few rows touched at both the top and the bottom: the first..last span covers the panel but
+     * only a handful of rows changed, so hashing must stay on instead of copying every row unhashed. */
+    fb.fWholeFrames = 0; fb.fUnhashed = 0; fb.fStatUnhashed = 0;
+    fill_band(&surf, 0, sh, 0xff203040u);
+    step(fullSrc, fullDst, 30, "sparse-prep");
+    for (int i = 0; i < 6; i++) {
+        fill_band(&surf, 0, 4, 0xff400000u + (uint32_t)i * 0x030303u);
+        fill_band(&surf, sh - 4, sh, 0xff004000u + (uint32_t)i * 0x030303u);
+        step(fullSrc, fullDst, 8, "sparse-top-bottom");
+    }
+    assert(fb.fWholeFrames == 0);
+    assert(fb.fStatUnhashed == 0);
 
     free(surf.buf);
     free(bufA);

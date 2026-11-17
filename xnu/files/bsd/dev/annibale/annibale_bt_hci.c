@@ -27,7 +27,11 @@ extern const uint8_t *annibale_image_file(const char *dir, const char *name, uin
 extern kern_return_t thread_terminate(thread_t thread);
 
 #define H4_COMMAND              0x01
+#define H4_ACL                  0x02
+#define H4_SCO                  0x03
 #define H4_EVENT                0x04
+/* btqca.c QCA_DEBUG_HANDLE: the SoC's own log comes as ACL packets on this handle */
+#define QCA_DEBUG_HANDLE        0x2edc
 #define EV_COMMAND_COMPLETE     0x0e
 #define EV_COMMAND_STATUS       0x0f
 #define EV_LE_META              0x3e
@@ -72,22 +76,28 @@ ms(uint32_t n)
 	delay_for_interval(n, NSEC_PER_MSEC);
 }
 
-/* The next HCI event (04, code, length, parameters) into ev, its length; 0 when none came within wait_ms. Bytes
- * before an event's 04 are not H4 (in-band sleep bytes FC/FD/FE, line noise): the first few runs are shown, all
- * dropped. */
+/*
+ * The next HCI event (04, code, length, parameters) into ev, its length; 0 when none came within wait_ms.
+ *
+ * ACL and SCO packets ahead of it are skipped whole, by their own length. After the rampatch the SoC sends its log
+ * as ACL packets on QCA_DEBUG_HANDLE, and their payload holds 04 bytes: taking such a byte for an event's start
+ * reads the wrong length and swallows the real event behind it (an HCI Reset's Command Complete, for one). Bytes
+ * outside any packet (in-band sleep FC/FD/FE, line noise) are dropped; the first few runs are shown.
+ */
 static uint32_t
 hci_event(uint8_t *ev, uint32_t max, uint32_t wait_ms)
 {
+	static uint32_t log_packets;
 	uint64_t end, span;
 	uint32_t shown = 0;
 
 	nanoseconds_to_absolutetime((uint64_t)wait_ms * NSEC_PER_MSEC, &span);
 	end = mach_absolute_time() + span;
 	for (;;) {
-		uint32_t have, skip = 0;
+		uint32_t have, skip = 0, whole = 0;
 		const uint8_t *rx = annibale_bt_uart_rx(&have);
 
-		while (skip < have && rx[skip] != H4_EVENT) {
+		while (skip < have && rx[skip] != H4_EVENT && rx[skip] != H4_ACL && rx[skip] != H4_SCO) {
 			if (rx[skip] == 0xfd) {
 				uint8_t ack = 0xfc;
 
@@ -102,7 +112,28 @@ hci_event(uint8_t *ev, uint32_t max, uint32_t wait_ms)
 			annibale_bt_uart_take(skip);
 			rx = annibale_bt_uart_rx(&have);
 		}
-		if (have >= 3 && have >= 3u + rx[2]) {
+		if (have >= 5 && rx[0] == H4_ACL) {
+			whole = 5u + (rx[3] | (uint32_t)rx[4] << 8);
+		} else if (have >= 4 && rx[0] == H4_SCO) {
+			whole = 4u + rx[3];
+		}
+		if (whole > BT_UART_RX_BYTES - 4) {
+			/* longer than the receive buffer can collect, so not a packet: the type byte was noise */
+			annibale_bt_uart_take(1);
+			continue;
+		}
+		if (whole != 0 && have >= whole) {
+			if (rx[0] == H4_ACL && (rx[1] | rx[2] << 8) == QCA_DEBUG_HANDLE) {
+				if (log_packets++ < 2) {
+					annibale_bt_hex("SoC log packet, skipped", rx, whole);
+				}
+			} else if (shown++ < 4) {
+				annibale_bt_hex("not an event, skipped", rx, whole);
+			}
+			annibale_bt_uart_take(whole);
+			continue;
+		}
+		if (have >= 3 && rx[0] == H4_EVENT && have >= 3u + rx[2]) {
 			uint32_t n = 3u + rx[2], kept = n < max ? n : max;
 
 			memcpy(ev, rx, kept);
@@ -618,7 +649,12 @@ bring_up(uint32_t steps)
 static void
 bt_thread(void *parameter, __unused wait_result_t result)
 {
-	bring_up((uint32_t)(uintptr_t)parameter);
+	uint32_t steps = (uint32_t)(uintptr_t)parameter;
+
+	bring_up(steps);
+	if (steps >= 4) {
+		annibale_bt_ios_ended();
+	}
 	thread_terminate(current_thread());
 }
 
@@ -633,6 +669,9 @@ annibale_bt_start(void)
 	}
 	if (!PE_parse_boot_argn("pcie_bt_en", &bt_en, sizeof(bt_en)) || bt_en == 0) {
 		bt_say("bt: stop: bt=%u needs pcie_bt_en=1, BT_EN stays low without it\n", steps);
+		if (steps >= 4) {
+			annibale_bt_ios_ended();
+		}
 		return;
 	}
 	if (steps > 4) {

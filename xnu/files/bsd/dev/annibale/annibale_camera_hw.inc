@@ -473,6 +473,12 @@ cam_diag_capture_probe(const char *tag)
 		    reg_rd(csid_lite_base, 0x1228u), reg_rd(csid_lite_base, 0x122cu),
 		    reg_rd(csid_lite_base, 0x1700u), reg_rd(csid_lite_base, 0x1704u),
 		    reg_rd(csid_lite_base, 0x170cu), reg_rd(csid_lite_base, 0x1714u));
+		/* IFE-lite overflow (0x1268) and out-of-bounds (0x1270) status: distinguish a WM-generated bad address from CAMNOC mis-decoding a valid one. */
+		say("probe[%s] bus_ovf 1260=%#x 1264=%#x 1268=%#x 126c=%#x 1270=%#x 1274=%#x 1278=%#x\n",
+		    tag, reg_rd(csid_lite_base, 0x1260u), reg_rd(csid_lite_base, 0x1264u),
+		    reg_rd(csid_lite_base, 0x1268u), reg_rd(csid_lite_base, 0x126cu),
+		    reg_rd(csid_lite_base, 0x1270u), reg_rd(csid_lite_base, 0x1274u),
+		    reg_rd(csid_lite_base, 0x1278u));
 		say("probe[%s] wm_dbg 1770=%#x 177c=%#x 1780=%#x 1784=%#x 1790=%#x 1794=%#x 1798=%#x 179c=%#x\n",
 		    tag, reg_rd(csid_lite_base, 0x1770u), reg_rd(csid_lite_base, 0x177cu),
 		    reg_rd(csid_lite_base, 0x1780u), reg_rd(csid_lite_base, 0x1784u),

@@ -28,7 +28,7 @@ struct RowJob {
 	int32_t         by0, by1;       /* the panel rows this frame draws (dirtyBand), within py0..py1 */
 	uint32_t        bufferSeq;      /* fRowSeq when the target panel buffer was last updated */
 	bool            filter, unscaled, allDirty, hashPhase, hashKnown;
-	int32_t         hashFirst[8], hashLast[8];
+	int32_t         hashFirst[8], hashLast[8], hashCount[8];
 };
 
 void
@@ -182,7 +182,7 @@ IOMobileFramebuffer::hashRows(RowJob * job, unsigned share, unsigned shares)
 {
 	int32_t r0 = (int32_t) ((int64_t) job->sh * share / shares);
 	int32_t r1 = (int32_t) ((int64_t) job->sh * (share + 1) / shares);
-	int32_t words = job->sw / 2, first = -1, last = -1;
+	int32_t words = job->sw / 2, first = -1, last = -1, count = 0;
 	bool known = job->hashKnown;
 	uint32_t seq = fRowSeq;
 
@@ -226,19 +226,21 @@ IOMobileFramebuffer::hashRows(RowJob * job, unsigned share, unsigned shares)
 		if (!known || h0 != fRowHash[r]) {
 			first = first < 0 ? r : first;
 			last = r;
+			count++;
 			fRowChanged[r] = seq;
 		}
 		fRowHash[r] = h0;
 	}
 	job->hashFirst[share] = first;
 	job->hashLast[share] = last;
+	job->hashCount[share] = count;
 }
 
 bool
 IOMobileFramebuffer::dirtyBand(RowJob * job)
 {
 	int32_t geometry[8] = { job->sx, job->sy, job->sw, job->sh, job->px0, job->py0, job->px1, job->py1 };
-	int32_t first = -1, last = -1;
+	int32_t first = -1, last = -1, changed = 0;
 	int64_t span = job->py1 - job->py0;
 	uint64_t now = mach_absolute_time(), gap;
 	bool known;
@@ -312,6 +314,7 @@ IOMobileFramebuffer::dirtyBand(RowJob * job)
 		IOLockUnlock(fHelperLock);
 		job->hashPhase = false;
 		for (unsigned s = 0; s < fThreads; s++) {
+			changed += job->hashCount[s];
 			if (job->hashFirst[s] >= 0) {
 				first = first < 0 ? job->hashFirst[s] : first;
 				last = job->hashLast[s];
@@ -321,13 +324,17 @@ IOMobileFramebuffer::dirtyBand(RowJob * job)
 		hashRows(job, 0, 1);
 		first = job->hashFirst[0];
 		last = job->hashLast[0];
+		changed = job->hashCount[0];
 	}
 	fRowHashRows = (uint32_t) job->sh;
 	memcpy(fRowHashGeometry, geometry, sizeof(geometry));
 	if (!known) {
 		fAllChangedSeq = fRowSeq;
 	} else {
-		fWholeFrames = first >= 0 && (int64_t) (last - first + 1) * 10 >= (int64_t) job->sh * 9 ? fWholeFrames + 1 : 0;
+		/* Count changed rows, not the first..last span: a few rows touched at both the top and the
+		 * bottom span the whole panel without being a whole-frame animation, and judging by the span
+		 * would drop hashing and copy every row for the next ROWS_UNHASHED frames. */
+		fWholeFrames = first >= 0 && (int64_t) changed * 10 >= (int64_t) job->sh * 9 ? fWholeFrames + 1 : 0;
 		fUnhashed = 0;
 	}
 	if (first < 0) {
@@ -335,6 +342,7 @@ IOMobileFramebuffer::dirtyBand(RowJob * job)
 	}
 	fStatRowsFrom = fStatRowsFrom < 0 || first < fStatRowsFrom ? first : fStatRowsFrom;
 	fStatRowsTo = last > fStatRowsTo ? last : fStatRowsTo;
+	fStatChangedRows += (uint64_t) changed;
 	/* the panel rows that sample source rows first .. last, with a row to spare for the filter */
 	job->by0 = job->py0 + (int32_t) ((int64_t) (first - 1) * span / job->sh) - 1;
 	job->by1 = job->py0 + (int32_t) ((int64_t) (last + 2) * span / job->sh) + 2;
