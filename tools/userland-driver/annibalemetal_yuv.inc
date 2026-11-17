@@ -33,7 +33,12 @@ rw_combined_yuv(AnnibaleMetalDevice *device, MTLTextureDescriptor *d, void *surf
 	    shape->sample_count != 1 || shape->depth != 1 || shape->array_length != 1 ||
 	    shape->width == 0 || shape->height == 0 ||
 	    shape->width > get_width(surface, 0) || shape->height > get_height(surface, 0)) {
-		rw_print("combined YCbCr requires a two-plane, single-level sampled surface\n");
+		rw_print("combined YCbCr requires a two-plane, single-level sampled surface: plane %lu of %zu, "
+		    "format %u type %u %ux%u depth %u array %u mips %u samples %u usage %#x, plane 0 %zux%zu\n",
+		    (unsigned long)plane, surface && get_count ? get_count(surface) : 0, shape->pixel_format,
+		    shape->type, shape->width, shape->height, shape->depth, shape->array_length, shape->mip_levels,
+		    shape->sample_count, shape->usage, surface && get_width ? get_width(surface, 0) : 0,
+		    surface && get_height ? get_height(surface, 0) : 0);
 		return nil;
 	}
 	uint32_t format = get_format(surface);

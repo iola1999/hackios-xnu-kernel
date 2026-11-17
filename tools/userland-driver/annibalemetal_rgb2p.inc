@@ -22,7 +22,13 @@ rw_combined_rgb2p(AnnibaleMetalDevice *device, MTLTextureDescriptor *d, void *su
 	    shape->width > get_width(surface, 0) || shape->height > get_height(surface, 0) ||
 	    (shape->width + horizontal - 1)/horizontal > get_width(surface, 1) ||
 	    (shape->height + vertical - 1)/vertical > get_height(surface, 1)) {
-		rw_print("RGB2P requires a two-plane, single-level sample/render surface\n");
+		rw_print("RGB2P requires a two-plane, single-level sample/render surface: plane %lu of %zu, format %u "
+		    "type %u %ux%u depth %u array %u mips %u samples %u usage %#x, planes %zux%zu and %zux%zu\n",
+		    (unsigned long)plane, surface && get_count ? get_count(surface) : 0, shape->pixel_format,
+		    shape->type, shape->width, shape->height, shape->depth, shape->array_length, shape->mip_levels,
+		    shape->sample_count, effective, surface && get_width ? get_width(surface, 0) : 0,
+		    surface && get_height ? get_height(surface, 0) : 0, surface && get_width ? get_width(surface, 1) : 0,
+		    surface && get_height ? get_height(surface, 1) : 0);
 		return nil;
 	}
 	uint32_t format = get_format(surface);
