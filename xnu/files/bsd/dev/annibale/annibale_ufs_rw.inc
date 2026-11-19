@@ -585,14 +585,16 @@ ufs_lfn_feed(const uint8_t *ent, char lfn[256])
 bool
 annibale_ufs_fat16_fw_read(const char *name, uint64_t *size_out, volatile void *dst_buf, uint64_t dst_cap)
 {
-	static const char *const parts[2] = { "modem_a", "modem_b" };
+	static const char *const parts[4] = {
+		"modem_a", "modemfirmware_a", "modem_b", "modemfirmware_b"
+	};
 	char target11[11], image11[11] = { 'I','M','A','G','E',' ',' ',' ',' ',' ',' ' };
 	bool has_83 = ufs_fat83_name(name, target11);
 
 	uint8_t *sec = kalloc_data(8192, Z_WAITOK);
 	if (sec == NULL) return false;
 
-	for (unsigned p = 0; p < 2; p++) {
+	for (unsigned p = 0; p < 4; p++) {
 		if (annibale_ufs_part_read(parts[p], 0, sec, 512) != 0) continue;
 		uint16_t bps = (uint16_t)(sec[11] | (sec[12] << 8));
 		uint8_t spc = sec[13];
@@ -677,6 +679,7 @@ annibale_ufs_fat16_fw_read(const char *name, uint64_t *size_out, volatile void *
 		for (unsigned hop = 0; hop < 8192 && rem > 0 && cur >= 2 && cur < 0xfff8; hop++) {
 			uint32_t run = 1;
 			uint16_t nxt = cur;
+			bool run_broke = false;
 			while (rem > run * csize && run < 256) {
 				uint32_t ent_off = fat_off + (uint32_t)nxt * 2u;
 				uint32_t aligned = ent_off & ~4095u;
@@ -686,11 +689,15 @@ annibale_ufs_fat16_fw_read(const char *name, uint64_t *size_out, volatile void *
 				}
 				uint32_t idx = ent_off - aligned;
 				uint16_t c2 = (uint16_t)(fat_sec[idx] | (fat_sec[idx + 1] << 8));
-				if (c2 != nxt + 1) { nxt = c2; break; }
+				if (c2 != nxt + 1) {
+					nxt = c2;
+					run_broke = true;
+					break;
+				}
 				nxt = c2;
 				run++;
 			}
-			if (run == 1 || nxt == cur + run - 1) {
+			if (!run_broke) {
 				uint32_t ent_off = fat_off + (uint32_t)nxt * 2u;
 				uint32_t aligned = ent_off & ~4095u;
 				if (aligned != fat_sec_base &&

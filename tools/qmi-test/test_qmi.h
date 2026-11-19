@@ -30,5 +30,6 @@ uint64_t now_ms(void);
 
 void test_own_tables(void);             /* test_encode.c  -- the coding against bytes written by hand */
 void test_helpers(void);                /* test_router.c  -- the helpers over a router made up here */
+void test_qrtr_multilink(void);         /* test_router.c  -- real annibale_qrtr.c with node 0 + multi-link */
 
 #endif /* TEST_QMI_H */

@@ -167,11 +167,15 @@ static const char *kIOUserClientClassKey="IOUserClientClass";
 static unsigned mode, allocated, released, attached, detached, registrations, lock_allocations, lock_frees, stopped;
 static bool cached_arg;
 struct IOLock { unsigned depth=0; };
+struct IOSimpleLock { unsigned depth=0; };
 static IOLock *IOLockAlloc() { if(mode==1) return nullptr; lock_allocations++; return new IOLock; }
 static void IOLockFree(IOLock *p) { assert(p && !p->depth); lock_frees++; delete p; }
 static void IOLockLock(IOLock *p) { assert(p && p->depth++==0); }
 static void IOLockUnlock(IOLock *p) { assert(p && p->depth--==1); }
+static IOSimpleLock *IOSimpleLockAlloc() { lock_allocations++; return new IOSimpleLock; }
+static void IOSimpleLockFree(IOSimpleLock *p) { assert(p && !p->depth); lock_frees++; delete p; }
 static IOLock *gGPULock;
+static IOSimpleLock *gGPURoleLock;
 static bool gGPUCached, gGPUCoherent;
 static void IOLog(const char *, ...) {}
 static bool PE_parse_boot_argn(const char *, void *v, unsigned) { *(uint32_t *)v=cached_arg; return true; }
@@ -189,7 +193,8 @@ struct IOService {
     void release() { released++; delete this; }
     virtual ~IOService() = default;
 };
-struct AnnibaleGPU : IOService { bool start(IOService *) override; };
+struct IOGPU : IOService {};
+struct AnnibaleGPU : IOGPU { bool start(IOService *) override; };
 static AnnibaleGPU *make_gpu() { if(mode==3) return nullptr; allocated++; return new AnnibaleGPU; }
 #define OSTypeAlloc(type) make_gpu()
 #define OSSafeReleaseNULL(p) do { if(p) { (p)->release(); (p)=nullptr; } } while(0)
@@ -200,16 +205,17 @@ PUBLISH_CASES = r'''
 int main() {
     for (mode=1;mode<=9;mode++) {
         allocated=released=attached=detached=registrations=lock_allocations=lock_frees=stopped=0;
-        assert(!AnnibaleGPUStart() && !gGPUService && !gGPULock);
+        assert(!AnnibaleGPUStart() && !gGPUService && !gGPULock && !gGPURoleLock);
         assert(allocated==released && attached==detached && lock_allocations==lock_frees);
         AnnibaleGPUStop(); assert(!stopped);
     }
-    mode=0; assert(AnnibaleGPUStart() && gGPUService && gGPULock);
+    mode=0; assert(AnnibaleGPUStart() && gGPUService && gGPULock && gGPURoleLock);
     unsigned count=allocated, locks=lock_allocations, regs=registrations;
     assert(AnnibaleGPUStart() && allocated==count && locks==lock_allocations && regs==registrations);
     AnnibaleGPUStop(); assert(stopped==1 && !gGPULock->depth);
     gGPUService->state=3; assert(!AnnibaleGPUStart() && allocated==count);
     gGPUService->detach(IOService::getPlatform()); gGPUService->release(); gGPUService=nullptr;
+    IOSimpleLockFree(gGPURoleLock); gGPURoleLock=nullptr;
     IOLockFree(gGPULock); gGPULock=nullptr;
     puts("IOKit publication: real registered state, sync registration, cleanup, repeat and stop lock: PASS");
 }
@@ -345,7 +351,7 @@ def main():
         struct gpu_buffer{}; const unsigned GPU_BUFFERS=3;
         #define IONewZero(type,n) new type[n]{}
         struct IOUserClient:IOService{};
-        struct AnnibaleGPUUserClient:IOUserClient{gpu_buffer *fBuffers=nullptr;bool start(IOService*) override;};
+        struct AnnibaleGPUUserClient:IOUserClient{uint32_t fClientType=0;gpu_buffer *fBuffers=nullptr;bool start(IOService*) override;};
         '''+function(source,"AnnibaleGPUUserClient::start")+'''
         static int entry(unsigned selector){'''+ready_block+'''return kIOReturnSuccess;}
         static int parameter(){int ret=kIOReturnSuccess;struct{struct{uint32_t param;uint64_t value;}param;}r{};

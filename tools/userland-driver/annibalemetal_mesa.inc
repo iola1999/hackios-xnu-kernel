@@ -25,6 +25,7 @@ static struct {
 	__typeof__(&rwa_texture_thumbnail) texture_thumbnail;
 	__typeof__(&rwa_buffer_set_mirror) buffer_set_mirror;
 	__typeof__(&rwa_buffer_from_memory) buffer_from_memory;
+	__typeof__(&rwa_buffer_from_surface) buffer_from_surface;
 	struct rwa_fence *(*fence_take)(struct rwa_device *);
 	int (*fence_wait)(struct rwa_device *, struct rwa_fence *);
 	void (*fence_release)(struct rwa_device *, struct rwa_fence *);
@@ -38,6 +39,8 @@ static struct {
 	struct rwa_compute *(*compute_create)(struct rwa_device *, const void *, size_t,
 					      const char *, struct rwa_compute_info *, char *,
 					      size_t);
+	__typeof__(&rwa_compute_create_deferred) compute_create_deferred;
+	__typeof__(&rwa_compute_materialize) compute_materialize;
 	__typeof__(&rwa_compute_create_stitched) compute_create_stitched;
 	void (*compute_destroy)(struct rwa_compute *);
 	__typeof__(&rwa_compute_get_reflection) compute_get_reflection;
@@ -132,6 +135,7 @@ mesa_available(void)
 	*(void **)&mesa.texture_thumbnail = dlsym(mesa.handle, "rwa_texture_thumbnail");
 	*(void **)&mesa.buffer_set_mirror = dlsym(mesa.handle, "rwa_buffer_set_mirror");
 	*(void **)&mesa.buffer_from_memory = dlsym(mesa.handle, "rwa_buffer_from_memory");
+	*(void **)&mesa.buffer_from_surface = dlsym(mesa.handle, "rwa_buffer_from_surface");
 	*(void **)&mesa.fence_take = dlsym(mesa.handle, "rwa_fence_take");
 	*(void **)&mesa.fence_wait = dlsym(mesa.handle, "rwa_fence_wait");
 	*(void **)&mesa.fence_release = dlsym(mesa.handle, "rwa_fence_release");
@@ -149,6 +153,8 @@ mesa_available(void)
 	*(void **)&mesa.buffer_size = dlsym(mesa.handle, "rwa_buffer_size");
 	*(void **)&mesa.buffer_destroy = dlsym(mesa.handle, "rwa_buffer_destroy");
 	*(void **)&mesa.compute_create = dlsym(mesa.handle, "rwa_compute_create");
+	*(void **)&mesa.compute_create_deferred = dlsym(mesa.handle, "rwa_compute_create_deferred");
+	*(void **)&mesa.compute_materialize = dlsym(mesa.handle, "rwa_compute_materialize");
 	*(void **)&mesa.compute_create_stitched = dlsym(mesa.handle, "rwa_compute_create_stitched");
 	*(void **)&mesa.compute_destroy = dlsym(mesa.handle, "rwa_compute_destroy");
 	*(void **)&mesa.compute_get_reflection = dlsym(mesa.handle, "rwa_compute_get_reflection");

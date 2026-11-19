@@ -1,8 +1,8 @@
 diff --git a/osfmk/kern/work_interval.c b/osfmk/kern/work_interval.c
-index 3829f5fb5ebc..b0e218daf64c 100644
+index 3829f5fb5ebc..4f85924d146d 100644
 --- a/osfmk/kern/work_interval.c
 +++ b/osfmk/kern/work_interval.c
-@@ -758,6 +758,18 @@ kern_work_interval_get_thread_group(struct work_interval *work_interval,
+@@ -758,6 +758,34 @@ kern_work_interval_get_thread_group(struct work_interval *work_interval,
  }
  #endif /* CONFIG_THREAD_GROUPS */
  
@@ -10,12 +10,28 @@ index 3829f5fb5ebc..b0e218daf64c 100644
 + * (annibale) What kind of work the thread's work interval is for: one of WORK_INTERVAL_TYPE_*,
 + * or WORK_INTERVAL_TYPE_LAST for a thread that has joined none.
 + */
++kern_return_t
++kern_work_interval_lookup_type(thread_t thread, uint64_t work_interval_id, uint32_t *out_type)
++{
++	const struct work_interval *work_interval = thread ? thread->th_work_interval : NULL;
++
++	if (work_interval == NULL || out_type == NULL) {
++		return KERN_INVALID_ARGUMENT;
++	}
++	if (work_interval_id != 0 && work_interval->wi_id != work_interval_id) {
++		return KERN_INVALID_ARGUMENT;
++	}
++	*out_type = work_interval->wi_create_flags & WORK_INTERVAL_TYPE_MASK;
++	return KERN_SUCCESS;
++}
++
 +uint32_t
 +kern_work_interval_type_of_thread(thread_t thread)
 +{
-+	const struct work_interval *work_interval = thread->th_work_interval;
++	uint32_t type = WORK_INTERVAL_TYPE_LAST;
 +
-+	return work_interval ? work_interval->wi_create_flags & WORK_INTERVAL_TYPE_MASK : WORK_INTERVAL_TYPE_LAST;
++	(void)kern_work_interval_lookup_type(thread, 0, &type);
++	return type;
 +}
 +
  /*

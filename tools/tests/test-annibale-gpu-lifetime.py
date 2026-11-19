@@ -33,7 +33,9 @@ using addr64_t = uint64_t;
 using user_addr_t = uint64_t;
 using vm_size_t = uint64_t;
 using task_t = void *;
+using pid_t = int;
 using IOReturn = int;
+struct IOExternalMethodArguments;
 enum { kIOReturnSuccess, kIOReturnBadArgument, kIOReturnNoMemory,
        kIOReturnNotReady, kIOReturnNotFound, kIOReturnUnsupported,
        kIOReturnVMError, kIOReturnTimeout };
@@ -67,6 +69,7 @@ static int copyin(user_addr_t from, void *to, size_t size) {
 struct IOLock { unsigned depth = 0; };
 static void IOLockLock(IOLock *l) { assert(l && l->depth++ == 0); }
 static void IOLockUnlock(IOLock *l) { assert(l && l->depth-- == 1); }
+static void gpuNoteSubmit(pid_t) {}
 
 class IOMemoryDescriptor {
 public:

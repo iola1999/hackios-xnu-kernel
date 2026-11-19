@@ -459,3 +459,284 @@ test_helpers(void)
 	check(router.closed == 1 && !router.open && qmi.sock == NULL, "release does not close the port");
 	annibale_qmi_set_transport(NULL);
 }
+
+/* ---- 4. multi-link annibale_qrtr.c over MPSS node 0 and peer node 3 ------------------------------- */
+
+extern void annibale_qrtr_attach_node(uint32_t peer_node, int (*send)(const void *data, uint32_t length));
+extern int annibale_qrtr_publish(struct annibale_qrtr_port *port, uint32_t service, uint32_t version, uint32_t instance);
+
+void
+annibale_wifi_say(const char *fmt, ...)
+{
+	(void)fmt;
+}
+
+struct wire_cap {
+	unsigned count;
+	uint32_t types[32];
+	uint32_t to_nodes[32];
+	uint32_t to_ports[32];
+	uint32_t cmds[32];
+	uint32_t words0[32];
+	uint32_t words1[32];
+	uint32_t words2[32];
+	uint32_t words3[32];
+};
+static struct wire_cap link0_tx, link3_tx;
+static int link0_send_err;
+
+static int
+capture_tx(struct wire_cap *cap, const void *data, uint32_t length)
+{
+	if (length >= 32 && cap->count < 32) {
+		uint32_t w[13] = { 0 };
+		size_t copy = length < sizeof(w) ? length : sizeof(w);
+		memcpy(w, data, copy);
+		unsigned idx = cap->count++;
+		cap->types[idx] = w[1];
+		cap->to_nodes[idx] = w[6];
+		cap->to_ports[idx] = w[7];
+		cap->cmds[idx] = w[8];
+		cap->words0[idx] = w[9];
+		cap->words1[idx] = w[10];
+		cap->words2[idx] = w[11];
+		cap->words3[idx] = w[12];
+	}
+	return 0;
+}
+
+static int
+send_node0(const void *data, uint32_t length)
+{
+	if (link0_send_err != 0) {
+		return link0_send_err;
+	}
+	return capture_tx(&link0_tx, data, length);
+}
+
+static int
+send_node3(const void *data, uint32_t length)
+{
+	return capture_tx(&link3_tx, data, length);
+}
+
+static void
+inject_qrtr_ctrl(uint32_t from_node, uint32_t from_port, uint32_t cmd, uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3)
+{
+	uint32_t pkt[8 + 5] = {
+		1u, 1u, from_node, from_port, 0u, 20u, 1u, 0xfffffffeu,
+		cmd, w0, w1, w2, w3,
+	};
+	annibale_qrtr_input(pkt, sizeof(pkt));
+}
+
+struct qrtr_seen_srv {
+	unsigned arrived, left;
+	uint32_t service, node, port;
+};
+
+static void
+on_qrtr_srv(void *context, bool arrived, uint32_t service, uint32_t version, uint32_t instance, uint32_t node, uint32_t port)
+{
+	struct qrtr_seen_srv *s = context;
+	(void)version;
+	(void)instance;
+	if (arrived) {
+		s->arrived++;
+		s->service = service;
+		s->node = node;
+		s->port = port;
+	} else {
+		s->left++;
+	}
+}
+
+static void
+on_qrtr_rx(void *context, uint32_t node, uint32_t port, const void *data, size_t length)
+{
+	(void)context;
+	(void)node;
+	(void)port;
+	(void)data;
+	(void)length;
+}
+
+struct local_rx_cap {
+	unsigned count;
+	uint32_t from_node, from_port;
+	size_t len;
+	uint8_t data[64];
+};
+
+static void
+on_local_srv_rx(void *context, uint32_t node, uint32_t port, const void *data, size_t length)
+{
+	struct local_rx_cap *c = context;
+	c->count++;
+	c->from_node = node;
+	c->from_port = port;
+	c->len = length < sizeof(c->data) ? length : sizeof(c->data);
+	memcpy(c->data, data, c->len);
+}
+
+static void
+test_qrtr_local_servers(void)
+{
+	struct local_rx_cap rx_rmtfs = { 0 }, rx_mem = { 0 };
+	struct annibale_qrtr_port *p_rmtfs, *p_mem;
+
+	memset(&link0_tx, 0, sizeof(link0_tx));
+	memset(&link3_tx, 0, sizeof(link3_tx));
+	annibale_qrtr_attach(NULL);
+	link0_send_err = 0;
+
+	/* Publish RMTFS (0x0e, v1, inst 0) BEFORE MPSS link attaches. */
+	p_rmtfs = annibale_qrtr.open(on_local_srv_rx, NULL, &rx_rmtfs);
+	check(p_rmtfs != NULL && annibale_qrtr_publish(p_rmtfs, 0x0eu, 1u, 0u) == 0,
+	    "pre-attach annibale_qrtr_publish(RMTFS) failed");
+	check(link0_tx.count == 0, "pre-attach publish must not emit packets before link up");
+
+	/* Attach node 0 and receive HELLO from node 0: reply HELLO + announce RMTFS as NEW_SERVER. */
+	annibale_qrtr_attach_node(0u, send_node0);
+	check(link0_tx.count == 1 && link0_tx.cmds[0] == 2u, "attach_node(0) must send initial HELLO");
+	inject_qrtr_ctrl(0u, 0xfffffffeu, 2u /* HELLO */, 0u, 0u, 0u, 0u);
+	check(link0_tx.count == 3, "HELLO from node 0 must send HELLO reply + 1 local NEW_SERVER (got %u)",
+	    link0_tx.count);
+	check(link0_tx.cmds[1] == 2u && link0_tx.types[2] == 4u && link0_tx.to_nodes[2] == 0u &&
+	    link0_tx.to_ports[2] == 0xfffffffeu && link0_tx.cmds[2] == 4u &&
+	    link0_tx.words0[2] == 0x0eu && link0_tx.words1[2] == 0x0001u &&
+	    link0_tx.words2[2] == 1u && link0_tx.words3[2] >= 0x4000u,
+	    "NEW_SERVER after HELLO mismatch (type=%u svc=%#x inst=%#x node=%u port=%#x)",
+	    link0_tx.types[2], link0_tx.words0[2], link0_tx.words1[2], link0_tx.words2[2], link0_tx.words3[2]);
+	uint32_t rmtfs_port = link0_tx.words3[2];
+
+	/* Late publish after HELLO (MEMSHARE 0x34, v1, inst 1) must immediately broadcast NEW_SERVER. */
+	p_mem = annibale_qrtr.open(on_local_srv_rx, NULL, &rx_mem);
+	check(p_mem != NULL && annibale_qrtr_publish(p_mem, 0x34u, 1u, 1u) == 0,
+	    "post-HELLO annibale_qrtr_publish(MEMSHARE) failed");
+	check(link0_tx.count == 4 && link0_tx.types[3] == 4u && link0_tx.cmds[3] == 4u &&
+	    link0_tx.words0[3] == 0x34u && link0_tx.words1[3] == 0x0101u && link0_tx.words2[3] == 1u,
+	    "late publish must broadcast NEW_SERVER (count=%u svc=%#x inst=%#x)",
+	    link0_tx.count, link0_tx.words0[3], link0_tx.words1[3]);
+
+	/* QRTR_NEW_LOOKUP from node 0 for 0x0e must return matching NEW_SERVER (QRTR_DATA) + zero terminator. */
+	{
+		unsigned before = link0_tx.count;
+		inject_qrtr_ctrl(0u, 0x4020u, 10u /* NEW_LOOKUP */, 0x0eu, 0u, 0u, 0u);
+		check(link0_tx.count == before + 2, "NEW_LOOKUP for local svc must send hit + terminator (got %u)",
+		    link0_tx.count - before);
+		check(link0_tx.types[before] == 1u && link0_tx.to_ports[before] == 0x4020u &&
+		    link0_tx.cmds[before] == 4u && link0_tx.words0[before] == 0x0eu &&
+		    link0_tx.words1[before] == 0x0001u && link0_tx.words3[before] == rmtfs_port,
+		    "NEW_LOOKUP hit packet mismatch");
+		check(link0_tx.types[before + 1] == 1u && link0_tx.cmds[before + 1] == 4u &&
+		    link0_tx.words0[before + 1] == 0u && link0_tx.words1[before + 1] == 0u,
+		    "NEW_LOOKUP terminator packet mismatch");
+	}
+
+	/* Deliver a QRTR_DATA request from node 0 to the published RMTFS port. */
+	{
+		uint32_t req[8 + 2] = { 1u, 1u, 0u, 0x123u, 0u, 7u, 1u, rmtfs_port, 0x00010000u, 0x00000001u };
+		annibale_qrtr_input(req, sizeof(req));
+		check(rx_rmtfs.count == 1 && rx_rmtfs.from_node == 0u && rx_rmtfs.from_port == 0x123u &&
+		    rx_rmtfs.len == 7u, "QRTR_DATA delivery to published server port failed");
+	}
+
+	/* Closing published port must send DEL_SERVER (5) before DEL_CLIENT (6) and remove from lookup table. */
+	{
+		unsigned before = link0_tx.count;
+		annibale_qrtr.close(p_rmtfs);
+		check(link0_tx.count == before + 2 && link0_tx.types[before] == 5u &&
+		    link0_tx.cmds[before] == 5u && link0_tx.words0[before] == 0x0eu &&
+		    link0_tx.words3[before] == rmtfs_port && link0_tx.cmds[before + 1] == 6u,
+		    "close(published port) must emit DEL_SERVER then DEL_CLIENT");
+	}
+	annibale_qrtr.close(p_mem);
+	annibale_qrtr_attach_node(0u, NULL);
+}
+
+void
+test_qrtr_multilink(void)
+{
+	struct annibale_qrtr_counts counts;
+	struct qrtr_seen_srv srv0 = { 0 }, srv0_after = { 0 };
+	struct annibale_qrtr_port *p0, *p1;
+
+	memset(&link0_tx, 0, sizeof(link0_tx));
+	memset(&link3_tx, 0, sizeof(link3_tx));
+	annibale_qrtr_attach(NULL);
+	annibale_qrtr_counts(&counts);
+	check(counts.peer == ~0u, "initial qrtr_peer sentinel must not collide with MPSS node 0");
+
+	annibale_qrtr_attach(send_node3);
+	link0_send_err = EAGAIN;
+	annibale_qrtr_attach_node(0u, send_node0);
+	annibale_qrtr_attach_node(3u, send_node3);
+	check(link0_tx.count == 0, "deferred attach_node(0) with EAGAIN must not record TX");
+
+	/* Incoming HELLO from node 0 while send_node0 returns EAGAIN must NOT latch hello_answered. */
+	inject_qrtr_ctrl(0u, 0xfffffffeu, 2u /* HELLO */, 0u, 0u, 0u, 0u);
+	annibale_qrtr_counts(&counts);
+	check(counts.peer == 0u && counts.hellos == 0u && link0_tx.count == 0,
+	    "failed HELLO reply must not increment qrtr_hellos or latch hello_answered");
+
+	/* Once send_node0 succeeds, re-attaching sends HELLO and incoming HELLO answers once. */
+	link0_send_err = 0;
+	annibale_qrtr_attach_node(0u, send_node0);
+	check(link0_tx.count == 1 && link0_tx.cmds[0] == 2u && link0_tx.to_nodes[0] == 0u,
+	    "retry attach_node(0) must send HELLO to node 0");
+	inject_qrtr_ctrl(0u, 0xfffffffeu, 2u /* HELLO */, 0u, 0u, 0u, 0u);
+	annibale_qrtr_counts(&counts);
+	check(counts.hellos == 1u && link0_tx.count == 2 && link0_tx.cmds[1] == 2u,
+	    "incoming HELLO from node 0 must answer once send_node0 succeeds");
+	/* Re-calling attach_node(0) after hello_answered must not send a duplicate HELLO. */
+	annibale_qrtr_attach_node(0u, send_node0);
+	check(link0_tx.count == 2, "idempotent attach_node(0) after HELLO must not resend HELLO");
+
+	/* Advertise UIM-like service on node 0 and lookup on node 0. */
+	inject_qrtr_ctrl(0u, 0xfffffffeu, 4u /* NEW_SERVER */, 0x0bu, 0x101u, 0u, 11u);
+	inject_qrtr_ctrl(3u, 0xfffffffeu, 4u /* NEW_SERVER */, 0x45u, 0x301u, 3u, 22u);
+
+	p0 = annibale_qrtr.open(on_qrtr_rx, on_qrtr_srv, &srv0);
+	check(p0 != NULL && annibale_qrtr.lookup(p0, 0x0bu, 0u, 0u) == 0, "qrtr open/lookup for node 0 failed");
+	annibale_qrtr_fresh();
+	check(srv0.arrived == 1 && srv0.service == 0x0bu && srv0.node == 0u && srv0.port == 11u,
+	    "lookup must deliver service registered at node 0 (arrived=%u node=%u port=%u)",
+	    srv0.arrived, srv0.node, srv0.port);
+
+	/* MPSS (node 0) sends QRTR_NEW_LOOKUP; must get terminating zero NEW_SERVER even without qrtr_answer=1. */
+	{
+		unsigned before0 = link0_tx.count;
+		inject_qrtr_ctrl(0u, 0x4005u, 10u /* NEW_LOOKUP */, 0x222u, 0u, 0u, 0u);
+		check(link0_tx.count == before0 + 1 && link0_tx.to_nodes[before0] == 0u &&
+		    link0_tx.to_ports[before0] == 0x4005u && link0_tx.cmds[before0] == 4u &&
+		    link0_tx.words0[before0] == 0u && link0_tx.words1[before0] == 0u,
+		    "node 0 NEW_LOOKUP did not receive terminating empty NEW_SERVER");
+	}
+
+	/* Closing port with qrtr_peer == 0 must send DEL_CLIENT to BOTH active links (node 0 and node 3). */
+	{
+		unsigned before0 = link0_tx.count, before3 = link3_tx.count;
+		annibale_qrtr.close(p0);
+		check(link0_tx.count == before0 + 1 && link0_tx.cmds[before0] == 6u && link0_tx.to_nodes[before0] == 0u,
+		    "close with qrtr_peer==0 must send DEL_CLIENT to node 0");
+		check(link3_tx.count == before3 + 1 && link3_tx.cmds[before3] == 6u && link3_tx.to_nodes[before3] == 3u,
+		    "close must send DEL_CLIENT to active link node 3");
+	}
+
+	/* Detaching legacy single link when qrtr_peer==0 owned by qrtr_links must NOT wipe node 0 services. */
+	annibale_qrtr_attach(NULL);
+	p1 = annibale_qrtr.open(on_qrtr_rx, on_qrtr_srv, &srv0_after);
+	check(p1 != NULL && annibale_qrtr.lookup(p1, 0x0bu, 0u, 0u) == 0, "second qrtr lookup failed");
+	annibale_qrtr_fresh();
+	check(srv0_after.arrived == 1 && srv0_after.node == 0u && srv0_after.port == 11u,
+	    "annibale_qrtr_attach(NULL) must not wipe node 0 server owned by qrtr_links");
+	annibale_qrtr.close(p1);
+
+	/* Now detaching node 0 itself must clear node 0 server. */
+	annibale_qrtr_attach_node(0u, NULL);
+	annibale_qrtr_attach_node(3u, NULL);
+	annibale_qrtr_counts(&counts);
+	check(counts.services == 0u, "detaching both node 0 and node 3 must leave 0 services (got %u)", counts.services);
+	test_qrtr_local_servers();
+}

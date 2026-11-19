@@ -120,6 +120,61 @@
 	return self;
 }
 
+- (instancetype)initWithDevice:(AnnibaleMetalDevice *)device
+		     iosurface:(void *)surface
+{
+	static size_t (*get_alloc_size)(void *);
+	static void *(*get_base_address)(void *);
+	static dispatch_once_t once;
+	char why[256] = { 0 };
+	struct rwa_buffer *own = NULL;
+	size_t alloc_size;
+	void *base;
+	uint32_t surface_id;
+
+	self = [super init];
+	if (self == nil) {
+		return nil;
+	}
+	dispatch_once(&once, ^{
+		*(void **)&get_alloc_size = dlsym(RTLD_DEFAULT, "IOSurfaceGetAllocSize");
+		*(void **)&get_base_address = dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddress");
+	});
+	if (surface == NULL || get_alloc_size == NULL || !mesa_available() ||
+	    [device mesaDevice] == NULL) {
+		[self release];
+		return nil;
+	}
+	alloc_size = get_alloc_size(surface);
+	if (alloc_size == 0 || alloc_size > UINT32_MAX) {
+		[self release];
+		return nil;
+	}
+	base = get_base_address != NULL ? get_base_address(surface) : NULL;
+	surface_id = ann_surface_id(surface);
+	if (surface_id != 0 && mesa.buffer_from_surface != NULL) {
+		own = mesa.buffer_from_surface([device mesaDevice], (int)surface_id, alloc_size,
+					       why, sizeof(why));
+	}
+	if (own == NULL && base != NULL && mesa.buffer_from_memory != NULL) {
+		NSUInteger page_size = (alloc_size + 4095) & ~(NSUInteger)4095;
+		own = mesa.buffer_from_memory([device mesaDevice], base, page_size,
+					      why, sizeof(why));
+	}
+	if (own == NULL) {
+		rw_print("newBufferWithIOSurface %p (%zu bytes, id %u): %s\n", surface, alloc_size,
+			 surface_id, why[0] ? why : "surface import unavailable");
+		[self release];
+		return nil;
+	}
+	_mesa = own;
+	_owner = device;
+	_length = alloc_size;
+	_contents = base != NULL ? base : mesa.buffer_map(own);
+	_iosurface = CFRetain(surface);
+	return self;
+}
+
 - (void)dealloc
 {
 	/* The caller handed us its own memory and an expectation to be told when we are done with it:
@@ -149,6 +204,10 @@
 			rw_print("rwa dealloc: destroyed %llu mesa %p\n",
 				 (unsigned long long)dealloc_n, _mesa);
 		}
+		if (_iosurface != NULL) {
+			CFRelease(_iosurface);
+			_iosurface = NULL;
+		}
 		[super dealloc];
 		return;
 	}
@@ -163,6 +222,10 @@
 		IOConnectCallStructMethod(_gpu, kDrmGemClose, &request, sizeof(request), &request,
 					  &size);
 	}
+	if (_iosurface != NULL) {
+		CFRelease(_iosurface);
+		_iosurface = NULL;
+	}
 	[super dealloc];
 }
 
@@ -171,6 +234,7 @@
 - (id)device                { return _owner; }
 - (uint64_t)gpuAddress      { return _iova; }
 - (NSUInteger)allocatedSize { return _length; }
+- (IOSurfaceRef)iosurface   { return (IOSurfaceRef)_iosurface; }
 
 /* The memory is write-combined and the GPU reads it through no cache of ours, so there is
  * nothing to push out; saying so is not the same as doing nothing by accident. */
@@ -290,10 +354,37 @@
 - (struct rwa_compute *)compute { return _compute; }
 - (BOOL)groupFree { return _info.group_free != 0; }
 
+- (void)ensureLimitsMaterialized
+{
+	if (__atomic_load_n(&_limitsMaterialized, __ATOMIC_ACQUIRE) != 0)
+		return;
+	if (_compute == NULL || mesa.compute_materialize == NULL)
+		return;
+	char why[512] = { 0 };
+	struct rwa_compute_info mat = { 0 };
+	if (mesa.compute_materialize(_compute, &mat, why, sizeof(why)) != 0) {
+		static unsigned materialize_logged;
+		if (__atomic_fetch_add(&materialize_logged, 1, __ATOMIC_RELAXED) < 16)
+			rw_print("compute materialize refused: %s\n", why);
+		return;
+	}
+	__atomic_store_n(&_info.max_threads_per_group, mat.max_threads_per_group, __ATOMIC_RELAXED);
+	__atomic_store_n(&_info.thread_execution_width, mat.thread_execution_width, __ATOMIC_RELAXED);
+	__atomic_store_n(&_limitsMaterialized, 1u, __ATOMIC_RELEASE);
+}
+
 /* The three the base class answers with nothing at all (docs/metal.md 10.8), so they can
  * only come from whoever compiled the shader -- which is why the contract carries them. */
-- (NSUInteger)maxTotalThreadsPerThreadgroup { return _info.max_threads_per_group; }
-- (NSUInteger)threadExecutionWidth          { return _info.thread_execution_width; }
+- (NSUInteger)maxTotalThreadsPerThreadgroup
+{
+	[self ensureLimitsMaterialized];
+	return __atomic_load_n(&_info.max_threads_per_group, __ATOMIC_ACQUIRE);
+}
+- (NSUInteger)threadExecutionWidth
+{
+	[self ensureLimitsMaterialized];
+	return __atomic_load_n(&_info.thread_execution_width, __ATOMIC_ACQUIRE);
+}
 - (NSUInteger)staticThreadgroupMemoryLength { return _info.static_shared_bytes; }
 - (NSUInteger)imageblockMemoryLengthForDimensions:(MTLSize)dimensions
 {

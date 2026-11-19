@@ -54,12 +54,18 @@ struct annibale_qrtr_port {
 static LCK_GRP_DECLARE(qrtr_lock_group, "annibale-qrtr");
 static LCK_MTX_DECLARE(qrtr_lock, &qrtr_lock_group);    /* the tables below */
 static LCK_MTX_DECLARE(qrtr_calling, &qrtr_lock_group); /* held by the link's thread around a callback */
-static struct annibale_qrtr_port qrtr_ports[16];
+static struct annibale_qrtr_port qrtr_ports[24];
 static struct {
 	uint32_t service, instance, node, port;
 	bool there;
-} qrtr_servers[64];
-static uint32_t qrtr_peer;                      /* the other side's node; 0: it has not said */
+} qrtr_servers[96];
+#define QRTR_MAX_LOCAL_SERVERS  16
+static struct {
+	uint32_t service, instance, port;
+	bool active;
+} qrtr_local_servers[QRTR_MAX_LOCAL_SERVERS];
+#define QRTR_NODE_NONE          (~0u)
+static uint32_t qrtr_peer = QRTR_NODE_NONE;      /* the other side's node; QRTR_NODE_NONE: unset */
 static uint32_t qrtr_next_port = QRTR_FIRST_PORT, qrtr_in, qrtr_out, qrtr_hellos, qrtr_dropped;
 static thread_t calling_thread;                 /* the link's thread, while it holds qrtr_calling */
 static int (*link_send)(const void *data, uint32_t length);
@@ -149,10 +155,41 @@ qrtr_tell(uint32_t service, uint32_t instance, uint32_t node, uint32_t port, boo
 	}
 }
 
+/* Announce all active local servers to a peer node after HELLO exchange. */
+static void
+qrtr_announce_local_to(uint32_t peer_node)
+{
+	struct {
+		uint32_t service, instance, port;
+	} snap[QRTR_MAX_LOCAL_SERVERS];
+	unsigned count = 0;
+
+	lck_mtx_lock(&qrtr_lock);
+	for (unsigned i = 0; i < QRTR_MAX_LOCAL_SERVERS; i++) {
+		if (qrtr_local_servers[i].active) {
+			snap[count].service = qrtr_local_servers[i].service;
+			snap[count].instance = qrtr_local_servers[i].instance;
+			snap[count].port = qrtr_local_servers[i].port;
+			count++;
+		}
+	}
+	lck_mtx_unlock(&qrtr_lock);
+
+	for (unsigned i = 0; i < count; i++) {
+		struct qrtr_control srv = {
+			.command = QRTR_NEW_SERVER,
+			.words = { snap[i].service, snap[i].instance, QRTR_US, snap[i].port },
+		};
+		int err = qrtr_out_packet(QRTR_NEW_SERVER, QRTR_CONTROL, peer_node, QRTR_CONTROL, &srv, sizeof(srv));
+		printf("qrtr: announce local svc %u (%#x) inst %#x port %#x -> node %u: %s (err=%d)\n",
+		    snap[i].service, snap[i].service, snap[i].instance, snap[i].port, peer_node,
+		    err == 0 ? "SENT" : "ERR", err);
+	}
+}
+
 /*
- * The control port's part: Linux's name service, without services of our own to tell of. A lookup from the other
- * side is said; with qrtr_answer=1 it is answered as Linux's ns.c answers one it has nothing for: the terminating
- * "new server" of all zeros, a data message from the control port to the port that asked.
+ * The control port's part: Linux's name service, advertising local services after HELLO and
+ * answering lookups with matching local servers plus the terminating all-zero NEW_SERVER.
  */
 static void
 qrtr_control(const struct qrtr_header *header, const struct qrtr_control *control)
@@ -168,16 +205,29 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
 		for (unsigned i = 0; i < QRTR_MAX_LINKS; i++) {
 			if (qrtr_links[i].active && qrtr_links[i].node == header->from_node) {
 				already = qrtr_links[i].hello_answered;
-				qrtr_links[i].hello_answered = true;
 				break;
 			}
 		}
 		lck_mtx_unlock(&qrtr_lock);
-		if (already || qrtr_hellos++ > 8) {
+		if (already || qrtr_hellos > 8) {
 			break;                                  /* (answered once per peer node) */
 		}
 		error = qrtr_out_packet(QRTR_HELLO, QRTR_CONTROL, header->from_node, QRTR_CONTROL, &hello, sizeof(hello));
+		if (error == 0) {
+			qrtr_hellos++;
+			lck_mtx_lock(&qrtr_lock);
+			for (unsigned i = 0; i < QRTR_MAX_LINKS; i++) {
+				if (qrtr_links[i].active && qrtr_links[i].node == header->from_node) {
+					qrtr_links[i].hello_answered = true;
+					break;
+				}
+			}
+			lck_mtx_unlock(&qrtr_lock);
+		}
 		printf("qrtr: HELLO FROM NODE %u; ours to it: %s\n", header->from_node, error == 0 ? "SENT" : "NOT SENT");
+		if (error == 0) {
+			qrtr_announce_local_to(header->from_node);
+		}
 		break;
 	}
 	case QRTR_NEW_SERVER:
@@ -222,13 +272,47 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
 		break;
 	case QRTR_NEW_LOOKUP: {
 		struct qrtr_control end = { .command = QRTR_NEW_SERVER };
+		struct {
+			uint32_t service, instance, port;
+		} matches[QRTR_MAX_LOCAL_SERVERS];
+		unsigned nmatch = 0;
 		uint32_t answer = 0;
+		bool should_answer;
 
 		(void)PE_parse_boot_argn("qrtr_answer", &answer, sizeof(answer));
-		error = answer ? qrtr_out_packet(QRTR_DATA, QRTR_CONTROL, header->from_node, header->from_port, &end, sizeof(end)) : 0;
-		printf("qrtr: node %u port %u looks up service %u (%#x), instance %#x: %s\n", header->from_node, header->from_port,
-		    control->words[0], control->words[0], control->words[1],
-		    !answer ? "not answered (qrtr_answer=1 answers it)" : error == 0 ? "none here, said so" : "the answer was not sent");
+		lck_mtx_lock(&qrtr_lock);
+		for (unsigned i = 0; i < QRTR_MAX_LOCAL_SERVERS; i++) {
+			if (qrtr_local_servers[i].active &&
+			    qrtr_local_servers[i].service == control->words[0] &&
+			    (control->words[1] == 0 || qrtr_local_servers[i].instance == control->words[1])) {
+				matches[nmatch].service = qrtr_local_servers[i].service;
+				matches[nmatch].instance = qrtr_local_servers[i].instance;
+				matches[nmatch].port = qrtr_local_servers[i].port;
+				nmatch++;
+			}
+		}
+		lck_mtx_unlock(&qrtr_lock);
+		/* MPSS (node 0) sends QRTR_NEW_LOOKUP during bringup and expects matching servers plus the zero terminator. */
+		should_answer = (answer != 0 || header->from_node == 0 || nmatch > 0);
+		error = 0;
+		if (should_answer) {
+			for (unsigned i = 0; i < nmatch && error == 0; i++) {
+				struct qrtr_control hit = {
+					.command = QRTR_NEW_SERVER,
+					.words = { matches[i].service, matches[i].instance, QRTR_US, matches[i].port },
+				};
+				error = qrtr_out_packet(QRTR_DATA, QRTR_CONTROL, header->from_node, header->from_port,
+				    &hit, sizeof(hit));
+			}
+			if (error == 0) {
+				error = qrtr_out_packet(QRTR_DATA, QRTR_CONTROL, header->from_node, header->from_port,
+				    &end, sizeof(end));
+			}
+		}
+		printf("qrtr: node %u port %u looks up service %u (%#x), instance %#x: %u local, %s\n",
+		    header->from_node, header->from_port, control->words[0], control->words[0], control->words[1],
+		    nmatch, !should_answer ? "not answered (qrtr_answer=1 answers it)" :
+		    error == 0 ? "answered" : "the answer was not sent");
 		break;
 	}
 	default:
@@ -270,7 +354,7 @@ qrtr_input(const uint8_t *data, uint32_t length)
 		return;
 	}
 	qrtr_in++;
-	if (qrtr_peer == 0) {
+	if (qrtr_peer == QRTR_NODE_NONE) {
 		qrtr_peer = header.from_node;
 	}
 	if (header.type == QRTR_RESUME_TX) {
@@ -388,7 +472,14 @@ static void
 qrtr_close(struct annibale_qrtr_port *port)
 {
 	struct qrtr_control gone = { .command = QRTR_DEL_CLIENT, .words = { QRTR_US, port ? port->number : 0 } };
+	struct {
+		uint32_t service, instance;
+	} owned[QRTR_MAX_LOCAL_SERVERS];
+	unsigned owned_count = 0;
 	bool outside = current_thread() != calling_thread;
+	uint32_t peers[QRTR_MAX_LINKS + 1];
+	unsigned peer_count = 0;
+	uint32_t pnum;
 
 	if (port == NULL || port->number == 0) {
 		return;
@@ -397,14 +488,117 @@ qrtr_close(struct annibale_qrtr_port *port)
 		lck_mtx_lock(&qrtr_calling);            /* (a callback of the port's that is running ends first) */
 	}
 	lck_mtx_lock(&qrtr_lock);
+	pnum = port->number;
+	gone.words[1] = pnum;
 	port->number = 0;
+	for (unsigned i = 0; i < QRTR_MAX_LOCAL_SERVERS; i++) {
+		if (qrtr_local_servers[i].active && qrtr_local_servers[i].port == pnum) {
+			owned[owned_count].service = qrtr_local_servers[i].service;
+			owned[owned_count].instance = qrtr_local_servers[i].instance;
+			owned_count++;
+			qrtr_local_servers[i].active = false;
+		}
+	}
+	for (unsigned i = 0; i < QRTR_MAX_LINKS; i++) {
+		if (qrtr_links[i].active && qrtr_links[i].send != NULL) {
+			peers[peer_count++] = qrtr_links[i].node;
+		}
+	}
+	if (qrtr_peer != QRTR_NODE_NONE) {
+		bool seen = false;
+		for (unsigned i = 0; i < peer_count; i++) {
+			if (peers[i] == qrtr_peer) {
+				seen = true;
+				break;
+			}
+		}
+		if (!seen && link_send != NULL) {
+			peers[peer_count++] = qrtr_peer;
+		}
+	}
 	lck_mtx_unlock(&qrtr_lock);
 	if (outside) {
 		lck_mtx_unlock(&qrtr_calling);
 	}
-	if (qrtr_peer != 0) {
-		qrtr_out_packet(QRTR_DEL_CLIENT, gone.words[1], qrtr_peer, QRTR_CONTROL, &gone, sizeof(gone));
+	for (unsigned i = 0; i < peer_count; i++) {
+		for (unsigned s = 0; s < owned_count; s++) {
+			struct qrtr_control del = {
+				.command = QRTR_DEL_SERVER,
+				.words = { owned[s].service, owned[s].instance, QRTR_US, pnum },
+			};
+			qrtr_out_packet(QRTR_DEL_SERVER, QRTR_CONTROL, peers[i], QRTR_CONTROL, &del, sizeof(del));
+		}
+		qrtr_out_packet(QRTR_DEL_CLIENT, pnum, peers[i], QRTR_CONTROL, &gone, sizeof(gone));
 	}
+}
+
+int
+annibale_qrtr_publish(struct annibale_qrtr_port *port, uint32_t service, uint32_t version, uint32_t instance)
+{
+	uint32_t wire_inst = (version & 0xffu) | (instance << 8);
+	uint32_t peers[QRTR_MAX_LINKS + 1];
+	unsigned peer_count = 0;
+	int slot = -1;
+	uint32_t pnum;
+
+	if (port == NULL || service == 0) {
+		return EINVAL;
+	}
+	lck_mtx_lock(&qrtr_lock);
+	pnum = port->number;
+	if (pnum == 0) {
+		lck_mtx_unlock(&qrtr_lock);
+		return EINVAL;
+	}
+	for (unsigned i = 0; i < QRTR_MAX_LOCAL_SERVERS; i++) {
+		if (qrtr_local_servers[i].active &&
+		    qrtr_local_servers[i].service == service &&
+		    qrtr_local_servers[i].instance == wire_inst &&
+		    qrtr_local_servers[i].port == pnum) {
+			slot = (int)i;
+			break;
+		}
+		if (!qrtr_local_servers[i].active && slot < 0) {
+			slot = (int)i;
+		}
+	}
+	if (slot < 0) {
+		lck_mtx_unlock(&qrtr_lock);
+		return ENOSPC;
+	}
+	qrtr_local_servers[slot].service = service;
+	qrtr_local_servers[slot].instance = wire_inst;
+	qrtr_local_servers[slot].port = pnum;
+	qrtr_local_servers[slot].active = true;
+	for (unsigned i = 0; i < QRTR_MAX_LINKS; i++) {
+		if (qrtr_links[i].active && qrtr_links[i].hello_answered && qrtr_links[i].send != NULL) {
+			peers[peer_count++] = qrtr_links[i].node;
+		}
+	}
+	if (qrtr_peer != QRTR_NODE_NONE && qrtr_hellos > 0 && link_send != NULL) {
+		bool seen = false;
+		for (unsigned i = 0; i < peer_count; i++) {
+			if (peers[i] == qrtr_peer) {
+				seen = true;
+				break;
+			}
+		}
+		if (!seen) {
+			peers[peer_count++] = qrtr_peer;
+		}
+	}
+	lck_mtx_unlock(&qrtr_lock);
+
+	for (unsigned i = 0; i < peer_count; i++) {
+		struct qrtr_control srv = {
+			.command = QRTR_NEW_SERVER,
+			.words = { service, wire_inst, QRTR_US, pnum },
+		};
+		int err = qrtr_out_packet(QRTR_NEW_SERVER, QRTR_CONTROL, peers[i], QRTR_CONTROL, &srv, sizeof(srv));
+		printf("qrtr: publish local svc %u (%#x) inst %#x port %#x -> node %u: %s (err=%d)\n",
+		    service, service, wire_inst, pnum, peers[i], err == 0 ? "SENT" : "ERR", err);
+	}
+	return 0;
 }
 
 const struct annibale_qrtr_ops annibale_qrtr = { .open = qrtr_open, .send = qrtr_send, .lookup = qrtr_lookup, .close = qrtr_close };
@@ -414,14 +608,24 @@ annibale_qrtr_attach(int (*send)(const void *data, uint32_t length))
 {
 	lck_mtx_lock(&qrtr_lock);
 	link_send = send;
-	if (send == NULL) {
-		for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
-			if (qrtr_servers[i].node == qrtr_peer) {
-				qrtr_servers[i].there = false;
+	if (send == NULL && qrtr_peer != QRTR_NODE_NONE) {
+		bool owned_by_link = false;
+		for (unsigned i = 0; i < QRTR_MAX_LINKS; i++) {
+			if (qrtr_links[i].active && qrtr_links[i].node == qrtr_peer) {
+				owned_by_link = true;
+				break;
+			}
+		}
+		if (!owned_by_link) {
+			for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
+				if (qrtr_servers[i].node == qrtr_peer) {
+					qrtr_servers[i].there = false;
+				}
 			}
 		}
 	}
-	qrtr_peer = qrtr_hellos = qrtr_in = qrtr_out = 0;
+	qrtr_peer = QRTR_NODE_NONE;
+	qrtr_hellos = qrtr_in = qrtr_out = 0;
 	lck_mtx_unlock(&qrtr_lock);
 }
 
@@ -430,6 +634,7 @@ annibale_qrtr_attach_node(uint32_t peer_node, int (*send)(const void *data, uint
 {
 	struct qrtr_control hello = { .command = QRTR_HELLO };
 	int slot = -1;
+	bool already_answered = false;
 
 	lck_mtx_lock(&qrtr_lock);
 	for (unsigned i = 0; i < QRTR_MAX_LINKS; i++) {
@@ -442,10 +647,15 @@ annibale_qrtr_attach_node(uint32_t peer_node, int (*send)(const void *data, uint
 		}
 	}
 	if (slot >= 0) {
+		bool same = qrtr_links[slot].active && qrtr_links[slot].node == peer_node &&
+		    qrtr_links[slot].send == send;
+		already_answered = same && qrtr_links[slot].hello_answered;
 		qrtr_links[slot].node = peer_node;
 		qrtr_links[slot].send = send;
 		qrtr_links[slot].active = (send != NULL);
-		qrtr_links[slot].hello_answered = false;
+		if (!same) {
+			qrtr_links[slot].hello_answered = false;
+		}
 	}
 	if (link_send == NULL && send != NULL) {
 		link_send = send;
@@ -458,8 +668,10 @@ annibale_qrtr_attach_node(uint32_t peer_node, int (*send)(const void *data, uint
 		}
 	}
 	lck_mtx_unlock(&qrtr_lock);
-	if (send != NULL) {
-		qrtr_out_packet(QRTR_HELLO, QRTR_CONTROL, peer_node, QRTR_CONTROL, &hello, sizeof(hello));
+	if (send != NULL && !already_answered) {
+		int err = qrtr_out_packet(QRTR_HELLO, QRTR_CONTROL, peer_node, QRTR_CONTROL, &hello, sizeof(hello));
+		printf("qrtr: attached node %u; HELLO to it: %s (err=%d)\n",
+		    peer_node, err == 0 ? "SENT" : "DEFERRED", err);
 	}
 }
 

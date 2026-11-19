@@ -159,7 +159,6 @@ rw_stitch_dump_linked(id descriptor)
  * constant values kept for the translator. Everything else goes to the function underneath,
  * bitcodeData included.
  */
-#include <CommonCrypto/CommonDigest.h>
 #include <stdbool.h>
 #include <sys/stat.h>
 
@@ -170,6 +169,8 @@ rw_stitch_dump_linked(id descriptor)
 	NSString *_name;
 	id _constantValues;
 	NSData *_cachedBitcode;
+	BOOL _hasCachedBitCodeHash;
+	uint8_t _cachedBitCodeHash[32];
 }
 - (instancetype)initWithFunction:(id)function name:(NSString *)name constantValues:(id)values;
 - (instancetype)initWithFunction:(id)function name:(NSString *)name constantValues:(id)values
@@ -177,7 +178,10 @@ rw_stitch_dump_linked(id descriptor)
 - (id)annibaleConstantValues;
 - (id)annibaleUnspecializedFunction;
 - (NSData *)bitcodeData;
+- (const uint8_t *)bitCodeHash;
 @end
+
+#include <CommonCrypto/CommonDigest.h>
 
 @implementation AnnibaleMetalSpecializedFunction
 
@@ -189,6 +193,24 @@ rw_stitch_dump_linked(id descriptor)
 		_name = [name copy];
 		_constantValues = [values retain];
 		_cachedBitcode = [bitcode retain];
+		NSUInteger len = [_cachedBitcode length];
+		if (len > 0) {
+			CC_SHA256_CTX ctx;
+			const uint8_t *bytes = (const uint8_t *)[_cachedBitcode bytes];
+			NSUInteger offset = 0;
+
+			_Static_assert(sizeof(_cachedBitCodeHash) == CC_SHA256_DIGEST_LENGTH,
+				       "bitCodeHash digest length mismatch");
+			CC_SHA256_Init(&ctx);
+			while (offset < len) {
+				NSUInteger remain = len - offset;
+				CC_LONG chunk = remain > UINT32_MAX ? UINT32_MAX : (CC_LONG)remain;
+				CC_SHA256_Update(&ctx, bytes + offset, chunk);
+				offset += chunk;
+			}
+			CC_SHA256_Final(_cachedBitCodeHash, &ctx);
+			_hasCachedBitCodeHash = YES;
+		}
 	} @catch (id exception) {
 		(void)exception;
 		[self release];
@@ -223,6 +245,15 @@ rw_stitch_dump_linked(id descriptor)
 		return ((NSData *(*)(id, SEL))objc_msgSend)(_function, sel);
 	return nil;
 }
+- (const uint8_t *)bitCodeHash
+{
+	if (_hasCachedBitCodeHash)
+		return _cachedBitCodeHash;
+	SEL sel = sel_getUid("bitCodeHash");
+	if ([_function respondsToSelector:sel])
+		return ((const uint8_t *(*)(id, SEL))objc_msgSend)(_function, sel);
+	return NULL;
+}
 - (id)forwardingTargetForSelector:(SEL)sel
 {
 	(void)sel;
@@ -242,6 +273,8 @@ rw_stitch_dump_linked(id descriptor)
 		return _cachedBitcode == nil;
 	if (sel == sel_getUid("bitcodeData"))
 		return _cachedBitcode != nil || [_function respondsToSelector:sel];
+	if (sel == sel_getUid("bitCodeHash"))
+		return _hasCachedBitCodeHash || [_function respondsToSelector:sel];
 	return sel == @selector(annibaleConstantValues) || [_function respondsToSelector:sel];
 }
 - (BOOL)isKindOfClass:(Class)cls { return [_function isKindOfClass:cls]; }
@@ -525,70 +558,89 @@ rw_specialize_by_proxy(id function, NSString *name, NSString *specialized, id va
 }
 
 static id
-rw_library_finish_specialization(id library, id function, NSString *name, NSString *specialized,
-				 id values, id descriptor, NSError *why)
+rw_library_specialize(id library, SEL _cmd, id descriptor, NSString *name, NSString *specialized,
+		      id values, NSError **error)
 {
 	id base = nil;
+	id function = nil;
+	NSString *cache_key = nil;
+	NSError *why = nil;
+	BOOL lookup_done = NO;
+
 	@try {
-		base = name != nil
-		    ? rw_library_function_with_name(library, @selector(newFunctionWithName:), name) : nil;
-		NSString *cache_key = rw_air_cache_key(base, name, specialized, values, descriptor);
-		if (function != nil) {
-			SEL bitcode = sel_getUid("bitcodeData");
-			if (cache_key != nil && [function respondsToSelector:bitcode]) {
-				NSData *bc = ((NSData *(*)(id, SEL))objc_msgSend)(function, bitcode);
-				if (bc != nil && [bc length] > 0)
-					rw_air_cache_store(cache_key, bc);
+		@try {
+			if (descriptor != nil) {
+				name = [descriptor name];
+				specialized = [descriptor respondsToSelector:@selector(specializedName)]
+				    ? [descriptor specializedName] : nil;
+				values = [descriptor respondsToSelector:@selector(constantValues)]
+				    ? [descriptor constantValues] : nil;
 			}
-		} else {
+			lookup_done = YES;
+			base = name != nil
+			    ? rw_library_function_with_name(library, @selector(newFunctionWithName:), name)
+			    : nil;
+			cache_key = rw_air_cache_key(base, name, specialized, values, descriptor);
 			NSData *cached = cache_key != nil ? rw_air_cache_lookup(cache_key) : nil;
-			if (cached == nil) {
-				NSString *legacy_key = rw_air_cache_legacy_key(library, name, specialized, values);
-				cached = rw_air_cache_lookup(legacy_key);
+			if (cached != nil) {
+				function = rw_specialize_by_proxy(base, name, specialized, values,
+								  descriptor != nil ? descriptor : name,
+								  nil, cached);
+				if (function != nil)
+					return function;
 			}
-			function = rw_specialize_by_proxy(base, name, specialized, values,
-						  descriptor != nil ? descriptor : name, why, cached);
+		} @catch (id exception) {
+			/* Cache pre-lookup failures fall back to native specialization. */
+			(void)exception;
 		}
-	} @catch (id exception) {
-		/* Cache failures preserve the original specialization result. */
-		(void)exception;
+
+		function = descriptor != nil
+		    ? rw_library_function_with_descriptor(library, _cmd, descriptor, &why)
+		    : rw_library_function_with_constants(library, _cmd, name, values, &why);
+
+		@try {
+			if (!lookup_done && name != nil) {
+				base = rw_library_function_with_name(library, @selector(newFunctionWithName:),
+								     name);
+				cache_key = rw_air_cache_key(base, name, specialized, values, descriptor);
+			}
+			if (function != nil) {
+				SEL bitcode = sel_getUid("bitcodeData");
+				if (cache_key != nil && [function respondsToSelector:bitcode]) {
+					NSData *bc = ((NSData *(*)(id, SEL))objc_msgSend)(function, bitcode);
+					if (bc != nil && [bc length] > 0)
+						rw_air_cache_store(cache_key, bc);
+				}
+			} else {
+				NSString *legacy_key = rw_air_cache_legacy_key(library, name, specialized, values);
+				NSData *cached = rw_air_cache_lookup(legacy_key);
+				function = rw_specialize_by_proxy(base, name, specialized, values,
+								  descriptor != nil ? descriptor : name,
+								  why, cached);
+			}
+		} @catch (id exception) {
+			/* Cache failures preserve the original specialization result. */
+			(void)exception;
+		}
 	} @finally {
 		[base release];
 	}
+	if (function == nil && error != NULL)
+		*error = why;
 	return function;
 }
 
 static id
 rw_library_new_function_with_descriptor(id self, SEL _cmd, id descriptor, NSError **error)
 {
-	NSError *why = nil;
-	id function = rw_library_function_with_descriptor(self, _cmd, descriptor, &why);
-	@try {
-		NSString *name = [descriptor name];
-		NSString *specialized = [descriptor respondsToSelector:@selector(specializedName)]
-		    ? [descriptor specializedName] : nil;
-		id values = [descriptor respondsToSelector:@selector(constantValues)]
-		    ? [descriptor constantValues] : nil;
-		function = rw_library_finish_specialization(self, function, name, specialized, values,
-						    descriptor, why);
-	} @catch (id exception) {
-		(void)exception;
-	}
-	if (function == nil && error != NULL)
-		*error = why;
-	return function;
+	return rw_library_specialize(self, _cmd, descriptor, nil, nil, nil, error);
 }
 
 static id
 rw_library_new_function_with_constants(id self, SEL _cmd, NSString *name, id values,
 				       NSError **error)
 {
-	NSError *why = nil;
-	id function = rw_library_function_with_constants(self, _cmd, name, values, &why);
-	function = rw_library_finish_specialization(self, function, name, nil, values, nil, why);
-	if (function == nil && error != NULL)
-		*error = why;
-	return function;
+	return rw_library_specialize(self, _cmd, nil, name, nil, values, error);
 }
 
 /* Once per process, on the first device: _MTLLibrary's two specializing calls, which send what

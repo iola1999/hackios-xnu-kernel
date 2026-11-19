@@ -201,7 +201,14 @@ cam_hardware_power_up(void)
 		camcc_base = ml_io_map(CAMCC_PHYS, CAMCC_SIZE);
 		cci0_base = ml_io_map(CCI0_PHYS, CCI0_SIZE);
 		csid_lite_base = ml_io_map(CSID_LITE0_PHYS, CSID_LITE0_SIZE);
-		camnoc_rt_base = ml_io_map(CAMNOC_RT_PHYS, CAMNOC_RT_SIZE);
+		if (boot_cam_probe != 0 || boot_cam_bcm != 0) {
+			camnoc_rt_base = ml_io_map(CAMNOC_RT_PHYS, CAMNOC_RT_SIZE);
+		}
+		if (boot_cam_probe != 0) {
+			camnoc_nrt_base = ml_io_map(CAMNOC_NRT_PHYS, CAMNOC_NRT_SIZE);
+			cam_hf_qtb_base = ml_io_map(CAM_HF_QTB_PHYS, CAM_HF_QTB_SIZE);
+			mmss_noc_base = ml_io_map(MMSS_NOC_PHYS, MMSS_NOC_SIZE);
+		}
 		tlmm_base = ml_io_map(TLMM_PHYS, TLMM_SIZE);
 	}
 	if (gcc_base == 0 || mclkcc_base == 0 || cpas_base == 0 || camcc_base == 0 ||
@@ -254,6 +261,10 @@ cam_hardware_power_up(void)
 	bool cpas_ahb_ok = false;
 	bool core_ahb_ok = false;
 	bool cci0_clk_ok = false;
+	bool gcc_cam_sf_axi_ok = false;
+	bool cam_rt_axi_ok = false;
+	gcc_cam_hf_axi_ok = false;
+	cam_nrt_axi_ok = false;
 	cam_ife_lite_clks_on = false;
 
 	if (camcc_base != 0 && gcc_cam_ahb_ok) {
@@ -281,8 +292,8 @@ cam_hardware_power_up(void)
 		}
 		if (titan_top_on && gcc_base != 0) {
 			/* Enable GCC HF/SF AXI after TITAN_TOP_GDSC un-gates downstream CLK_OFF. */
-			(void)cbcr_enable(gcc_base, GCC_CAMERA_HF_AXI_CBCR, true);
-			(void)cbcr_enable(gcc_base, GCC_CAMERA_SF_AXI_CBCR, true);
+			gcc_cam_hf_axi_ok = cbcr_enable(gcc_base, GCC_CAMERA_HF_AXI_CBCR, true);
+			gcc_cam_sf_axi_ok = cbcr_enable(gcc_base, GCC_CAMERA_SF_AXI_CBCR, true);
 		}
 
 		cpas_ahb_ok = cbcr_enable(camcc_base, CAMCC_CPAS_AHB_CBCR, true);
@@ -290,8 +301,8 @@ cam_hardware_power_up(void)
 		core_ahb_ok = cbcr_enable(camcc_base, CAMCC_CORE_AHB_CBCR, true);
 		(void)cbcr_enable(camcc_base, CAMCC_ICP_AHB_CBCR, true);
 		rcgr_enable_xo(camcc_base, CAMCC_CAMNOC_AXI_RT_CMD_RCGR, CAMCC_CAMNOC_AXI_RT_CFG_RCGR);
-		(void)cbcr_enable(camcc_base, CAMCC_CAMNOC_AXI_RT_CBCR, true);
-		(void)cbcr_enable(camcc_base, CAMCC_CAMNOC_AXI_NRT_CBCR, false);
+		cam_rt_axi_ok = cbcr_enable(camcc_base, CAMCC_CAMNOC_AXI_RT_CBCR, true);
+		cam_nrt_axi_ok = cbcr_enable(camcc_base, CAMCC_CAMNOC_AXI_NRT_CBCR, false);
 		(void)cbcr_enable(camcc_base, CAMCC_CAMNOC_DCD_XO_CBCR, true);
 		(void)cbcr_enable(camcc_base, CAMCC_CAMNOC_XO_CBCR, true);
 		(void)cbcr_enable(camcc_base, CAMCC_QDSS_DEBUG_XO_CBCR, true);
@@ -312,11 +323,20 @@ cam_hardware_power_up(void)
 	    camcc_base != 0 ? 1u : 0u, camcc_base != 0 && gcc_cam_ahb_ok ? 1u : 0u,
 	    titan_top_on ? 1u : 0u, cpas_ahb_ok ? 1u : 0u, core_ahb_ok ? 1u : 0u,
 	    cci0_clk_ok ? 1u : 0u, cam_ife_lite_clks_on ? 1u : 0u);
+	say("axi hf_ok=%u(0x%08x) sf_ok=%u(0x%08x) rt_ok=%u(0x%08x) nrt_ok=%u(0x%08x) fast_ahb=0x%08x\n",
+	    gcc_cam_hf_axi_ok ? 1u : 0u, gcc_base != 0 ? reg_rd(gcc_base, GCC_CAMERA_HF_AXI_CBCR) : 0u,
+	    gcc_cam_sf_axi_ok ? 1u : 0u, gcc_base != 0 ? reg_rd(gcc_base, GCC_CAMERA_SF_AXI_CBCR) : 0u,
+	    cam_rt_axi_ok ? 1u : 0u, camcc_base != 0 ? reg_rd(camcc_base, CAMCC_CAMNOC_AXI_RT_CBCR) : 0u,
+	    cam_nrt_axi_ok ? 1u : 0u, camcc_base != 0 ? reg_rd(camcc_base, CAMCC_CAMNOC_AXI_NRT_CBCR) : 0u,
+	    camcc_base != 0 ? reg_rd(camcc_base, CAMCC_CPAS_FAST_AHB_CBCR) : 0u);
 
-	/* 5. Read CAM-CPAS (0x0ac04000, HW_VERSION / HW_CAPABILITY) once clocked */
+	/* 5. Read CAM-CPAS (0x0ac04000, HW_VERSION / HW_CAPABILITY) and optionally init QChannel + QoS */
 	if (cpas_base != 0 && titan_top_on && cpas_ahb_ok && core_ahb_ok) {
 		cached_cpas_ver = reg_rd(cpas_base, 0x00u);
 		cached_cpas_cap = reg_rd(cpas_base, 0x04u);
+		if (boot_cam_bcm != 0) {
+			cam_diag_cpas_qos_init();
+		}
 	}
 
 	/* 6. Configure TLMM GPIOs and enable cambistmclkcc MCLK1 (Wide) & MCLK4 (Front) */
@@ -401,6 +421,9 @@ annibale_cam_open(dev_t dev __unused, int flags __unused, int devtype __unused, 
 {
 	lck_mtx_lock(cam_lock);
 	if (cam_is_open || cam_capture_resources_held()) {
+		say("open busy: open=%u state=%u flags=%#x err=%u reset_fail=%u submitted=%u\n",
+		    cam_is_open ? 1u : 0u, cam_capture.state, cam_capture.flags, cam_capture.error,
+		    cam_native_reset_failed ? 1u : 0u, cam_native_submitted ? 1u : 0u);
 		lck_mtx_unlock(cam_lock);
 		return EBUSY;
 	}
@@ -414,6 +437,7 @@ annibale_cam_open(dev_t dev __unused, int flags __unused, int devtype __unused, 
 	}
 	cam_is_open = true;
 	cam_session_probed = false;
+	cam_mid_sampled = false;
 	cam_frame_seq = 0;
 	lck_mtx_unlock(cam_lock);
 	return 0;
@@ -442,6 +466,8 @@ annibale_cam_close(dev_t dev __unused, int flags __unused, int devtype __unused,
 				}
 				bzero(&cam_capture, sizeof(cam_capture));
 				cam_hw_dma_verified = false;
+				cam_session_probed = false;
+				cam_mid_sampled = false;
 			}
 		}
 	}

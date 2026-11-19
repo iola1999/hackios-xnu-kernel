@@ -219,4 +219,32 @@ test_own_tables(void)
 		check_bytes(buffer, annibale_qmi_encode(QMI_REQUEST, 0x24, 9, none_ei, &nothing, buffer, sizeof(buffer)), empty, sizeof(empty), "an empty request");
 		check_bytes(buffer, annibale_qmi_encode(QMI_REQUEST, 0x24, 9, NULL, NULL, buffer, sizeof(buffer)), empty, sizeof(empty), "a request with no table");
 	}
+	/* UIM GET_CARD_STATUS TLV 0x10 (4 x uint16 indices + num_slots at [8]) & DMS operating mode */
+	{
+		bool annibale_qmi_uim_parse_card_status(const uint8_t *tlvs, size_t tlvs_len, uint8_t *card_state, uint8_t *app_state);
+		bool annibale_qmi_dms_parse_oper_mode(const uint8_t *tlvs, size_t tlvs_len, uint8_t *mode_out);
+		static const uint8_t uim_tlvs[] = {
+			0x02, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x10, 0x11, 0x00,
+			0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, /* 4 x u16 indices */
+			0x02,                                           /* num_slots = 2 (v[8]) */
+			0x01, 0x02, 0x00, 0x00, 0x00,                   /* card_state=1 (v[9]), upin, gw, 1x, err=0 */
+			0x01,                                           /* num_apps = 1 (v[14]) */
+			0x02, 0x07,                                     /* USIM (v[15]), READY (v[16]) */
+		};
+		static const uint8_t uim_absent[] = {
+			0x10, 0x0f, 0x00,
+			0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		};
+		static const uint8_t dms_tlvs[] = { 0x01, 0x01, 0x00, 0x03 };
+		uint8_t card = 99, app = 99, mode = 99;
+
+		check(annibale_qmi_uim_parse_card_status(uim_tlvs, sizeof(uim_tlvs), &card, &app) && card == 1 && app == 7,
+		    "uim TLV 0x10 parser must read card_state at [9] and app_state at [16]");
+		check(annibale_qmi_uim_parse_card_status(uim_absent, sizeof(uim_absent), &card, &app) && card == 0 && app == 0,
+		    "uim TLV 0x10 parser with absent card / 0 apps");
+		check(annibale_qmi_dms_parse_oper_mode(dms_tlvs, sizeof(dms_tlvs), &mode) && mode == 3,
+		    "dms GET_OPERATING_MODE TLV 0x01 parser");
+	}
 }

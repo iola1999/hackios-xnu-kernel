@@ -1,26 +1,61 @@
 diff --git a/bsd/kern/sys_work_interval.c b/bsd/kern/sys_work_interval.c
-index b544bf307dfe..85e34caf9f62 100644
+index b544bf307dfe..9d9533df643e 100644
 --- a/bsd/kern/sys_work_interval.c
 +++ b/bsd/kern/sys_work_interval.c
-@@ -265,6 +265,22 @@ work_interval_ctl(__unused proc_t p, struct work_interval_ctl_args *uap,
+@@ -37,6 +37,24 @@
+ #include <kern/work_interval.h>
+ 
+ #include <libkern/libkern.h>
++#include <os/atomic_private.h>
++
++extern void annibale_perfctl_work_interval(uint32_t op, uint32_t wi_type,
++    uint64_t start, uint64_t finish, uint64_t deadline);
++
++struct annibale_wi_instance {
++	uint64_t wi_id;
++	uint64_t instance_id;
++	uint64_t start;
++	uint64_t finish;
++	uint64_t deadline;
++	uint64_t complexity;
++	uint32_t create_flags;
++	uint32_t _pad;
++	uint8_t  telemetry[0x28];
++};
++
++static _Atomic uint64_t wi_next_instance_id = 0;
+ 
+ int
+ work_interval_ctl(__unused proc_t p, struct work_interval_ctl_args *uap,
+@@ -265,6 +283,32 @@ work_interval_ctl(__unused proc_t p, struct work_interval_ctl_args *uap,
  
  		break;
  
 +	case 6:
 +	case 7:
-+	case 8:
-+		/*
-+		 * (annibale) Not in the open source: what os_workgroup_interval_start(), _update() and
-+		 * _finish() of iOS send, for the performance controller, which is not here either.
-+		 * CoreAudio does it in every I/O cycle and logs an error each time it is refused: fifty
-+		 * lines a second from the audio server's real-time thread. For its threads, and only
-+		 * for them, there is nothing to do and nothing wrong. (The window server asks for its
-+		 * frames too, and is used to the refusal.)
-+		 */
-+		if (kern_work_interval_type_of_thread(current_thread()) == WORK_INTERVAL_TYPE_COREAUDIO) {
-+			return 0;
++	case 8: {
++		struct annibale_wi_instance inst;
++		uint32_t wi_type = WORK_INTERVAL_TYPE_LAST;
++
++		if (uap->arg == USER_ADDR_NULL || uap->len < 0x38 || uap->len > sizeof(inst)) {
++			return EINVAL;
 +		}
-+		return ENOTSUP;
++		bzero(&inst, sizeof(inst));
++		if ((error = copyin(uap->arg, &inst, uap->len)) != 0) {
++			return error;
++		}
++		if (kern_work_interval_lookup_type(current_thread(), uap->work_interval_id, &wi_type) != KERN_SUCCESS) {
++			return EINVAL;
++		}
++		if (operation == 6) {
++			uint64_t id = os_atomic_inc(&wi_next_instance_id, relaxed);
++			if ((error = copyout(&id, uap->arg + offsetof(struct annibale_wi_instance, instance_id), sizeof(id))) != 0) {
++				return error;
++			}
++		}
++		annibale_perfctl_work_interval(operation, wi_type, inst.start, inst.finish, inst.deadline);
++		return 0;
++	}
 +
  	default:
  		return ENOTSUP;

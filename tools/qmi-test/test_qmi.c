@@ -61,6 +61,7 @@ main(void)
 	} parts[] = {
 		{ "the coding, tables of our own, bytes by hand", test_own_tables },
 		{ "the helpers over a made-up router", test_helpers },
+		{ "multi-link qrtr including node 0 (mpss)", test_qrtr_multilink },
 	};
 
 	setvbuf(stdout, NULL, _IOLBF, 0);

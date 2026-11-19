@@ -1026,21 +1026,21 @@ annibale_qmi_check_result(const uint8_t *tlvs, size_t tlvs_len, uint16_t *out_er
 	return get_16(v) == 0;
 }
 
-/* UIM (0x0b) QMI_UIM_GET_CARD_STATUS (0x002F) TLV 0x10 parser. */
+/* UIM (0x0b) QMI_UIM_GET_CARD_STATUS (0x002F) TLV 0x10 parser (4 x uint16 indices, uint8 num_slots). */
 bool
 annibale_qmi_uim_parse_card_status(const uint8_t *tlvs, size_t tlvs_len, uint8_t *card_state, uint8_t *app_state)
 {
 	uint16_t len = 0;
 	const uint8_t *v = annibale_qmi_find_tlv(tlvs, tlvs_len, 0x10, &len);
 
-	if (v == NULL || len < 6 || v[4] == 0) {
+	if (v == NULL || len < 15 || v[8] == 0) {
 		return false;
 	}
 	if (card_state != NULL) {
-		*card_state = v[5];     /* 0 = absent, 1 = present, 2 = error */
+		*card_state = v[9];     /* 0 = absent, 1 = present, 2 = error */
 	}
 	if (app_state != NULL) {
-		*app_state = (len >= 13 && v[10] > 0) ? v[12] : 0; /* 7 = ready */
+		*app_state = (len >= 17 && v[14] > 0) ? v[16] : 0; /* 7 = ready */
 	}
 	return true;
 }

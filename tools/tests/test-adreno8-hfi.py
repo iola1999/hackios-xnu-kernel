@@ -299,6 +299,9 @@ static void absolutetime_to_nanoseconds(uint64_t a, uint64_t *n) { *n = a; }
 static bool annibale_gpu_temperature(int32_t *t) { *t = (int32_t)hot; return hot_read; }
 static uint64_t adreno8_retired_total, touched_at;
 static uint64_t annibale_cpufreq_touched(void) { return touched_at; }
+static bool perfctl_interactive_mock, gpu_focal_mock;
+bool annibale_perfctl_gpu_interactive_active(uint64_t now) { (void)now; return perfctl_interactive_mock; }
+bool annibale_gpu_focal_active(uint64_t now) { (void)now; return gpu_focal_mock; }
 static struct block adreno8_gmu;
 static uint32_t adreno8_step, adreno8_gx_count = 2;
 static uint32_t adreno8_speed_asked;
@@ -316,6 +319,8 @@ static bool adreno8_gmu_runs = true, adreno8_gmu_talks, wait_ok = true, vote_ok 
 static vm_offset_t adreno8_hfi_view_table = 1, adreno8_hfi_view_cmd = 1;
 static vm_offset_t adreno8_hfi_view_resp = 1, adreno8_hfi_view_debug = 1;
 static uint32_t version = 0x20070001, mask_written, sent[8][255], ids[8], lengths[8], send_count, fail_id;
+static unsigned wait_idle_calls;
+static bool context_idle_ok = true, gpu_idle_for_speed;
 
 #define BCM_COUNT 3
 #define GMU_GMU2HOST_CLR 0
@@ -329,6 +334,12 @@ static uint32_t version = 0x20070001, mask_written, sent[8][255], ids[8], length
 static int adreno8_say(const char *format, ...) { return 0; }
 #define printf adreno8_say
 static bool adreno8_cx_ready(void) { return true; }
+static bool __attribute__((unused)) adreno8_context_wait_idle(const char *what) {
+    assert(!strcmp(what, "GPU speed"));
+    wait_idle_calls++;
+    gpu_idle_for_speed = context_idle_ok;
+    return context_idle_ok;
+}
 static void adreno8_announce(const char *format, ...) {}
 static uint32_t adreno8_rd(vm_offset_t address) { return 0; }
 static void adreno8_put(struct block *b, const char *name, uint32_t offset, uint32_t value) {
@@ -365,6 +376,10 @@ static uint32_t adreno8_rpmh_lookup(const char *name, uint16_t *levels, unsigned
 static bool adreno8_hfi_send(uint32_t id, const uint32_t *payload, uint32_t words, const char *what) {
     assert(send_count < 8 && words <= 255);
     if (id == 30) assert(adreno8_reset_required);
+    if (id == 30 && adreno8_hfi_tables_sent) {
+        assert(gpu_idle_for_speed);
+        gpu_idle_for_speed = false;
+    }
     ids[send_count] = id; lengths[send_count] = words;
     if (words) memcpy(sent[send_count], payload, words * 4);
     send_count++;
@@ -459,18 +474,19 @@ int main(void) {
     adreno8_speed_floor = 1; adreno8_touch_ms = 300;
     for (unsigned i = 0; i < 4; i++) { adreno8_gx_hz[i] = i ? adreno8_boot_speeds[i - 1].hz : 0; }
     adreno8_gx_count = 4; adreno8_hfi_tables_sent = true; adreno8_reset_required = true; fail_id = 0;
-    adreno8_speed_asked = 1; send_count = 0; adreno8_retired_total = 1000000; adreno8_speed_tick(); assert(send_count == 0);
-    adreno8_speed_asked = 4; adreno8_speed_tick(); assert(send_count == 0);
-    adreno8_speed_asked = 3; adreno8_hfi_tables_sent = false; adreno8_speed_tick(); assert(send_count == 0);
-    adreno8_hfi_tables_sent = true; adreno8_speed_tick(); assert(send_count == 0);
-    clock_now += 100000000; adreno8_retired_total += 383999; adreno8_speed_tick(); assert(send_count == 0);
-    clock_now += 50000000; adreno8_retired_total += 384000; adreno8_speed_tick(); assert(send_count == 0);
+    wait_idle_calls = 0; context_idle_ok = true; gpu_idle_for_speed = false;
+    adreno8_speed_asked = 1; send_count = 0; adreno8_retired_total = 1000000; adreno8_speed_tick(); assert(send_count == 0 && wait_idle_calls == 0);
+    adreno8_speed_asked = 4; adreno8_speed_tick(); assert(send_count == 0 && wait_idle_calls == 0);
+    adreno8_speed_asked = 3; adreno8_hfi_tables_sent = false; adreno8_speed_tick(); assert(send_count == 0 && wait_idle_calls == 0);
+    adreno8_hfi_tables_sent = true; adreno8_speed_tick(); assert(send_count == 0 && wait_idle_calls == 0);
+    clock_now += 100000000; adreno8_retired_total += 383999; adreno8_speed_tick(); assert(send_count == 0 && wait_idle_calls == 0);
+    clock_now += 50000000; adreno8_retired_total += 384000; adreno8_speed_tick(); assert(send_count == 0 && wait_idle_calls == 0);
     clock_now += 50000000; adreno8_speed_tick();
-    assert(send_count == 1 && ids[0] == 30 && sent[0][0] == 1 && sent[0][1] == 3 && sent[0][2] == 3);
+    assert(send_count == 1 && wait_idle_calls == 1 && ids[0] == 30 && sent[0][0] == 1 && sent[0][1] == 3 && sent[0][2] == 3);
     /* 9 ms of 100 at 342 MHz would be 19 at 160: between the two limits, the speed stays, and light ticks before count no more. */
     for (unsigned i = 0; i < 3; i++) { clock_now += 100000000; adreno8_retired_total += 76800; adreno8_speed_tick(); }
     for (unsigned i = 0; i < 8; i++) { clock_now += 100000000; adreno8_retired_total += 172800; adreno8_speed_tick(); }
-    assert(send_count == 1);
+    assert(send_count == 1 && wait_idle_calls == 1);
     /* 4 ms of 100 at 342 MHz is 8.6 at 160: down once that lasted 500 ms. */
     for (unsigned i = 0; i < 5; i++) { clock_now += 100000000; adreno8_retired_total += 76800; adreno8_speed_tick(); }
     assert(send_count == 1);
@@ -498,6 +514,21 @@ int main(void) {
     assert(send_count == 1 && adreno8_speed_asked == 1);
     clock_now += 100000000; fail_id = 0; adreno8_speed_tick(); assert(send_count == 1);
     { uint32_t mhz, changes; adreno8_speed_state(&mhz, &changes); assert(mhz == 160 && changes == 8); }
+    /* Interactive work-interval and focal GPU submit lift idle level 1 to step_floor immediately. */
+    adreno8_gx_hz[4] = adreno8_boot_speeds[3].hz; adreno8_gx_count = 5;
+    adreno8_speed_asked = 4; adreno8_speed_limit = 4; adreno8_speed_now = 1;
+    touched_at = 0; send_count = 0;
+    clock_now += 10000000; perfctl_interactive_mock = true; adreno8_speed_tick();
+    assert(send_count == 1 && sent[0][1] == 3);
+    perfctl_interactive_mock = false; adreno8_speed_now = 1; send_count = 0;
+    clock_now += 10000000; gpu_focal_mock = true; adreno8_speed_tick();
+    assert(send_count == 1 && sent[0][1] == 3);
+    gpu_focal_mock = false;
+    /* Refused idle wait aborts the GX frequency switch without altering adreno8_speed_now. */
+    adreno8_speed_now = 1; send_count = 0; wait_idle_calls = 0; context_idle_ok = false;
+    clock_now += 100000000; touched_at = clock_now; adreno8_speed_tick();
+    assert(wait_idle_calls == 1 && send_count == 0 && adreno8_speed_now == 1);
+    context_idle_ok = true;
     puts("HFI version, perf/BW payloads, ACV threshold, AB=0, minimum DCVS and the load, touch and temperature speed rules: PASS");
 }
 '''
@@ -547,6 +578,7 @@ speed_mutations = [
     ("missing reading kept at speed", "if (!annibale_gpu_temperature(&tenths) ||", "if ((annibale_gpu_temperature(&tenths), false) ||"),
     ("speed vote without rate limit", "since < SPEED_TICK_NS", "since < 0"),
     ("bus row of the slowest speed", "adreno8_speeds[want - 1].bus", "adreno8_speeds[0].bus"),
+    ("speed change without pipeline idle drain", 'if (!adreno8_context_wait_idle("GPU speed"))', "if (false)"),
 ]
 for label, before, after in vote_mutations + speed_mutations:
     assert STAGE_SOURCE.count(before) == 1, label

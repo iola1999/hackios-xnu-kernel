@@ -184,6 +184,36 @@ static void call_counts(BOOL useDescriptor)
     check(atomic_load(&descriptor_calls) == (unsigned)useDescriptor &&
           atomic_load(&constants_calls) == (unsigned)!useDescriptor, "native specialization count changed");
 }
+static void call_counts_hit(void)
+{
+    check(atomic_load(&named_calls) == 1 && atomic_load(&descriptor_calls) == 0 &&
+          atomic_load(&constants_calls) == 0, "v2 cache hit invoked native specialization");
+}
+static void check_bitcode_hash(id function, NSData *bytes)
+{
+    uint8_t expected[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(bytes.bytes, (CC_LONG)bytes.length, expected);
+    SEL hash_sel = sel_getUid("bitCodeHash");
+    check([function respondsToSelector:hash_sel], "cached proxy missing bitCodeHash");
+    const uint8_t *actual = ((const uint8_t *(*)(id, SEL))objc_msgSend)(function, hash_sel);
+    check(actual != NULL && memcmp(actual, expected, sizeof(expected)) == 0,
+          "cached proxy bitCodeHash mismatch");
+}
+static void clear_cache_entry(id base, NSString *name, id values, BOOL useDescriptor)
+{
+    MTLFunctionDescriptor *request = nil;
+    if (useDescriptor) {
+        request = [[[MTLFunctionDescriptor alloc] init] autorelease];
+        request.name = name;
+        request.constantValues = values;
+    }
+    NSString *key = rw_air_cache_key(base, name, nil, request != nil ? request.constantValues : values, request);
+    if (key != nil) {
+        [rw_air_memcache removeObjectForKey:key];
+        NSString *path = [NSString stringWithFormat:@"%s/%@.air", cache_directory, key];
+        unlink([path fileSystemRepresentation]);
+    }
+}
 
 @interface CopyFailure : NSString
 @end
@@ -296,7 +326,8 @@ static void compatibility_cases(HookLibrary *library, CacheFunction *base,
             reset_calls(); result = invoke_request(library, request, name, values, &error);
             check(result != nil && [[result bitcodeData] isEqualToData:native.bytes] && error == sentinel,
                   "native failure did not prefer v2 AIR over legacy AIR");
-            [result release]; call_counts(useDescriptor);
+            check_bitcode_hash(result, native.bytes);
+            [result release]; call_counts_hit();
             check([base retainCount] == heldBase && [rw_air_memcache objectForKey:legacyKey] == nil,
                   "v2 hit changed base ownership or read legacy AIR");
 
@@ -341,6 +372,8 @@ int main(int argc, char **argv)
             BOOL useDescriptor = route != 0;
             NSError *error = sentinel;
             NSUInteger heldBase = [base retainCount], heldNative = [native retainCount];
+            if (!unavailable)
+                clear_cache_entry(base, @"kernel", nil, useDescriptor);
             reset_calls();
             id result = invoke(library, useDescriptor, @"kernel", nil, &error);
             check(result == native && error == sentinel, "cache changed native success or caller error");
@@ -351,6 +384,16 @@ int main(int argc, char **argv)
             check([native retainCount] == heldNative, "native return leaked");
             if (unavailable) continue;
 
+            library.nativeFunction = nil;
+            reset_calls(); result = invoke(library, useDescriptor, @"kernel", nil, &error);
+            check(result != nil && [[result bitcodeData] isEqualToData:native.bytes] && error == sentinel,
+                  "v2 memory hit called native or lost bytes");
+            check_bitcode_hash(result, native.bytes);
+            [result release]; call_counts_hit();
+            check([base retainCount] == heldBase, "v2 memory hit leaked base");
+            library.nativeFunction = native;
+
+            clear_cache_entry(base, @"kernel", nil, useDescriptor);
             library.nativeFunction = base;
             heldBase = [base retainCount];
             reset_calls(); result = invoke(library, useDescriptor, @"kernel", nil, &error);
@@ -361,6 +404,7 @@ int main(int argc, char **argv)
             library.nativeFunction = native;
             heldBase = [base retainCount];
 
+            clear_cache_entry(base, @"kernel", nil, useDescriptor);
             unsigned reads = native.reads;
             base.missingHash = YES;
             reset_calls(); result = invoke(library, useDescriptor, @"kernel", nil, &error);
@@ -392,10 +436,12 @@ int main(int argc, char **argv)
             reset_calls(); BOOL propagated = NO;
             @try { result = invoke(library, useDescriptor, @"kernel", nil, &error); [result release]; }
             @catch (NSException *exception) { propagated = [exception.name isEqualToString:@"NativeSpecialization"]; }
-            check(propagated && atomic_load(&named_calls) == 0, "native exception entered cache handling");
+            check(propagated && atomic_load(&named_calls) == 1 && [base retainCount] == heldBase,
+                  "native exception leaked base or miscounted pre-lookup");
             library.throwNative = NO;
 
             SerializedValues *values = [[[SerializedValues alloc] init] autorelease];
+            clear_cache_entry(base, @"kernel", values, useDescriptor);
             reset_calls(); result = invoke(library, useDescriptor, @"kernel", values, &error);
             check(result == native, "valid serialized constants lost native result");
             [result release]; call_counts(useDescriptor);
@@ -406,14 +452,17 @@ int main(int argc, char **argv)
             check(result != nil, "cached specialization unavailable");
             check([[result bitcodeData] isEqualToData:native.bytes] && base.reads == reads,
                   "cached proxy read base bitcode or changed bytes");
+            check_bitcode_hash(result, native.bytes);
             check([base retainCount] == heldBase + 1, "cached proxy did not retain base");
-            [result release]; call_counts(useDescriptor);
+            [result release]; call_counts_hit();
             check([base retainCount] == heldBase, "cached proxy retained base after release");
 
             values.failure = 1;
             reset_calls(); result = invoke(library, useDescriptor, @"kernel", values, &error);
-            check(result != nil && [result annibaleUnspecializedFunction] == base,
-                  "uncached fallback lost base function");
+            check(result != nil && [result annibaleUnspecializedFunction] == base &&
+                  memcmp(((const uint8_t *(*)(id, SEL))objc_msgSend)(result, sel_getUid("bitCodeHash")),
+                         [base bitCodeHash], 32) == 0,
+                  "uncached fallback lost base function or base bitCodeHash");
             [result release]; call_counts(useDescriptor);
             check([base retainCount] == heldBase, "uncached proxy leaked base");
 
@@ -442,6 +491,11 @@ int main(int argc, char **argv)
                 [proxy release];
             } @catch (NSException *exception) { thrown = [exception.name isEqualToString:@"NameCopy"]; }
             check(thrown && [base retainCount] == heldBase, "partial proxy initialization retained base");
+            clear_cache_entry(base, @"kernel", nil, NO);
+            reset_calls();
+            id warmup = invoke(library, NO, @"kernel", nil, &sentinel);
+            check(warmup == native, "concurrent warmup failed");
+            [warmup release]; call_counts(NO);
             NSUInteger heldNative = [native retainCount];
             reset_calls();
             dispatch_apply(8, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t index) {
@@ -450,14 +504,16 @@ int main(int argc, char **argv)
                     for (unsigned j = 0; j < 20; j++) {
                         NSError *error = sentinel;
                         id result = invoke(library, NO, @"kernel", nil, &error);
-                        if (result != native || error != sentinel) atomic_fetch_add(&concurrent_errors, 1);
+                        if (result == nil || error != sentinel ||
+                            ![[result bitcodeData] isEqualToData:native.bytes])
+                            atomic_fetch_add(&concurrent_errors, 1);
                         [result release];
                     }
                 }
             });
             check(atomic_load(&concurrent_errors) == 0 && atomic_load(&named_calls) == 160 &&
-                  atomic_load(&constants_calls) == 160 && atomic_load(&descriptor_calls) == 0,
-                  "concurrent hook call counts changed");
+                  atomic_load(&constants_calls) == 0 && atomic_load(&descriptor_calls) == 0,
+                  "concurrent v2 cache hits invoked native or errored");
             check([base retainCount] == heldBase && [native retainCount] == heldNative,
                   "concurrent hooks changed ownership");
         }

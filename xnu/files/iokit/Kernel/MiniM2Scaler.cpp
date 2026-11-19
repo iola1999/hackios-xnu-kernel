@@ -37,7 +37,7 @@ enum {
 enum {
 	kM2FlagFlipH             = 1ULL << 0,
 	kM2FlagFlipV             = 1ULL << 1,
-	kM2FlagTranspose         = 1ULL << 2,
+	kM2FlagRotate90          = 1ULL << 2, /* kIOSurfaceAcceleratorSymmetricTransformKey: CW 90° */
 	kM2FlagNearestFilter     = 1ULL << 7,
 	kM2FlagSkipAsyncCallback = 1ULL << 10,
 	kM2FlagAlphaOverride     = 1ULL << 18,
@@ -196,15 +196,22 @@ unorm16ToHalf(uint16_t u)
 	return (uint16_t) ((exp << 10) | mant);
 }
 
-/* Fast integer bilinear plane resampler for 1- or 2-component 8/16-bit YUV planes. */
-static void
+static inline bool
+m2Aborted(const volatile uint32_t * abortGen, uint32_t startGen)
+{
+	return abortGen != NULL && __atomic_load_n(abortGen, __ATOMIC_ACQUIRE) != startGen;
+}
+
+/* Fast integer bilinear/nearest plane resampler for 1- or 2-component 8/16-bit YUV planes. */
+static bool
 m2ScalePlane(const uint8_t * srcBase, uint32_t srcW, uint32_t srcH, uint32_t srcBPR, bool srcWide,
     uint8_t * dstBase, uint32_t dstW, uint32_t dstH, uint32_t dstBPR, bool dstWide,
     uint32_t channels, uint64_t sx16, uint64_t sy16, uint64_t sw16, uint64_t sh16,
-    uint32_t dx0, uint32_t dy0, uint32_t dw, uint32_t dh, bool nearest)
+    uint32_t dx0, uint32_t dy0, uint32_t dw, uint32_t dh, bool nearest, uint32_t xform,
+    const volatile uint32_t * abortGen, uint32_t startGen)
 {
 	if (dw == 0 || dh == 0 || srcW == 0 || srcH == 0 || dx0 >= dstW || dy0 >= dstH) {
-		return;
+		return true;
 	}
 	if (dw > dstW - dx0) {
 		dw = dstW - dx0;
@@ -212,10 +219,103 @@ m2ScalePlane(const uint8_t * srcBase, uint32_t srcW, uint32_t srcH, uint32_t src
 	if (dh > dstH - dy0) {
 		dh = dstH - dy0;
 	}
-	uint64_t stepX = sw16 / dw;
-	uint64_t stepY = sh16 / dh;
+
+	bool rot90 = (xform & kM2FlagRotate90) != 0;
+	bool flipH = (xform & kM2FlagFlipH) != 0;
+	bool flipV = (xform & kM2FlagFlipV) != 0;
+	uint32_t denomX = rot90 ? dh : dw;
+	uint32_t denomY = rot90 ? dw : dh;
+
+	/* Fast 1:1 rotated/flipped plane copy without per-pixel division or RGB round-trip. */
+	if (xform != 0 && srcWide == dstWide &&
+	    (sx16 & 0xffffu) == 0 && (sy16 & 0xffffu) == 0 &&
+	    (sw16 & 0xffffu) == 0 && (sh16 & 0xffffu) == 0 &&
+	    (sw16 >> 16) == denomX && (sh16 >> 16) == denomY) {
+		uint32_t sx0 = (uint32_t) (sx16 >> 16);
+		uint32_t sy0 = (uint32_t) (sy16 >> 16);
+		if (sx0 + denomX <= srcW && sy0 + denomY <= srcH) {
+			uint32_t elemBytes = channels * (srcWide ? 2u : 1u);
+			for (uint32_t y = 0; y < dh; y++) {
+				if (m2Aborted(abortGen, startGen)) {
+					return false;
+				}
+				uint32_t uy = flipV ? (dh - 1 - y) : y;
+				uint8_t * drow = dstBase + (size_t) (dy0 + y) * dstBPR + (size_t) dx0 * elemBytes;
+				if (!rot90) {
+					const uint8_t * srow = srcBase + (size_t) (sy0 + uy) * srcBPR;
+					if (!flipH) {
+						bcopy(srow + (size_t) sx0 * elemBytes, drow, (size_t) dw * elemBytes);
+					} else if (elemBytes == 1u) {
+						const uint8_t * s = srow + sx0 + dw - 1;
+						for (uint32_t x = 0; x < dw; x++) drow[x] = s[-(intptr_t) x];
+					} else if (elemBytes == 2u) {
+						const uint16_t * s = (const uint16_t *) (srow + (size_t) (sx0 + dw - 1) * 2u);
+						uint16_t * d = (uint16_t *) drow;
+						for (uint32_t x = 0; x < dw; x++) d[x] = s[-(intptr_t) x];
+					} else {
+						const uint32_t * s = (const uint32_t *) (srow + (size_t) (sx0 + dw - 1) * 4u);
+						uint32_t * d = (uint32_t *) drow;
+						for (uint32_t x = 0; x < dw; x++) d[x] = s[-(intptr_t) x];
+					}
+				} else {
+					/* CW 90° maps dst(x,y) -> src(uy, dw-1-ux); flipH reverses ux. */
+					const uint8_t * scol = srcBase + (size_t) (sx0 + uy) * elemBytes;
+					bool revY = !flipH;
+					intptr_t step = revY ? -(intptr_t) srcBPR : (intptr_t) srcBPR;
+					const uint8_t * sp = scol + (size_t) (sy0 + (revY ? (dw - 1) : 0)) * srcBPR;
+					if (elemBytes == 1u) {
+						for (uint32_t x = 0; x < dw; x++, sp += step) drow[x] = *sp;
+					} else if (elemBytes == 2u) {
+						uint16_t * d = (uint16_t *) drow;
+						for (uint32_t x = 0; x < dw; x++, sp += step) d[x] = *(const uint16_t *) sp;
+					} else {
+						uint32_t * d = (uint32_t *) drow;
+						for (uint32_t x = 0; x < dw; x++, sp += step) d[x] = *(const uint32_t *) sp;
+					}
+				}
+			}
+			return true;
+		}
+	}
+
+	uint64_t stepX = sw16 / denomX;
+	uint64_t stepY = sh16 / denomY;
+
+	if (xform != 0) {
+		for (uint32_t y = 0; y < dh; y++) {
+			if (m2Aborted(abortGen, startGen)) {
+				return false;
+			}
+			uint32_t uy = flipV ? (dh - 1 - y) : y;
+			uint8_t * drow = dstBase + (size_t) (dy0 + y) * dstBPR;
+			for (uint32_t x = 0; x < dw; x++) {
+				uint32_t ux = flipH ? (dw - 1 - x) : x;
+				uint32_t tx = rot90 ? uy : ux;
+				uint32_t ty = rot90 ? (dw - 1 - ux) : uy;
+				uint32_t ix = (uint32_t) ((sx16 + tx * stepX) >> 16);
+				uint32_t iy = (uint32_t) ((sy16 + ty * stepY) >> 16);
+				if (ix >= srcW) ix = srcW - 1;
+				if (iy >= srcH) iy = srcH - 1;
+				const uint8_t * srow = srcBase + (size_t) iy * srcBPR;
+				for (uint32_t c = 0; c < channels; c++) {
+					uint32_t val16 = srcWide ?
+					    ((const uint16_t *) srow)[ix * channels + c] :
+					    ((uint32_t) srow[ix * channels + c] << 8);
+					if (dstWide) {
+						((uint16_t *) drow)[(dx0 + x) * channels + c] = (uint16_t) val16;
+					} else {
+						drow[(dx0 + x) * channels + c] = (uint8_t) (val16 >> 8);
+					}
+				}
+			}
+		}
+		return true;
+	}
 
 	for (uint32_t y = 0; y < dh; y++) {
+		if (m2Aborted(abortGen, startGen)) {
+			return false;
+		}
 		uint64_t fy = sy16 + (nearest ? (y * stepY + (stepY >> 1)) : (y * stepY));
 		uint32_t y0 = (uint32_t) (fy >> 16);
 		if (y0 >= srcH) {
@@ -266,6 +366,7 @@ m2ScalePlane(const uint8_t * srcBase, uint32_t srcW, uint32_t srcH, uint32_t src
 			}
 		}
 	}
+	return true;
 }
 
 /* Read one RGBA16 [0..65535] pixel from any supported single-plane or biplanar IOSurface. */
@@ -422,7 +523,8 @@ m2StoreSinglePlaneRGBA16(uint32_t fmt, uint8_t * p0, uint32_t bpr0, uint32_t x, 
 }
 
 static IOReturn
-m2ExecuteTransfer(const struct m2scaler_req * req, MiniIOSurface * src, MiniIOSurface * dst)
+m2ExecuteTransfer(const struct m2scaler_req * req, MiniIOSurface * src, MiniIOSurface * dst,
+    const volatile uint32_t * abortGen, uint32_t startGen)
 {
 	uint32_t sw0 = 0, sh0 = 0, sbpr0 = 0, sbpe0 = 0;
 	uint32_t dw0 = 0, dh0 = 0, dbpr0 = 0, dbpe0 = 0;
@@ -477,18 +579,22 @@ m2ExecuteTransfer(const struct m2scaler_req * req, MiniIOSurface * src, MiniIOSu
 	bool nearest = (req->flags & kM2FlagNearestFilter) != 0;
 	uint32_t xform = (uint32_t) (req->flags & 7ULL);
 
-	/* Fast biplanar YUV -> YUV path (covers 420f/420v/xf20/x420 pyramid & encoder transfers). */
-	if (sbi && dbi && xform == 0 && sfull == dfull) {
-		m2ScalePlane(sp0, sw0, sh0, sbpr0, swide, dp0, dw0, dh0, dbpr0, dwide, 1,
-		    sx16, sy16, sw16, sh16, dx0, dy0, dw, dh, nearest);
+	/* Fast biplanar YUV -> YUV path (covers 420f/420v/xf20/x420 pyramid, rotation & encoder transfers). */
+	if (sbi && dbi && sfull == dfull) {
+		if (!m2ScalePlane(sp0, sw0, sh0, sbpr0, swide, dp0, dw0, dh0, dbpr0, dwide, 1,
+		    sx16, sy16, sw16, sh16, dx0, dy0, dw, dh, nearest, xform, abortGen, startGen)) {
+			return kIOReturnAborted;
+		}
 		uint32_t cdx0 = dx0 / dhsub, cdy0 = dy0 / dvsub;
 		uint32_t cdw = (dw + dhsub - 1) / dhsub, cdh = (dh + dvsub - 1) / dvsub;
 		if (cdx0 < dw1p && cdy0 < dh1p) {
 			if (cdw > dw1p - cdx0) cdw = dw1p - cdx0;
 			if (cdh > dh1p - cdy0) cdh = dh1p - cdy0;
-			m2ScalePlane(sp1, sw1p, sh1p, sbpr1, swide, dp1, dw1p, dh1p, dbpr1, dwide, 2,
+			if (!m2ScalePlane(sp1, sw1p, sh1p, sbpr1, swide, dp1, dw1p, dh1p, dbpr1, dwide, 2,
 			    sx16 / shsub, sy16 / svsub, sw16 / shsub, sh16 / svsub,
-			    cdx0, cdy0, cdw, cdh, nearest);
+			    cdx0, cdy0, cdw, cdh, nearest, xform, abortGen, startGen)) {
+				return kIOReturnAborted;
+			}
 		}
 		return kIOReturnSuccess;
 	}
@@ -507,21 +613,24 @@ m2ExecuteTransfer(const struct m2scaler_req * req, MiniIOSurface * src, MiniIOSu
 		return kIOReturnSuccess;
 	}
 
-	/* General path: handles CSC (YUV <-> BGRA/RGBA), half-float, flips, transpose/rotations. */
-	bool transpose = (xform & kM2FlagTranspose) != 0;
+	/* General path: handles CSC (YUV <-> BGRA/RGBA), half-float, flips, and CW rotations. */
+	bool rot90 = (xform & kM2FlagRotate90) != 0;
 	bool flipH = (xform & kM2FlagFlipH) != 0;
 	bool flipV = (xform & kM2FlagFlipV) != 0;
 	uint16_t alphaOv = (uint16_t) ((req->alphaOverride & 0xffu) << 8);
 	bool hasAlphaOv = (req->flags & kM2FlagAlphaOverride) != 0;
 
 	for (uint32_t y = 0; y < dh; y++) {
+		if (m2Aborted(abortGen, startGen)) {
+			return kIOReturnAborted;
+		}
 		for (uint32_t x = 0; x < dw; x++) {
 			uint32_t ux = flipH ? (dw - 1 - x) : x;
 			uint32_t uy = flipV ? (dh - 1 - y) : y;
-			uint32_t tx = transpose ? uy : ux;
-			uint32_t ty = transpose ? ux : uy;
-			uint32_t denomX = transpose ? dh : dw;
-			uint32_t denomY = transpose ? dw : dh;
+			uint32_t tx = rot90 ? uy : ux;
+			uint32_t ty = rot90 ? (dw - 1 - ux) : uy;
+			uint32_t denomX = rot90 ? dh : dw;
+			uint32_t denomY = rot90 ? dw : dh;
 			uint64_t fx = sx16 + ((sw16 * tx) / (denomX ? denomX : 1));
 			uint64_t fy = sy16 + ((sh16 * ty) / (denomY ? denomY : 1));
 			uint32_t ix = (uint32_t) (fx >> 16);
@@ -643,6 +752,7 @@ private:
 	IOLock *        fLock;
 	mach_port_t     fNotifyPort;
 	bool            fClosed;
+	volatile uint32_t fAbortGen;
 	uint32_t        fLastHist[3][128];
 
 public:
@@ -688,6 +798,7 @@ AppleM2ScalerCSCDriverUserClient::clientClose(void)
 		fClosed = true;
 		IOLockUnlock(fLock);
 	}
+	__atomic_add_fetch(&fAbortGen, 1u, __ATOMIC_RELEASE);
 	if (!isInactive()) {
 		terminate();
 	}
@@ -732,8 +843,11 @@ AppleM2ScalerCSCDriverUserClient::externalMethod(uint32_t selector, IOExternalMe
 	static uint64_t sLoggedSelectors;
 
 	switch (selector) {
-	case kM2MethodCaptureSurface:
 	case kM2MethodAbortTransfers:
+		__atomic_add_fetch(&fAbortGen, 1u, __ATOMIC_RELEASE);
+		return kIOReturnSuccess;
+
+	case kM2MethodCaptureSurface:
 	case kM2MethodAbortCaptures:
 	case kM2MethodSetCustomFilter:
 	case kM2MethodGetTransformEstimation:
@@ -760,34 +874,42 @@ AppleM2ScalerCSCDriverUserClient::externalMethod(uint32_t selector, IOExternalMe
 		if (args->structureInput == NULL || args->structureInputSize < sizeof(struct m2scaler_req)) {
 			return kIOReturnBadArgument;
 		}
+		uint32_t startGen = __atomic_load_n(&fAbortGen, __ATOMIC_ACQUIRE);
 		const struct m2scaler_req * req = (const struct m2scaler_req *) args->structureInput;
-		if (req->srcEventPort != 0 && req->srcEventWait != 0) {
+		if (!m2Aborted(&fAbortGen, startGen) && req->srcEventPort != 0 && req->srcEventWait != 0) {
 			(void) MiniIOSurfaceWaitSharedEvent(fTask, req->srcEventPort, req->srcEventWait, 1000);
 		}
-		if (req->dstEventPort != 0 && req->dstEventWait != 0) {
+		if (!m2Aborted(&fAbortGen, startGen) && req->dstEventPort != 0 && req->dstEventWait != 0) {
 			(void) MiniIOSurfaceWaitSharedEvent(fTask, req->dstEventPort, req->dstEventWait, 1000);
 		}
-		MiniIOSurface * src = MiniIOSurfaceCopy(req->srcSurfaceID);
-		MiniIOSurface * dst = MiniIOSurfaceCopy(req->dstSurfaceID);
-		if (src == NULL || dst == NULL) {
-			if (src != NULL) MiniIOSurfaceDrop(src);
-			if (dst != NULL) MiniIOSurfaceDrop(dst);
-			return kIOReturnBadArgument;
-		}
-		(void) MiniIOSurfaceDrawn(src, 250);
-		IOReturn ret = m2ExecuteTransfer(req, src, dst);
-		if (ret == kIOReturnSuccess) {
-			if (req->histBinMode != 0) {
-				uint32_t hist[3][128];
-				m2ComputeHistogram(req, dst, hist);
-				IOLockLock(fLock);
-				bcopy(hist, fLastHist, sizeof(fLastHist));
-				IOLockUnlock(fLock);
+		IOReturn ret = kIOReturnAborted;
+		if (!m2Aborted(&fAbortGen, startGen)) {
+			MiniIOSurface * src = MiniIOSurfaceCopy(req->srcSurfaceID);
+			MiniIOSurface * dst = MiniIOSurfaceCopy(req->dstSurfaceID);
+			if (src == NULL || dst == NULL) {
+				if (src != NULL) MiniIOSurfaceDrop(src);
+				if (dst != NULL) MiniIOSurfaceDrop(dst);
+				return kIOReturnBadArgument;
 			}
-			__atomic_add_fetch(&dst->shared()->seed, 1u, __ATOMIC_RELEASE);
+			if (!m2Aborted(&fAbortGen, startGen)) {
+				(void) MiniIOSurfaceDrawn(src, 250);
+			}
+			if (!m2Aborted(&fAbortGen, startGen)) {
+				ret = m2ExecuteTransfer(req, src, dst, &fAbortGen, startGen);
+			}
+			if (ret == kIOReturnSuccess) {
+				if (req->histBinMode != 0) {
+					uint32_t hist[3][128];
+					m2ComputeHistogram(req, dst, hist);
+					IOLockLock(fLock);
+					bcopy(hist, fLastHist, sizeof(fLastHist));
+					IOLockUnlock(fLock);
+				}
+				__atomic_add_fetch(&dst->shared()->seed, 1u, __ATOMIC_RELEASE);
+			}
+			MiniIOSurfaceDrop(src);
+			MiniIOSurfaceDrop(dst);
 		}
-		MiniIOSurfaceDrop(src);
-		MiniIOSurfaceDrop(dst);
 
 		if (req->srcEventPort != 0 && req->srcEventSignal != 0) {
 			(void) MiniIOSurfaceSignalSharedEvent(fTask, req->srcEventPort, req->srcEventSignal);

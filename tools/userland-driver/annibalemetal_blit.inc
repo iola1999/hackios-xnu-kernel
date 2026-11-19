@@ -296,6 +296,23 @@ protocol_declares(const char *name, SEL selector, struct objc_method_description
 	}
 }
 
+- (void)copyFromTexture:(id)source toTexture:(id)destination
+{
+	if (![self acceptSource:source destination:destination resourceClass:[AnnibaleMetalTexture class]])
+		return;
+	id<MTLTexture> from = source, to = destination;
+	MTLTextureType fromType = [from textureType], toType = [to textureType];
+	NSUInteger fromSlices = [from arrayLength] *
+	    (fromType == MTLTextureTypeCube || fromType == MTLTextureTypeCubeArray ? 6u : 1u);
+	NSUInteger toSlices = [to arrayLength] *
+	    (toType == MTLTextureTypeCube || toType == MTLTextureTypeCubeArray ? 6u : 1u);
+	NSUInteger slices = MIN(fromSlices, toSlices);
+	NSUInteger levels = MIN([from mipmapLevelCount], [to mipmapLevelCount]);
+
+	[self copyFromTexture:source sourceSlice:0 sourceLevel:0 toTexture:destination
+	     destinationSlice:0 destinationLevel:0 sliceCount:slices levelCount:levels];
+}
+
 - (void)generateMipmapsForTexture:(id)texture
 {
 	if (_ended) {

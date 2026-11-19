@@ -38,7 +38,7 @@ static uint8_t front_slave_addr, wide_slave_addr, wide_bus_mode;
 static uint32_t cached_csid_ver, cached_ife_ver, cam_hw_mmio, current_sensor;
 static uint32_t boot_cam_keep_stream;
 static uint64_t cam_frame_seq;
-static bool cam_is_open, cam_hw_dma_verified, cam_sensor_streaming, cci_ready, cam_session_probed;
+static bool cam_is_open, cam_hw_dma_verified, cam_sensor_streaming, cci_ready, cam_session_probed, cam_mid_sampled;
 static bool cam_native_phy_configured;
 static uint32_t regs[0x2800 / 4];
 static uint32_t top_clear, buf_clear, rx_clear, path_clear;
@@ -139,8 +139,9 @@ static bool cam_native_phy_down(void)
     phy_stops++; phy_owned = false; return true;
 }
 static bool cam_native_sensor_power(bool up __unused) { return true; }
-static bool cam_native_apply_exposure_regs(void) { return true; }
+static bool cam_native_apply_exposure_regs(bool force __unused) { return true; }
 static void cam_diag_bus_debug_enable(void) { }
+static void cam_diag_midframe_sample(void) { }
 static void cam_diag_capture_probe(const char *tag __unused) { }
 static bool cam_native_register_table(uint32_t table, uint32_t count)
 {
@@ -205,13 +206,17 @@ static void fake_dma(void)
     CHECK(address_writes && clocks_owned && phy_owned && smmu_owned);
     CHECK(regs[0x1700 / 4] == 1 && regs[0x504 / 4] == 1);
     CHECK(regs[0x510 / 4] == 0x8000 && regs[0x1718 / 4] == 0);
-    CHECK(regs[0x170c / 4] == ((1458u << 16) | 203u) && regs[0x1714 / 4] == 3248);
+    CHECK(regs[0x170c / 4] == ((profile_data.height << 16) | (profile_data.stride / 16u)) &&
+          regs[0x1714 / 4] == profile_data.stride);
     CHECK(cache_flushes == 2u * completed_frames + 1u);
     CHECK(!cam_hw_dma_verified && cam_capture.state == ANNIBALE_CAM_CAPTURE_RUNNING);
+    uint32_t active_bytes = (profile_data.width * 5u) / 4u;
     for (uint32_t y = 0; y < profile_data.height; y++) {
         uint8_t *line = region + y * profile_data.stride;
-        memset(line, (int)(0x30u + completed_frames), 3240);
-        memset(line + 3240, 0xa5, 8);
+        memset(line, (int)(0x30u + completed_frames), active_bytes);
+        if (profile_data.stride > active_bytes) {
+            memset(line + active_bytes, 0xa5, profile_data.stride - active_bytes);
+        }
     }
     regs[0x08c / 4] |= wrong_group ? 1u : 2u;
     regs[0x1790 / 4] = regs[0x1704 / 4] + (wrong_address ? 1u : 0u);
@@ -415,10 +420,39 @@ int main(void)
     cam_region_vbase = (vm_offset_t)region;
     completed_frames = cache_flushes = 0;
     CHECK(annibale_cam_open(0, 0, 0, NULL) == 0);
+    wide_bus_mode = 1;
     cam_profile = &profile_data;
     delivered = false;
     cam_native_capture();
     check_success();
+    CHECK(annibale_cam_close(0, 0, 0, NULL) == 0);
+    cases++;
+
+    /* Verify continuous MIPI RX keep-stream across 3 rear wide C-PHY frames, clean close, and re-open. */
+    reset_fixture();
+    boot_cam_keep_stream = 1;
+    wide_chip_id = WIDE_SENSOR_ID_EXPECTED;
+    wide_slave_addr = 0x10;
+    wide_bus_mode = 1;
+    profile_data.sensor = 1; profile_data.mode = 24;
+    profile_data.width = 2560; profile_data.height = 1920; profile_data.stride = 3200;
+    for (unsigned f = 0; f < 3; f++) {
+        delivered = false;
+        cam_native_capture();
+        CHECK(cam_capture.state == ANNIBALE_CAM_CAPTURE_STOPPED && cam_capture.error == 0);
+        CHECK(cam_sensor_streaming && regs[0x200 / 4] != 0 && regs[0x204 / 4] != 0);
+        CHECK(table_writes[2] == 1 && table_writes[3] == 0);
+    }
+    CHECK(annibale_cam_close(0, 0, 0, NULL) == 0);
+    CHECK(!cam_sensor_streaming && regs[0x200 / 4] == 0 && table_writes[3] == 1 && region_frees == 1);
+    cam_region_vbase = (vm_offset_t)region;
+    completed_frames = cache_flushes = 0;
+    CHECK(annibale_cam_open(0, 0, 0, NULL) == 0);
+    wide_bus_mode = 1;
+    cam_profile = &profile_data;
+    delivered = false;
+    cam_native_capture();
+    CHECK(cam_capture.state == ANNIBALE_CAM_CAPTURE_STOPPED && cam_capture.error == 0);
     CHECK(annibale_cam_close(0, 0, 0, NULL) == 0);
     cases++;
     printf("%u native capture/read/close scenarios passed\n", cases);

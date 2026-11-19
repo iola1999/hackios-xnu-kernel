@@ -912,6 +912,7 @@ struct gem_close { uint32_t handle, pad; };
 	struct rwa_compute *_compute;
 	struct rwa_compute_info _info;
 	unsigned _imageblockDataSize;
+	uint32_t _limitsMaterialized;
 }
 @end
 
@@ -1073,6 +1074,7 @@ struct gem_close { uint32_t handle, pad; };
 	int _responsibleProcess;  /* what <MTLResourceSPI> calls the owner, for accounting */
 	void (^_callerDeallocator)(void *, NSUInteger); /* copied: CoreAnimation's is on its stack */
 	void *_callerBytes;       /* what that block expects back, not what we allocated */
+	CFTypeRef _iosurface;     /* retained when backed by an IOSurface (-newBufferWithIOSurface:) */
 }
 @property (readonly) struct rwa_buffer *mesaBuffer;
 - (instancetype)initWithDevice:(AnnibaleMetalDevice *)device
@@ -1083,6 +1085,8 @@ struct gem_close { uint32_t handle, pad; };
 			 bytes:(const void *)bytes
 			length:(NSUInteger)length
 		   deallocator:(void (^)(void *, NSUInteger))deallocator;
+- (instancetype)initWithDevice:(AnnibaleMetalDevice *)device
+		     iosurface:(void *)surface;
 @end
 
 #include "annibalemetal_stitch.inc"

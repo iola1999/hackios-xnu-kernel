@@ -23,7 +23,6 @@
 #define CAMCC_PHY4_TIMER_CBCR    0x1009cu
 #define CAMCC_PHY4_RX_CBCR       0x100a0u
 
-static vm_offset_t cam_crm_base;
 static bool cam_native_clocks_owned, cam_native_pll_changed, cam_crm_failed;
 static uint32_t cam_native_phy_supplies;
 static uint32_t cam_crm_rx_saved[3], cam_crm_rt_saved[3];
@@ -395,7 +394,7 @@ cam_native_sensor_power(bool up)
 }
 
 static bool
-cam_native_apply_exposure_regs(void)
+cam_native_apply_exposure_regs(bool force)
 {
 	if (cam_native_exposure_lines == 0 || cam_native_gain == 0 ||
 	    (!cam_native_is_ov20b_m4(cam_profile) && !cam_native_is_ovx8000_m24(cam_profile))) {
@@ -403,9 +402,14 @@ cam_native_apply_exposure_regs(void)
 	}
 	uint32_t fll = cam_native_frame_lines;
 	uint32_t lines = cam_native_exposure_lines;
+	uint32_t gain = cam_native_gain;
+	if (!force && fll == cam_native_applied_frame_lines &&
+	    lines == cam_native_applied_exposure_lines &&
+	    gain == cam_native_applied_gain) {
+		return true;
+	}
 	/* OV20B40 0x3500..0x3502 stores integration lines in Q4 fixed-point ([3:0] fractional). */
 	uint32_t raw_exp = cam_native_is_ov20b_m4(cam_profile) ? (lines << 4u) : lines;
-	uint32_t gain = cam_native_gain;
 	const struct {
 		uint16_t reg;
 		uint8_t val;
@@ -431,13 +435,16 @@ cam_native_apply_exposure_regs(void)
 			return false;
 		}
 	}
+	cam_native_applied_frame_lines = fll;
+	cam_native_applied_exposure_lines = lines;
+	cam_native_applied_gain = gain;
 	return true;
 }
 
 static bool
 cam_native_register_table(uint32_t table, uint32_t count)
 {
-	if (table == 2u && !cam_native_apply_exposure_regs()) {
+	if (table == 2u && !cam_native_apply_exposure_regs(true)) {
 		return false;
 	}
 	const struct annibale_camera_register *entries = cam_profile_registers(table);

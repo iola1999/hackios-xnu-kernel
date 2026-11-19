@@ -35,6 +35,9 @@
 static uint32_t cam_native_exposure_lines;
 static uint32_t cam_native_gain;
 static uint32_t cam_native_frame_lines;
+static uint32_t cam_native_applied_exposure_lines;
+static uint32_t cam_native_applied_gain;
+static uint32_t cam_native_applied_frame_lines;
 
 static bool
 cam_native_is_ov20b_m4(const struct annibale_camera_profile *p)
@@ -51,11 +54,20 @@ cam_native_is_ovx8000_m24(const struct annibale_camera_profile *p)
 }
 
 static void
+cam_native_exposure_invalidate(void)
+{
+	cam_native_applied_exposure_lines = 0;
+	cam_native_applied_gain = 0;
+	cam_native_applied_frame_lines = 0;
+}
+
+static void
 cam_native_exposure_reset(void)
 {
 	cam_native_exposure_lines = 0;
 	cam_native_gain = 0;
 	cam_native_frame_lines = 0;
+	cam_native_exposure_invalidate();
 }
 
 static void

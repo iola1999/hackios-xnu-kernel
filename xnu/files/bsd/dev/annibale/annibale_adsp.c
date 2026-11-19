@@ -431,7 +431,8 @@ static bool vote_adsp_rails(uint32_t level)
 
 /* ---- AOSS QMP Mailbox ------------------------------------------------------------------------ */
 
-static bool aoss_send_msg(const char *msg)
+bool
+annibale_aoss_send_msg(const char *msg)
 {
 	uint32_t words[QMP_MESSAGE / 4] = { 0 };
 	bool ok = false;
@@ -1087,7 +1088,7 @@ static void annibale_adsp_boot_thread(void *arg __unused, wait_result_t w __unus
 				say("loaded adsp_dtb.mdt (%u segs, %#x B) and adsp.mdt (%u segs, %#x B)\n",
 				    dtb_fw.segments, dtb_fw.size, main_fw.segments, main_fw.size);
 				(void)vote_adsp_rails(384);
-				(void)aoss_send_msg("{class: image, res: load_state, name: adsp, val: on}");
+				(void)annibale_aoss_send_msg("{class: image, res: load_state, name: adsp, val: on}");
 				if (pas_stage_and_setup("adsp_dtb", PAS_ADSP_DTB, ADSP_DTB_MEMORY, ADSP_DTB_MEMORY_SIZE, &dtb_fw) &&
 				    pas_stage_and_setup("adsp", PAS_ADSP, ADSP_MEMORY, ADSP_MEMORY_SIZE, &main_fw)) {
 					uint64_t r1 = 0;

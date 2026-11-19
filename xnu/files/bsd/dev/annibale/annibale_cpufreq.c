@@ -38,6 +38,7 @@
 #include <pexpert/pexpert.h>
 #include <sys/annibale_input.h>
 #include <sys/systm.h>
+#include <sys/work_interval.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void loader_log_putc(char c);
@@ -106,6 +107,9 @@ static volatile uint32_t *scmi_shmem, *scmi_doorbell;
 static uint32_t scmi_token, mode;
 static vm_offset_t tsens_base[TSENS_GROUPS];
 static uint64_t touch_at;                       /* mach_absolute_time() of the last touch; 0: none yet */
+static uint64_t wi_boost_until, wi_overrun_until, wi_last_wake;
+static uint32_t ui_quantum_expiries;
+static uint64_t wi_min_boost_abs, wi_max_boost_abs, wi_overrun_abs, wi_wake_gap_abs;
 static bool governing;
 
 /* domain N is cluster N, whose sensors are tsens_groups[N]; levels slowest first */
@@ -442,7 +446,8 @@ perf_go(uint32_t d, uint32_t i, uint64_t now, uint64_t *then)
 
 /* The level the governor wants for domain d, given its busiest core's thousandths busy. */
 static uint32_t
-perf_want(uint32_t d, uint32_t busy, uint64_t now, uint64_t boost_abs, bool valid, int32_t t)
+perf_want(uint32_t d, uint32_t busy, uint64_t now, uint64_t boost_abs, bool valid, int32_t t,
+    bool wi_boost, bool overrun_boost)
 {
 	__typeof__(perf_domain[0]) *pd = &perf_domain[d];
 	uint32_t want = 0, khz = (uint32_t)((uint64_t)pd->khz[pd->now] * busy / BUSY_TARGET);
@@ -475,8 +480,11 @@ perf_want(uint32_t d, uint32_t busy, uint64_t now, uint64_t boost_abs, bool vali
 	while (want < pd->ceiling && pd->khz[want] < khz) {
 		want++;
 	}
-	if (touched != 0 && now - touched < boost_abs && want < pd->boost) {
+	if (((touched != 0 && now - touched < boost_abs) || wi_boost) && want < pd->boost) {
 		want = pd->boost;
+	}
+	if (overrun_boost && want < pd->ceiling) {
+		want = pd->ceiling;
 	}
 	return MIN(want, pd->limit);
 }
@@ -678,6 +686,9 @@ governor_thread(void *arg __unused, wait_result_t wr __unused)
 			idle_before[i] = idle;
 			busy[d] = MAX(busy[d], (uint32_t)((span - idle_span) * 1000 / span));
 		}
+		uint32_t ui_q = os_atomic_xchg(&ui_quantum_expiries, 0, relaxed);
+		bool wi_boost = now < os_atomic_load(&wi_boost_until, relaxed);
+		bool overrun_boost = now < os_atomic_load(&wi_overrun_until, relaxed) || ui_q >= 2;
 		for (uint32_t d = 0; d < PERF_DOMAINS; d++) {
 			__typeof__(perf_domain[0]) *pd = &perf_domain[d];
 			int32_t t = 0, per[TSENS_SENSORS];
@@ -721,7 +732,7 @@ governor_thread(void *arg __unused, wait_result_t wr __unused)
 				level_since[d] = now;
 				continue;
 			}
-			want = perf_want(d, busy[d], now, boost_abs, valid, t);
+			want = perf_want(d, busy[d], now, boost_abs, valid, t, wi_boost, overrun_boost);
 			if (want > pd->now || pd->limit < pd->now) {
 				pd->low_since = 0;
 				perf_go(d, want, now, &level_since[d]);
@@ -743,6 +754,128 @@ governor_thread(void *arg __unused, wait_result_t wr __unused)
 		}
 	}
 }
+
+static void
+atomic_max_u64(uint64_t *slot, uint64_t val)
+{
+	uint64_t cur = os_atomic_load(slot, relaxed);
+
+	while (cur < val && !os_atomic_cmpxchg(slot, cur, val, relaxed)) {
+		cur = os_atomic_load(slot, relaxed);
+	}
+}
+
+static void
+perfctl_maybe_wake(uint64_t now, bool need_ceiling)
+{
+	bool under = false;
+	uint64_t last;
+
+	if (!governing) {
+		return;
+	}
+	for (uint32_t d = 0; d < PERF_DOMAINS; d++) {
+		uint32_t target = need_ceiling ? perf_domain[d].ceiling : perf_domain[d].boost;
+
+		if (perf_domain[d].ours && perf_domain[d].known &&
+		    perf_domain[d].now < MIN(target, perf_domain[d].limit)) {
+			under = true;
+			break;
+		}
+	}
+	if (!under) {
+		return;
+	}
+	last = os_atomic_load(&wi_last_wake, relaxed);
+	if (last != 0 && now >= last && now - last < wi_wake_gap_abs) {
+		return;
+	}
+	if (os_atomic_cmpxchg(&wi_last_wake, last, now, relaxed)) {
+		thread_wakeup((event_t)&touch_at);
+	}
+}
+
+static bool
+perfctl_wi_interactive(uint32_t wi_type)
+{
+	return wi_type == WORK_INTERVAL_TYPE_CA_RENDER_SERVER ||
+	       wi_type == WORK_INTERVAL_TYPE_CA_CLIENT ||
+	       wi_type == WORK_INTERVAL_TYPE_HID_DELIVERY ||
+	       wi_type == WORK_INTERVAL_TYPE_FRAME_COMPOSITOR;
+}
+
+static void
+perfctl_record_interval(uint32_t op, uint32_t wi_type, uint64_t start, uint64_t finish, uint64_t deadline)
+{
+	uint64_t now;
+
+	if (!governing) {
+		return;
+	}
+	now = mach_absolute_time();
+	if ((op == 6u || op == 7u) && perfctl_wi_interactive(wi_type)) {
+		uint64_t min_until = now + wi_min_boost_abs;
+		uint64_t max_until = now + wi_max_boost_abs;
+		uint64_t until = deadline > min_until ? deadline : min_until;
+
+		if (until > max_until) {
+			until = max_until;
+		}
+		atomic_max_u64(&wi_boost_until, until);
+		perfctl_maybe_wake(now, false);
+		return;
+	}
+	if ((op == 8u || op == 2u) && (perfctl_wi_interactive(wi_type) || wi_type == WORK_INTERVAL_TYPE_COREAUDIO)) {
+		uint64_t elapsed = finish > start ? finish - start : 0;
+		uint64_t budget = deadline > start ? deadline - start : 0;
+
+		if ((deadline != 0 && finish > deadline) || (budget > 0 && elapsed * 4 >= budget * 3)) {
+			atomic_max_u64(&wi_overrun_until, now + wi_overrun_abs);
+			perfctl_maybe_wake(now, true);
+		}
+	}
+}
+
+void
+annibale_perfctl_work_interval(uint32_t op, uint32_t wi_type, uint64_t start, uint64_t finish, uint64_t deadline)
+{
+	perfctl_record_interval(op, wi_type, start, finish, deadline);
+}
+
+static void
+perfctl_wi_notify(__unused perfcontrol_state_t state, perfcontrol_work_interval_t wi)
+{
+	if (wi != NULL) {
+		perfctl_record_interval(2u, wi->create_flags & WORK_INTERVAL_TYPE_MASK,
+		    wi->start, wi->finish, wi->deadline);
+	}
+}
+
+/* Interrupts may be disabled and scheduler locks held here; atomic counters only. */
+static void
+perfctl_state_update(perfcontrol_event event, __unused uint32_t cpu_id, __unused uint64_t timestamp,
+    __unused uint32_t flags, struct perfcontrol_thread_data *thr_data, __unused uint64_t *timeout_ticks)
+{
+	if (event == QUANTUM_EXPIRY && thr_data != NULL &&
+	    thr_data->perfctl_class >= PERFCONTROL_CLASS_USER_INITIATED) {
+		os_atomic_inc(&ui_quantum_expiries, relaxed);
+	}
+}
+
+bool
+annibale_perfctl_gpu_interactive_active(uint64_t now)
+{
+	return governing &&
+	       (now < os_atomic_load(&wi_boost_until, relaxed) ||
+	        now < os_atomic_load(&wi_overrun_until, relaxed));
+}
+
+/* SCHED_PERFCONTROL_CALLBACKS_VERSION_7 leaves VERSION_10 timer hook at safe default. */
+static struct sched_perfcontrol_callbacks annibale_perfctl_cbs = {
+	.version = SCHED_PERFCONTROL_CALLBACKS_VERSION_7,
+	.work_interval_notify = perfctl_wi_notify,
+	.state_update = perfctl_state_update,
+};
 
 /* A touch (annibale_input.c's touch_post()): the governor raises the level now rather than at its next tick. */
 void
@@ -797,7 +930,14 @@ annibale_cpufreq_init(void)
 	for (uint32_t d = 0; d < domains && d < PERF_DOMAINS; d++) {
 		perf_describe(d, version);
 	}
+	nanoseconds_to_absolutetime(4ULL * NSEC_PER_MSEC, &wi_min_boost_abs);
+	nanoseconds_to_absolutetime(25ULL * NSEC_PER_MSEC, &wi_max_boost_abs);
+	nanoseconds_to_absolutetime(32ULL * NSEC_PER_MSEC, &wi_overrun_abs);
+	nanoseconds_to_absolutetime(8ULL * NSEC_PER_MSEC, &wi_wake_gap_abs);
 	governing = mode == 1 || mode == 3;
+	if (governing) {
+		sched_perfcontrol_register_callbacks(&annibale_perfctl_cbs, 0);
+	}
 	if (kernel_thread_start(governor_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}

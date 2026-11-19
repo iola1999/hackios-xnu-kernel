@@ -14,6 +14,7 @@
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
+#include <mach/vm_param.h>
 #include <net/bpf.h>
 #include <net/ethernet.h>
 #include <net/if.h>
@@ -48,8 +49,9 @@ extern const uint8_t *annibale_image_file(const char *dir, const char *name, uin
 #endif
 
 /* SM8750 IPA v5.5 hardware & reserved memory regions from annibale.dtb */
-#define IPA_WRAPPER_PHYS        0x01e00000ULL
+#define IPA_WRAPPER_PHYS        0x03e00000ULL
 #define IPA_WRAPPER_SIZE        0x00100000ULL
+#define IPA_GSI_PHYS            0x03e04000ULL
 #define IPA_FW_MEM_PHYS         0x9b080000ULL
 #define IPA_FW_MEM_SIZE         0x00010000ULL
 #define IPA_GSI_MEM_PHYS        0x9b090000ULL
@@ -482,34 +484,77 @@ annibale_ipa_init(void)
 #define SCM_PAS_INIT_IMAGE      SCM_CALL(2, 1)
 #define SCM_PAS_MEM_SETUP       SCM_CALL(2, 2)
 #define SCM_PAS_AUTH_AND_RESET  SCM_CALL(2, 5)
+#define SCM_MP_ASSIGN           SCM_CALL(0xc, 0x16)
+#define SCM_MP_ASSIGN_ARGINFO   0x1117ULL
+#define QCOM_VMID_HLOS          3u
+#define QCOM_PERM_RW            6u
 
 struct ipa_elf32_phdr {
 	uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align;
 };
 
 static int64_t
-annibale_tz_smc(uint64_t fn, uint64_t arg_cnt, uint64_t a0, uint64_t a1, uint64_t a2)
+annibale_tz_smc(uint64_t fn, uint64_t arginfo, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t *res1_out)
 {
-	for (unsigned tries = 0; tries < 500; tries++) {
-		register uint64_t x0 __asm__("x0") = fn | SCM_SIP | SCM_64;
-		register uint64_t x1 __asm__("x1") = (arg_cnt & 0xff) | (1ULL << 8);
-		register uint64_t x2 __asm__("x2") = a0;
-		register uint64_t x3 __asm__("x3") = a1;
-		register uint64_t x4 __asm__("x4") = a2;
-		register uint64_t x6 __asm__("x6") = 0;
+	uint64_t x0 = fn | SCM_SIP | SCM_64;
+	uint64_t x1 = arginfo, x2 = a0, x3 = a1, x4 = a2, x5 = a3, x6 = 0;
+	unsigned ebusy_tries = 0;
+
+	for (unsigned tries = 0; tries < 2000; tries++) {
+		register uint64_t rx0 __asm__("x0") = x0;
+		register uint64_t rx1 __asm__("x1") = x1;
+		register uint64_t rx2 __asm__("x2") = x2;
+		register uint64_t rx3 __asm__("x3") = x3;
+		register uint64_t rx4 __asm__("x4") = x4;
+		register uint64_t rx5 __asm__("x5") = x5;
+		register uint64_t rx6 __asm__("x6") = x6;
+		register uint64_t rx7 __asm__("x7") = 0;
 
 		__asm__ volatile("smc #0"
-		    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x6)
+		    : "+r"(rx0), "+r"(rx1), "+r"(rx2), "+r"(rx3), "+r"(rx4), "+r"(rx5), "+r"(rx6), "+r"(rx7)
 		    :
-		    : "x5", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
-		if ((int64_t)x0 != 1 && (int64_t)x0 != -6 && (int64_t)x0 != -13) {
-			return (int64_t)x0;
-		}
-		if ((int64_t)x0 == 1) {
-			fn = x0;
+		    : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
+		if (rx0 == 1) {
+			x0 = 1ULL;
+			x1 = arginfo;
+			x2 = a0;
+			x3 = a1;
+			x4 = a2;
+			x5 = a3;
+			x6 = rx6;
+			delay_for_interval(1, NSEC_PER_MSEC);
 			continue;
 		}
-		delay_for_interval(2, NSEC_PER_MSEC);
+		if (rx0 == 2 || rx0 == 6 || (int64_t)rx0 == -6 || (int64_t)rx0 == -13) {
+			x0 = fn | SCM_SIP | SCM_64;
+			x1 = arginfo;
+			x2 = a0;
+			x3 = a1;
+			x4 = a2;
+			x5 = a3;
+			x6 = 0;
+			delay_for_interval(1, NSEC_PER_MSEC);
+			continue;
+		}
+		if ((int64_t)rx0 == -12 && ebusy_tries < 120u) {
+			ebusy_tries++;
+			x0 = fn | SCM_SIP | SCM_64;
+			x1 = arginfo;
+			x2 = a0;
+			x3 = a1;
+			x4 = a2;
+			x5 = a3;
+			x6 = 0;
+			delay_for_interval(30, NSEC_PER_MSEC);
+			continue;
+		}
+		if (res1_out != NULL) {
+			*res1_out = rx1;
+		}
+		return (int64_t)rx0;
+	}
+	if (res1_out != NULL) {
+		*res1_out = 0;
 	}
 	return -1;
 }
@@ -519,11 +564,26 @@ extern bool annibale_ufs_fat16_fw_read(const char *name, uint64_t *size_out, vol
 int64_t
 annibale_tz_pas_auth_reset(uint32_t pas_id)
 {
-	return annibale_tz_smc(SCM_PAS_AUTH_AND_RESET, 1, pas_id, 0, 0);
+	uint64_t res1 = 0;
+	int64_t rc = annibale_tz_smc(SCM_PAS_AUTH_AND_RESET, 1u, pas_id, 0, 0, 0, &res1);
+
+	return rc != 0 ? rc : (int64_t)res1;
+}
+
+int64_t
+annibale_tz_pas_is_supported(uint32_t pas_id, uint64_t *res1_out)
+{
+	return annibale_tz_smc(SCM_CALL(2, 7), 1u, pas_id, 0, 0, 0, res1_out);
+}
+
+int64_t
+annibale_tz_pas_auth_reset_detail(uint32_t pas_id, uint64_t *res1_out)
+{
+	return annibale_tz_smc(SCM_PAS_AUTH_AND_RESET, 1u, pas_id, 0, 0, 0, res1_out);
 }
 
 static uint8_t *
-annibale_read_fw_file(const char *name, uint64_t *size_out, bool *needs_free_out)
+annibale_read_fw_override(const char *name, uint64_t *size_out, bool *needs_free_out)
 {
 	static const char *const fw_dirs[] = { "/fw", "/annibale/fw", "/System/Volumes/iOS/fw" };
 	const uint8_t *img_data;
@@ -570,9 +630,20 @@ annibale_read_fw_file(const char *name, uint64_t *size_out, bool *needs_free_out
 			kfree_data(buf, va.va_data_size);
 		}
 	}
+	return NULL;
+}
+
+static uint8_t *
+annibale_read_fw_file(const char *name, uint64_t *size_out, bool *needs_free_out)
+{
+	uint8_t *buf = annibale_read_fw_override(name, size_out, needs_free_out);
 	uint64_t fat_sz = 0;
+
+	if (buf != NULL) {
+		return buf;
+	}
 	if (annibale_ufs_fat16_fw_read(name, &fat_sz, NULL, 0) && fat_sz > 0 && fat_sz <= 0x400000ULL) {
-		uint8_t *buf = kalloc_data(fat_sz, Z_WAITOK);
+		buf = kalloc_data(fat_sz, Z_WAITOK);
 		if (buf != NULL) {
 			if (annibale_ufs_fat16_fw_read(name, &fat_sz, buf, fat_sz)) {
 				*size_out = fat_sz;
@@ -585,16 +656,61 @@ annibale_read_fw_file(const char *name, uint64_t *size_out, bool *needs_free_out
 	return NULL;
 }
 
+static void
+ipa_wcomb_copy(volatile uint8_t *dst, const uint8_t *src, uint32_t len)
+{
+	uint32_t i = 0;
+
+	while (i < len && (((uintptr_t)(dst + i)) & 7UL) != 0) {
+		dst[i] = src[i];
+		i++;
+	}
+	while (i + 8u <= len) {
+		uint64_t w;
+		memcpy(&w, src + i, sizeof(w));
+		*(volatile uint64_t *)(dst + i) = w;
+		i += 8u;
+	}
+	while (i < len) {
+		dst[i] = src[i];
+		i++;
+	}
+}
+
+static void
+ipa_wcomb_zero(volatile uint8_t *dst, uint32_t len)
+{
+	uint32_t i = 0;
+
+	while (i < len && (((uintptr_t)(dst + i)) & 7UL) != 0) {
+		dst[i++] = 0;
+	}
+	while (i + 8u <= len) {
+		*(volatile uint64_t *)(dst + i) = 0ULL;
+		i += 8u;
+	}
+	while (i < len) {
+		dst[i++] = 0;
+	}
+}
+
+static int64_t
+pas_init_try(uint32_t pas, uint64_t hdr_pa, uint64_t *res1)
+{
+	return annibale_tz_smc(SCM_PAS_INIT_IMAGE, 2u | (2u << 6), pas, hdr_pa, 0, 0, res1);
+}
+
 bool
 annibale_fw_exists(const char *name)
 {
 	uint64_t sz = 0;
 	bool need_free = false;
+	uint8_t *buf;
+
 	if (annibale_ufs_fat16_fw_read(name, &sz, NULL, 0) && sz > 0) {
 		return true;
 	}
-	uint8_t *buf = annibale_read_fw_file(name, &sz, &need_free);
-
+	buf = annibale_read_fw_override(name, &sz, &need_free);
 	if (buf == NULL) {
 		return false;
 	}
@@ -604,49 +720,290 @@ annibale_fw_exists(const char *name)
 	return true;
 }
 
+#define IPA_TZ_HDR_SLOTS        3u
+#define IPA_TZ_HDR_SLOT_SZ      0x10000u
+
+static vm_offset_t ipa_tz_hdr_va[IPA_TZ_HDR_SLOTS];
+static uint64_t ipa_tz_hdr_pa[IPA_TZ_HDR_SLOTS];
+
+static bool
+ipa_ensure_tz_hdr_pages(void)
+{
+	vm_offset_t va[IPA_TZ_HDR_SLOTS] = { 0 };
+	uint64_t pa[IPA_TZ_HDR_SLOTS] = { 0 };
+	bool from_lowdma = false;
+	uint64_t low = 0, mb = 0;
+
+	lck_mtx_lock(&ipa_lock);
+	if (ipa_tz_hdr_va[0] != 0 && ipa_tz_hdr_va[1] != 0 && ipa_tz_hdr_va[2] != 0) {
+		lck_mtx_unlock(&ipa_lock);
+		return true;
+	}
+	lck_mtx_unlock(&ipa_lock);
+
+	/* SM8750 TZ PAS rejects metadata headers >= 4 GiB and pins f120=1 SHM bridges until AUTH_AND_RESET. */
+	if (PE_parse_boot_argn("lowdma", &low, sizeof(low)) &&
+	    PE_parse_boot_argn("lowdma_mb", &mb, sizeof(mb)) &&
+	    low >= 0x80000000ULL && mb >= 32 && mb <= 1024) {
+		uint64_t pool_sz = IPA_TZ_HDR_SLOTS * (uint64_t)IPA_TZ_HDR_SLOT_SZ;
+		uint64_t low_end = low + (mb << 20);
+		uint64_t base_pa = low_end - pool_sz;
+
+		if (low_end <= 0x100000000ULL && base_pa >= low + 0x02000000ULL) {
+			vm_offset_t mapped = ml_io_map_unmappable((vm_offset_t)base_pa,
+			    (vm_size_t)pool_sz, VM_WIMG_DEFAULT);
+			if (mapped != 0) {
+				for (unsigned s = 0; s < IPA_TZ_HDR_SLOTS; s++) {
+					va[s] = mapped + s * IPA_TZ_HDR_SLOT_SZ;
+					pa[s] = base_pa + s * IPA_TZ_HDR_SLOT_SZ;
+				}
+				from_lowdma = true;
+			}
+		}
+	}
+
+	if (!from_lowdma) {
+		ppnum_t max_pnum_4g = (ppnum_t)(0xffffffffULL >> PAGE_SHIFT);
+
+		for (unsigned s = 0; s < IPA_TZ_HDR_SLOTS; s++) {
+			vm_offset_t sva = 0;
+			uint64_t p0 = 0;
+			bool contig = true;
+
+			if (kmem_alloc_contig(kernel_map, &sva, IPA_TZ_HDR_SLOT_SZ, PAGE_MASK, max_pnum_4g, 0,
+			    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS &&
+			    kmem_alloc_contig(kernel_map, &sva, IPA_TZ_HDR_SLOT_SZ, PAGE_MASK, 0, 0,
+			    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+				for (unsigned k = 0; k < s; k++) {
+					kmem_free(kernel_map, va[k], IPA_TZ_HDR_SLOT_SZ);
+				}
+				return false;
+			}
+			p0 = kvtophys(sva);
+			if (p0 == 0 || (p0 & 0xfffULL) != 0) {
+				contig = false;
+			}
+			for (uint32_t p = 0; contig && p < IPA_TZ_HDR_SLOT_SZ; p += 4096u) {
+				if (kvtophys(sva + p) != p0 + p) {
+					contig = false;
+				}
+			}
+			if (!contig) {
+				kmem_free(kernel_map, sva, IPA_TZ_HDR_SLOT_SZ);
+				for (unsigned k = 0; k < s; k++) {
+					kmem_free(kernel_map, va[k], IPA_TZ_HDR_SLOT_SZ);
+				}
+				return false;
+			}
+			va[s] = sva;
+			pa[s] = p0;
+		}
+	}
+
+	lck_mtx_lock(&ipa_lock);
+	if (ipa_tz_hdr_va[0] == 0) {
+		for (unsigned s = 0; s < IPA_TZ_HDR_SLOTS; s++) {
+			ipa_tz_hdr_va[s] = va[s];
+			ipa_tz_hdr_pa[s] = pa[s];
+			va[s] = 0;
+		}
+		printf("annibale-ipa: tz hdr %s slots pa0=%#llx pa1=%#llx pa2=%#llx sz=%#x\n",
+		    from_lowdma ? "lowdma" : "kmem",
+		    ipa_tz_hdr_pa[0], ipa_tz_hdr_pa[1], ipa_tz_hdr_pa[2], IPA_TZ_HDR_SLOT_SZ);
+	}
+	lck_mtx_unlock(&ipa_lock);
+	if (va[0] != 0) {
+		if (from_lowdma) {
+			ml_io_unmap(va[0], IPA_TZ_HDR_SLOTS * IPA_TZ_HDR_SLOT_SZ);
+		} else {
+			for (unsigned s = 0; s < IPA_TZ_HDR_SLOTS; s++) {
+				if (va[s] != 0) {
+					kmem_free(kernel_map, va[s], IPA_TZ_HDR_SLOT_SZ);
+				}
+			}
+		}
+	}
+	return true;
+}
+
+struct tz_assign_mem {
+	uint64_t addr;
+	uint64_t size;
+};
+
+struct tz_assign_perm {
+	uint32_t vmid;
+	uint32_t perm;
+	uint64_t ctx;
+	uint32_t ctx_size;
+	uint32_t pad;
+};
+
+int64_t
+annibale_tz_assign_mem(uint64_t region_pa, uint64_t region_sz, uint32_t peer_vmid, bool shared, uint64_t *res1_out)
+{
+	if (res1_out != NULL) {
+		*res1_out = 0;
+	}
+	if (region_sz == 0 || !ipa_ensure_tz_hdr_pages()) {
+		return -1;
+	}
+
+	lck_mtx_lock(&ipa_lock);
+	vm_offset_t va = ipa_tz_hdr_va[2];
+	uint64_t pa = ipa_tz_hdr_pa[2];
+	uint64_t src_pa = pa + 0x000ULL;
+	uint64_t mem_pa = pa + 0x040ULL;
+	uint64_t dst_pa = pa + 0x080ULL;
+	uint64_t ext_pa = pa + 0x100ULL;
+
+	uint32_t src_vmid = QCOM_VMID_HLOS;
+	struct tz_assign_mem mem = { .addr = region_pa, .size = region_sz };
+	struct tz_assign_perm dst[2] = { 0 };
+	uint64_t dst_sz;
+	if (shared) {
+		dst[0].vmid = QCOM_VMID_HLOS;
+		dst[0].perm = QCOM_PERM_RW;
+		dst[1].vmid = peer_vmid;
+		dst[1].perm = QCOM_PERM_RW;
+		dst_sz = 2ULL * sizeof(struct tz_assign_perm);
+	} else {
+		/* Match qcom_q6v5_pas.ko sun_mpss_resource (region_assign_shared=0): exclusive peer ownership. */
+		dst[0].vmid = peer_vmid;
+		dst[0].perm = QCOM_PERM_RW;
+		dst_sz = sizeof(struct tz_assign_perm);
+	}
+	uint64_t ext[7] = { 4ULL, dst_pa, dst_sz, 0ULL, 0ULL, 0ULL, 0ULL };
+
+	bzero((void *)va, 0x200u);
+	memcpy((void *)(va + 0x000u), &src_vmid, sizeof(src_vmid));
+	memcpy((void *)(va + 0x040u), &mem, sizeof(mem));
+	memcpy((void *)(va + 0x080u), dst, (size_t)dst_sz);
+	memcpy((void *)(va + 0x100u), ext, sizeof(ext));
+
+	for (uint32_t off = 0; off < 0x200u; off += 64u) {
+		uintptr_t line = (uintptr_t)va + off;
+		__asm__ volatile("dc civac, %0" :: "r"(line) : "memory");
+	}
+	__builtin_arm_dsb(0xf);
+
+	int64_t rc = annibale_tz_smc(SCM_MP_ASSIGN, SCM_MP_ASSIGN_ARGINFO, mem_pa, 16ULL, src_pa, ext_pa, res1_out);
+	lck_mtx_unlock(&ipa_lock);
+	return rc;
+}
+
 bool
 annibale_load_mdt_image(const char *prefix, uint32_t pas_id, uint32_t alt_pas_id,
-    uint64_t mem_phys, uint64_t mem_size, uint32_t *used_pas_out)
+    uint64_t mem_phys, uint64_t region_size, uint32_t *used_pas_out)
 {
 	char mdt_name[32];
-	uint64_t mdt_sz = 0;
-	bool mdt_free = false, ok = false;
+	uint64_t mdt_sz = 0, res1 = 0;
+	bool mdt_free = false, ok = false, reloc = false;
 	uint8_t *mdt_buf;
-	uint32_t phnum, lowest = ~0u, highest = 0, active_pas = pas_id;
-	void *tz_hdr_page = NULL;
+	uint32_t phnum, lowest = ~0u, highest_off = 0, base_paddr, span, active_pas = pas_id;
 	vm_offset_t carveout = 0;
 	int64_t rc;
 
 	snprintf(mdt_name, sizeof(mdt_name), "%s.mdt", prefix);
 	mdt_buf = annibale_read_fw_file(mdt_name, &mdt_sz, &mdt_free);
-	if (mdt_buf == NULL || mdt_sz < 52) {
+	if (mdt_buf == NULL || mdt_sz < 52 || mdt_sz > IPA_TZ_HDR_SLOT_SZ) {
+		printf("annibale-ipa: %s invalid mdt (buf=%p sz=%llu)\n", mdt_name, (const void *)mdt_buf, mdt_sz);
 		if (mdt_buf != NULL && mdt_free) {
 			kfree_data(mdt_buf, mdt_sz);
 		}
 		return false;
 	}
 	phnum = mdt_buf[44] | ((uint32_t)mdt_buf[45] << 8);
-	if (memcmp(mdt_buf, "\177ELF\1", 5) != 0 || phnum < 2 || phnum > 64 || 52 + phnum * 32 > mdt_sz) {
+	if (memcmp(mdt_buf, "\177ELF\1", 5) != 0 || phnum < 2 || phnum > 128 || 52 + phnum * 32 > mdt_sz) {
+		printf("annibale-ipa: %s bad ELF header (phnum=%u sz=%llu)\n", mdt_name, phnum, mdt_sz);
 		goto out;
 	}
-	tz_hdr_page = kalloc_data(mdt_sz < PAGE_SIZE ? PAGE_SIZE : mdt_sz, Z_WAITOK | Z_ZERO);
-	if (tz_hdr_page == NULL) {
+	for (uint32_t i = 0; i < phnum; i++) {
+		struct ipa_elf32_phdr ph;
+		memcpy(&ph, mdt_buf + 52 + i * 32, sizeof(ph));
+		if (ph.type != 1 || ((ph.flags >> 24) & 7u) == 2u || ph.memsz == 0) {
+			continue;
+		}
+		if ((ph.flags & (1u << 27)) != 0) {
+			reloc = true;
+		}
+		if (ph.paddr < lowest) {
+			lowest = ph.paddr;
+		}
+	}
+	if (lowest == ~0u) {
+		printf("annibale-ipa: %s has no loadable segments\n", mdt_name);
 		goto out;
 	}
-	memcpy(tz_hdr_page, mdt_buf, mdt_sz);
-	__asm__ volatile("dc civac, %0; dsb sy" :: "r"(tz_hdr_page) : "memory");
+	base_paddr = reloc ? lowest : (uint32_t)mem_phys;
+	for (uint32_t i = 0; i < phnum; i++) {
+		struct ipa_elf32_phdr ph;
+		uint32_t end_off;
 
-	rc = annibale_tz_smc(SCM_PAS_INIT_IMAGE, 2, active_pas, kvtophys((vm_offset_t)tz_hdr_page), 0);
-	if (rc != 0 && alt_pas_id != 0) {
-		active_pas = alt_pas_id;
-		rc = annibale_tz_smc(SCM_PAS_INIT_IMAGE, 2, active_pas, kvtophys((vm_offset_t)tz_hdr_page), 0);
+		memcpy(&ph, mdt_buf + 52 + i * 32, sizeof(ph));
+		if (ph.type != 1 || ((ph.flags >> 24) & 7u) == 2u || ph.memsz == 0) {
+			continue;
+		}
+		if (ph.paddr < base_paddr || ph.filesz > ph.memsz ||
+		    (uint64_t)(ph.paddr - base_paddr) + ph.memsz > region_size) {
+			printf("annibale-ipa: %s seg %u out of range (paddr=%#x base=%#x filesz=%#x memsz=%#x)\n",
+			    mdt_name, i, ph.paddr, base_paddr, ph.filesz, ph.memsz);
+			goto out;
+		}
+		end_off = (ph.paddr - base_paddr) + ph.memsz;
+		if (end_off > highest_off) {
+			highest_off = end_off;
+		}
 	}
-	if (rc != 0) {
-		printf("annibale-ipa: PAS_INIT_IMAGE(%s, pas=%u) returned %lld\n", prefix, active_pas, rc);
+	span = (highest_off + 0xfffu) & ~0xfffu;
+	if (span == 0 || (uint64_t)span > region_size) {
+		printf("annibale-ipa: %s bad span (%#x vs region %#llx)\n", mdt_name, span, region_size);
 		goto out;
 	}
-	carveout = ml_io_map_unmappable(mem_phys, mem_size, VM_WIMG_WCOMB);
+	if (!ipa_ensure_tz_hdr_pages()) {
+		printf("annibale-ipa: %s tz hdr page alloc failed\n", mdt_name);
+		goto out;
+	}
+
+	unsigned slot = (pas_id == 4u) ? 1u : 0u;
+	vm_offset_t hdr_va = ipa_tz_hdr_va[slot];
+	uint64_t hdr_pa = ipa_tz_hdr_pa[slot];
+
+	bzero((void *)hdr_va, IPA_TZ_HDR_SLOT_SZ);
+	memcpy((void *)hdr_va, mdt_buf, mdt_sz);
+	for (uint32_t off = 0; off < IPA_TZ_HDR_SLOT_SZ; off += 64u) {
+		uintptr_t line = (uintptr_t)hdr_va + off;
+		__asm__ volatile("dc civac, %0" :: "r"(line) : "memory");
+	}
+	__builtin_arm_dsb(0xf);
+
+	uint32_t hdr0 = 0;
+	memcpy(&hdr0, mdt_buf, sizeof(hdr0));
+	rc = pas_init_try(active_pas, hdr_pa, &res1);
+	if ((rc != 0 || res1 != 0) && alt_pas_id != 0) {
+		printf("annibale-ipa: PAS_INIT_IMAGE(%s, pas=%u) returned %lld (%#llx)/%#llx hdr_pa=%#llx mdt_sz=%llu hdr0=%#x; retrying alt pas=%u\n",
+		    prefix, active_pas, rc, (uint64_t)rc, res1, hdr_pa, mdt_sz, hdr0, alt_pas_id);
+		active_pas = alt_pas_id;
+		rc = pas_init_try(active_pas, hdr_pa, &res1);
+	}
+	if (rc != 0 || res1 != 0) {
+		printf("annibale-ipa: PAS_INIT_IMAGE(%s, pas=%u) returned %lld (%#llx)/%#llx hdr_pa=%#llx mdt_sz=%llu hdr0=%#x\n",
+		    prefix, active_pas, rc, (uint64_t)rc, res1, hdr_pa, mdt_sz, hdr0);
+		goto out;
+	}
+	printf("annibale-ipa: PAS_INIT_IMAGE(%s, pas=%u) ok hdr_pa=%#llx mdt_sz=%llu\n",
+	    prefix, active_pas, hdr_pa, mdt_sz);
+	rc = annibale_tz_smc(SCM_PAS_MEM_SETUP, 3u, active_pas, mem_phys, region_size, 0, &res1);
+	if (rc != 0 || res1 != 0) {
+		printf("annibale-ipa: PAS_MEM_SETUP(%s, pas=%u) returned %lld (%#llx)/%#llx\n",
+		    prefix, active_pas, rc, (uint64_t)rc, res1);
+		goto out;
+	}
+	printf("annibale-ipa: PAS_MEM_SETUP(%s, pas=%u) ok phys=%#llx sz=%#llx span=%#x\n",
+	    prefix, active_pas, mem_phys, region_size, span);
+	carveout = ml_io_map_unmappable(mem_phys, region_size, VM_WIMG_WCOMB);
 	if (carveout == 0) {
+		printf("annibale-ipa: %s carveout map failed (phys=%#llx sz=%#llx)\n", mdt_name, mem_phys, region_size);
 		goto out;
 	}
 	for (uint32_t i = 0; i < phnum; i++) {
@@ -658,54 +1015,53 @@ annibale_load_mdt_image(const char *prefix, uint32_t pas_id, uint32_t alt_pas_id
 		uint32_t rel_off;
 
 		memcpy(&ph, mdt_buf + 52 + i * 32, sizeof(ph));
-		if (ph.type != 1 || ((ph.flags >> 24) & 7) == 2 || ph.memsz == 0) {
+		if (ph.type != 1 || ((ph.flags >> 24) & 7u) == 2u || ph.memsz == 0) {
 			continue;
 		}
-		if (ph.paddr < mem_phys || (uint64_t)ph.paddr + ph.memsz > mem_phys + mem_size) {
-			goto out;
-		}
-		rel_off = (uint32_t)(ph.paddr - mem_phys);
+		rel_off = ph.paddr - base_paddr;
 		if (ph.filesz > 0) {
 			snprintf(seg_name, sizeof(seg_name), "%s.b%02u", prefix, i);
-			seg_buf = annibale_read_fw_file(seg_name, &seg_sz, &seg_free);
-			if (seg_buf == NULL || seg_sz != ph.filesz) {
-				if (seg_buf != NULL && seg_free) {
+			seg_buf = annibale_read_fw_override(seg_name, &seg_sz, &seg_free);
+			if (seg_buf != NULL) {
+				if (seg_sz != ph.filesz) {
+					printf("annibale-ipa: %s seg %s size mismatch (%llu != %u)\n",
+					    mdt_name, seg_name, seg_sz, ph.filesz);
+					if (seg_free) {
+						kfree_data(seg_buf, seg_sz);
+					}
+					goto out;
+				}
+				ipa_wcomb_copy((volatile uint8_t *)(carveout + rel_off), seg_buf, ph.filesz);
+				if (seg_free) {
 					kfree_data(seg_buf, seg_sz);
 				}
+			} else if (!annibale_ufs_fat16_fw_read(seg_name, &seg_sz,
+			    (volatile uint8_t *)(carveout + rel_off), ph.filesz) || seg_sz != ph.filesz) {
+				printf("annibale-ipa: %s seg %s read failed (got=%llu exp=%u)\n",
+				    mdt_name, seg_name, seg_sz, ph.filesz);
 				goto out;
-			}
-			memcpy((void *)(carveout + rel_off), seg_buf, ph.filesz);
-			if (seg_free) {
-				kfree_data(seg_buf, seg_sz);
 			}
 		}
 		if (ph.memsz > ph.filesz) {
-			bzero((void *)(carveout + rel_off + ph.filesz), ph.memsz - ph.filesz);
-		}
-		if (ph.paddr < lowest) {
-			lowest = ph.paddr;
-		}
-		if (ph.paddr + ph.memsz > highest) {
-			highest = ph.paddr + ph.memsz;
+			ipa_wcomb_zero((volatile uint8_t *)(carveout + rel_off + ph.filesz), ph.memsz - ph.filesz);
 		}
 	}
-	__asm__ volatile("dsb sy" ::: "memory");
-	rc = annibale_tz_smc(SCM_PAS_MEM_SETUP, 3, active_pas, mem_phys,
-	    ((highest + 0xfffu) & ~0xfffu) - (uint32_t)mem_phys);
-	if (rc != 0) {
-		printf("annibale-ipa: PAS_MEM_SETUP(%s, pas=%u) returned %lld\n", prefix, active_pas, rc);
-		goto out;
+	if (span > highest_off) {
+		ipa_wcomb_zero((volatile uint8_t *)(carveout + highest_off), span - highest_off);
 	}
+	__builtin_arm_dsb(0xf);
+	uint32_t w0 = *(volatile const uint32_t *)carveout;
+	uint32_t wlast = highest_off >= 4u ?
+	    *(volatile const uint32_t *)(carveout + ((highest_off - 4u) & ~3u)) : 0u;
+	printf("annibale-ipa: staged %s phys=%#llx span=%#x highest=%#x w0=%#x wlast=%#x\n",
+	    prefix, mem_phys, span, highest_off, w0, wlast);
 	if (used_pas_out != NULL) {
 		*used_pas_out = active_pas;
 	}
 	ok = true;
 out:
 	if (carveout != 0) {
-		ml_io_unmap(carveout, mem_size);
-	}
-	if (tz_hdr_page != NULL) {
-		kfree_data(tz_hdr_page, mdt_sz < PAGE_SIZE ? PAGE_SIZE : mdt_sz);
+		ml_io_unmap(carveout, region_size);
 	}
 	if (mdt_buf != NULL && mdt_free) {
 		kfree_data(mdt_buf, mdt_sz);

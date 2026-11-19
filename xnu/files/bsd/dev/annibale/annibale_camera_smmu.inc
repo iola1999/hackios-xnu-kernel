@@ -171,8 +171,7 @@ cam_smmu_route(bool allow)
 {
 	cam_smmu_ready = false;
 	if (cam_smmu_slot == 0xffu || (allow && cam_smmu_sync_failed) ||
-	    reg_rd(cam_smmu_base, CAM_SMMU_SMR(cam_smmu_slot)) !=
-	    (CAM_SMMU_SMR_VALID | CAM_SMMU_SID_IFE) ||
+	    reg_rd(cam_smmu_base, CAM_SMMU_SMR(cam_smmu_slot)) != (CAM_SMMU_SMR_VALID | CAM_SMMU_SID_IFE) ||
 	    (allow && !cam_smmu_bank_valid(CAM_SMMU_S1_BYPASS_SCTLR))) {
 		return false;
 	}

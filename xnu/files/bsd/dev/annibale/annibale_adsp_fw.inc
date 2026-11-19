@@ -6,6 +6,7 @@
 static int scm_pas_call(uint64_t fn, uint64_t arginfo, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t *res1)
 {
 	uint64_t x0 = fn, x1 = arginfo, x2 = a0, x3 = a1, x4 = a2, x6 = 0, r1 = 0;
+	unsigned ebusy_tries = 0;
 	for (unsigned tries = 0; tries < 2000; tries++) {
 		register uint64_t rx0 __asm__("x0") = x0, rx1 __asm__("x1") = x1;
 		register uint64_t rx2 __asm__("x2") = x2, rx3 __asm__("x3") = x3, rx4 __asm__("x4") = x4;
@@ -15,6 +16,12 @@ static int scm_pas_call(uint64_t fn, uint64_t arginfo, uint64_t a0, uint64_t a1,
 		    : : "x5", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
 		if (rx0 == 1) { x0 = rx0; x1 = rx1; x2 = rx2; x3 = rx3; x4 = rx4; x6 = rx6; sleep_ms(1); continue; }
 		if (rx0 == 2 || rx0 == 6) { x0 = fn; x1 = arginfo; x2 = a0; x3 = a1; x4 = a2; x6 = 0; sleep_ms(1); continue; }
+		if ((int64_t)rx0 == -12 && ebusy_tries < 120u) {
+			ebusy_tries++;
+			x0 = fn; x1 = arginfo; x2 = a0; x3 = a1; x4 = a2; x6 = 0;
+			sleep_ms(30);
+			continue;
+		}
 		r1 = rx1;
 		x0 = rx0;
 		break;

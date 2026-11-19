@@ -732,10 +732,12 @@ adreno8_speed_state(uint32_t *mhz, uint32_t *changes)
 void
 adreno8_speed_tick(void)
 {
+	extern bool annibale_perfctl_gpu_interactive_active(uint64_t now);
+	extern bool annibale_gpu_focal_active(uint64_t now);
 	uint64_t now = mach_absolute_time(), since, light, touched, touch_age, permille, busy_ns;
 	uint32_t want = adreno8_speed_now, msg[3], floor, step_floor, load_want;
 	int32_t tenths = 0;
-	bool touch_boost;
+	bool touch_boost, interactive_boost;
 
 	if (adreno8_speed_asked <= 1 || adreno8_speed_asked >= adreno8_gx_count || !adreno8_hfi_tables_sent) {
 		return;
@@ -743,9 +745,10 @@ adreno8_speed_tick(void)
 	touched = annibale_cpufreq_touched();
 	absolutetime_to_nanoseconds(now - touched, &touch_age);
 	touch_boost = touched != 0 && touched <= now && touch_age < (uint64_t)adreno8_touch_ms * 1000000;
+	interactive_boost = touch_boost || annibale_perfctl_gpu_interactive_active(now) || annibale_gpu_focal_active(now);
 	absolutetime_to_nanoseconds(now - adreno8_speed_ticked, &since);
 	if (adreno8_speed_ticked != 0 && since < SPEED_TICK_NS) {
-		if (!touch_boost || adreno8_speed_now > 1 || adreno8_speed_limit == 1) {
+		if (!interactive_boost || adreno8_speed_now > 1 || adreno8_speed_limit == 1) {
 			return;
 		}
 		permille = 0;
@@ -772,7 +775,7 @@ adreno8_speed_tick(void)
 	}
 	floor = adreno8_speed_floor < 1 ? 1 : adreno8_speed_floor > adreno8_speed_asked ? adreno8_speed_asked : adreno8_speed_floor;
 	step_floor = MIN(MAX(floor, 3u), adreno8_speed_asked);
-	if (permille >= SPEED_UP_PERMILLE || touch_boost) {
+	if (permille >= SPEED_UP_PERMILLE || interactive_boost) {
 		load_want = touch_boost ? adreno8_speed_asked : step_floor;
 		while (load_want < adreno8_speed_asked &&
 		    (uint64_t)adreno8_gx_hz[load_want] * SPEED_TARGET_PERMILLE < permille * adreno8_gx_hz[1]) {
@@ -800,6 +803,10 @@ adreno8_speed_tick(void)
 	}
 	want = MIN(MAX(want, floor), adreno8_speed_limit);
 	if (want == adreno8_speed_now) {
+		return;
+	}
+	/* Drain inflight GPU batches before HFI changes GX clock/voltage or DDR bandwidth. */
+	if (!adreno8_context_wait_idle("GPU speed")) {
 		return;
 	}
 	msg[0] = 1;

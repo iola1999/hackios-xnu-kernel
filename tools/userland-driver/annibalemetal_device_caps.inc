@@ -306,10 +306,14 @@
 		NSData *air = ((NSData *(*)(id, SEL))objc_msgSend)(function, bitcode);
 		if ([air length] == 0)
 			return [self fail:error with:@"the compute function has no bitcode"];
-		rw_compute_pipe_key(key, [air bytes], [air length], [[function name] UTF8String]);
+		rw_compute_pipe_key_nsdata(key, air, [[function name] UTF8String]);
 		compute = rw_compute_pipe_find(_mesa, key, &info);
 		if (compute == NULL) {
-			compute = mesa.compute_create(_mesa, [air bytes], [air length],
+			struct rwa_compute *(*create_fn)(struct rwa_device *, const void *, size_t,
+			    const char *, struct rwa_compute_info *, char *, size_t) =
+			    mesa.compute_create_deferred != NULL ? mesa.compute_create_deferred :
+			    mesa.compute_create;
+			compute = create_fn(_mesa, [air bytes], [air length],
 				[[function name] UTF8String], &info, why, sizeof(why));
 			if (compute != NULL)
 				rw_compute_pipe_keep(_mesa, key, compute, &info);
@@ -325,7 +329,10 @@
 		 * which construct it refused, and an application can act on that. */
 		return [self fail:error with:[NSString stringWithUTF8String:why]];
 	}
-	rw_print("compute pipeline %p is %s\n", (void *)compute, [[function name] UTF8String]);
+	static unsigned compute_created_logged;
+	if (__atomic_fetch_add(&compute_created_logged, 1, __ATOMIC_RELAXED) < 64) {
+		rw_print("compute pipeline %p is %s\n", (void *)compute, [[function name] UTF8String]);
+	}
 	return [[AnnibaleMetalComputePipeline alloc] initWithAnnibaleDevice:self
 								 compute:compute
 								    info:&info
@@ -466,7 +473,13 @@
  * CoreAnimation does not test what it gets back, so a bare nil becomes a CAMetalDrawable
  * whose -texture is nil, and the application finds out later and somewhere else.
  */
-- (id)newBufferWithIOSurface:(void *)surface        { (void)surface; return nil; }
+- (id)newBufferWithIOSurface:(void *)surface
+{
+	if (surface == NULL) {
+		return nil;
+	}
+	return [[AnnibaleMetalBuffer alloc] initWithDevice:self iosurface:surface];
+}
 - (id)newBufferWithBytesNoCopy:(void *)bytes
 			length:(NSUInteger)length
 		       options:(NSUInteger)options

@@ -9,14 +9,20 @@
 #define GCC_SIZE                0x000b0000UL
 #define MCLKCC_PHYS             0x01760000UL
 #define MCLKCC_SIZE             0x00006000UL
+#define MMSS_NOC_PHYS           0x01780000UL
+#define MMSS_NOC_SIZE           0x0005c000UL
+#define CAM_HF_QTB_PHYS         0x017d2000UL
+#define CAM_HF_QTB_SIZE         0x00001000UL
 #define CAM_CPAS_PHYS           0x0ac04000UL    /* qcom,cam-cpas cam_cpas_top (<0xac04000 0x1000>) */
 #define CAM_CPAS_SIZE           0x00001000UL
+#define CAMNOC_NRT_PHYS         0x0ac62000UL    /* cam980_cpas100_camnoc_info_nrt (<0xac62000 0x9200>) */
+#define CAMNOC_NRT_SIZE         0x0000a000UL
 #define CCI0_PHYS               0x0ac7b000UL
 #define CCI0_SIZE               0x00001000UL
 #define CSID_LITE0_PHYS         0x0ad6d000UL    /* csid-lite980 (0xa00) + vfe-lite980 (0x2800) */
 #define CSID_LITE0_SIZE         0x00002800UL
-#define CAMNOC_RT_PHYS          0x0ad90000UL    /* cam980_cpas100_camnoc_info_rt (<0xad90000 0x6000>) */
-#define CAMNOC_RT_SIZE          0x00006000UL
+#define CAMNOC_RT_PHYS          0x0ad90000UL    /* cam980_cpas100_camnoc_info_rt (<0xad90000 0x9000>) */
+#define CAMNOC_RT_SIZE          0x00009000UL
 #define CSIPHY3_PHYS            0x0adaf000UL
 #define CSIPHY3_SIZE            0x00002000UL
 #define CSIPHY4_PHYS            0x0adb1000UL
@@ -169,9 +175,13 @@ static vm_offset_t gcc_base;
 static vm_offset_t mclkcc_base;
 static vm_offset_t cpas_base;
 static vm_offset_t camcc_base;
+static vm_offset_t cam_crm_base;
 static vm_offset_t cci0_base;
 static vm_offset_t csid_lite_base;
 static vm_offset_t camnoc_rt_base;
+static vm_offset_t camnoc_nrt_base;
+static vm_offset_t cam_hf_qtb_base;
+static vm_offset_t mmss_noc_base;
 static vm_offset_t cam_spmi_core;
 static vm_offset_t cam_spmi_obsrv;
 static vm_offset_t tlmm_base;
@@ -186,13 +196,16 @@ static uint32_t cached_cpas_ver = 0;
 static uint32_t cached_cpas_cap = 0;
 static uint32_t cached_csid_ver = 0;
 static uint32_t cached_ife_ver = 0;
-static uint32_t boot_cam_bcm = 0;
+static uint32_t boot_cam_bcm = 0u;
 static uint32_t boot_cam_rt_mhz = 200u;
-static uint32_t boot_cam_probe = 1u;
+static uint32_t boot_cam_probe = 0u;
 static uint32_t boot_cam_keep_stream = 1u;
 static bool cam_session_probed = false;
+static bool cam_mid_sampled = false;
 static bool cci_ready = false;
 static bool cam_ife_lite_clks_on = false;
+static bool gcc_cam_hf_axi_ok = false;
+static bool cam_nrt_axi_ok = false;
 static bool cam_hw_dma_verified = false;
 static bool cam_sensor_streaming = false;
 
@@ -342,12 +355,15 @@ cam_vote_rpmh_supplies(bool enable)
 		say("rpmh arc mmcx_return=%u mxc_return=%u\n", mmcx_ok ? 1u : 0u, mxc_ok ? 1u : 0u);
 		if (boot_cam_bcm != 0) {
 			/* MM0/SH0/MC0/ACV are shared with MDSS display in APPS DRV; never unvote on close. */
+			bool mm1 = annibale_rpmh_bcm_vote("MM1", 0, 0x00004001u); /* enable_mask=0x1: qnm_camnoc_hf/sf */
 			bool mm0 = annibale_rpmh_bcm_vote("MM0", 2100ULL * 1000000ULL, 0);
+			bool sh1 = annibale_rpmh_bcm_vote("SH1", 0, 0x00004001u); /* enable_mask=0x1: qnm_mnoc_hf */
 			bool sh0 = annibale_rpmh_bcm_vote("SH0", 2100ULL * 1000000ULL, 0);
-			bool mc0 = annibale_rpmh_bcm_vote("MC0", 1600ULL * 1000000ULL, 0);
-			bool acv = annibale_rpmh_bcm_vote("ACV", 0, 0x8u);
-			say("rpmh bcm on mm0=%u sh0=%u mc0=%u acv=%u\n",
-			    mm0 ? 1u : 0u, sh0 ? 1u : 0u, mc0 ? 1u : 0u, acv ? 1u : 0u);
+			bool mc0 = annibale_rpmh_bcm_vote("MC0", 2100ULL * 1000000ULL, 0);
+			bool acv = annibale_rpmh_bcm_vote("ACV", 0, (0x8u << 14) | 0x8u);
+			say("rpmh bcm on mm1=%u mm0=%u sh1=%u sh0=%u mc0=%u acv=%u\n",
+			    mm1 ? 1u : 0u, mm0 ? 1u : 0u, sh1 ? 1u : 0u,
+			    sh0 ? 1u : 0u, mc0 ? 1u : 0u, acv ? 1u : 0u);
 		}
 	}
 	for (size_t i = 0; i < sizeof(cam_vrm_rails) / sizeof(cam_vrm_rails[0]); i++) {
@@ -436,56 +452,7 @@ cam_spmi_front_ldo_probe(const char *tag)
 	}
 }
 
-static void
-cam_diag_bus_debug_enable(void)
-{
-	if (boot_cam_probe != 0 && csid_lite_base != 0) {
-		csid_wr(0x177cu, 0xb00u);
-	}
-}
-
-static void
-cam_diag_capture_probe(const char *tag)
-{
-	if (boot_cam_probe == 0 || cam_session_probed) {
-		return;
-	}
-	cam_session_probed = true;
-	if (cpas_base != 0) {
-		say("probe[%s] cpas 1c=%#x ec=%#x f0=%#x\n", tag,
-		    reg_rd(cpas_base, 0x1cu), reg_rd(cpas_base, 0xecu), reg_rd(cpas_base, 0xf0u));
-	}
-	if (camnoc_rt_base != 0) {
-		say("probe[%s] camnoc_rt err08=%#x 0c=%#x 10=%#x 18=%#x 20=%#x 30=%#x 248=%#x 300=%#x\n",
-		    tag, reg_rd(camnoc_rt_base, 0x08u), reg_rd(camnoc_rt_base, 0x0cu),
-		    reg_rd(camnoc_rt_base, 0x10u), reg_rd(camnoc_rt_base, 0x18u),
-		    reg_rd(camnoc_rt_base, 0x20u), reg_rd(camnoc_rt_base, 0x30u),
-		    reg_rd(camnoc_rt_base, 0x248u), reg_rd(camnoc_rt_base, 0x300u));
-		say("probe[%s] camnoc_rt1 qos=%#x/%#x/%#x niu=%#x/%#x/%#x rt3 niu=%#x/%#x\n",
-		    tag, reg_rd(camnoc_rt_base, 0x4088u), reg_rd(camnoc_rt_base, 0x408cu),
-		    reg_rd(camnoc_rt_base, 0x40a0u), reg_rd(camnoc_rt_base, 0x4820u),
-		    reg_rd(camnoc_rt_base, 0x4840u), reg_rd(camnoc_rt_base, 0x4848u),
-		    reg_rd(camnoc_rt_base, 0x4c20u), reg_rd(camnoc_rt_base, 0x4c40u));
-	}
-	if (csid_lite_base != 0) {
-		say("probe[%s] bus 1200=%#x 121c=%#x 1228=%#x 122c=%#x wm 1700=%#x 1704=%#x 170c=%#x 1714=%#x\n",
-		    tag, reg_rd(csid_lite_base, 0x1200u), reg_rd(csid_lite_base, 0x121cu),
-		    reg_rd(csid_lite_base, 0x1228u), reg_rd(csid_lite_base, 0x122cu),
-		    reg_rd(csid_lite_base, 0x1700u), reg_rd(csid_lite_base, 0x1704u),
-		    reg_rd(csid_lite_base, 0x170cu), reg_rd(csid_lite_base, 0x1714u));
-		/* IFE-lite overflow (0x1268) and out-of-bounds (0x1270) status: distinguish a WM-generated bad address from CAMNOC mis-decoding a valid one. */
-		say("probe[%s] bus_ovf 1260=%#x 1264=%#x 1268=%#x 126c=%#x 1270=%#x 1274=%#x 1278=%#x\n",
-		    tag, reg_rd(csid_lite_base, 0x1260u), reg_rd(csid_lite_base, 0x1264u),
-		    reg_rd(csid_lite_base, 0x1268u), reg_rd(csid_lite_base, 0x126cu),
-		    reg_rd(csid_lite_base, 0x1270u), reg_rd(csid_lite_base, 0x1274u),
-		    reg_rd(csid_lite_base, 0x1278u));
-		say("probe[%s] wm_dbg 1770=%#x 177c=%#x 1780=%#x 1784=%#x 1790=%#x 1794=%#x 1798=%#x 179c=%#x\n",
-		    tag, reg_rd(csid_lite_base, 0x1770u), reg_rd(csid_lite_base, 0x177cu),
-		    reg_rd(csid_lite_base, 0x1780u), reg_rd(csid_lite_base, 0x1784u),
-		    reg_rd(csid_lite_base, 0x1790u), reg_rd(csid_lite_base, 0x1794u),
-		    reg_rd(csid_lite_base, 0x1798u), reg_rd(csid_lite_base, 0x179cu));
-	}
-}
+#include "annibale_camera_diag.inc"
 
 /* CCI0 v2 Master 1 initialization (400 kHz Fast-Mode I2C on 19.2 MHz bi_tcxo) */
 static bool

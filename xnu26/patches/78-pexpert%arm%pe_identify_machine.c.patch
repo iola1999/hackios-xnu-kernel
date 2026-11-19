@@ -1,5 +1,5 @@
 diff --git a/pexpert/arm/pe_identify_machine.c b/pexpert/arm/pe_identify_machine.c
-index 937ce42df60f..9b7abbd44cdb 100644
+index 937ce42df60f..b3dcdc033111 100644
 --- a/pexpert/arm/pe_identify_machine.c
 +++ b/pexpert/arm/pe_identify_machine.c
 @@ -3,6 +3,7 @@
@@ -10,13 +10,22 @@ index 937ce42df60f..9b7abbd44cdb 100644
  #include <pexpert/boot.h>
  #include <pexpert/protos.h>
  #include <pexpert/device_tree.h>
-@@ -80,6 +81,11 @@ pe_identify_machine(boot_args * bootArgs)
+@@ -22,6 +23,7 @@ extern void clean_mmu_dcache(void);
+ static char    *gPESoCDeviceType;
+ static char     gPESoCDeviceTypeBuffer[SOC_DEVICE_TYPE_BUFFER_SIZE];
+ static vm_offset_t gPESoCBasePhys;
++uint32_t        annibale_timebase_scale_125 = 0;
+ 
+ static uint32_t pe_arm_init_timer(void *args);
+ 
+@@ -80,6 +82,12 @@ pe_identify_machine(boot_args * bootArgs)
  			}
  		}
  		gPEClockFrequencyInfo.dec_clock_rate_hz = gPEClockFrequencyInfo.timebase_frequency_hz;
 +#if defined(ANNIBALE_ARM64E_USERLAND)
 +		if (gPEClockFrequencyInfo.dec_clock_rate_hz == ANNIBALE_HW_TIMEBASE_HZ) {
 +			gPEClockFrequencyInfo.timebase_frequency_hz = ANNIBALE_MACH_TIMEBASE_HZ;
++			annibale_timebase_scale_125 = 1;
 +		}
 +#endif
  

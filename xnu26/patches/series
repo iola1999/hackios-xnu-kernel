@@ -78,3 +78,5 @@
 76-osfmk%arm%rtclock.c.patch
 77-osfmk%arm%Makefile.patch
 78-pexpert%arm%pe_identify_machine.c.patch
+79-osfmk%arm64%genassym.c.patch
+80-osfmk%arm64%locore.s.patch

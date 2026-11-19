@@ -79,6 +79,7 @@ void annibale_gpu_stop(void);
 
 bool AnnibaleGPUStart(void);
 void AnnibaleGPUStop(void);
+bool annibale_gpu_focal_active(uint64_t now);
 void MiniIOMobileFramebufferShow(const uint8_t * pixels, uint32_t width, uint32_t height, uint32_t rowBytes);
 }
 
@@ -229,6 +230,93 @@ static bool gGPUCached;                         /* boot-arg gpu_cached=1 */
 static bool gGPUCoherent;                       /* boot-arg gpu_coherent=1: the GPU snoops the caches (adreno8.c) */
 static bool gGPUSaidSetIova;                    /* MSM_INFO_SET_IOVA has been refused out loud once */
 
+/* PID -> IOGPU role table updated by RunningBoard (`type = 1`) and consulted on 3D submit. */
+struct gpu_pid_role {
+	pid_t    pid;
+	uint8_t  role;
+	uint32_t gen;
+};
+#define GPU_PID_ROLES           64
+#define GPU_ROLE_BACKGROUND     2u
+static IOSimpleLock * gGPURoleLock;
+static struct gpu_pid_role gGPURoles[GPU_PID_ROLES];
+static uint32_t gGPURoleGen;
+static uint64_t gGPUFocalActiveUntil;
+
+static void
+gpuRoleSet(pid_t pid, uint8_t role)
+{
+	uint8_t clamped = role > GPU_ROLE_BACKGROUND ? GPU_ROLE_BACKGROUND : role;
+	int empty = -1, oldest = 0;
+
+	if (pid <= 0 || gGPURoleLock == NULL) {
+		return;
+	}
+	IOSimpleLockLock(gGPURoleLock);
+	gGPURoleGen++;
+	for (int i = 0; i < GPU_PID_ROLES; i++) {
+		if (gGPURoles[i].pid == pid) {
+			gGPURoles[i].role = clamped;
+			gGPURoles[i].gen = gGPURoleGen;
+			IOSimpleLockUnlock(gGPURoleLock);
+			return;
+		}
+		if (gGPURoles[i].pid == 0 && empty < 0) {
+			empty = i;
+		}
+		if (gGPURoles[i].gen < gGPURoles[oldest].gen) {
+			oldest = i;
+		}
+	}
+	int slot = empty >= 0 ? empty : oldest;
+	gGPURoles[slot].pid = pid;
+	gGPURoles[slot].role = clamped;
+	gGPURoles[slot].gen = gGPURoleGen;
+	IOSimpleLockUnlock(gGPURoleLock);
+}
+
+static uint8_t
+gpuRoleGet(pid_t pid)
+{
+	uint8_t role = GPU_ROLE_BACKGROUND;
+
+	if (pid <= 0 || gGPURoleLock == NULL) {
+		return role;
+	}
+	IOSimpleLockLock(gGPURoleLock);
+	for (int i = 0; i < GPU_PID_ROLES; i++) {
+		if (gGPURoles[i].pid == pid) {
+			role = gGPURoles[i].role;
+			gGPURoles[i].gen = ++gGPURoleGen;
+			break;
+		}
+	}
+	IOSimpleLockUnlock(gGPURoleLock);
+	return role;
+}
+
+static void
+gpuNoteSubmit(pid_t pid)
+{
+	uint64_t boost_ticks, until, cur;
+
+	if (gpuRoleGet(pid) > 1u) {
+		return;
+	}
+	nanoseconds_to_absolutetime(50ULL * NSEC_PER_MSEC, &boost_ticks);
+	until = mach_absolute_time() + boost_ticks;
+	cur = __atomic_load_n(&gGPUFocalActiveUntil, __ATOMIC_RELAXED);
+	while (cur < until &&
+	    !__atomic_compare_exchange_n(&gGPUFocalActiveUntil, &cur, until, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+	}
+}
+
+bool
+annibale_gpu_focal_active(uint64_t now)
+{
+	return now < __atomic_load_n(&gGPUFocalActiveUntil, __ATOMIC_RELAXED);
+}
+
 /* What the last seconds' submissions were and cost here, for the log. */
 static struct {
 	uint64_t since, flushing, waiting, taking;      /* times of the processor's clock */
@@ -365,7 +453,14 @@ waitOver(const struct msm_timespec * when, uint32_t fence)
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
-class AnnibaleGPU : public IOService
+class IOGPU : public IOService
+{
+	OSDeclareDefaultStructors(IOGPU);
+};
+
+OSDefineMetaClassAndStructors(IOGPU, IOService);
+
+class AnnibaleGPU : public IOGPU
 {
 	OSDeclareDefaultStructors(AnnibaleGPU);
 
@@ -373,12 +468,12 @@ public:
 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
 };
 
-OSDefineMetaClassAndStructors(AnnibaleGPU, IOService);
+OSDefineMetaClassAndStructors(AnnibaleGPU, IOGPU);
 
 bool
 AnnibaleGPU::start(IOService * provider)
 {
-	if (!IOService::start(provider)) {
+	if (!IOGPU::start(provider)) {
 		return false;
 	}
 	if (!setProperty(kIOUserClientClassKey, "AnnibaleGPUUserClient")) return false;
@@ -399,7 +494,11 @@ AnnibaleGPUStart(void)
 	AnnibaleGPU * gpu = NULL;
 	uint32_t cached = 0;
 
-	if (provider == NULL || (gGPULock = IOLockAlloc()) == NULL) {
+	if (provider == NULL || (gGPULock = IOLockAlloc()) == NULL || (gGPURoleLock = IOSimpleLockAlloc()) == NULL) {
+		if (gGPULock != NULL) {
+			IOLockFree(gGPULock);
+			gGPULock = NULL;
+		}
 		IOLog("AnnibaleGPU: cannot allocate the service lock or find its provider\n");
 		return false;
 	}
@@ -410,6 +509,8 @@ AnnibaleGPUStart(void)
 	gpu = OSTypeAlloc(AnnibaleGPU);
 	if (gpu == NULL || !gpu->init() || !gpu->attach(provider)) {
 		OSSafeReleaseNULL(gpu);
+		IOSimpleLockFree(gGPURoleLock);
+		gGPURoleLock = NULL;
 		IOLockFree(gGPULock);
 		gGPULock = NULL;
 		IOLog("AnnibaleGPU: cannot create the service\n");
@@ -418,6 +519,8 @@ AnnibaleGPUStart(void)
 	if (!gpu->start(provider)) {
 		gpu->detach(provider);
 		gpu->release();
+		IOSimpleLockFree(gGPURoleLock);
+		gGPURoleLock = NULL;
 		IOLockFree(gGPULock);
 		gGPULock = NULL;
 		IOLog("AnnibaleGPU: the service did not register\n");
@@ -496,6 +599,8 @@ class AnnibaleGPUUserClient : public IOUserClient
 	OSDeclareDefaultStructors(AnnibaleGPUUserClient);
 
 	task_t                  fTask;
+	uint32_t                fClientType;
+	pid_t                   fPid;
 	struct gpu_buffer *     fBuffers;               /* handle n is fBuffers[n - 1] */
 	uint32_t                fNextQueue;
 	uint32_t                fNextBuffer;            /* where the search for a free handle starts: one given back is not the next given */
@@ -521,6 +626,7 @@ class AnnibaleGPUUserClient : public IOUserClient
 	IOReturn gemInfo(struct msm_gem_info * request);
 	IOReturn submit(struct msm_gem_submit * request);
 	IOReturn show(const struct annibale_show * request);
+	IOReturn iogpuControlMethod(uint32_t selector, IOExternalMethodArguments * args);
 
 public:
 	virtual bool initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties) APPLE_KEXT_OVERRIDE;
@@ -541,12 +647,17 @@ AnnibaleGPUUserClient::initWithTask(task_t owningTask, void * securityID, UInt32
 		return false;
 	}
 	fTask = owningTask;
+	fClientType = type & 0xffffu;
+	fPid = proc_selfpid();
 	return true;
 }
 
 bool
 AnnibaleGPUUserClient::start(IOService * provider)
 {
+	if (fClientType == 1u) {
+		return IOUserClient::start(provider);
+	}
 	if (gGPULock == NULL) return false;
 	IOLockLock(gGPULock);
 	bool available = !gGPUReported && annibale_gpu_ready();
@@ -638,6 +749,9 @@ AnnibaleGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, 
 	struct gpu_buffer * b;
 	IOReturn ret = kIOReturnBadArgument;
 
+	if (fBuffers == NULL) {
+		return kIOReturnUnsupported;
+	}
 	IOLockLock(gGPULock);
 	b = buffer(type);
 	if (b != NULL) {
@@ -659,6 +773,57 @@ AnnibaleGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, 
 	}
 	IOLockUnlock(gGPULock);
 	return ret;
+}
+
+IOReturn
+AnnibaleGPUUserClient::iogpuControlMethod(uint32_t selector, IOExternalMethodArguments * args)
+{
+	switch (selector) {
+	case 0:
+		if (args->structureOutput == NULL || args->structureOutputSize < 0x40u) {
+			return kIOReturnBadArgument;
+		}
+		bzero(args->structureOutput, 0x40u);
+		args->structureOutputSize = 0x40u;
+		return kIOReturnSuccess;
+	case 2: {
+		uint64_t reg_id = gGPUService != NULL ? gGPUService->getRegistryEntryID() : 1ULL;
+
+		if (args->structureOutput == NULL || args->structureOutputSize < 0x218u) {
+			return kIOReturnBadArgument;
+		}
+		if (reg_id == 0) {
+			reg_id = 1ULL;
+		}
+		bzero(args->structureOutput, 0x218u);
+		memcpy(args->structureOutput, &reg_id, sizeof(reg_id));
+		args->structureOutputSize = 0x218u;
+		return kIOReturnSuccess;
+	}
+	case 4:
+		if (args->structureOutput == NULL || args->structureOutputSize < 0x20u) {
+			return kIOReturnBadArgument;
+		}
+		bzero(args->structureOutput, 0x20u);
+		args->structureOutputSize = 0x20u;
+		return kIOReturnSuccess;
+	case 0x21:
+		if (args->scalarInput == NULL || args->scalarInputCount < 2u) {
+			return kIOReturnBadArgument;
+		}
+		gpuRoleSet((pid_t)(int32_t)args->scalarInput[0], (uint8_t)args->scalarInput[1]);
+		return kIOReturnSuccess;
+	case 0x22:
+		if (args->scalarInput == NULL || args->scalarInputCount < 1u ||
+		    args->scalarOutput == NULL || args->scalarOutputCount < 1u) {
+			return kIOReturnBadArgument;
+		}
+		args->scalarOutput[0] = gpuRoleGet((pid_t)(int32_t)args->scalarInput[0]);
+		args->scalarOutputCount = 1u;
+		return kIOReturnSuccess;
+	default:
+		return kIOReturnUnsupported;
+	}
 }
 
 IOReturn
@@ -687,6 +852,9 @@ AnnibaleGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 	uint64_t zero = 0, patience, waitBegan;
 	uint32_t fence;
 
+	if (fClientType == 1u) {
+		return iogpuControlMethod(selector, args);
+	}
 	if (args->structureInput == NULL || size > sizeof(r) || fBuffers == NULL) {
 		return kIOReturnBadArgument;
 	}

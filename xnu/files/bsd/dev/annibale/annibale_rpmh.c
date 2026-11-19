@@ -273,7 +273,8 @@ annibale_rpmh_bcm_vote(const char *name, uint64_t bw_bytes_per_sec, uint32_t raw
 		return false;
 	}
 	if (raw_vote != 0) {
-		cmd = 0x60000000u | (raw_vote & 0x3fff3fffu);
+		/* VOTE_X occupies [27:14] and VOTE_Y occupies [13:0]; mask 0x0fffffffu preserves bits [15:14]. */
+		cmd = 0x60000000u | (raw_vote & 0x0fffffffu);
 		return annibale_rpmh_tcs_send(&addr, &cmd, 1u);
 	}
 	if (bw_bytes_per_sec == 0) {

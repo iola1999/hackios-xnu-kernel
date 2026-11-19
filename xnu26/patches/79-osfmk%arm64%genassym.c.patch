@@ -1,0 +1,12 @@
+diff --git a/osfmk/arm64/genassym.c b/osfmk/arm64/genassym.c
+index 43b73c02bf54..b8b5ad917a8f 100644
+--- a/osfmk/arm64/genassym.c
++++ b/osfmk/arm64/genassym.c
+@@ -329,6 +329,7 @@ main(int     argc,
+ #endif
+ 	DECLARE("CPU_NUMBER_GS", offsetof(cpu_data_t, cpu_number));
+ 	DECLARE("CPU_PENDING_AST", offsetof(cpu_data_t, cpu_pending_ast));
++	DECLARE("CPU_BASE_TIMEBASE", offsetof(cpu_data_t, cpu_base_timebase));
+ 	DECLARE("CPU_INT_STATE", offsetof(cpu_data_t, cpu_int_state));
+ 	DECLARE("CPU_USER_DEBUG", offsetof(cpu_data_t, cpu_user_debug));
+ 	DECLARE("CPU_STAT_IRQ", offsetof(cpu_data_t, cpu_stat.irq_ex_cnt));

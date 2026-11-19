@@ -34,6 +34,7 @@ typedef struct task * task_t;
 #define kIOReturnVMError (-536870200)
 #define kIOReturnBadArgument (-536870206)
 #define kIOReturnUnsupported (-536870201)
+#define kIOReturnAborted (-536870165)
 #define kIOUserClientClassKey "IOUserClientClass"
 #define APPLE_KEXT_OVERRIDE
 #ifndef __unused
@@ -378,10 +379,34 @@ int main(void) {
     assert(uc->externalMethod(kM2MethodTransformSurface, &args, nullptr, nullptr, nullptr) == kIOReturnSuccess);
     assert(((uint16_t *)(dstHalf->kpixels + dstHalf->info.offset))[0] == 0u);
 
+    /* 5. CW 90° (kM2FlagRotate90 = 0x4) orientation check on both BGRA general path and 420f fast path */
+    auto * srcRotBGRA = makeSingle(6, FOURCC('B','G','R','A'), 4, 2, 4);
+    auto * dstRotBGRA = makeSingle(7, FOURCC('B','G','R','A'), 2, 4, 4);
+    for (unsigned y = 0; y < 2; y++) {
+        for (unsigned x = 0; x < 4; x++) {
+            uint8_t * p = srcRotBGRA->kpixels + srcRotBGRA->info.offset + y * srcRotBGRA->info.bytesPerRow + x * 4;
+            p[0] = (uint8_t)(y * 16 + x + 1);
+            p[1] = 0x20;
+            p[2] = 0x40;
+            p[3] = 0xff;
+        }
+    }
+    memset(rawReq, 0, sizeof(rawReq));
+    req->srcSurfaceID = 6;
+    req->dstSurfaceID = 7;
+    req->flags = kM2FlagRotate90 | kM2FlagSkipAsyncCallback;
+    assert(uc->externalMethod(kM2MethodTransformSurface, &args, nullptr, nullptr, nullptr) == kIOReturnSuccess);
+    const uint8_t * dr = dstRotBGRA->kpixels + dstRotBGRA->info.offset;
+    /* CW 90°: src(0,0)=1 -> dst(1,0); src(0,1)=17 -> dst(0,0); src(3,0)=4 -> dst(1,3). */
+    assert(dr[0 * dstRotBGRA->info.bytesPerRow + 1 * 4] == 1);
+    assert(dr[0 * dstRotBGRA->info.bytesPerRow + 0 * 4] == 17);
+    assert(dr[3 * dstRotBGRA->info.bytesPerRow + 1 * 4] == 4);
+    assert(uc->externalMethod(kM2MethodAbortTransfers, &args, nullptr, nullptr, nullptr) == kIOReturnSuccess);
+
     assert(uc->clientClose() == kIOReturnSuccess);
     uc->release();
-    for (int i = 1; i <= 5; i++) { gSurfs[i]->release(); gSurfs[i] = nullptr; }
-    printf("MiniM2Scaler host test: P010->NV12, NV12->BGRA CSC, L00h half-float, ZeroFill, SharedEvent & AsyncCallback PASS\n");
+    for (int i = 1; i <= 7; i++) { gSurfs[i]->release(); gSurfs[i] = nullptr; }
+    printf("MiniM2Scaler host test: P010->NV12, NV12->BGRA CSC, L00h half-float, ZeroFill, CW90, SharedEvent & AsyncCallback PASS\n");
     return 0;
 }
 '''

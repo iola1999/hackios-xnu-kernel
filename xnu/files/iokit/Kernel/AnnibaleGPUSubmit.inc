@@ -111,6 +111,9 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request)
 	gGPUStat.flushing += mach_absolute_time() - began;
 	gGPUStat.buffers += request->nr_bos;
 	request->fence = annibale_gpu_submit(addresses, words, count);
+	if (request->fence != 0) {
+		gpuNoteSubmit(fPid);
+	}
 	/*
 	 * The ring is full and the core is not reading it: it has stopped. With gpu_recover=1 it is
 	 * reset and given this submission again -- after a reset the ring is empty, so there is
@@ -122,6 +125,9 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request)
 		gGPUReported = !annibale_gpu_recover();
 		if (!gGPUReported) {
 			request->fence = annibale_gpu_submit(addresses, words, count);
+			if (request->fence != 0) {
+				gpuNoteSubmit(fPid);
+			}
 		}
 	}
 	if (request->fence == 0) {
