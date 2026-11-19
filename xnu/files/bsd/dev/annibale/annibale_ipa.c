@@ -484,6 +484,7 @@ annibale_ipa_init(void)
 #define SCM_PAS_INIT_IMAGE      SCM_CALL(2, 1)
 #define SCM_PAS_MEM_SETUP       SCM_CALL(2, 2)
 #define SCM_PAS_AUTH_AND_RESET  SCM_CALL(2, 5)
+#define SCM_PAS_SHUTDOWN        SCM_CALL(2, 6)
 #define SCM_MP_ASSIGN           SCM_CALL(0xc, 0x16)
 #define SCM_MP_ASSIGN_ARGINFO   0x1117ULL
 #define QCOM_VMID_HLOS          3u
@@ -580,6 +581,12 @@ int64_t
 annibale_tz_pas_auth_reset_detail(uint32_t pas_id, uint64_t *res1_out)
 {
 	return annibale_tz_smc(SCM_PAS_AUTH_AND_RESET, 1u, pas_id, 0, 0, 0, res1_out);
+}
+
+int64_t
+annibale_tz_pas_shutdown(uint32_t pas_id, uint64_t *res1_out)
+{
+	return annibale_tz_smc(SCM_PAS_SHUTDOWN, 1u, pas_id, 0, 0, 0, res1_out);
 }
 
 static uint8_t *

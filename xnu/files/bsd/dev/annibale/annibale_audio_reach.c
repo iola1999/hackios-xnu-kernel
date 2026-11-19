@@ -722,10 +722,16 @@ annibale_audio_reach_is_active(void)
 	    __atomic_load_n(&in_flight_mask, __ATOMIC_RELAXED) != 0;
 }
 
+extern bool annibale_mic_gpr_event(uint32_t src_port, uint32_t dst_port, uint32_t opcode,
+    const void *payload, uint32_t len);
+
 static bool
 reach_gpr_event(uint32_t src_port, uint32_t dst_port, uint32_t opcode,
     uint32_t token __unused, const void *payload, uint32_t len)
 {
+	if (annibale_mic_gpr_event(src_port, dst_port, opcode, payload, len)) {
+		return true;
+	}
 	if (src_port != IID_PLAY_SHMEM || dst_port != OUR_PORT || opcode != OP_WRITE_DONE) {
 		return false;
 	}

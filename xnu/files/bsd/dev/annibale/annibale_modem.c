@@ -149,7 +149,8 @@ extern bool annibale_aoss_send_msg(const char *msg);
 #define QMI_SVC_LOC                     0x10u
 
 #define QMI_LOC_GET_SUPPORTED_MSGS      0x001eu
-#define QMI_LOC_GET_SERVICE_REVISION    0x0020u
+#define QMI_LOC_GET_SUPPORTED_FIELDS    0x001fu
+#define QMI_LOC_INFORM_CLIENT_REV       0x0020u
 #define QMI_LOC_REG_EVENTS              0x0021u
 #define QMI_LOC_START                   0x0022u
 #define QMI_LOC_STOP                    0x0023u
@@ -219,6 +220,8 @@ static int sysctl_cellular_sim_state = 0;
 static int sysctl_cellular_rsrp = -140;
 static char sysctl_cellular_rat[16] = "None";
 static char sysctl_cellular_operator[32] = "";
+static char sysctl_modem_loc_status[128] =
+    "dms_mode=255 dms_err=0 uim_card=255 uim_err=255 loc_reg=0 loc_fb=0 loc_err=0 loc_rev=0 loc_sv=0 loc_eng=-1 loc_fix=255";
 
 SYSCTL_INT(_kern_annibale, OID_AUTO, modem_state, CTLFLAG_RW | CTLFLAG_LOCKED,
     &sysctl_modem_state, 0, "SM8750 MPSS modem state (0=off..6=data_connected)");
@@ -232,6 +235,8 @@ SYSCTL_STRING(_kern_annibale, OID_AUTO, cellular_rat, CTLFLAG_RW | CTLFLAG_LOCKE
     sysctl_cellular_rat, sizeof(sysctl_cellular_rat), "Cellular radio access technology");
 SYSCTL_STRING(_kern_annibale, OID_AUTO, cellular_operator, CTLFLAG_RW | CTLFLAG_LOCKED,
     sysctl_cellular_operator, sizeof(sysctl_cellular_operator), "Cellular operator name");
+SYSCTL_STRING(_kern_annibale, OID_AUTO, modem_loc_status, CTLFLAG_RD | CTLFLAG_LOCKED,
+    sysctl_modem_loc_status, sizeof(sysctl_modem_loc_status), "MPSS DMS/UIM/QMI_LOC status (privacy-safe)");
 
 /* ---- Driver state ---------------------------------------------------------------------------------- */
 
@@ -306,7 +311,7 @@ static uint32_t wds_pkt_handle;
 static bool wds_data_wanted = true;
 static uint8_t dms_retry_count;
 static uint32_t modem_tick, dms_retry_at_tick, loc_stop_tick;
-static bool loc_reg_ok, loc_min_retried, loc_probe_started, loc_probe_stopped;
+static bool loc_rev_done, loc_reg_sent, loc_reg_ok, loc_min_retried, loc_probe_started, loc_probe_stopped;
 static const uint8_t loc_start_tlvs[] = { 0x01, 0x01, 0x00, 0x01, 0x10, 0x04, 0x00, 0x01, 0, 0, 0,
     0x12, 0x04, 0x00, 0x01, 0, 0, 0, 0x13, 0x04, 0x00, 0xe8, 0x03, 0, 0 };
 static const uint8_t loc_stop_tlvs[] = { 0x01, 0x01, 0x00, 0x01 };
@@ -343,6 +348,8 @@ smem_wr(uint32_t byte_off, uint32_t v)
 	__builtin_arm_dsb(0xf);
 }
 
+static void modem_format_loc_status(char *out, size_t cap, bool loc_reg, bool loc_fb);
+
 static void
 modem_sync_sysctls(void)
 {
@@ -352,6 +359,8 @@ modem_sync_sysctls(void)
 	sysctl_cellular_rsrp = (int)modem_status.rsrp_dbm;
 	strlcpy(sysctl_cellular_rat, modem_status.rat, sizeof(sysctl_cellular_rat));
 	strlcpy(sysctl_cellular_operator, modem_status.operator_name, sizeof(sysctl_cellular_operator));
+	modem_format_loc_status(sysctl_modem_loc_status, sizeof(sysctl_modem_loc_status),
+	    loc_reg_ok, loc_min_retried);
 }
 
 #include "annibale_modem_boot.inc"
@@ -692,12 +701,13 @@ modem_qmi_poll_services(void)
 		}
 	}
 	if (qmi_slots[SLOT_LOC].online && !qmi_slots[SLOT_LOC].queried) {
-		static const uint8_t loc_reg_tlvs[] = { 0x01, 0x08, 0x00, 0x87, 0x01, 0, 0, 0, 0, 0, 0 };
+		static const uint8_t loc_fields_tlvs[] = { 0x01, 0x02, 0x00, 0x21, 0x00 };
+		static const uint8_t loc_rev_tlvs[] = { 0x01, 0x04, 0x00, 0x02, 0x00, 0x00, 0x00 };
 		(void)modem_qmi_send(SLOT_LOC, QMI_LOC_GET_SUPPORTED_MSGS, NULL, 0);
-		(void)modem_qmi_send(SLOT_LOC, QMI_LOC_GET_SERVICE_REVISION, NULL, 0);
-		if (modem_qmi_send(SLOT_LOC, QMI_LOC_REG_EVENTS, loc_reg_tlvs, sizeof(loc_reg_tlvs)) == 0) {
+		(void)modem_qmi_send(SLOT_LOC, QMI_LOC_GET_SUPPORTED_FIELDS, loc_fields_tlvs, sizeof(loc_fields_tlvs));
+		if (modem_qmi_send(SLOT_LOC, QMI_LOC_INFORM_CLIENT_REV, loc_rev_tlvs, sizeof(loc_rev_tlvs)) == 0) {
 			qmi_slots[SLOT_LOC].queried = true;
-			printf("annibale-modem: QMI LOC querying msgs/rev + REG_EVENTS mask=0x187\n");
+			printf("annibale-modem: QMI LOC querying msgs/fields(0x21) + INFORM_CLIENT_REV=2\n");
 		}
 	}
 	if (qmi_slots[SLOT_LOC].online && loc_reg_ok && !loc_probe_started) {
@@ -817,8 +827,18 @@ modem_qmi_rx_cb(void *context, uint32_t from_node, uint32_t from_port, const voi
 		    &modem_status.sms_received, &modem_status.sms_sent);
 		break;
 	case SLOT_LOC: {
-		bool retry_min = false;
-		modem_loc_handle_rx(qmi_flags, txn_id, msg_id, tlvs, tlv_len, &loc_reg_ok, &retry_min);
+		bool rev_done = false, retry_min = false;
+		modem_loc_handle_rx(qmi_flags, txn_id, msg_id, tlvs, tlv_len, &rev_done, &loc_reg_ok, &retry_min);
+		if (rev_done) {
+			loc_rev_done = true;
+		}
+		if (loc_rev_done && !loc_reg_sent) {
+			static const uint8_t loc_reg_tlvs[] = { 0x01, 0x08, 0x00, 0x87, 0x01, 0, 0, 0, 0, 0, 0 };
+			loc_reg_sent = true;
+			if (modem_qmi_send(SLOT_LOC, QMI_LOC_REG_EVENTS, loc_reg_tlvs, sizeof(loc_reg_tlvs)) == 0) {
+				printf("annibale-modem: QMI LOC REG_EVENTS mask=0x187\n");
+			}
+		}
 		if (retry_min && !loc_min_retried) {
 			static const uint8_t min_tlvs[] = { 0x01, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0 };
 			loc_min_retried = true;
@@ -944,56 +964,12 @@ modem_worker_thread(__unused void *arg, __unused wait_result_t wres)
 	modem_bringup_sequence();
 	bool smp2p_seen = false;
 	uint32_t smp2p_last_val = 0, smp2p_last_flags = 0;
-	for (unsigned tick = 0;; tick++) {
-		bool newly_open = false, retry_hello = false, is_open = false, run_diag = false;
+	for (unsigned tick = 0; !mpss_stopping; tick++) {
+		bool newly_open = false, retry_hello = false, is_open = false;
 		uint32_t rcid_snap = 0, intent_snap = 0;
 
-		if (smem_base != NULL) {
-			if (tick % 4u == 0) {
-				uint32_t sv = 0, sf = 0;
-				if (smp2p_mpss_read_slave(&sv, &sf) &&
-				    (!smp2p_seen || sv != smp2p_last_val || sf != smp2p_last_flags)) {
-					if (smp2p_seen || (sv & SMP2P_MPSS_FATAL) != 0) {
-						printf("annibale-modem: SMP2P slave-kernel runtime val=%#x flags=%#x tick=%u\n",
-						    sv, sf, tick);
-						if ((sv & SMP2P_MPSS_FATAL) != 0) {
-							modem_log_crash_reason();
-						}
-					}
-					smp2p_seen = true;
-					smp2p_last_val = sv;
-					smp2p_last_flags = sf;
-				}
-			}
-			mpss_glink_poll_rx();
-			lck_mtx_lock(&mpss_glink_lock);
-			if (mpss_glink.ready && !mpss_glink.ipcrtr_open && tick == 10u && !mpss_glink.logged_stall) {
-				mpss_glink.logged_stall = true;
-				run_diag = true;
-				if (!mpss_glink.version_sent) {
-					mpss_glink.version_sent = mpss_glink_write_raw(GLINK_CMD_VERSION, 1u,
-					    mpss_glink.our_features, NULL, 0);
-				} else {
-					ipcc_ring_mpss(IPCC_SIG_GLINK);
-				}
-			}
-			if (mpss_glink.ipcrtr_open && !mpss_glink.qrtr_attached) {
-				mpss_glink.qrtr_attached = true;
-				mpss_glink.qrtr_hello_pending = !mpss_glink_has_free_intent(64u);
-				newly_open = true;
-				rcid_snap = mpss_glink.their_cid;
-				intent_snap = mpss_glink.their_intent_count;
-			} else if (mpss_glink.qrtr_attached && mpss_glink.qrtr_hello_pending &&
-			    mpss_glink_has_free_intent(64u)) {
-				mpss_glink.qrtr_hello_pending = false;
-				retry_hello = true;
-			}
-			is_open = mpss_glink.ipcrtr_open;
-			lck_mtx_unlock(&mpss_glink_lock);
-			if (run_diag) {
-				mpss_glink_log_stall_diag(tick);
-			}
-		}
+		modem_worker_glink_tick(tick, &smp2p_seen, &smp2p_last_val, &smp2p_last_flags,
+		    &newly_open, &retry_hello, &is_open, &rcid_snap, &intent_snap);
 
 		if (newly_open) {
 			lck_mtx_lock(&modem_lock);

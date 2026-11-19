@@ -200,6 +200,7 @@ static uint32_t boot_cam_bcm = 0u;
 static uint32_t boot_cam_rt_mhz = 200u;
 static uint32_t boot_cam_probe = 0u;
 static uint32_t boot_cam_keep_stream = 1u;
+static uint32_t boot_cam_wm_prefetch = 0u;
 static bool cam_session_probed = false;
 static bool cam_mid_sampled = false;
 static bool cci_ready = false;

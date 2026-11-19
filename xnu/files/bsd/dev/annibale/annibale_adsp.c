@@ -121,6 +121,8 @@ LCK_MTX_DECLARE(annibale_smem_alloc_lock, &annibale_ipc_lock_group);
 #define OP_WRITE_DONE             0x05001004u
 #define OP_READ_BUF               0x0400100bu
 #define OP_READ_BUF_DONE          0x05001005u
+#define PRM_CMD_REQUEST_HW_RSC    0x0100100fu
+#define PRM_CMD_RSP_REQUEST_HW_RSC 0x02001002u
 
 struct smem_table_entry {
 	uint32_t offset, size, flags;
@@ -969,6 +971,10 @@ bool annibale_adsp_gpr_send(const void *pkt, uint32_t len, uint32_t wait_ms,
 				ok = waited_opcode == OP_WRITE_DONE && waited_word_count >= 8;
 			else if (request_opcode == OP_READ_BUF)
 				ok = waited_opcode == OP_READ_BUF_DONE && waited_word_count >= 14;
+			else if (request_opcode == PRM_CMD_REQUEST_HW_RSC)
+				ok = waited_opcode == PRM_CMD_RSP_REQUEST_HW_RSC &&
+				    ((waited_word_count >= 2 && waited_words[1] == 0) ||
+				     (waited_word_count == 1 && waited_words[0] == 0));
 			lck_mtx_unlock(&aadsp_gpr_lock);
 			break;
 		}

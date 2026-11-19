@@ -42,6 +42,8 @@ HEADER = r'''
 #define OP_WRITE_DONE 0x05001004u
 #define OP_READ_BUF 0x0400100bu
 #define OP_READ_BUF_DONE 0x05001005u
+#define PRM_CMD_REQUEST_HW_RSC 0x0100100fu
+#define PRM_CMD_RSP_REQUEST_HW_RSC 0x02001002u
 static bool adsp_hw_up = true, waited_done;
 static uint32_t glink_our_q = 16, glink_our_q_size = 1024, glink_our_read_at = 4;
 static uint32_t glink_our_write_at = 8, glink_tx_write_pos, glink_gpr_our_cid = 2, glink_gpr_their_cid = 3;
@@ -79,6 +81,12 @@ static void glink_poll_rx(void) {
     if(response_mode>=7) {
         waited_opcode=OP_READ_BUF_DONE; waited_word_count=response_mode==7 ? 13 : 14;
     }
+    if(response_mode>=9) {
+        waited_opcode=PRM_CMD_RSP_REQUEST_HW_RSC;
+        waited_word_count=response_mode==11 ? 1 : 2;
+        waited_words[0]=response_mode==11 ? 0 : PRM_CMD_REQUEST_HW_RSC;
+        waited_words[1]=response_mode==9 ? 1 : 0;
+    }
 }
 '''
 TRANSPORT_MAIN = r'''
@@ -98,6 +106,11 @@ int main(void) {
     for (response_mode=7;response_mode<=8;response_mode++) {
         glink_tx_write_pos=0;
         assert(annibale_adsp_gpr_send(pkt,sizeof(pkt),1,&op,words,2)==(response_mode==8));
+    }
+    pkt[5]=PRM_CMD_REQUEST_HW_RSC;
+    for (response_mode=9;response_mode<=11;response_mode++) {
+        glink_tx_write_pos=0;
+        assert(annibale_adsp_gpr_send(pkt,sizeof(pkt),1,&op,words,2)!=(response_mode==9));
     }
     adsp_hw_up=false; int prior=writes;
     assert(!annibale_adsp_gpr_send(pkt,sizeof(pkt),0,0,0,0)); assert(writes==prior);

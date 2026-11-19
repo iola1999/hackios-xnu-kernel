@@ -32,9 +32,15 @@ HEADER = r'''
 #ifndef __unused
 #define __unused __attribute__((unused))
 #endif
+#ifndef __dead2
+#define __dead2
+#endif
+#ifndef __DEVOLATILE
+#define __DEVOLATILE(type, var) ((type)(uintptr_t)(volatile void *)(var))
+#endif
 #define __builtin_arm_dsb(x) ((void)0)
 #define MIN(a,b) ((a)<(b)?(a):(b))
-#define say(...) ((void)0)
+#define say(...) do { if (0) printf(__VA_ARGS__); } while (0)
 #define NSEC_PER_SEC 1000000000u
 #define NSEC_PER_MSEC 1000000u
 #define NSEC_PER_USEC 1000u
@@ -84,23 +90,28 @@ static void lck_mtx_lock(void *p) { (void)p;locked++; }
 static void lck_mtx_unlock(void *p) { (void)p;assert(locked>0);locked--; }
 static void lck_spin_lock(void *p) { (void)p; }
 static void lck_spin_unlock(void *p) { (void)p; }
-static uint32_t tlmm_memory[0x150000/4], lpi_memory[0x30000/4];
+static uint32_t tlmm_memory[0x150000/4], lpi_memory[0x30000/4], va_memory[0x2000/4];
 static vm_offset_t tlmm_base;
-static bool hw_up=true;
-static unsigned rail_calls,map_calls,fail_rail,fail_map,commands,fail_command;
+static bool hw_up=true, reach_active=true;
+static unsigned map_calls,fail_map,commands,fail_command;
 static bool annibale_adsp_is_hw_up(void) { return hw_up; }
-static bool annibale_rpmh_regulator(const char *name,uint32_t mv,bool on,uint32_t mode) {
-    (void)name;(void)mv;(void)on;(void)mode;return ++rail_calls!=fail_rail;
-}
+static bool annibale_audio_reach_is_active(void) { return reach_active; }
 static vm_offset_t ml_io_map(uintptr_t at,uintptr_t size) {
     (void)size;if(++map_calls==fail_map)return 0;
-    return (uintptr_t)(at==0x0f100000UL ? tlmm_memory:lpi_memory);
+    if(at==0x0f100000UL)return (uintptr_t)tlmm_memory;
+    if(at==0x07660000UL)return (uintptr_t)va_memory;
+    return (uintptr_t)lpi_memory;
 }
 static int16_t storage[65536], *mic_ring=storage;
 static uint32_t mic_ring_head,mic_ring_tail,mic_open_clients,mic_token;
-static bool mic_graphs_started,mic_wcd_powered;
+static bool mic_graphs_opened,mic_graphs_started,mic_hw_prepared;
 static int mic_capture_error;
 static uint64_t last_blocking_read_ns;
+static volatile uint32_t mic_inflight_mask;
+static uint32_t mic_slot_map_handle,mic_sent_count,mic_done_count;
+static uint64_t mic_slot_dsp_base;
+static volatile uint8_t *mic_slot_dma_va;
+static volatile bool mic_async_failed;
 static bool recording=true,dma_available=true;
 static uint32_t fed_frames;
 static int16_t fed[1920];
@@ -118,37 +129,38 @@ static uint32_t reply_bytes=1920;
 static bool annibale_audio_reach_dma_info(volatile uint8_t **va,uint64_t *pa,uint64_t *dsp,uint32_t *handle) {
     *va=dma_buffer;*pa=0xcf66f000;*dsp=dsp_address;*handle=map_handle;return dma_available;
 }
+bool annibale_mic_gpr_event(uint32_t src_port,uint32_t dst_port,uint32_t opcode,
+    const void *payload,uint32_t len);
 static bool annibale_adsp_gpr_send(const void *raw,uint32_t len,uint32_t wait,
     uint32_t *op,uint32_t *words,uint32_t count) {
-    const uint32_t *p=raw;(void)wait;
+    const uint32_t *p=raw;
+    if(wait==0) {
+        read_requests++;
+        assert(len==56 && (p[0]>>8)==len && p[2]==0x2002 && p[3]==0x6021 && p[5]==0x0400100b);
+        assert(p[9]==1920);
+        for(unsigned i=10;i<14;i++)assert(p[i]==0);
+        return fault!=1;
+    }
     commands++;if(commands==fail_command)return false;
-    if(p[5]!=0x0400100b) { *op=0x02001005;return true; }
-    read_requests++;
-    assert(len==56 && (p[0]>>8)==len && p[2]==0x2002 && p[3]==0x6021);
-    assert(count>=14 && p[9]==1920);
-    for(unsigned i=10;i<14;i++)assert(p[i]==0);
-    *op=0x05001005;
-    words[0]=0;words[1]=p[6];words[2]=p[7];words[3]=p[8];words[4]=reply_bytes;
-    words[8]=1; /* num_frames is not a status code */
-    words[9]=0;words[13]=0;
-    if(fault==1)return false;
-    if(fault==2)*op=0x02001005;
-    if(fault==3)words[0]=1;
-    if(fault==4)words[1]++;
-    if(fault==5)words[2]++;
-    if(fault==6)words[3]++;
-    if(fault==7)words[4]=1922;
-    if(fault==8)words[4]=3;
-    if(fault==9)words[9]=1;
-    if(fault==10)words[13]=4;
+    (void)count;
+    if(p[5]==0x0100100f) {
+        if(op) *op=0x02001002;
+        if(words && count>=2) { words[0]=p[5];words[1]=0; }
+        return true;
+    }
+    if(op) *op=0x02001005;
+    if(words && count>=2) { words[0]=0;words[1]=0; }
     return true;
 }
 '''
 MAIN = r'''
 static void reset(void) {
-    assert(locked==0);thread_test=false;tlmm_base=0;hw_up=true;
-    rail_calls=map_calls=fail_rail=fail_map=commands=fail_command=read_requests=0;
-    mic_wcd_powered=mic_graphs_started=false;mic_capture_error=0;mic_open_clients=0;
+    assert(locked==0);thread_test=false;tlmm_base=0;hw_up=true;reach_active=true;
+    map_calls=fail_map=commands=fail_command=read_requests=0;
+    mic_hw_prepared=mic_graphs_opened=mic_graphs_started=false;mic_capture_error=0;mic_open_clients=0;
+    memset(tlmm_memory,0,sizeof(tlmm_memory));memset(lpi_memory,0,sizeof(lpi_memory));memset(va_memory,0,sizeof(va_memory));
+    mic_inflight_mask=0;mic_slot_map_handle=0;mic_slot_dsp_base=0;mic_slot_dma_va=NULL;
+    mic_async_failed=false;mic_sent_count=mic_done_count=0;last_blocking_read_ns=0;
     mic_ring=storage;mic_ring_head=mic_ring_tail=0;moves=fed_frames=0;
     fault=0;reply_bytes=1920;recording=dma_available=true;
     memset(storage,0x55,sizeof(storage));memset(dma_buffer,0,sizeof(dma_buffer));
@@ -157,76 +169,100 @@ static void once(void) {
     thread_test=true;if(setjmp(thread_exit)==0)mic_capture_thread(NULL,0);thread_test=false;
     assert(locked==0);
 }
-int main(void) {
-    for(unsigned failure=1;failure<=3;failure++) {
-        reset();fail_rail=failure;
-        assert(!wcd9395_power_and_reset());assert(!mic_wcd_powered);
-        assert(rail_calls==failure && commands==0 && map_calls==0);
+static bool submit_async_case(uint32_t slot, uint32_t *bytes_out) {
+    if(!queue_capture_slot_async(slot, dma_buffer, dsp_address, map_handle)) return false;
+    uint64_t addr=dsp_address+0x8000u+(uint64_t)slot*1920u;
+    uint32_t words[14]={0,(uint32_t)addr,(uint32_t)(addr>>32),map_handle,reply_bytes,0,0,0,1,0,0,0,0,0};
+    if(fault==3)words[0]=1;
+    if(fault==4)words[1]++;
+    if(fault==5)words[2]++;
+    if(fault==6)words[3]++;
+    if(fault==7)words[4]=1922;
+    if(fault==8)words[4]=3;
+    if(fault==9)words[9]=1;
+    if(fault==10)words[13]=4;
+    uint32_t opcode = (fault==2) ? 0x02001005u : 0x05001005u;
+    if(opcode!=0x05001005u) {
+        assert(!annibale_mic_gpr_event(0x6021u, 0x2002u, opcode, words, sizeof(words)));
+        return false;
     }
+    assert(annibale_mic_gpr_event(0x6021u, 0x2002u, opcode, words, sizeof(words)));
+    if(mic_async_failed) return false;
+    if(bytes_out) *bytes_out=words[4];
+    return true;
+}
+int main(void) {
     for(unsigned failure=1;failure<=2;failure++) {
         reset();fail_map=failure;
-        assert(!wcd9395_power_and_reset() && !mic_wcd_powered);
+        assert(!mic_hw_prepare() && !mic_hw_prepared);
     }
-    reset();hw_up=false;assert(!wcd9395_power_and_reset() && !mic_wcd_powered && rail_calls==0);
-    reset();fail_command=1;assert(!wcd9395_power_and_reset() && !mic_wcd_powered);
-    reset();assert(wcd9395_power_and_reset() && mic_wcd_powered);
-    unsigned saved=rail_calls;assert(wcd9395_power_and_reset() && rail_calls==saved);
-    for(unsigned failure=1;failure<=9;failure++) {
+    reset();hw_up=false;assert(!mic_hw_prepare() && !mic_hw_prepared && commands==0);
+    reset();reach_active=false;assert(!mic_hw_prepare() && !mic_hw_prepared && commands==0);
+    for(unsigned failure=1;failure<=2;failure++) {
+        reset();fail_command=failure;
+        assert(!mic_hw_prepare() && !mic_hw_prepared);
+    }
+    reset();assert(mic_hw_prepare() && mic_hw_prepared);
+    unsigned saved=commands;assert(mic_hw_prepare() && commands==saved);
+    for(unsigned failure=1;failure<=10;failure++) {
         reset();fail_command=failure;
         assert(!start_capture_graphs() && !mic_graphs_started && commands==failure);
     }
-    reset();assert(start_capture_graphs() && mic_graphs_started && commands==9);
+    reset();assert(start_capture_graphs() && mic_graphs_started && commands==10);
     for(unsigned i=0;i<=10;i++) {
         reset();fault=i;uint32_t bytes=0;
-        assert(submit_capture_slot(2,dsp_address,map_handle,&bytes)==(i==0));
+        assert(submit_async_case(2,&bytes)==(i==0));
         assert(bytes==(i==0 ? 1920u:0u));
     }
-    reset();reply_bytes=4;uint32_t bytes=0;
-    assert(submit_capture_slot(2,dsp_address,map_handle,&bytes) && bytes==4);
+    reset();reply_bytes=4;
     int16_t *hw=(int16_t *)(dma_buffer+MIC_OFFSET+2*MIC_PERIOD_BYTES);
     hw[0]=123;hw[1]=-456;hw[2]=789;
-    harvest_capture_period(2,dma_buffer,bytes);
+    uint32_t bytes=0;assert(submit_async_case(2,&bytes) && bytes==4);
     assert(mic_ring_head==2 && storage[0]==123 && storage[1]==-456 && storage[2]==0x5555);
     assert(fed_frames==2 && fed[0]==123 && fed[1]==123 && fed[2]==-456 && fed[3]==-456);
     reset();harvest_capture_period(0,dma_buffer,1920);
     assert(mic_ring_head==960);for(unsigned i=0;i<960;i++)assert(storage[i]==0);
     reset();fail_command=1;once();assert(read_requests==0 && mic_ring_head==0);
-    reset();mic_graphs_started=true;mic_wcd_powered=true;fault=9;once();
-    assert(mic_capture_error==EIO && mic_ring_head==0 && read_requests==1);
-    once();assert(read_requests==1);
+    reset();mic_graphs_started=true;mic_hw_prepared=true;mic_open_clients=1;
+    mic_async_failed=true;once();
+    assert(mic_capture_error==EIO && mic_ring_head==0 && !mic_graphs_started);
     struct uio u={.remaining=8};
     assert(annibale_mic_read(&u,IO_NDELAY)==EIO && moves==0);
-    assert(mic_cdev_open(0,0,0,NULL)==EIO && mic_open_clients==0);
+    recording=false;assert(mic_cdev_close(0,0,0,NULL)==0 && mic_capture_error==0);
     reset();fail_command=1;u=(struct uio){.remaining=8};
     assert(annibale_mic_read(&u,IO_NDELAY)==EIO && moves==0);
     reset();fail_command=1;
     assert(mic_cdev_open(0,0,0,NULL)==EIO && mic_open_clients==0);
     reset();assert(mic_cdev_open(0,0,0,NULL)==0 && mic_open_clients==1);
-    u=(struct uio){.remaining=8};assert(annibale_mic_read(&u,IO_NDELAY)==0);
-    for(unsigned i=0;i<4;i++)assert(u.data[i]==0);
+    u=(struct uio){.remaining=8};assert(annibale_mic_read(&u,IO_NDELAY)==EAGAIN && moves==0);
+    storage[0]=111;storage[1]=-222;mic_ring_head=2;
+    assert(annibale_mic_read(&u,IO_NDELAY)==0 && u.offset==4 && u.remaining==4);
+    assert(u.data[0]==111 && u.data[1]==-222);
     reset();mic_ring=NULL;u=(struct uio){.remaining=8};assert(annibale_mic_read(&u,0)==ENXIO);
     assert(locked==0);
-    puts("PASS: production power/graph failures, READ_V2 replies, exact PCM extent and open/read errors");
+    puts("PASS: production power/graph failures, async READ_BUF_DONE replies, exact PCM extent and open/read/close recovery");
 }
 '''
 
 
 def main():
     constants = MIC[MIC.index('#define TLMM_PHYS'):MIC.index('static LCK_GRP_DECLARE')]
-    builders = MIC[MIC.index('struct mic_pkt {'):MIC.index('/* ---- WCD9395')]
+    builders = MIC[MIC.index('struct mic_pkt {'):MIC.index('/* ---- LPASS PRM')]
     source = HEADER + constants
     source += function(REACH, 'gpr_set32') + function(REACH, 'gpr_finish')
     source += function(REACH, 'annibale_audio_reach_send_cmd') + builders
     source += ''.join(function(MIC, name) for name in (
-        'wcd9395_power_and_reset', 'start_capture_graphs', 'submit_capture_slot',
-        'harvest_capture_period', 'mic_capture_thread', 'annibale_mic_read', 'mic_cdev_open'))
+        'mic_prm_vote_hw_core', 'mic_prm_set_clk', 'mic_configure_dmic_pins',
+        'mic_configure_va_macro', 'mic_hw_prepare', 'start_capture_graphs', 'stop_capture_graphs',
+        'queue_capture_slot_async', 'harvest_capture_period', 'annibale_mic_gpr_event',
+        'mic_capture_thread', 'annibale_mic_read', 'mic_cdev_open', 'mic_cdev_close'))
     source += MAIN
     mutations = (
         ('wrong metadata status', 'words[9] != 0', 'words[8] != 0'),
-        ('truncate reply copy', 'MIN(max_words, 16u)', 'MIN(max_words, 8u)'),
+        ('truncate reply copy', 'memcpy(words, payload, sizeof(words));', 'memcpy(words, payload, 32);'),
         ('accept odd byte count', '(words[4] % sizeof(int16_t)) != 0', 'false'),
         ('publish stale DMA tail', 'i < valid_samples; i++) {\n\t\tif ((mic_ring_head', 'i < MIC_PERIOD_FRAMES; i++) {\n\t\tif ((mic_ring_head'),
-        ('ignore power failure', 'if (!wcd9395_power_and_reset()) return false;', '(void)wcd9395_power_and_reset();'),
+        ('ignore power failure', 'if (!mic_hw_prepare()) return false;', '(void)mic_hw_prepare();'),
     )
     with tempfile.TemporaryDirectory(prefix='mic-production-') as directory:
         cfile, binary = Path(directory)/'test.c', Path(directory)/'test'

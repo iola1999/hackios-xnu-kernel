@@ -60,6 +60,8 @@ extern void annibale_haptic_quiesce(void);
 extern void annibale_torch_quiesce(void);
 extern bool annibale_iris_return_quiesce(void);
 extern bool annibale_camera_return_quiesce(void);
+extern void annibale_modem_stop(void);
+extern bool annibale_modem_return_quiesce(void);
 extern void MiniIOMobileFramebufferQuiesce(void);   /* iokit/Kernel/MiniFramebufferFlip.inc */
 extern void MiniIOMobileFramebufferPowerOff(void);
 boolean_t annibale_halting_poweroff = FALSE;
@@ -711,6 +713,7 @@ loader_return(void)
 	adreno8_return_quiesce();       /* the GMU back in reset and its translation off without parking */
 	bool iris_quiesced = annibale_iris_return_quiesce();
 	bool cam_quiesced = annibale_camera_return_quiesce();
+	bool modem_quiesced = annibale_modem_return_quiesce();
 	annibale_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
 	annibale_haptic_quiesce();      /* or the PMIC's haptics block of the other phone, if it was configured */
 	annibale_torch_quiesce();       /* or the other phone's, lit on its PMIC's flash module */
@@ -722,8 +725,8 @@ loader_return(void)
 
 	hv_wdt_pet_NOW();
 	/* reason 3 keeps loader memory held even if every kernel CPU is off. */
-	loader_jump((iris_quiesced && cam_quiesced) ? 0 : 3,
-	    !iris_quiesced ? 9 : (cam_quiesced ? 0 : 10));
+	loader_jump((iris_quiesced && cam_quiesced && modem_quiesced) ? 0 : 3,
+	    !iris_quiesced ? 9 : (!cam_quiesced ? 10 : (modem_quiesced ? 0 : 4)));
 }
 
 /* Bring-up aid: stop here if the loader asked for checkpoint n. */
@@ -771,6 +774,7 @@ loader_return_timer(__unused thread_call_param_t p0, __unused thread_call_param_
 	if (!as_panic) {
 		annibale_var_save_on_return();   /* the data volume kept, while the system is still whole */
 		annibale_wifi_stop();            /* and the Wi-Fi DSP, if it runs, shut down */
+		annibale_modem_stop();
 	}
 	if (PE_parse_boot_argn("return_cpu", &cpu, sizeof(cpu)) && cpu <= (uint32_t)ml_get_max_cpu_number() &&
 	    cpu_xcall((int)cpu, loader_return_test, (void *)(uintptr_t)(as_panic ? 2 : 1)) == KERN_SUCCESS) {
@@ -815,6 +819,7 @@ loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p
 		}
 		annibale_var_save_on_return();
 		annibale_wifi_stop();
+		annibale_modem_stop();
 		loader_return();
 	}
 	clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);

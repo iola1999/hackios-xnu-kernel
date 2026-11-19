@@ -162,15 +162,15 @@ smem_find_item_in_partition(uint16_t host_a, uint16_t host_b, uint32_t item_id, 
 	return 0;
 }
 
+extern int64_t annibale_tz_pas_shutdown(uint32_t pas_id, uint64_t *res1_out);
+
+static volatile bool mpss_pas_dtb_authed, mpss_pas_fw_authed, mpss_stopping;
+
 static uint32_t
 smem_find_mpss_item(uint32_t item_id, uint32_t *size_out)
 {
-	uint32_t off = smem_find_item_in_partition(SMEM_HOST_APPS, SMEM_HOST_MPSS, item_id, size_out);
-
-	if (off != 0) {
-		return off;
-	}
-	return smem_find_item_in_partition(SMEM_HOST_GLOBAL, SMEM_HOST_GLOBAL, item_id, size_out);
+	/* Never fall back to SMEM_HOST_GLOBAL for MPSS GLINK/SMP2P items (avoids ADSP queue aliasing). */
+	return smem_find_item_in_partition(SMEM_HOST_APPS, SMEM_HOST_MPSS, item_id, size_out);
 }
 
 static uint32_t
@@ -365,6 +365,9 @@ mpss_glink_locate_queues(void)
 	uint32_t d_sz = 0, o_sz = 0, t_sz = 0;
 	bool was_ready = mpss_glink.ready;
 
+	if (was_ready) {
+		return true;
+	}
 	mpss_glink.desc_off = smem_find_mpss_item(ITEM_GLINK_DESCRIPTOR, &d_sz);
 	mpss_glink.our_q_off = smem_find_mpss_item(ITEM_GLINK_OUR_QUEUE, &o_sz);
 	mpss_glink.their_q_off = smem_find_mpss_item(ITEM_GLINK_THEIR_QUEUE, &t_sz);
@@ -448,6 +451,21 @@ smp2p_mpss_init_ours(void)
 		smem_wr(at + 20u + 4u * w, nw);
 	}
 	smem_wr(at + 36u, 0u);
+	ipcc_ring_mpss(IPCC_SIG_SMP2P);
+}
+
+static void
+smp2p_mpss_set_stop(void)
+{
+	uint32_t sz = 0, at = smem_find_mpss_item(ITEM_SMP2P_MPSS_OURS, &sz);
+
+	if (at == 0 || sz < sizeof(struct modem_smp2p_item)) {
+		return;
+	}
+	/* annibale.dts modem_pas qcom,smem-states = <modem_smp2p_out 0> ("stop" = bit 0 of entry[0]). */
+	uint32_t val = smem_rd(at + 36u);
+	smem_wr(at + 36u, val | 1u);
+	(void)smem_rd(at + 36u);
 	ipcc_ring_mpss(IPCC_SIG_SMP2P);
 }
 
@@ -647,6 +665,9 @@ modem_log_crash_reason(void)
 	uint32_t len;
 
 	if (at == 0 || sz == 0) {
+		at = smem_find_item_in_partition(SMEM_HOST_GLOBAL, SMEM_HOST_GLOBAL, ITEM_MPSS_CRASH_REASON, &sz);
+	}
+	if (at == 0 || sz == 0) {
 		return;
 	}
 	len = sz < sizeof(raw) - 1 ? sz : (uint32_t)(sizeof(raw) - 1);
@@ -738,10 +759,16 @@ modem_bringup_sequence(void)
 	lck_mtx_unlock(&modem_lock);
 
 	/* ipa_fws belongs to ipa_hw@3e00000 (ipa_gsi_mem 0x9b090000) after IPA clocks are up, not modem_pas. */
+	mpss_pas_dtb_authed = false;
+	mpss_pas_fw_authed = false;
+	mpss_stopping = false;
 	if (modem_boot_arg == 2) {
 		if (annibale_load_mdt_image("modem_dtb", MPSS_DTB_PAS_ID, MPSS_DTB_PAS_ID_ALT,
 		    MPSS_DTB_MEM_PHYS, MPSS_DTB_MEM_SIZE, &dtb_pas)) {
 			int64_t rc = annibale_tz_pas_auth_reset(dtb_pas);
+			if (rc == 0) {
+				mpss_pas_dtb_authed = true;
+			}
 			printf("annibale-modem: modem=2 PAS_AUTH_AND_RESET(modem_dtb, pas=%u) -> %lld\n", dtb_pas, rc);
 		}
 		return;
@@ -789,6 +816,9 @@ modem_bringup_sequence(void)
 	}
 	uint64_t dtb_res1 = 0;
 	int64_t dtb_rc = annibale_tz_pas_auth_reset_detail(dtb_pas, &dtb_res1);
+	if (dtb_rc == 0 && dtb_res1 == 0) {
+		mpss_pas_dtb_authed = true;
+	}
 	printf("annibale-modem: PAS_AUTH_AND_RESET(modem_dtb, pas=%u) -> rc=%lld (%#llx) res1=%#llx\n",
 	    dtb_pas, dtb_rc, (uint64_t)dtb_rc, dtb_res1);
 
@@ -799,6 +829,9 @@ modem_bringup_sequence(void)
 	}
 	uint64_t fw_res1 = 0;
 	int64_t fw_rc = annibale_tz_pas_auth_reset_detail(fw_pas, &fw_res1);
+	if (fw_rc == 0 && fw_res1 == 0) {
+		mpss_pas_fw_authed = true;
+	}
 	printf("annibale-modem: PAS_AUTH_AND_RESET(modem, pas=%u) -> rc=%lld (%#llx) res1=%#llx\n",
 	    fw_pas, fw_rc, (uint64_t)fw_rc, fw_res1);
 
@@ -807,7 +840,7 @@ modem_bringup_sequence(void)
 		bool saw_slave = false;
 		uint32_t last_val = 0, last_flags = 0;
 
-		for (unsigned ms = 0; ms < 8000u; ms += 50u) {
+		for (unsigned ms = 0; ms < 8000u && !mpss_stopping; ms += 50u) {
 			uint32_t val = 0, flags = 0;
 
 			if (smp2p_mpss_read_slave(&val, &flags)) {
@@ -831,16 +864,146 @@ modem_bringup_sequence(void)
 			}
 			modem_sleep_ms(50);
 		}
-		if (!mpss_ready && !mpss_fatal) {
-			printf("annibale-modem: MPSS SMP2P READY timeout after 8000 ms\n");
+		if (!mpss_ready && !mpss_fatal && !mpss_stopping) {
+			printf("annibale-modem: MPSS SMP2P READY timeout after 8000 ms (polling continues)\n");
 		}
 	}
 	if (dtb_rc != 0 || dtb_res1 != 0 || fw_rc != 0 || fw_res1 != 0) {
 		modem_log_tz_diag();
 	}
-	if ((dtb_rc != 0 || dtb_res1 != 0 || fw_rc != 0 || fw_res1 != 0 || !mpss_ready) && !mpss_fatal) {
+	if ((dtb_rc != 0 || dtb_res1 != 0 || fw_rc != 0 || fw_res1 != 0 || (!mpss_ready && !mpss_stopping)) &&
+	    !mpss_fatal) {
 		modem_log_crash_reason();
 	}
+}
+
+static void mpss_glink_poll_rx(void);
+
+static void
+modem_worker_glink_tick(unsigned tick, bool *smp2p_seen, uint32_t *smp2p_val, uint32_t *smp2p_flags,
+    bool *newly_open_out, bool *retry_hello_out, bool *is_open_out,
+    uint32_t *rcid_out, uint32_t *intent_out)
+{
+	bool run_diag = false;
+
+	*newly_open_out = false;
+	*retry_hello_out = false;
+	*is_open_out = false;
+	if (smem_base == NULL || mpss_stopping) {
+		return;
+	}
+	if (tick % 4u == 0) {
+		uint32_t sv = 0, sf = 0;
+		if (smp2p_mpss_read_slave(&sv, &sf) &&
+		    (!*smp2p_seen || sv != *smp2p_val || sf != *smp2p_flags)) {
+			if (*smp2p_seen || (sv & SMP2P_MPSS_FATAL) != 0 || (sv & SMP2P_MPSS_READY) != 0) {
+				printf("annibale-modem: SMP2P slave-kernel runtime val=%#x flags=%#x tick=%u\n",
+				    sv, sf, tick);
+				if ((sv & SMP2P_MPSS_FATAL) != 0) {
+					modem_log_crash_reason();
+				}
+			}
+			*smp2p_seen = true;
+			*smp2p_val = sv;
+			*smp2p_flags = sf;
+		}
+	}
+	if (!mpss_glink.ready) {
+		(void)mpss_glink_locate_queues();
+	}
+	mpss_glink_poll_rx();
+	lck_mtx_lock(&mpss_glink_lock);
+	if (mpss_glink.ready && !mpss_glink.ipcrtr_open && tick >= 10u && !mpss_glink.logged_stall) {
+		mpss_glink.logged_stall = true;
+		run_diag = true;
+		if (!mpss_glink.version_sent) {
+			mpss_glink.version_sent = mpss_glink_write_raw(GLINK_CMD_VERSION, 1u,
+			    mpss_glink.our_features, NULL, 0);
+		} else {
+			ipcc_ring_mpss(IPCC_SIG_GLINK);
+		}
+	}
+	if (mpss_glink.ipcrtr_open && !mpss_glink.qrtr_attached) {
+		mpss_glink.qrtr_attached = true;
+		mpss_glink.qrtr_hello_pending = !mpss_glink_has_free_intent(64u);
+		*newly_open_out = true;
+		*rcid_out = mpss_glink.their_cid;
+		*intent_out = mpss_glink.their_intent_count;
+	} else if (mpss_glink.qrtr_attached && mpss_glink.qrtr_hello_pending &&
+	    mpss_glink_has_free_intent(64u)) {
+		mpss_glink.qrtr_hello_pending = false;
+		*retry_hello_out = true;
+	}
+	*is_open_out = mpss_glink.ipcrtr_open;
+	lck_mtx_unlock(&mpss_glink_lock);
+	if (run_diag) {
+		mpss_glink_log_stall_diag(tick);
+	}
+}
+
+static bool
+modem_pas_shutdown_active(bool send_aoss_off)
+{
+	bool ok = true;
+
+	if (!mpss_pas_fw_authed && !mpss_pas_dtb_authed) {
+		return true;
+	}
+	smp2p_mpss_set_stop();
+	if (mpss_pas_fw_authed) {
+		uint64_t res1 = 0;
+		int64_t rc = annibale_tz_pas_shutdown(MPSS_FW_PAS_ID, &res1);
+		printf("annibale-modem: PAS_SHUTDOWN(modem, pas=%u) -> rc=%lld res1=%#llx\n",
+		    MPSS_FW_PAS_ID, rc, res1);
+		if (rc == 0 && res1 == 0) {
+			mpss_pas_fw_authed = false;
+		} else {
+			ok = false;
+		}
+	}
+	if (mpss_pas_dtb_authed) {
+		uint64_t res1 = 0;
+		int64_t rc = annibale_tz_pas_shutdown(MPSS_DTB_PAS_ID, &res1);
+		printf("annibale-modem: PAS_SHUTDOWN(modem_dtb, pas=%u) -> rc=%lld res1=%#llx\n",
+		    MPSS_DTB_PAS_ID, rc, res1);
+		if (rc == 0 && res1 == 0) {
+			mpss_pas_dtb_authed = false;
+		} else {
+			ok = false;
+		}
+	}
+	if (send_aoss_off) {
+		(void)annibale_aoss_send_msg("{class: image, res: load_state, name: modem, val: off}");
+	}
+	return ok;
+}
+
+void annibale_modem_stop(void);
+bool annibale_modem_return_quiesce(void);
+
+void
+annibale_modem_stop(void)
+{
+	if (modem_boot_arg == 0 || mpss_stopping) {
+		return;
+	}
+	mpss_stopping = true;
+	if (!mpss_pas_fw_authed && !mpss_pas_dtb_authed) {
+		return;
+	}
+	smp2p_mpss_set_stop();
+	modem_sleep_ms(50);
+	(void)modem_pas_shutdown_active(true);
+}
+
+bool
+annibale_modem_return_quiesce(void)
+{
+	mpss_stopping = true;
+	if (modem_boot_arg == 0 || (!mpss_pas_fw_authed && !mpss_pas_dtb_authed)) {
+		return true;
+	}
+	return modem_pas_shutdown_active(false);
 }
 
 #endif /* _ANNIBALE_MODEM_BOOT_INC_ */

@@ -1,11 +1,12 @@
 /*
  * Microphone capture driver for REDMI K90 (annibale):
- * Implements the SM8750 WCD9395 TX / SoundWire / LPASS VA & TX Macro / AudioReach capture path:
- *   - WCD9395 codec power rails via RPMh (ldob15 1800 mV, ldoi2 1200 mV, bobb1 on) & reset GPIO101
- *   - LPASS TX Macro (0x06ae0000), VA Macro (0x07660000), TX SoundWire Master (0x07630000),
- *     and LPI TLMM (0x07760000) pins LPI_GPIO 3/4/5/15 when ADSP LPIMX clocks are active
+ * Implements the SM8750 LPASS VA Macro / DMIC / AudioReach capture path
+ * (K90 hardware disables WCD9395 via qcom,wcd-disabled and wires DMIC0..5):
+ *   - Q6PRM LPASS core vote (PARAM_ID_RSC_HW_CORE=1) & VA/TX MCLK (19.2 MHz)
+ *   - DMIC power/enable TLMM GPIOs 182/183 & LPI TLMM pins 6/7, 8/9, 12/13 (func 1)
+ *   - LPASS VA Macro (0x07660000) MCLK, FS broadcast, DMIC0 clock & DEC0 path
  *   - AudioReach capture subgraphs:
- *       SG_MIC (0x4007):     MOD_CODEC_DMA_SOURCE (0x07001024, IID 0x6071) on LPASS TX0
+ *       SG_MIC (0x4007):     MOD_CODEC_DMA_SOURCE (0x07001024, IID 0x6071) on LPASS VA0
  *       SG_CAPTURE (0x4003): MOD_PCM_CNV (0x07001003, IID 0x6023) ->
  *                            MOD_PCM_ENC (0x07001004, IID 0x6022) ->
  *                            MOD_RD_SHMEM (0x07001001, IID 0x6021)
@@ -34,18 +35,24 @@
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern bool annibale_adsp_is_hw_up(void);
-extern bool annibale_rpmh_regulator(const char *name, uint32_t mv, bool enable, uint32_t mode);
+extern bool annibale_audio_reach_is_active(void);
+extern bool annibale_adsp_gpr_send(const void *pkt, uint32_t len, uint32_t wait_ms,
+    uint32_t *rsp_opcode, uint32_t *rsp_words, uint32_t max_words);
 extern bool annibale_audio_reach_dma_info(volatile uint8_t **va_out, uint64_t *pa_out,
     uint64_t *dsp_addr_out, uint32_t *map_handle_out);
 extern bool annibale_audio_reach_send_cmd(const void *raw_pkt, uint32_t raw_len, const char *descr,
     uint32_t *rsp_opcode, uint32_t *rsp_words, uint32_t max_words);
+
+bool annibale_mic_gpr_event(uint32_t src_port, uint32_t dst_port, uint32_t opcode,
+    const void *payload, uint32_t len);
 
 #define say(...) printf("dmic: " __VA_ARGS__)
 
 /* Hardware physical addresses on SM8750 (annibale) */
 #define TLMM_PHYS               0x0f100000UL
 #define TLMM_SIZE               0x00150000UL
-#define PIN_WCD_RST             101u
+#define PIN_DMIC23_EN           182u
+#define PIN_DMIC01_EN           183u
 
 #define TX_MACRO_PHYS           0x06ae0000UL
 #define TX_MACRO_SIZE           0x00002000UL
@@ -70,7 +77,15 @@ extern bool annibale_audio_reach_send_cmd(const void *raw_pkt, uint32_t raw_len,
 #define OP_SET_CFG              0x01001006u
 #define OP_READ_BUF             0x0400100bu
 #define OP_READ_BUF_DONE        0x05001005u
-#define OP_REGISTER_RES         0x0100102bu
+#define PRM_CMD_REQUEST_HW_RSC      0x0100100fu
+#define PRM_CMD_RSP_REQUEST_HW_RSC  0x02001002u
+#define PARAM_ID_RSC_AUDIO_HW_CLK   0x0800102cu
+#define PARAM_ID_RSC_HW_CORE        0x08001032u
+#define Q6PRM_HW_CORE_ID_LPASS      1u
+#define Q6PRM_LPASS_CLK_ID_VA_MCLK  0x307u
+#define Q6PRM_LPASS_CLK_SRC_INT     1u
+#define Q6PRM_LPASS_CLK_ROOT_DEF    0u
+#define VA_MACRO_MCLK_HZ            19200000u
 
 #define MOD_RD_SHMEM            0x07001001u
 #define MOD_PCM_CNV             0x07001003u
@@ -103,11 +118,19 @@ static uint32_t mic_ring_head;
 static uint32_t mic_ring_tail;
 
 static uint32_t mic_open_clients;
+static bool mic_graphs_opened;
 static bool mic_graphs_started;
 static int mic_capture_error;
-static bool mic_wcd_powered;
+static bool mic_hw_prepared;
 static uint32_t mic_token = 500;
 static uint64_t last_blocking_read_ns;
+static volatile uint32_t mic_inflight_mask;
+static uint32_t mic_slot_map_handle;
+static uint64_t mic_slot_dsp_base;
+static volatile uint8_t *mic_slot_dma_va;
+static volatile bool mic_async_failed;
+static uint32_t mic_sent_count;
+static uint32_t mic_done_count;
 
 /* ---- Packet builder helpers ------------------------------------------------------------------ */
 
@@ -304,83 +327,160 @@ mic_graph_cmd(uint32_t opcode, uint32_t sg, const char *descr)
 	return annibale_audio_reach_send_cmd(p.buf, p.len, descr, NULL, NULL, 0);
 }
 
-/* ---- WCD9395 Codec Power, Reset & AudioReach Capture Graph Setup ----------------------------- */
+/* ---- LPASS PRM Voting, DMIC Pins & VA Macro Setup ---------------------------------------------- */
 
 static bool
-wcd9395_power_and_reset(void)
+mic_prm_vote_hw_core(uint32_t core_id, const char *descr)
 {
-	if (mic_wcd_powered) {
-		return true;
-	}
-	if (!annibale_adsp_is_hw_up()) return false;
-	/* Enable WCD9395 RPMh power supplies (ldob15 1.8V, ldoi2 1.2V, bobb1 BuckBoost) */
-	if (!annibale_rpmh_regulator("ldob15", 1800, true, 7) ||
-	    !annibale_rpmh_regulator("ldoi2", 1200, true, 7) ||
-	    !annibale_rpmh_regulator("bobb1", 0, true, 0)) {
-		say("WCD9395 power rail setup failed\n");
-		return false;
-	}
+	struct mic_pkt p;
+	uint32_t rop = 0;
+
+	mpkt_begin(&p, OUR_MIC_PORT, PRM_IID, PRM_CMD_REQUEST_HW_RSC);
+	uint32_t cmd = mpkt_cmd_begin(&p);
+	uint32_t at = mpkt_param_begin(&p, PRM_IID, PARAM_ID_RSC_HW_CORE);
+	mpkt_put32(&p, core_id);
+	mpkt_set32(&p, at + 8, p.len - at - 16u);
+	mpkt_cmd_end(&p, cmd);
+	mpkt_finish(&p);
+	return annibale_audio_reach_send_cmd(p.buf, p.len, descr, &rop, NULL, 0) &&
+	    rop == PRM_CMD_RSP_REQUEST_HW_RSC;
+}
+
+static bool
+mic_prm_set_clk(uint32_t clk_id, uint32_t freq_hz, const char *descr)
+{
+	struct mic_pkt p;
+	uint32_t rop = 0;
+
+	mpkt_begin(&p, OUR_MIC_PORT, PRM_IID, PRM_CMD_REQUEST_HW_RSC);
+	uint32_t cmd = mpkt_cmd_begin(&p);
+	uint32_t at = mpkt_param_begin(&p, PRM_IID, PARAM_ID_RSC_AUDIO_HW_CLK);
+	mpkt_put32(&p, 1u);
+	mpkt_put32(&p, clk_id);
+	mpkt_put32(&p, freq_hz);
+	mpkt_put32(&p, Q6PRM_LPASS_CLK_SRC_INT);
+	mpkt_put32(&p, Q6PRM_LPASS_CLK_ROOT_DEF);
+	mpkt_set32(&p, at + 8, p.len - at - 16u);
+	mpkt_cmd_end(&p, cmd);
+	mpkt_finish(&p);
+	return annibale_audio_reach_send_cmd(p.buf, p.len, descr, &rop, NULL, 0) &&
+	    rop == PRM_CMD_RSP_REQUEST_HW_RSC;
+}
+
+static bool
+mic_configure_dmic_pins(void)
+{
+	static const unsigned en_pins[] = { PIN_DMIC23_EN, PIN_DMIC01_EN };
+	static const struct {
+		unsigned pin;
+		bool is_clk;
+	} lpi_dmic_pins[] = {
+		{ 6u, true }, { 7u, false },
+		{ 8u, true }, { 9u, false },
+		{ 12u, true }, { 13u, false },
+	};
 
 	if (tlmm_base == 0) {
 		tlmm_base = ml_io_map(TLMM_PHYS, TLMM_SIZE);
 	}
 	if (tlmm_base == 0) {
-		say("WCD9395 reset GPIO mapping failed\n");
+		say("TLMM mapping failed\n");
 		return false;
 	}
-	{
-		vm_offset_t cfg_reg = tlmm_base + 0x1000UL * PIN_WCD_RST;
+	for (unsigned i = 0; i < sizeof(en_pins) / sizeof(en_pins[0]); i++) {
+		vm_offset_t cfg_reg = tlmm_base + 0x1000UL * en_pins[i];
 		vm_offset_t io_reg = cfg_reg + 4UL;
 		uint32_t cfg = *(volatile uint32_t *)cfg_reg;
-		cfg = (cfg & ~0x3ffu) | (1u << 9) | (2u << 6);
+		cfg = (cfg & ~0x3ffu) | (1u << 9) | (3u << 6) | 3u; /* GPIO output-high, 8 mA, pull-up */
 		if (cfg & (1u << 11)) {
 			cfg |= (1u << 12);
 		}
-		*(volatile uint32_t *)io_reg = 0;
-		*(volatile uint32_t *)cfg_reg = cfg;
-		__builtin_arm_dsb(0xf);
-		delay_for_interval(2, NSEC_PER_MSEC);
 		*(volatile uint32_t *)io_reg = 2u;
-		__builtin_arm_dsb(0xf);
-		delay_for_interval(10, NSEC_PER_MSEC);
+		*(volatile uint32_t *)cfg_reg = cfg;
+	}
+	__builtin_arm_dsb(0xf);
+
+	vm_offset_t lpi_tlmm = ml_io_map(LPI_TLMM_PHYS, LPI_TLMM_SIZE);
+	if (lpi_tlmm == 0) {
+		say("LPI TLMM mapping failed\n");
+		return false;
+	}
+	for (unsigned i = 0; i < sizeof(lpi_dmic_pins) / sizeof(lpi_dmic_pins[0]); i++) {
+		vm_offset_t reg = lpi_tlmm + 0x1000UL * lpi_dmic_pins[i].pin;
+		uint32_t v = *(volatile uint32_t *)reg;
+		v = (v & ~0x3ffu) | (3u << 6) | (1u << 2); /* func 1, 8 mA, bias disable */
+		if (lpi_dmic_pins[i].is_clk) {
+			v |= (1u << 9);
+			*(volatile uint32_t *)(reg + 4UL) = 2u;
+		}
+		*(volatile uint32_t *)reg = v;
+	}
+	__builtin_arm_dsb(0xf);
+	return true;
+}
+
+static void
+mic_configure_va_macro(void)
+{
+	vm_offset_t va = ml_io_map(VA_MACRO_PHYS, VA_MACRO_SIZE);
+	if (va == 0) {
+		say("VA macro mapping failed\n");
+		return;
+	}
+	volatile uint32_t *regs = (volatile uint32_t *)va;
+	say("VA macro core id %#x %#x %#x %#x\n",
+	    regs[0x00c0 / 4], regs[0x00c4 / 4], regs[0x00c8 / 4], regs[0x00cc / 4]);
+
+	regs[0x0000 / 4] |= 1u; /* MCLK_CONTROL_EN */
+	regs[0x0004 / 4] = 3u;  /* FS_CNT clear + enable */
+	regs[0x0004 / 4] = 1u;
+	regs[0x0080 / 4] |= 2u; /* FS_BROADCAST_EN */
+	regs[0x0094 / 4] = 0u;  /* release RESET_ALL_DMICS */
+	regs[0x0084 / 4] = (5u << 1) | 1u; /* DMIC0/1 enable, DIV16 */
+	regs[0x0088 / 4] = (5u << 1) | 1u; /* DMIC2/3 enable, DIV16 */
+	regs[0x008c / 4] = (5u << 1) | 1u; /* DMIC4/5 enable, DIV16 */
+	regs[0x0104 / 4] = 0u;             /* DEC0 mux = VA_DMIC */
+	regs[0x0100 / 4] = (1u << 4);      /* DEC0 input = DMIC0 */
+	regs[0x0404 / 4] = (1u << 7) | (2u << 5); /* DMIC select, 150 Hz HPF */
+	regs[0x0400 / 4] = (1u << 5) | 4u; /* TX0 CLK_EN, 48 kHz, unmuted */
+	regs[0x0418 / 4] = 0u;
+	__builtin_arm_dsb(0xf);
+	delay_for_interval(1, NSEC_PER_MSEC);
+	regs[0x0418 / 4] = 2u;
+	delay_for_interval(1, NSEC_PER_MSEC);
+	regs[0x0418 / 4] = 0u;
+	regs[0x0418 / 4] = 1u;
+	delay_for_interval(6, NSEC_PER_MSEC);
+	regs[0x040c / 4] = 0u;             /* TX0 0 dB gain */
+	__builtin_arm_dsb(0xf);
+}
+
+static bool
+mic_hw_prepare(void)
+{
+	if (mic_hw_prepared) {
+		return true;
+	}
+	if (!annibale_adsp_is_hw_up() || !annibale_audio_reach_is_active()) {
+		return false;
 	}
 
-	/* If ADSP hardware is active, vote LPASS core & LPIMX root clock (0x201 @ 19.2 MHz) */
-	if (annibale_adsp_is_hw_up()) {
-		struct mic_pkt p;
-		mpkt_begin(&p, OUR_MIC_PORT, PRM_IID, OP_REGISTER_RES);
-		uint32_t cmd = mpkt_cmd_begin(&p);
-		uint32_t at = mpkt_param_begin(&p, PRM_IID, 0x08001029);
-		mpkt_put32(&p, 1);
-		mpkt_put32(&p, 13); /* LPASS core */
-		mpkt_param_end(&p, at);
-		mpkt_cmd_end(&p, cmd);
-		mpkt_finish(&p);
-		if (!annibale_audio_reach_send_cmd(p.buf, p.len, "REQ LPASS CORE", NULL, NULL, 0)) {
-			say("LPASS core resource request failed\n");
-			return false;
-		}
-
-		vm_offset_t lpi_tlmm = ml_io_map(LPI_TLMM_PHYS, LPI_TLMM_SIZE);
-		if (lpi_tlmm == 0) {
-			say("LPI TLMM mapping failed\n");
-			return false;
-		}
-		{
-			/* LPI GPIO 3 (TX SWR CLK), 4 (TX SWR DATA0), 5 (TX SWR DATA1), 15 (TX SWR DATA2) func 1 */
-			static const unsigned swr_pins[] = { 3, 4, 5, 15 };
-			for (unsigned i = 0; i < 4; i++) {
-				vm_offset_t reg = lpi_tlmm + 0x1000UL * swr_pins[i];
-				uint32_t v = *(volatile uint32_t *)reg;
-				v = (v & ~0x3ffu) | (1u << 2) | (2u << 6) | 1u;
-				*(volatile uint32_t *)reg = v;
-			}
-			__builtin_arm_dsb(0xf);
-		}
+	if (!mic_prm_vote_hw_core(Q6PRM_HW_CORE_ID_LPASS, "REQ LPASS CORE")) {
+		say("LPASS core resource request failed\n");
+		return false;
+	}
+	if (!mic_prm_set_clk(Q6PRM_LPASS_CLK_ID_VA_MCLK, VA_MACRO_MCLK_HZ, "REQ VA MCLK")) {
+		say("LPASS VA MCLK request failed\n");
+		return false;
 	}
 
-	mic_wcd_powered = true;
-	say("WCD9395 supplies enabled and reset GPIO101 released\n");
+	if (!mic_configure_dmic_pins()) {
+		return false;
+	}
+	mic_configure_va_macro();
+
+	mic_hw_prepared = true;
+	say("LPASS core, VA macro and DMIC pins configured\n");
 	return true;
 }
 
@@ -390,64 +490,68 @@ start_capture_graphs(void)
 	if (mic_graphs_started) {
 		return true;
 	}
-	if (!wcd9395_power_and_reset()) return false;
+	if (!mic_hw_prepare()) return false;
 
-	static const struct mic_mod mic_mods[] = {
-		{ MOD_CODEC_DMA_SOURCE, IID_MIC_SOURCE, 0, 1 }
-	};
-	static const struct mic_mod cap_mods[] = {
-		{ MOD_RD_SHMEM, IID_CAP_SHMEM, 1, 0 },
-		{ MOD_PCM_ENC,  IID_CAP_ENC,   1, 1 },
-		{ MOD_PCM_CNV,  IID_CAP_CNV,   1, 1 }
-	};
-	static const struct mic_link cap_links[] = {
-		{ IID_MIC_SOURCE, IID_CAP_CNV },
-		{ IID_CAP_CNV,    IID_CAP_ENC },
-		{ IID_CAP_ENC,    IID_CAP_SHMEM }
-	};
+	if (!mic_graphs_opened) {
+		static const struct mic_mod mic_mods[] = {
+			{ MOD_CODEC_DMA_SOURCE, IID_MIC_SOURCE, 0, 1 }
+		};
+		static const struct mic_mod cap_mods[] = {
+			{ MOD_RD_SHMEM, IID_CAP_SHMEM, 1, 0 },
+			{ MOD_PCM_ENC,  IID_CAP_ENC,   1, 1 },
+			{ MOD_PCM_CNV,  IID_CAP_CNV,   1, 1 }
+		};
+		static const struct mic_link cap_links[] = {
+			{ IID_MIC_SOURCE, IID_CAP_CNV },
+			{ IID_CAP_CNV,    IID_CAP_ENC },
+			{ IID_CAP_ENC,    IID_CAP_SHMEM }
+		};
 
-	struct mic_pkt p;
+		struct mic_pkt p;
 
-	/* 1. Open SG_MIC (0x4007) */
-	mpkt_graph_open(&p, SG_MIC, 2, mic_mods, 1, NULL, 0);
-	if (!annibale_audio_reach_send_cmd(p.buf, p.len, "OPEN SG_MIC (0x4007)", NULL, NULL, 0)) return false;
+		/* 1. Open SG_MIC (0x4007) */
+		mpkt_graph_open(&p, SG_MIC, 2, mic_mods, 1, NULL, 0);
+		if (!annibale_audio_reach_send_cmd(p.buf, p.len, "OPEN SG_MIC (0x4007)", NULL, NULL, 0)) return false;
 
-	/* 2. Configure CODEC DMA Source (TX0, 48 kHz 16-bit mono) */
-	mpkt_begin(&p, OUR_MIC_PORT, APM_IID, OP_SET_CFG);
-	uint32_t cmd = mpkt_cmd_begin(&p);
-	uint32_t at = mpkt_param_begin(&p, IID_MIC_SOURCE, 0x08001063); /* CODEC_DMA_INTF_CFG */
-	mpkt_put32(&p, 3); /* lpaif_type = LPASS_TX */
-	mpkt_put32(&p, 1); /* intf_idx = TX0 */
-	mpkt_put32(&p, 1); /* active_channels_mask = ch 0 */
-	mpkt_param_end(&p, at);
-	at = mpkt_param_begin(&p, IID_MIC_SOURCE, 0x08001017); /* HW_EP_MF */
-	mpkt_put32(&p, MIC_RATE);
-	mpkt_put16(&p, 16);
-	mpkt_put16(&p, 1);
-	mpkt_put32(&p, 1);
-	mpkt_param_end(&p, at);
-	mpkt_cmd_end(&p, cmd);
-	mpkt_finish(&p);
-	if (!annibale_audio_reach_send_cmd(p.buf, p.len, "SET_CFG MIC_SOURCE", NULL, NULL, 0)) return false;
+		/* 2. Configure CODEC DMA Source (TX0, 48 kHz 16-bit mono) */
+		mpkt_begin(&p, OUR_MIC_PORT, APM_IID, OP_SET_CFG);
+		uint32_t cmd = mpkt_cmd_begin(&p);
+		uint32_t at = mpkt_param_begin(&p, IID_MIC_SOURCE, 0x08001063); /* CODEC_DMA_INTF_CFG */
+		mpkt_put32(&p, 3); /* lpaif_type = LPASS_TX */
+		mpkt_put32(&p, 1); /* intf_idx = TX0 */
+		mpkt_put32(&p, 1); /* active_channels_mask = ch 0 */
+		mpkt_param_end(&p, at);
+		at = mpkt_param_begin(&p, IID_MIC_SOURCE, 0x08001017); /* HW_EP_MF */
+		mpkt_put32(&p, MIC_RATE);
+		mpkt_put16(&p, 16);
+		mpkt_put16(&p, 1);
+		mpkt_put32(&p, 1);
+		mpkt_param_end(&p, at);
+		mpkt_cmd_end(&p, cmd);
+		mpkt_finish(&p);
+		if (!annibale_audio_reach_send_cmd(p.buf, p.len, "SET_CFG MIC_SOURCE", NULL, NULL, 0)) return false;
 
-	/* 3. Open SG_CAPTURE (0x4003) */
-	mpkt_graph_open(&p, SG_CAPTURE, 1, cap_mods, 3, cap_links, 3);
-	if (!annibale_audio_reach_send_cmd(p.buf, p.len, "OPEN SG_CAPTURE (0x4003)", NULL, NULL, 0)) return false;
+		/* 3. Open SG_CAPTURE (0x4003) */
+		mpkt_graph_open(&p, SG_CAPTURE, 1, cap_mods, 3, cap_links, 3);
+		if (!annibale_audio_reach_send_cmd(p.buf, p.len, "OPEN SG_CAPTURE (0x4003)", NULL, NULL, 0)) return false;
 
-	/* 4. Configure PCM converter & encoder for 48 kHz 16-bit mono */
-	mpkt_begin(&p, OUR_MIC_PORT, APM_IID, OP_SET_CFG);
-	cmd = mpkt_cmd_begin(&p);
-	at = mpkt_param_begin(&p, IID_CAP_ENC, 0x08001006);
-	mpkt_put32(&p, 0); mpkt_put32(&p, 0);
-	mpkt_put32(&p, 0x09001000); mpkt_put32(&p, 20);
-	mpkt_put32(&p, MIC_RATE);
-	mpkt_put16(&p, 16); mpkt_put16(&p, 16); mpkt_put16(&p, 15);
-	mpkt_put16(&p, 1);  mpkt_put16(&p, 1);  mpkt_put16(&p, 0);
-	mpkt_put16(&p, 1);  mpkt_put8(&p, 1);   mpkt_put8(&p, 0);
-	mpkt_param_end(&p, at);
-	mpkt_cmd_end(&p, cmd);
-	mpkt_finish(&p);
-	if (!annibale_audio_reach_send_cmd(p.buf, p.len, "SET_CFG CAP_ENC", NULL, NULL, 0)) return false;
+		/* 4. Configure PCM converter & encoder for 48 kHz 16-bit mono */
+		mpkt_begin(&p, OUR_MIC_PORT, APM_IID, OP_SET_CFG);
+		cmd = mpkt_cmd_begin(&p);
+		at = mpkt_param_begin(&p, IID_CAP_ENC, 0x08001006);
+		mpkt_put32(&p, 0); mpkt_put32(&p, 0);
+		mpkt_put32(&p, 0x09001000); mpkt_put32(&p, 20);
+		mpkt_put32(&p, MIC_RATE);
+		mpkt_put16(&p, 16); mpkt_put16(&p, 16); mpkt_put16(&p, 15);
+		mpkt_put16(&p, 1);  mpkt_put16(&p, 1);  mpkt_put16(&p, 0);
+		mpkt_put16(&p, 1);  mpkt_put8(&p, 1);   mpkt_put8(&p, 0);
+		mpkt_param_end(&p, at);
+		mpkt_cmd_end(&p, cmd);
+		mpkt_finish(&p);
+		if (!annibale_audio_reach_send_cmd(p.buf, p.len, "SET_CFG CAP_ENC", NULL, NULL, 0)) return false;
+
+		mic_graphs_opened = true;
+	}
 
 	/* 5. Prepare & Start SG_MIC and SG_CAPTURE */
 	if (!mic_graph_cmd(OP_GRAPH_PREPARE, SG_MIC, "PREPARE SG_MIC") ||
@@ -455,16 +559,38 @@ start_capture_graphs(void)
 	    !mic_graph_cmd(OP_GRAPH_PREPARE, SG_CAPTURE, "PREPARE SG_CAPTURE") ||
 	    !mic_graph_cmd(OP_GRAPH_START, SG_CAPTURE, "START SG_CAPTURE")) return false;
 
+	__atomic_store_n(&mic_async_failed, false, __ATOMIC_RELEASE);
 	mic_graphs_started = true;
 	say("AudioReach capture graphs SG_MIC (0x4007) & SG_CAPTURE (0x4003) started\n");
 	return true;
 }
 
+/* Stop capture subgraphs and clear stale ring/inflight state; caller holds amic_lock. */
+static void
+stop_capture_graphs(void)
+{
+	if (mic_graphs_started) {
+		(void)mic_graph_cmd(OP_GRAPH_STOP, SG_CAPTURE, "STOP SG_CAPTURE");
+		(void)mic_graph_cmd(OP_GRAPH_STOP, SG_MIC, "STOP SG_MIC");
+		mic_graphs_started = false;
+	}
+	lck_spin_lock(amic_ring_lock);
+	mic_inflight_mask = 0;
+	mic_ring_head = 0;
+	mic_ring_tail = 0;
+	lck_spin_unlock(amic_ring_lock);
+	__atomic_store_n(&mic_async_failed, false, __ATOMIC_RELEASE);
+	last_blocking_read_ns = 0;
+	thread_wakeup((event_t)__DEVOLATILE(void *, &mic_inflight_mask));
+}
+
 static bool
-submit_capture_slot(uint32_t slot, uint64_t dsp_base, uint32_t map_handle, uint32_t *data_bytes_out)
+queue_capture_slot_async(uint32_t slot, volatile uint8_t *dma_va, uint64_t dsp_base, uint32_t map_handle)
 {
 	struct mic_pkt p;
 	uint64_t slot_addr = dsp_base + MIC_OFFSET + (uint64_t)slot * MIC_PERIOD_BYTES;
+
+	__builtin_arm_dsb(0xf);
 	mpkt_begin(&p, OUR_MIC_PORT, IID_CAP_SHMEM, OP_READ_BUF);
 	mpkt_put32(&p, (uint32_t)slot_addr);
 	mpkt_put32(&p, (uint32_t)(slot_addr >> 32));
@@ -475,16 +601,23 @@ submit_capture_slot(uint32_t slot, uint64_t dsp_base, uint32_t map_handle, uint3
 	mpkt_put32(&p, 0); /* metadata map handle */
 	mpkt_put32(&p, 0); /* metadata size */
 	mpkt_finish(&p);
-	uint32_t opcode = 0, words[16] = { 0 };
-	if (!annibale_audio_reach_send_cmd(p.buf, p.len, "READ (MIC_PERIOD)", &opcode, words, 16) ||
-	    opcode != OP_READ_BUF_DONE || words[0] != 0 || words[1] != (uint32_t)slot_addr ||
-	    words[2] != (uint32_t)(slot_addr >> 32) || words[3] != map_handle ||
-	    words[4] > MIC_PERIOD_BYTES || (words[4] % sizeof(int16_t)) != 0 ||
-	    words[9] != 0 || words[13] != 0) {
-		say("capture completion failed for slot %u (opcode %#x)\n", slot, opcode);
+
+	lck_spin_lock(amic_ring_lock);
+	mic_slot_dma_va = dma_va;
+	mic_slot_dsp_base = dsp_base;
+	mic_slot_map_handle = map_handle;
+	mic_inflight_mask |= (1u << slot);
+	lck_spin_unlock(amic_ring_lock);
+
+	if (!annibale_adsp_gpr_send(p.buf, p.len, 0, NULL, NULL, 0)) {
+		lck_spin_lock(amic_ring_lock);
+		mic_inflight_mask &= ~(1u << slot);
+		lck_spin_unlock(amic_ring_lock);
 		return false;
 	}
-	if (data_bytes_out != NULL) *data_bytes_out = words[4];
+	lck_spin_lock(amic_ring_lock);
+	mic_sent_count++;
+	lck_spin_unlock(amic_ring_lock);
 	return true;
 }
 
@@ -523,11 +656,65 @@ harvest_capture_period(uint32_t slot, volatile uint8_t *dma_va, uint32_t valid_b
 	}
 }
 
+bool
+annibale_mic_gpr_event(uint32_t src_port, uint32_t dst_port, uint32_t opcode,
+    const void *payload, uint32_t len)
+{
+	if (src_port != IID_CAP_SHMEM || dst_port != OUR_MIC_PORT || opcode != OP_READ_BUF_DONE) {
+		return false;
+	}
+	if (payload == NULL || len < 56u) {
+		__atomic_store_n(&mic_async_failed, true, __ATOMIC_RELEASE);
+		thread_wakeup((event_t)__DEVOLATILE(void *, &mic_inflight_mask));
+		return true;
+	}
+
+	uint32_t words[14];
+	memcpy(words, payload, sizeof(words));
+
+	lck_spin_lock(amic_ring_lock);
+	uint64_t dsp_base = mic_slot_dsp_base;
+	uint32_t map_handle = mic_slot_map_handle;
+	volatile uint8_t *dma_va = mic_slot_dma_va;
+	uint32_t mask = mic_inflight_mask;
+	lck_spin_unlock(amic_ring_lock);
+
+	uint64_t cap_base = dsp_base + MIC_OFFSET;
+	uint64_t done_addr = ((uint64_t)words[2] << 32) | words[1];
+	bool addr_ok = (done_addr >= cap_base) &&
+	    (done_addr < cap_base + (uint64_t)MIC_SLOTS * MIC_PERIOD_BYTES) &&
+	    (((done_addr - cap_base) % MIC_PERIOD_BYTES) == 0);
+	uint32_t slot = addr_ok ? (uint32_t)((done_addr - cap_base) / MIC_PERIOD_BYTES) : 0u;
+
+	if (!addr_ok || (mask & (1u << slot)) == 0 || words[0] != 0 ||
+	    words[3] != map_handle || words[4] > MIC_PERIOD_BYTES ||
+	    (words[4] % sizeof(int16_t)) != 0 || words[9] != 0 || words[13] != 0) {
+		__atomic_store_n(&mic_async_failed, true, __ATOMIC_RELEASE);
+		if (addr_ok) {
+			lck_spin_lock(amic_ring_lock);
+			mic_inflight_mask &= ~(1u << slot);
+			lck_spin_unlock(amic_ring_lock);
+		}
+		thread_wakeup((event_t)__DEVOLATILE(void *, &mic_inflight_mask));
+		return true;
+	}
+
+	/* Harvest DMA period before releasing slot bit so feeder cannot overwrite it. */
+	harvest_capture_period(slot, dma_va, words[4]);
+
+	lck_spin_lock(amic_ring_lock);
+	mic_inflight_mask &= ~(1u << slot);
+	mic_done_count++;
+	lck_spin_unlock(amic_ring_lock);
+	thread_wakeup((event_t)__DEVOLATILE(void *, &mic_inflight_mask));
+	return true;
+}
+
 __dead2
 static void
 mic_capture_thread(void *arg __unused, wait_result_t w __unused)
 {
-	uint32_t slot = 0;
+	uint32_t slot = 0, last_done = 0, stall_ticks = 0;
 
 	say("capture feeder thread running\n");
 	for (;;) {
@@ -539,22 +726,88 @@ mic_capture_thread(void *arg __unused, wait_result_t w __unused)
 				delay_for_interval(20, NSEC_PER_MSEC);
 				continue;
 			}
-			lck_mtx_unlock(&amic_lock);
-
-			volatile uint8_t *dma_va = NULL;
-			uint64_t dma_pa = 0, dsp_addr = 0;
-			uint32_t map_handle = 0, data_bytes = 0;
-			if (annibale_audio_reach_dma_info(&dma_va, &dma_pa, &dsp_addr, &map_handle) &&
-			    submit_capture_slot(slot % MIC_SLOTS, dsp_addr, map_handle, &data_bytes)) {
-				harvest_capture_period(slot % MIC_SLOTS, dma_va, data_bytes);
-			} else {
-				lck_mtx_lock(&amic_lock);
+			if (__atomic_load_n(&mic_async_failed, __ATOMIC_ACQUIRE)) {
+				stop_capture_graphs();
 				mic_capture_error = EIO;
 				lck_mtx_unlock(&amic_lock);
 				say("capture DMA completion failed; capture stopped\n");
+				continue;
 			}
-			slot++;
+
+			volatile uint8_t *dma_va = NULL;
+			uint64_t dma_pa = 0, dsp_addr = 0;
+			uint32_t map_handle = 0;
+			if (!annibale_audio_reach_dma_info(&dma_va, &dma_pa, &dsp_addr, &map_handle)) {
+				stop_capture_graphs();
+				mic_capture_error = EIO;
+				lck_mtx_unlock(&amic_lock);
+				say("capture DMA info unavailable; capture stopped\n");
+				continue;
+			}
+
+			lck_spin_lock(amic_ring_lock);
+			uint32_t mask = mic_inflight_mask;
+			uint32_t done = mic_done_count;
+			lck_spin_unlock(amic_ring_lock);
+			uint32_t next_slot = slot;
+			bool failed = false;
+
+			for (uint32_t i = 0; i < MIC_SLOTS && mic_graphs_started; i++) {
+				uint32_t s = (slot + i) % MIC_SLOTS;
+				if ((mask & (1u << s)) != 0) {
+					continue;
+				}
+				if (!queue_capture_slot_async(s, dma_va, dsp_addr, map_handle)) {
+					stop_capture_graphs();
+					mic_capture_error = EIO;
+					say("capture DMA submission failed; capture stopped\n");
+					failed = true;
+					break;
+				}
+				next_slot = (s + 1u) % MIC_SLOTS;
+				lck_spin_lock(amic_ring_lock);
+				mask = mic_inflight_mask;
+				lck_spin_unlock(amic_ring_lock);
+			}
+			slot = next_slot;
+			uint32_t inflight = (uint32_t)__builtin_popcount(mask);
+			if (!failed && inflight > 0 && done == last_done && ++stall_ticks >= 25u) {
+				stop_capture_graphs();
+				mic_capture_error = EIO;
+				lck_mtx_unlock(&amic_lock);
+				say("capture DMA completion stalled; capture stopped\n");
+				stall_ticks = 0;
+				continue;
+			}
+			lck_mtx_unlock(&amic_lock);
+			if (failed) {
+				continue;
+			}
+			if (inflight == 0 || done != last_done) {
+				last_done = done;
+				stall_ticks = 0;
+			}
+
+			assert_wait_timeout((event_t)__DEVOLATILE(void *, &mic_inflight_mask),
+			    THREAD_INTERRUPTIBLE, 25, NSEC_PER_MSEC);
+			lck_spin_lock(amic_ring_lock);
+			bool can_step = (__builtin_popcount(mic_inflight_mask) < (int)MIC_SLOTS) ||
+			    __atomic_load_n(&mic_async_failed, __ATOMIC_ACQUIRE) ||
+			    (mic_open_clients == 0 && !annibale_audio_recording_mic());
+			lck_spin_unlock(amic_ring_lock);
+			if (can_step) {
+				clear_wait(current_thread(), THREAD_AWAKENED);
+			} else {
+				thread_block(THREAD_CONTINUE_NULL);
+			}
 		} else {
+			lck_mtx_lock(&amic_lock);
+			if (mic_graphs_started) {
+				stop_capture_graphs();
+			}
+			lck_mtx_unlock(&amic_lock);
+			last_done = 0;
+			stall_ticks = 0;
 			assert_wait_timeout((event_t)&mic_open_clients, THREAD_INTERRUPTIBLE, 250, NSEC_PER_MSEC);
 			if ((mic_open_clients > 0) || annibale_audio_recording_mic()) {
 				clear_wait(current_thread(), THREAD_AWAKENED);
@@ -575,6 +828,8 @@ annibale_mic_read(struct uio *uio, int ioflag)
 {
 	int16_t chunk[1024];
 	int error = 0;
+	bool nonblock = (ioflag & IO_NDELAY) != 0;
+	bool moved_any = false;
 
 	if (mic_ring == NULL) {
 		return ENXIO;
@@ -590,11 +845,11 @@ annibale_mic_read(struct uio *uio, int ioflag)
 	/*
 	 * For blocking callers (not O_NONBLOCK), pace reads at 48 kHz wall-clock rate so
 	 * direct readers (cat / dd / test tools) receive samples at 48,000 frames/s.
-	 * For O_NONBLOCK callers (audiomxd CoreAudio IO thread), return requested frames
-	 * immediately because CoreAudio's IO cycle already paces itself at 48,000 frames/s.
+	 * For O_NONBLOCK callers (audiomxd CoreAudio IO thread), return only available
+	 * samples without zero-padding so short reads surface to the HAL accurately.
 	 */
 	user_ssize_t total_req_bytes = uio_resid(uio);
-	if (!(ioflag & IO_NDELAY) && total_req_bytes >= 2) {
+	if (!nonblock && total_req_bytes >= 2) {
 		uint64_t now_ns = 0;
 		absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
 		uint64_t req_samples = (uint64_t)total_req_bytes / sizeof(int16_t);
@@ -617,21 +872,42 @@ annibale_mic_read(struct uio *uio, int ioflag)
 			bytes = sizeof(chunk);
 		}
 		bytes -= bytes % (user_ssize_t)sizeof(int16_t);
-		uint32_t count = (uint32_t)(bytes / (user_ssize_t)sizeof(int16_t));
+		uint32_t want = (uint32_t)(bytes / (user_ssize_t)sizeof(int16_t));
+		uint32_t take = 0;
 
 		lck_spin_lock(amic_ring_lock);
-		for (uint32_t i = 0; i < count; i++) {
-			if (mic_ring_tail != mic_ring_head) {
+		uint32_t avail = mic_ring_head - mic_ring_tail;
+		if (nonblock) {
+			take = avail < want ? avail : want;
+			for (uint32_t i = 0; i < take; i++) {
 				chunk[i] = mic_ring[mic_ring_tail & MIC_RING_MASK];
 				mic_ring_tail++;
-			} else {
-				chunk[i] = 0;
+			}
+		} else {
+			take = want;
+			for (uint32_t i = 0; i < want; i++) {
+				if (mic_ring_tail != mic_ring_head) {
+					chunk[i] = mic_ring[mic_ring_tail & MIC_RING_MASK];
+					mic_ring_tail++;
+				} else {
+					chunk[i] = 0;
+				}
 			}
 		}
 		lck_spin_unlock(amic_ring_lock);
 
-		error = uiomove((caddr_t)chunk, (int)bytes, uio);
+		if (nonblock && take == 0) {
+			if (!moved_any) {
+				error = EAGAIN;
+			}
+			break;
+		}
+		error = uiomove((caddr_t)chunk, (int)(take * (uint32_t)sizeof(int16_t)), uio);
 		if (error != 0) {
+			break;
+		}
+		moved_any = true;
+		if (nonblock && take < want) {
 			break;
 		}
 	}
@@ -642,7 +918,15 @@ static int
 mic_cdev_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
 {
 	lck_mtx_lock(&amic_lock);
-	if (mic_ring == NULL || mic_capture_error != 0 || (!mic_graphs_started && !start_capture_graphs())) {
+	if (mic_ring == NULL) {
+		lck_mtx_unlock(&amic_lock);
+		return ENXIO;
+	}
+	if (mic_open_clients == 0 && mic_capture_error != 0) {
+		stop_capture_graphs();
+		mic_capture_error = 0;
+	}
+	if (mic_capture_error != 0 || (!mic_graphs_started && !start_capture_graphs())) {
 		lck_mtx_unlock(&amic_lock);
 		return EIO;
 	}
@@ -659,7 +943,12 @@ mic_cdev_close(__unused dev_t dev, __unused int flags, __unused int devtype, __u
 	if (mic_open_clients > 0) {
 		mic_open_clients--;
 	}
+	if (mic_open_clients == 0 && !annibale_audio_recording_mic()) {
+		stop_capture_graphs();
+		mic_capture_error = 0;
+	}
 	lck_mtx_unlock(&amic_lock);
+	thread_wakeup((event_t)&mic_open_clients);
 	return 0;
 }
 
@@ -686,20 +975,13 @@ static const struct cdevsw mic_cdevsw = {
 void
 annibale_mic_init(void)
 {
-	say("initializing WCD9395 / SoundWire / AudioReach microphone subsystem...\n");
+	say("initializing LPASS DMIC / VA Macro / AudioReach microphone subsystem...\n");
 
 	if (amic_ring_lock == NULL) {
 		amic_ring_lock = lck_spin_alloc_init(&amic_lck_grp, LCK_ATTR_NULL);
 	}
 	if (mic_ring == NULL) {
 		mic_ring = kalloc_data(MIC_RING_SAMPLES * sizeof(int16_t), Z_WAITOK | Z_ZERO);
-		if (mic_ring != NULL) {
-			/* Keep an initial silent period available to non-blocking readers. */
-			for (uint32_t i = 0; i < 2 * MIC_PERIOD_FRAMES; i++) {
-				mic_ring[mic_ring_head & MIC_RING_MASK] = 0;
-				mic_ring_head++;
-			}
-		}
 	}
 
 	int major = cdevsw_add(-1, &mic_cdevsw);

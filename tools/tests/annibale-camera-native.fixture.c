@@ -36,18 +36,18 @@ static void *kernel_map, *cam_lock;
 static uint16_t front_chip_id, wide_chip_id;
 static uint8_t front_slave_addr, wide_slave_addr, wide_bus_mode;
 static uint32_t cached_csid_ver, cached_ife_ver, cam_hw_mmio, current_sensor;
-static uint32_t boot_cam_keep_stream;
+static uint32_t boot_cam_keep_stream, boot_cam_wm_prefetch;
 static uint64_t cam_frame_seq;
 static bool cam_is_open, cam_hw_dma_verified, cam_sensor_streaming, cci_ready, cam_session_probed, cam_mid_sampled;
 static bool cam_native_phy_configured;
 static uint32_t regs[0x2800 / 4];
 static uint32_t top_clear, buf_clear, rx_clear, path_clear;
 static uint64_t physical;
-static unsigned address_writes, resets, table_writes[4], cache_flushes;
+static unsigned address_writes, resets, table_writes[4], cache_flushes, vblank_polls;
 static unsigned clock_starts, clock_stops, phy_starts, phy_stops;
 static unsigned route_stops, smmu_restores, region_frees, profile_frees, power_stops;
 static unsigned gpio_writes, shared_power_writes, completed_frames;
-static bool clocks_owned, phy_owned, smmu_owned, delivered, power_up_ok;
+static bool clocks_owned, phy_owned, smmu_owned, delivered, power_up_ok, vblank_eof_seen;
 static bool stale_reset, stale_buf, missing_finish_reset, fail_global_reset;
 static bool wrong_address, stuck_fifo, fail_smmu_stop, fail_smmu_restore;
 static bool fail_phy_stop, fail_clock_stop, bad_contiguity, invalid_status;
@@ -60,6 +60,13 @@ static uint32_t reg_rd(vm_offset_t base, uint32_t offset)
 {
     if (base != csid_lite_base) return 0;
     CHECK(offset < sizeof(regs));
+    if (offset == 0x0ec && cam_sensor_streaming && regs[0x1700 / 4] == 0) {
+        vblank_polls++;
+        if (vblank_polls >= 2u) {
+            regs[0x0ec / 4] |= 0x200u;
+            vblank_eof_seen = true;
+        }
+    }
     if (offset == 0x08c && cam_sensor_streaming && regs[0x1700 / 4] == 1 && !delivered) fake_dma();
     if (invalid_status && cam_sensor_streaming && offset == 0x08c) return UINT32_MAX;
     if (stuck_fifo && address_writes && offset == 0x1798) return 1;
@@ -245,12 +252,12 @@ static void reset_fixture(void)
     front_chip_id = 0x2042; front_slave_addr = 0x10;
     cached_csid_ver = 0x30000004; cached_ife_ver = 0x20050000;
     cam_sensor_streaming = cam_hw_dma_verified = cam_native_phy_configured = false;
-    boot_cam_keep_stream = 0;
+    boot_cam_keep_stream = boot_cam_wm_prefetch = 0;
     cam_native_initialized = cam_native_sensor_powered = cam_native_submitted = false;
     cam_native_path_configured = cam_native_reset_failed = false;
     cam_native_dma_bytes = 0;
-    clocks_owned = phy_owned = smmu_owned = delivered = false;
-    address_writes = resets = cache_flushes = completed_frames = 0;
+    clocks_owned = phy_owned = smmu_owned = delivered = vblank_eof_seen = false;
+    address_writes = resets = cache_flushes = completed_frames = vblank_polls = 0;
     clock_starts = clock_stops = phy_starts = phy_stops = 0;
     route_stops = smmu_restores = region_frees = profile_frees = power_stops = 0;
     gpio_writes = shared_power_writes = 0;
@@ -455,6 +462,34 @@ int main(void)
     CHECK(cam_capture.state == ANNIBALE_CAM_CAPTURE_STOPPED && cam_capture.error == 0);
     CHECK(annibale_cam_close(0, 0, 0, NULL) == 0);
     cases++;
+
+    /* Verify VBLANK EOF synchronization before keep-stream WM0 arming and clean status reset. */
+    reset_fixture();
+    boot_cam_keep_stream = 1;
+    cam_native_capture();
+    check_success();
+    CHECK(vblank_polls == 0 && !vblank_eof_seen);
+    delivered = false;
+    cam_native_capture();
+    check_success();
+    CHECK(vblank_polls >= 2u && vblank_eof_seen && (regs[0x0ec / 4] & 0x200u) == 0);
+    CHECK(annibale_cam_close(0, 0, 0, NULL) == 0);
+    cases++;
+
+    /* Verify cam_wm_prefetch=0 vs 1 writes IFE-lite0 WM0 0x1760/0x1764 accordingly. */
+    reset_fixture();
+    cam_native_capture();
+    check_success();
+    CHECK(regs[0x1760 / 4] == 0u && regs[0x1764 / 4] == 0u);
+    CHECK(annibale_cam_close(0, 0, 0, NULL) == 0);
+    reset_fixture();
+    boot_cam_wm_prefetch = 1u;
+    cam_native_capture();
+    check_success();
+    CHECK(regs[0x1760 / 4] == 1u && regs[0x1764 / 4] == UINT32_MAX);
+    CHECK(annibale_cam_close(0, 0, 0, NULL) == 0);
+    cases++;
+
     printf("%u native capture/read/close scenarios passed\n", cases);
     return 0;
 }

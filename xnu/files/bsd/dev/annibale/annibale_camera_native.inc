@@ -40,11 +40,13 @@
 #define CAM980_WM_IRQ_PERIOD     0x1730u
 #define CAM980_WM_IRQ_PATTERN    0x1734u
 #define CAM980_WM_PREFETCH       0x1760u
+#define CAM980_WM_PREFETCH_MASK  0x1764u
 #define CAM980_WM_CACHE          0x1768u
 #define CAM980_WM_ADDR_CONFIG    0x1770u
 #define CAM980_WM_CONSUMED       0x1790u
 #define CAM980_WM_FIFO           0x1798u
 #define CAM980_RDI0_DONE         2u
+#define CAM980_PATH_INPUT_EOF    0x200u
 #define CAM980_RX_FATAL          0x019fa800u
 #define CAM980_PATH_FATAL        0x20186001u
 
@@ -296,7 +298,8 @@ cam_native_configure(void)
 	csid_wr(CAM980_WM_LINE_DONE, 0);
 	csid_wr(CAM980_WM_IRQ_PERIOD, 0);
 	csid_wr(CAM980_WM_IRQ_PATTERN, 1u);
-	csid_wr(CAM980_WM_PREFETCH, 0);
+	csid_wr(CAM980_WM_PREFETCH, boot_cam_wm_prefetch != 0 ? 1u : 0u);
+	csid_wr(CAM980_WM_PREFETCH_MASK, boot_cam_wm_prefetch != 0 ? UINT32_MAX : 0u);
 	csid_wr(CAM980_WM_CACHE, 0);
 	csid_wr(CAM980_WM_ADDR_CONFIG, (uint32_t)(cam_capture.dma_address & 0xffu));
 	cam_diag_bus_debug_enable();
@@ -304,6 +307,31 @@ cam_native_configure(void)
 	       reg_rd(csid_lite_base, CAM980_WM_IMAGE_CFG0) ==
 	       ((cam_profile->height << 16) | (cam_profile->stride / 16u)) &&
 	       reg_rd(csid_lite_base, CAM980_WM_IMAGE_CFG2) == cam_profile->stride;
+}
+
+/*
+ * Wait for an incoming sensor EOF edge so keep-stream WM0/RDI0 arming always
+ * runs inside VBLANK rather than mid-frame (which causes bus_ovf=0x1 / consumed=0).
+ */
+static bool
+cam_native_wait_vblank(void)
+{
+	csid_wr(CAM980_PATH_CLEAR, CAM980_PATH_INPUT_EOF);
+	csid_wr(CAM980_IRQ_COMMAND, 1u);
+	for (uint32_t elapsed = 0; elapsed < 100000u; elapsed += 250u) {
+		uint32_t st = reg_rd(csid_lite_base, CAM980_PATH_STATUS);
+		if (st == UINT32_MAX) {
+			return false;
+		}
+		if ((st & CAM980_PATH_INPUT_EOF) != 0) {
+			csid_wr(CAM980_PATH_CLEAR, UINT32_MAX);
+			csid_wr(CAM980_RX_CLEAR, UINT32_MAX);
+			csid_wr(CAM980_IRQ_COMMAND, 1u);
+			return true;
+		}
+		delay_for_interval(250, NSEC_PER_USEC);
+	}
+	return false;
 }
 
 static int
@@ -447,6 +475,18 @@ cam_native_capture(void)
 		}
 		cam_native_trace("capture prepare release state=%u error=%u\n", cam_capture.state, cam_capture.error);
 		return;
+	}
+	if (keep_active) {
+		if (!cam_native_wait_vblank()) {
+			static bool vblank_miss_logged;
+			if (!vblank_miss_logged) {
+				vblank_miss_logged = true;
+				say("vblank wait timeout seq=%llu path=%#x rx=%#x\n",
+				    (unsigned long long)sequence,
+				    reg_rd(csid_lite_base, CAM980_PATH_STATUS),
+				    reg_rd(csid_lite_base, CAM980_RX_STATUS));
+			}
+		}
 	}
 	cam_native_submitted = true;
 #ifdef KERNEL

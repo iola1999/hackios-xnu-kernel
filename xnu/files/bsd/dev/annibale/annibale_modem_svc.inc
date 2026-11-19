@@ -905,6 +905,26 @@ svc_rmtfs_rx(void *context, uint32_t from_node, uint32_t from_port, const void *
 
 /* ---- QMI_DMS (0x02), QMI_UIM (0x0b), and QMI_LOC (0x10) diagnostic decoders ------------------------- */
 
+static struct {
+	uint8_t  dms_mode, uim_card, uim_err, loc_sv;
+	uint16_t dms_err, loc_err;
+	uint32_t loc_rev, loc_fix;
+	int32_t  loc_eng;
+} modem_loc_diag = {
+	.dms_mode = 0xffu, .uim_card = 0xffu, .uim_err = 0xffu, .loc_eng = -1, .loc_fix = 0xffu,
+};
+
+static void
+modem_format_loc_status(char *out, size_t cap, bool loc_reg, bool loc_fb)
+{
+	snprintf(out, cap,
+	    "dms_mode=%u dms_err=%u uim_card=%u uim_err=%u loc_reg=%u loc_fb=%u loc_err=%u loc_rev=%u loc_sv=%u loc_eng=%d loc_fix=%u",
+	    modem_loc_diag.dms_mode, modem_loc_diag.dms_err,
+	    modem_loc_diag.uim_card, modem_loc_diag.uim_err,
+	    loc_reg ? 1u : 0u, loc_fb ? 1u : 0u, modem_loc_diag.loc_err,
+	    modem_loc_diag.loc_rev, modem_loc_diag.loc_sv, modem_loc_diag.loc_eng, modem_loc_diag.loc_fix);
+}
+
 static bool
 svc_qmi_read_result(const uint8_t *tlvs, uint16_t tlv_len, uint16_t *res_out, uint16_t *err_out)
 {
@@ -950,10 +970,12 @@ modem_dms_handle_rx(uint8_t qmi_flags, uint16_t msg_id, const uint8_t *tlvs, uin
 		}
 		printf("annibale-modem: QMI DMS operating_mode=%u offline_reason=%#x hw_restr=%u (device_serial=***)\n",
 		    v_mode[0], reason, hw);
+		modem_loc_diag.dms_mode = v_mode[0];
 		*mode_out = v_mode[0];
 		*want_online_out = (v_mode[0] != 0u);
 	} else if (msg_id == 0x002eu /* QMI_DMS_SET_OPERATING_MODE */) {
 		if (svc_qmi_read_result(tlvs, tlv_len, &res, &err)) {
+			modem_loc_diag.dms_err = err;
 			printf("annibale-modem: QMI DMS SET_OPERATING_MODE result=%u err=%u\n", res, err);
 			*requery_out = true;
 		}
@@ -980,6 +1002,8 @@ modem_uim_handle_rx(uint8_t qmi_flags, uint16_t msg_id, const uint8_t *tlvs, uin
 	}
 	uint8_t num_slots = cv[8], card = cv[9], upin = cv[10], uim_err = cv[13], apps = cv[14];
 	uint8_t app_state = (clen >= 17u && apps > 0) ? cv[16] : 0u;
+	modem_loc_diag.uim_card = card;
+	modem_loc_diag.uim_err = uim_err;
 	*sim_state_out = (card == 1u) ? (app_state == 7u ? 2u : 1u) : 0u;
 	printf("annibale-modem: QMI UIM slots=%u slot0=(card=%u upin=%u err=%u apps=%u app_st=%u) sim=%u (subscriber_id=***)\n",
 	    num_slots, card, upin, uim_err, apps, app_state, *sim_state_out);
@@ -1020,30 +1044,34 @@ modem_voice_handle_rx(uint16_t msg_id, const uint8_t *tlvs, uint16_t tlv_len, ui
 
 static void
 modem_loc_handle_rx(uint8_t qmi_flags, uint16_t txn_id, uint16_t msg_id, const uint8_t *tlvs,
-    uint16_t tlv_len, bool *reg_ok_out, bool *retry_min_mask_out)
+    uint16_t tlv_len, bool *rev_done_out, bool *reg_ok_out, bool *retry_min_mask_out)
 {
 	if (qmi_flags == 0x02u /* QMI_RESPONSE */) {
 		uint16_t res = 0, err = 0;
 		if (svc_qmi_read_result(tlvs, tlv_len, &res, &err)) {
-			printf("annibale-modem: QMI LOC rsp txn=%u msg=%#04x len=%u result=%u err=%u\n",
-			    txn_id, msg_id, tlv_len, res, err);
+			char raw[129];
+			uint16_t rn = ((msg_id >= 0x001eu && msg_id <= 0x0021u) || res != 0) ? (tlv_len < 64u ? tlv_len : 64u) : 0u;
+			for (uint16_t i = 0; i < rn; i++) {
+				snprintf(raw + i * 2u, 3u, "%02x", tlvs[i]);
+			}
+			raw[rn * 2u] = '\0';
+			printf("annibale-modem: QMI LOC rsp flags=%#x txn=%u msg=%#04x len=%u result=%u err=%u tlvs=%s\n",
+			    qmi_flags, txn_id, msg_id, tlv_len, res, err, rn ? raw : "-");
 			if (msg_id == 0x001eu && res == 0) {
-				uint16_t ml = 0;
+				uint16_t ml = 0, n = 0;
 				const uint8_t *mv = annibale_qmi_find_tlv(tlvs, tlv_len, 0x10u, &ml);
-				uint64_t mask0 = 0;
-				if (mv != NULL && ml > 0) {
-					memcpy(&mask0, mv, ml < 8u ? ml : 8u);
+				uint64_t w0 = 0, w1 = 0;
+				if (mv != NULL && ml >= 2u) {
+					n = (uint16_t)mv[0] | ((uint16_t)mv[1] << 8);
+					memcpy(&w0, mv + 2u, (ml - 2u) < 8u ? (ml - 2u) : 8u);
+					if (ml > 10u) memcpy(&w1, mv + 10u, (ml - 10u) < 8u ? (ml - 10u) : 8u);
 				}
-				printf("annibale-modem: QMI LOC supported_msgs len=%u w0=%#llx\n", ml, mask0);
-			} else if (msg_id == 0x0020u && res == 0) {
-				uint16_t rl = 0;
-				const uint8_t *rv = annibale_qmi_find_tlv(tlvs, tlv_len, 0x01u, &rl);
-				uint32_t rev = 0;
-				if (rv != NULL && rl >= 4u) {
-					memcpy(&rev, rv, 4u);
-					printf("annibale-modem: QMI LOC service_rev=%u\n", rev);
-				}
+				printf("annibale-modem: QMI LOC supported_msgs len=%u n=%u w0=%#llx w1=%#llx\n", ml, n, w0, w1);
+			} else if (msg_id == 0x0020u) {
+				if (res == 0) modem_loc_diag.loc_rev = 2u;
+				if (rev_done_out != NULL) *rev_done_out = true;
 			} else if (msg_id == 0x0021u) {
+				modem_loc_diag.loc_err = err;
 				if (res == 0 && reg_ok_out != NULL) {
 					*reg_ok_out = true;
 				} else if (res != 0 && retry_min_mask_out != NULL) {
@@ -1054,6 +1082,7 @@ modem_loc_handle_rx(uint8_t qmi_flags, uint16_t txn_id, uint16_t msg_id, const u
 		return;
 	}
 	if (qmi_flags != 0x04u /* QMI_INDICATION */) {
+		printf("annibale-modem: QMI LOC rx flags=%#x txn=%u msg=%#04x len=%u\n", qmi_flags, txn_id, msg_id, tlv_len);
 		return;
 	}
 	switch (msg_id) {
@@ -1063,6 +1092,7 @@ modem_loc_handle_rx(uint8_t qmi_flags, uint16_t txn_id, uint16_t msg_id, const u
 		uint32_t rev = 0;
 		if (rv != NULL && rl >= 4u) {
 			memcpy(&rev, rv, 4u);
+			modem_loc_diag.loc_rev = rev;
 		}
 		printf("annibale-modem: QMI LOC service_rev_ind=%u\n", rev);
 		break;
@@ -1094,6 +1124,7 @@ modem_loc_handle_rx(uint8_t qmi_flags, uint16_t txn_id, uint16_t msg_id, const u
 		uint16_t l_sv = 0;
 		const uint8_t *v_sv = annibale_qmi_find_tlv(tlvs, tlv_len, 0x10u, &l_sv);
 		uint8_t count = (v_sv != NULL && l_sv >= 1u) ? v_sv[0] : 0u;
+		modem_loc_diag.loc_sv = count;
 		printf("annibale-modem: QMI LOC sv_info count=%u\n", count);
 		break;
 	}
@@ -1116,6 +1147,7 @@ modem_loc_handle_rx(uint8_t qmi_flags, uint16_t txn_id, uint16_t msg_id, const u
 		const uint8_t *v_eng = annibale_qmi_find_tlv(tlvs, tlv_len, 0x01u, &l_eng);
 		int32_t eng = 0;
 		if (v_eng != NULL && l_eng >= 4u) memcpy(&eng, v_eng, 4u);
+		modem_loc_diag.loc_eng = eng;
 		printf("annibale-modem: QMI LOC engine_state=%d\n", eng);
 		break;
 	}
@@ -1124,6 +1156,7 @@ modem_loc_handle_rx(uint8_t qmi_flags, uint16_t txn_id, uint16_t msg_id, const u
 		const uint8_t *v_ss = annibale_qmi_find_tlv(tlvs, tlv_len, 0x01u, &l_ss);
 		uint32_t ss = 0;
 		if (v_ss != NULL && l_ss >= 4u) memcpy(&ss, v_ss, 4u);
+		modem_loc_diag.loc_fix = ss;
 		printf("annibale-modem: QMI LOC fix_session_state=%u\n", ss);
 		break;
 	}

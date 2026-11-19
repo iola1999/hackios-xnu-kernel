@@ -961,6 +961,7 @@ annibale_camera_init(void)
 	(void)PE_parse_boot_argn("cam_rt_mhz", &boot_cam_rt_mhz, sizeof(boot_cam_rt_mhz));
 	(void)PE_parse_boot_argn("cam_probe", &boot_cam_probe, sizeof(boot_cam_probe));
 	(void)PE_parse_boot_argn("cam_keep_stream", &boot_cam_keep_stream, sizeof(boot_cam_keep_stream));
+	(void)PE_parse_boot_argn("cam_wm_prefetch", &boot_cam_wm_prefetch, sizeof(boot_cam_wm_prefetch));
 	if (PE_parse_boot_argn("cam", &cam_arg, sizeof(cam_arg))) {
 		if (cam_arg == 0) {
 			say("cam=0: camera driver disabled by boot-arg\n");

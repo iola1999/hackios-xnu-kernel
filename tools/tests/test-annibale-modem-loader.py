@@ -42,7 +42,16 @@ assert 'MODEM_STATE_OFF' in modem_src
 assert 'mpss_glink_init_preboot();' in boot_inc
 assert 'SMP2P_VERSION | (SMP2P_SSR_ACK << 8)' in boot_inc
 assert 'mpss_glink_log_stall_diag(' in boot_inc
-assert 'mpss_glink_log_stall_diag(tick)' in modem_src
+assert '#define SCM_PAS_SHUTDOWN        SCM_CALL(2, 6)' in ipa_src
+assert 'annibale_tz_pas_shutdown(' in ipa_src and 'annibale_tz_pas_shutdown(' in boot_inc
+assert 'annibale_modem_stop(' in boot_inc and 'annibale_modem_return_quiesce(' in boot_inc
+loader_ret_src = (ROOT / "xnu/files/osfmk/arm64/loader_return.c").read_text()
+assert 'annibale_modem_stop();' in loader_ret_src and 'annibale_modem_return_quiesce();' in loader_ret_src
+assert 'mpss_glink_log_stall_diag(tick)' in boot_inc and 'modem_worker_glink_tick(' in modem_src
+assert 'SYSCTL_STRING(_kern_annibale, OID_AUTO, modem_loc_status, CTLFLAG_RD' in modem_src
+assert 'modem_format_loc_status(' in svc_inc and 'modem_loc_diag' in svc_inc
+smem_find_body = boot_inc[boot_inc.index("smem_find_mpss_item("):boot_inc.index("smem_alloc_mpss_item(")]
+assert 'smem_find_item_in_partition(SMEM_HOST_GLOBAL' not in smem_find_body
 assert 'mpss_glink_lock' in modem_src
 assert 'GLINK_CMD_TX_SHORT_DATA' in modem_src
 assert 'GLINK_CMD_TX_DATA_CONT' in modem_src
@@ -59,6 +68,8 @@ assert 'annibale-modem: SMP2P slave-kernel val=%#x flags=%#x at %u ms' in boot_i
 assert 'SMP2P_MPSS_FATAL' in boot_inc
 assert '#define MPSS_GLINK_MAX_INTENTS          64u' in modem_src
 assert '#define QMI_SVC_LOC                     0x10u' in modem_src
+assert '#define QMI_LOC_GET_SUPPORTED_FIELDS    0x001fu' in modem_src
+assert '#define QMI_LOC_INFORM_CLIENT_REV       0x0020u' in modem_src
 assert '#include "annibale_modem_svc.inc"' in modem_src
 assert 'modem_start_local_services();' in modem_src
 assert 'annibale_qrtr_publish(' in qrtr_src
@@ -131,6 +142,9 @@ modem_glink_start = modem_src.index("static int\nmpss_qrtr_send(")
 modem_glink_end = modem_src.index("/* ---- QMI Client State Machine")
 modem_glink_src = modem_src[modem_glink_start:modem_glink_end]
 
+boot_tail_start = boot_inc.index("static void\nmodem_worker_glink_tick(")
+boot_tail_src = boot_inc[boot_tail_start:boot_inc.index("#endif /* _ANNIBALE_MODEM_BOOT_INC_ */")]
+
 qmi_codec_start = qmi_src.index("size_t\nannibale_qmi_encode_msg(")
 qmi_codec_end = qmi_src.index("bool\nannibale_qmi_check_result(")
 qmi_codec_src = qmi_src[qmi_codec_start:qmi_codec_end]
@@ -187,6 +201,7 @@ struct ipa_elf32_phdr {{ uint32_t type, offset, vaddr, paddr, filesz, memsz, fla
 #define SCM_PAS_INIT_IMAGE      SCM_CALL(2, 1)
 #define SCM_PAS_MEM_SETUP       SCM_CALL(2, 2)
 #define SCM_PAS_AUTH_AND_RESET  SCM_CALL(2, 5)
+#define SCM_PAS_SHUTDOWN        SCM_CALL(2, 6)
 #define SCM_MP_ASSIGN           SCM_CALL(0xc, 0x16)
 #define SCM_MP_ASSIGN_ARGINFO   0x1117ULL
 #define QCOM_VMID_HLOS          3u
@@ -279,6 +294,7 @@ static struct {{
     uint64_t fn, arginfo, a0, a1, a2, a3;
     unsigned cacheclean_before_smc, dsb_before_smc;
 }} last_assign_smc;
+static bool mock_aoss_off_sent;
 static char smc_seq[16][32];
 static unsigned smc_count;
 
@@ -356,6 +372,11 @@ static int64_t host_tz_smc(uint64_t fn, uint64_t arginfo, uint64_t a0, uint64_t 
     if (fn == SCM_PAS_AUTH_AND_RESET) {{
         assert(a3 == 0);
         snprintf(smc_seq[smc_count++], 32, "AUTH:%llu", a0);
+        return 0;
+    }}
+    if (fn == SCM_PAS_SHUTDOWN) {{
+        assert(arginfo == 1u && a1 == 0 && a2 == 0 && a3 == 0);
+        snprintf(smc_seq[smc_count++], 32, "SHUTDOWN:%llu", a0);
         return 0;
     }}
     if (fn == SCM_MP_ASSIGN) {{
@@ -486,6 +507,16 @@ static void annibale_qrtr_input(const void *data, uint32_t length);
 {boot_glink_src}
 {stall_diag_src}
 {modem_glink_src}
+#define MPSS_DTB_PAS_ID 38u
+#define MPSS_FW_PAS_ID  4u
+#define SMP2P_MPSS_FATAL (1u << 0)
+#define SMP2P_MPSS_READY (1u << 1)
+static void modem_sleep_ms(uint32_t ms) {{ (void)ms; }}
+static bool annibale_aoss_send_msg(const char *msg) {{
+    if (strstr(msg, "val: off") != NULL) mock_aoss_off_sent = true;
+    return true;
+}}
+{boot_tail_src}
 
 static void annibale_qrtr_input(const void *data, uint32_t length) {{
     assert(mpss_glink_lock == 0); /* must NOT hold mpss_glink_lock across QRTR upcall */
@@ -502,16 +533,21 @@ static void annibale_qrtr_input(const void *data, uint32_t length) {{
 static void mock_smem_init_partition(void) {{
     memset(mock_smem, 0, sizeof(mock_smem));
     uint32_t toc_off = (uint32_t)SM8750_SMEM_SIZE - 0x1000u;
-    uint32_t part_off = 0x1000u, part_sz = 0x20000u;
+    uint32_t part_off = 0x1000u, part_sz = 0x20000u, g_off = 0x22000u, g_sz = 0x8000u;
     smem_wr(toc_off + 0u, 0x434f5424u); /* $TOC */
-    smem_wr(toc_off + 8u, 1u);
-    smem_wr(toc_off + 32u + 0u, part_off);
-    smem_wr(toc_off + 32u + 4u, part_sz);
+    smem_wr(toc_off + 8u, 2u);
+    smem_wr(toc_off + 32u + 0u, part_off); smem_wr(toc_off + 32u + 4u, part_sz);
     smem_wr(toc_off + 32u + 12u, (uint32_t)SMEM_HOST_APPS | ((uint32_t)SMEM_HOST_MPSS << 16));
     smem_wr(toc_off + 32u + 16u, 64u);
-    smem_wr(part_off + 0u, 0x54525024u); /* $PRT */
-    smem_wr(part_off + 12u, 32u);        /* uncached_end */
-    smem_wr(part_off + 16u, part_sz);    /* cached_start */
+    smem_wr(part_off + 0u, 0x54525024u); smem_wr(part_off + 12u, 32u); smem_wr(part_off + 16u, part_sz);
+    /* Populate SMEM_HOST_GLOBAL with a competing ITEM_GLINK_THEIR_QUEUE (480) to prove isolation. */
+    uint32_t e2 = toc_off + 32u + 48u;
+    smem_wr(e2 + 0u, g_off); smem_wr(e2 + 4u, g_sz);
+    smem_wr(e2 + 12u, (uint32_t)SMEM_HOST_GLOBAL | ((uint32_t)SMEM_HOST_GLOBAL << 16));
+    smem_wr(e2 + 16u, 64u);
+    smem_wr(g_off + 0u, 0x54525024u); smem_wr(g_off + 12u, 32u + 16u + GLINK_QUEUE_SIZE); smem_wr(g_off + 16u, g_sz);
+    smem_wr(g_off + 32u, SMEM_CANARY | (ITEM_GLINK_THEIR_QUEUE << 16));
+    smem_wr(g_off + 36u, GLINK_QUEUE_SIZE);
 }}
 
 static void mpss_push_rx(uint16_t cmd, uint16_t p1, uint32_t p2, const void *payload, uint32_t len) {{
@@ -682,11 +718,33 @@ static void test_glink_mpss(void) {{
     assert(mpss_pop_tx(&tx) && tx.cmd == GLINK_CMD_TX_DATA && tx.p1 == GLINK_OUR_CID && tx.p2 == 25u);
 
     /* 5e. Queue-full guard without unsigned underflow when tail == head + 4; stall diag exercises SMEM+IPCC reads. */
-    smem_wr(mpss_glink.desc_off + 4u, 100u);
-    smem_wr(mpss_glink.desc_off + 0u, 104u);
+    smem_wr(mpss_glink.desc_off + 4u, 100u); smem_wr(mpss_glink.desc_off + 0u, 104u);
     assert(!mpss_glink_write_raw(GLINK_CMD_SIGNALS, GLINK_OUR_CID, 0u, NULL, 0));
     assert(smem_rd(mpss_glink.desc_off + 4u) == 100u);
     mpss_glink_log_stall_diag(10u);
+
+    /* 5f. Worker GLINK tick polls past timeout & PAS_SHUTDOWN lifecycle (stop + reboot quiesce + modem=0 no-op). */
+    bool s_seen = false, n_open = false, r_hello = false, is_op = false;
+    uint32_t s_v = 0, s_f = 0, rc_id = 0, in_cnt = 0;
+    modem_worker_glink_tick(12u, &s_seen, &s_v, &s_f, &n_open, &r_hello, &is_op, &rc_id, &in_cnt);
+    assert(is_op && n_open);
+    modem_worker_glink_tick(13u, &s_seen, &s_v, &s_f, &n_open, &r_hello, &is_op, &rc_id, &in_cnt);
+    assert(is_op && !n_open);
+
+    modem_boot_arg = 3u; mpss_pas_fw_authed = true; mpss_pas_dtb_authed = true; mpss_stopping = false;
+    smc_count = 0; ipcc_rings = 0; mock_aoss_off_sent = false;
+    annibale_modem_stop();
+    assert(mpss_stopping && !mpss_pas_fw_authed && !mpss_pas_dtb_authed && mock_aoss_off_sent);
+    assert(smc_count == 2 && strcmp(smc_seq[0], "SHUTDOWN:4") == 0 && strcmp(smc_seq[1], "SHUTDOWN:38") == 0);
+    assert((smem_rd(smp_at + 36u) & 1u) != 0 && ipcc_rings >= 1);
+    assert(annibale_modem_return_quiesce() && smc_count == 2); /* no-op once already stopped */
+
+    mpss_pas_fw_authed = true; mpss_pas_dtb_authed = true; mpss_stopping = false; smc_count = 0;
+    assert(annibale_modem_return_quiesce() && !mpss_pas_fw_authed && !mpss_pas_dtb_authed);
+    assert(smc_count == 2 && strcmp(smc_seq[0], "SHUTDOWN:4") == 0 && strcmp(smc_seq[1], "SHUTDOWN:38") == 0);
+
+    modem_boot_arg = 0u; mpss_pas_fw_authed = true; smc_count = 0;
+    assert(annibale_modem_return_quiesce() && smc_count == 0);
 }}
 
 /* ---- 6. APPS-side QMI servers (RMTFS 0x0e, MEMSHARE 0x34, SERVREG_LOCATOR 0x40) + QMI_LOC ---- */
@@ -758,8 +816,7 @@ static void test_modem_qmi_services(void) {{
     assert(svc_pubs[2].svc == 0x40u && svc_pubs[2].ver == 1u && svc_pubs[2].inst == 1u);
 
     /* 6a. SERVREG_LOCATOR GET_DOMAIN_LIST for "tms/servreg" + pagination + "gps/gps_service" + unknown. */
-    tp = 0;
-    svc_tlv_put(tlvs, sizeof(tlvs), &tp, 0x01u, "tms/servreg", 11u);
+    tp = 0; svc_tlv_put(tlvs, sizeof(tlvs), &tp, 0x01u, "tms/servreg", 11u);
     rn = annibale_qmi_encode_msg(req, sizeof(req), 0x00u, 7u, QMI_SERVREG_GET_DOMAIN_LIST, tlvs, (uint16_t)tp);
     svc_servreg_rx(NULL, 0u, 0x11u, req, rn);
     assert(svc_last_resp_len > 7u && svc_last_resp[0] == 0x02u && get_16(svc_last_resp + 1) == 7u);
@@ -770,20 +827,17 @@ static void test_modem_qmi_services(void) {{
     assert(tv != NULL && tl == 2u && get_16(tv) == 7u);
     tv = annibale_qmi_find_tlv(svc_last_resp + 7, svc_last_resp_len - 7, 0x12u, &tl);
     assert(tv != NULL && tv[0] == 7u && tv[1] == 17u && memcmp(tv + 2, "msm/modem/root_pd", 17u) == 0);
-    uint32_t inst0 = 0;
-    memcpy(&inst0, tv + 19, 4u);
+    uint32_t inst0 = 0; memcpy(&inst0, tv + 19, 4u);
     assert(inst0 == 180u && tv[23] == 0u);
 
-    tp = 0;
-    svc_tlv_put(tlvs, sizeof(tlvs), &tp, 0x01u, "tms/servreg", 11u);
+    tp = 0; svc_tlv_put(tlvs, sizeof(tlvs), &tp, 0x01u, "tms/servreg", 11u);
     svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x10u, 2u);
     rn = annibale_qmi_encode_msg(req, sizeof(req), 0x00u, 8u, QMI_SERVREG_GET_DOMAIN_LIST, tlvs, (uint16_t)tp);
     svc_servreg_rx(NULL, 0u, 0x11u, req, rn);
     tv = annibale_qmi_find_tlv(svc_last_resp + 7, svc_last_resp_len - 7, 0x12u, &tl);
     assert(tv != NULL && tv[0] == 5u);
 
-    tp = 0;
-    svc_tlv_put(tlvs, sizeof(tlvs), &tp, 0x01u, "no/such", 7u);
+    tp = 0; svc_tlv_put(tlvs, sizeof(tlvs), &tp, 0x01u, "no/such", 7u);
     rn = annibale_qmi_encode_msg(req, sizeof(req), 0x00u, 9u, QMI_SERVREG_GET_DOMAIN_LIST, tlvs, (uint16_t)tp);
     svc_servreg_rx(NULL, 0u, 0x11u, req, rn);
     tv = annibale_qmi_find_tlv(svc_last_resp + 7, svc_last_resp_len - 7, 0x10u, &tl);
@@ -791,58 +845,38 @@ static void test_modem_qmi_services(void) {{
     assert(annibale_qmi_find_tlv(svc_last_resp + 7, svc_last_resp_len - 7, 0x12u, &tl) == NULL);
 
     /* 6b. MEMSHARE QUERY_SIZE + exclusive ALLOC(cid=1, 5 MiB) + idempotent FREE/re-ALLOC + shared ALLOC(cid=6). */
-    tp = 0;
-    svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x01u, 1u);
+    tp = 0; svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x01u, 1u);
     rn = annibale_qmi_encode_msg(req, sizeof(req), 0x00u, 10u, QMI_MEM_QUERY_SIZE, tlvs, (uint16_t)tp);
     svc_memshare_rx(NULL, 0u, 0x22u, req, rn);
     tv = annibale_qmi_find_tlv(svc_last_resp + 7, svc_last_resp_len - 7, 0x10u, &tl);
-    uint32_t qsz = 0;
-    assert(tv != NULL && tl == 4u);
-    memcpy(&qsz, tv, 4u);
-    assert(qsz == 0x500000u);
+    uint32_t qsz = 0; assert(tv != NULL && tl == 4u); memcpy(&qsz, tv, 4u); assert(qsz == 0x500000u);
 
-    smc_count = 0;
-    tp = 0;
-    svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x01u, 0x500000u);
-    svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x02u, 1u);
-    svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x03u, 0u);
-    svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x04u, 42u);
+    smc_count = 0; tp = 0;
+    svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x01u, 0x500000u); svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x02u, 1u);
+    svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x03u, 0u); svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x04u, 42u);
     rn = annibale_qmi_encode_msg(req, sizeof(req), 0x00u, 11u, QMI_MEM_ALLOC_GENERIC, tlvs, (uint16_t)tp);
     svc_memshare_rx(NULL, 0u, 0x22u, req, rn);
     assert(smc_count == 1 && strcmp(smc_seq[0], "ASSIGN:0x1117") == 0);
-    /* Verify exclusive dst_sz=24 in slot 2 for cid=1! */
-    uint64_t ext_v[7];
-    memcpy(ext_v, mock_lowdma + 2u * IPA_TZ_HDR_SLOT_SZ + 0x100u, sizeof(ext_v));
+    uint64_t ext_v[7]; memcpy(ext_v, mock_lowdma + 2u * IPA_TZ_HDR_SLOT_SZ + 0x100u, sizeof(ext_v));
     assert(ext_v[2] == 24ULL);
     tv = annibale_qmi_find_tlv(svc_last_resp + 7, svc_last_resp_len - 7, 0x11u, &tl);
     assert(tv != NULL && tl == 13u && tv[0] == 1u);
-    uint64_t c1_pa = 0;
-    uint32_t c1_sz = 0;
-    memcpy(&c1_pa, tv + 1, 8u);
-    memcpy(&c1_sz, tv + 9, 4u);
+    uint64_t c1_pa = 0; uint32_t c1_sz = 0; memcpy(&c1_pa, tv + 1, 8u); memcpy(&c1_sz, tv + 9, 4u);
     assert(c1_pa == 0xce800000ULL && c1_sz == 0x500000u);
 
-    /* FREE + re-ALLOC cid=1 must reuse assigned slab without re-invoking HYP_ASSIGN. */
-    tp = 0;
-    svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x10u, 1u);
+    tp = 0; svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x10u, 1u);
     rn = annibale_qmi_encode_msg(req, sizeof(req), 0x00u, 12u, QMI_MEM_FREE_GENERIC, tlvs, (uint16_t)tp);
     svc_memshare_rx(NULL, 0u, 0x22u, req, rn);
-    smc_count = 0;
-    tp = 0;
-    svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x01u, 0x500000u);
-    svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x02u, 1u);
-    svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x03u, 0u);
-    svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x04u, 43u);
+    smc_count = 0; tp = 0;
+    svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x01u, 0x500000u); svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x02u, 1u);
+    svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x03u, 0u); svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x04u, 43u);
     rn = annibale_qmi_encode_msg(req, sizeof(req), 0x00u, 13u, QMI_MEM_ALLOC_GENERIC, tlvs, (uint16_t)tp);
     svc_memshare_rx(NULL, 0u, 0x22u, req, rn);
     assert(smc_count == 0);
 
-    /* Shared cid=6 (4 MiB) must invoke HYP_ASSIGN with shared=true (dst_sz=48). */
     tp = 0;
-    svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x01u, 0x400000u);
-    svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x02u, 6u);
-    svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x03u, 0u);
-    svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x04u, 44u);
+    svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x01u, 0x400000u); svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x02u, 6u);
+    svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x03u, 0u); svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x04u, 44u);
     rn = annibale_qmi_encode_msg(req, sizeof(req), 0x00u, 14u, QMI_MEM_ALLOC_GENERIC, tlvs, (uint16_t)tp);
     svc_memshare_rx(NULL, 0u, 0x22u, req, rn);
     assert(smc_count == 1);
@@ -850,18 +884,13 @@ static void test_modem_qmi_services(void) {{
     assert(ext_v[2] == 48ULL);
 
     /* 6c. RMTFS OPEN -> ALLOC_BUFF (shared dst_sz=48 at 0xcf200000) -> RW_IOVEC read & RAM-shadow write -> CLOSE. */
-    tp = 0;
-    svc_tlv_put(tlvs, sizeof(tlvs), &tp, 0x01u, "/boot/modem_fs1", 15u);
+    tp = 0; svc_tlv_put(tlvs, sizeof(tlvs), &tp, 0x01u, "/boot/modem_fs1", 15u);
     rn = annibale_qmi_encode_msg(req, sizeof(req), 0x00u, 20u, QMI_RMTFS_OPEN, tlvs, (uint16_t)tp);
     svc_rmtfs_rx(NULL, 0u, 0x33u, req, rn);
     tv = annibale_qmi_find_tlv(svc_last_resp + 7, svc_last_resp_len - 7, 0x10u, &tl);
-    uint32_t rmt_cid = 0;
-    assert(tv != NULL && tl == 4u);
-    memcpy(&rmt_cid, tv, 4u);
-    assert(rmt_cid == 1u);
+    uint32_t rmt_cid = 0; assert(tv != NULL && tl == 4u); memcpy(&rmt_cid, tv, 4u); assert(rmt_cid == 1u);
 
-    smc_count = 0;
-    tp = 0;
+    smc_count = 0; tp = 0;
     svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x01u, rmt_cid);
     svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x02u, 0x400000u);
     rn = annibale_qmi_encode_msg(req, sizeof(req), 0x00u, 21u, QMI_RMTFS_ALLOC_BUFF, tlvs, (uint16_t)tp);
@@ -870,34 +899,21 @@ static void test_modem_qmi_services(void) {{
     memcpy(ext_v, mock_lowdma + 2u * IPA_TZ_HDR_SLOT_SZ + 0x100u, sizeof(ext_v));
     assert(ext_v[2] == 48ULL);
     tv = annibale_qmi_find_tlv(svc_last_resp + 7, svc_last_resp_len - 7, 0x10u, &tl);
-    uint64_t rmt_pa = 0;
-    assert(tv != NULL && tl == 8u);
-    memcpy(&rmt_pa, tv, 8u);
-    assert(rmt_pa == 0xcf200000ULL);
+    uint64_t rmt_pa = 0; assert(tv != NULL && tl == 8u); memcpy(&rmt_pa, tv, 8u); assert(rmt_pa == 0xcf200000ULL);
 
-    /* READ 2 sectors from sector 2 into absolute PA 0xcf201000. */
-    uint8_t iov[13] = {{ 1u }};
-    uint32_t iov_w[3] = {{ 2u, 0xcf201000u, 2u }};
-    memcpy(iov + 1, iov_w, 12u);
-    tp = 0;
-    svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x01u, rmt_cid);
-    svc_tlv_put_u8(tlvs, sizeof(tlvs), &tp, 0x02u, 0u);
-    svc_tlv_put(tlvs, sizeof(tlvs), &tp, 0x03u, iov, sizeof(iov));
-    svc_tlv_put_u8(tlvs, sizeof(tlvs), &tp, 0x04u, 0u);
+    uint8_t iov[13] = {{ 1u }}; uint32_t iov_w[3] = {{ 2u, 0xcf201000u, 2u }};
+    memcpy(iov + 1, iov_w, 12u); tp = 0;
+    svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x01u, rmt_cid); svc_tlv_put_u8(tlvs, sizeof(tlvs), &tp, 0x02u, 0u);
+    svc_tlv_put(tlvs, sizeof(tlvs), &tp, 0x03u, iov, sizeof(iov)); svc_tlv_put_u8(tlvs, sizeof(tlvs), &tp, 0x04u, 0u);
     rn = annibale_qmi_encode_msg(req, sizeof(req), 0x00u, 22u, QMI_RMTFS_RW_IOVEC, tlvs, (uint16_t)tp);
-    ufs_rd_calls = 0;
-    svc_rmtfs_rx(NULL, 0u, 0x33u, req, rn);
+    ufs_rd_calls = 0; svc_rmtfs_rx(NULL, 0u, 0x33u, req, rn);
     assert(ufs_rd_calls > 0 && mock_rmtfs_shm[0x1000] == (uint8_t)((1024u ^ 0xa5u) & 0xffu));
 
-    /* WRITE 1 sector to sector 2 from absolute PA 0xcf202000 -> RAM shadow only, subsequent read sees new bytes! */
     memset(mock_rmtfs_shm + 0x2000, 0x5c, 512u);
     uint32_t iov_w2[3] = {{ 2u, 0xcf202000u, 1u }};
-    memcpy(iov + 1, iov_w2, 12u);
-    tp = 0;
-    svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x01u, rmt_cid);
-    svc_tlv_put_u8(tlvs, sizeof(tlvs), &tp, 0x02u, 1u);
-    svc_tlv_put(tlvs, sizeof(tlvs), &tp, 0x03u, iov, sizeof(iov));
-    svc_tlv_put_u8(tlvs, sizeof(tlvs), &tp, 0x04u, 1u);
+    memcpy(iov + 1, iov_w2, 12u); tp = 0;
+    svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x01u, rmt_cid); svc_tlv_put_u8(tlvs, sizeof(tlvs), &tp, 0x02u, 1u);
+    svc_tlv_put(tlvs, sizeof(tlvs), &tp, 0x03u, iov, sizeof(iov)); svc_tlv_put_u8(tlvs, sizeof(tlvs), &tp, 0x04u, 1u);
     rn = annibale_qmi_encode_msg(req, sizeof(req), 0x00u, 23u, QMI_RMTFS_RW_IOVEC, tlvs, (uint16_t)tp);
     svc_rmtfs_rx(NULL, 0u, 0x33u, req, rn);
     assert(rmtfs_parts[0].shadow != NULL && rmtfs_parts[0].shadow_loaded);
@@ -969,36 +985,49 @@ static void test_modem_qmi_services(void) {{
         assert(call_st == 0u);
     }}
 
-    /* 6g. QMI_LOC GET_SUPPORTED_MSGS, GET_SERVICE_REVISION, REG_EVENTS fallback, & indications. */
+    /* 6g. QMI_LOC GET_SUPPORTED_MSGS/FIELDS, INFORM_CLIENT_REV, REG_EVENTS fallback, & indications. */
     {{
-        bool reg_ok = false, retry_min = false;
+        bool rev_done = false, reg_ok = false, retry_min = false;
+        static const uint8_t sup_msgs[24] = {{ 0x16, 0x00, 0x00, 0x00, 0x00, 0xc0, 0xff, 0xff }};
+        static const uint8_t sup_flds[4] = {{ 0x02, 0x01, 0x00, 0x00 }};
         tp = 0; svc_tlv_put_result(tlvs, sizeof(tlvs), &tp, 0u, 0u);
-        svc_tlv_put_u64(tlvs, sizeof(tlvs), &tp, 0x10u, 0x0000000e00000001ULL);
-        modem_loc_handle_rx(0x02u, 11u, 0x001eu, tlvs, (uint16_t)tp, &reg_ok, &retry_min);
+        svc_tlv_put(tlvs, sizeof(tlvs), &tp, 0x10u, sup_msgs, (uint16_t)sizeof(sup_msgs));
+        modem_loc_handle_rx(0x02u, 11u, 0x001eu, tlvs, (uint16_t)tp, &rev_done, &reg_ok, &retry_min);
+        assert(!rev_done);
+        tp = 0; svc_tlv_put_result(tlvs, sizeof(tlvs), &tp, 0u, 0u);
+        svc_tlv_put(tlvs, sizeof(tlvs), &tp, 0x10u, sup_flds, (uint16_t)sizeof(sup_flds));
+        modem_loc_handle_rx(0x02u, 12u, 0x001fu, tlvs, (uint16_t)tp, &rev_done, &reg_ok, &retry_min);
+        tp = 0; svc_tlv_put_result(tlvs, sizeof(tlvs), &tp, 0u, 0u);
+        modem_loc_handle_rx(0x02u, 13u, 0x0020u, tlvs, (uint16_t)tp, &rev_done, &reg_ok, &retry_min);
+        assert(rev_done && modem_loc_diag.loc_rev == 2u);
         tp = 0; svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x01u, 3u);
-        modem_loc_handle_rx(0x04u, 0u, 0x0020u, tlvs, (uint16_t)tp, &reg_ok, &retry_min);
+        modem_loc_handle_rx(0x04u, 0u, 0x0020u, tlvs, (uint16_t)tp, &rev_done, &reg_ok, &retry_min);
 
         tp = 0; svc_tlv_put_result(tlvs, sizeof(tlvs), &tp, 1u, 48u);
-        modem_loc_handle_rx(0x02u, 12u, 0x0021u, tlvs, (uint16_t)tp, &reg_ok, &retry_min);
+        modem_loc_handle_rx(0x02u, 14u, 0x0021u, tlvs, (uint16_t)tp, &rev_done, &reg_ok, &retry_min);
         assert(!reg_ok && retry_min);
 
         retry_min = false;
         tp = 0; svc_tlv_put_result(tlvs, sizeof(tlvs), &tp, 0u, 0u);
-        modem_loc_handle_rx(0x02u, 13u, 0x0021u, tlvs, (uint16_t)tp, &reg_ok, &retry_min);
+        modem_loc_handle_rx(0x02u, 15u, 0x0021u, tlvs, (uint16_t)tp, &rev_done, &reg_ok, &retry_min);
         assert(reg_ok && !retry_min);
 
         tp = 0; svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x01u, 0u);
         svc_tlv_put_u8(tlvs, sizeof(tlvs), &tp, 0x02u, 1u);
         svc_tlv_put_u64(tlvs, sizeof(tlvs), &tp, 0x10u, 0x4042c00000000000ULL);
         svc_tlv_put_u64(tlvs, sizeof(tlvs), &tp, 0x11u, 0x405e000000000000ULL);
-        modem_loc_handle_rx(0x04u, 0u, 0x0024u, tlvs, (uint16_t)tp, &reg_ok, NULL);
+        modem_loc_handle_rx(0x04u, 0u, 0x0024u, tlvs, (uint16_t)tp, NULL, &reg_ok, NULL);
         tp = 0; svc_tlv_put_u8(tlvs, sizeof(tlvs), &tp, 0x10u, 6u);
-        modem_loc_handle_rx(0x04u, 0u, 0x0025u, tlvs, (uint16_t)tp, &reg_ok, NULL);
+        modem_loc_handle_rx(0x04u, 0u, 0x0025u, tlvs, (uint16_t)tp, NULL, &reg_ok, NULL);
         tp = 0; svc_tlv_put(tlvs, sizeof(tlvs), &tp, 0x01u, "$GPGGA,123456.00,3723.2475,N,12158.3416,W", 41u);
-        modem_loc_handle_rx(0x04u, 0u, 0x0026u, tlvs, (uint16_t)tp, &reg_ok, NULL);
+        modem_loc_handle_rx(0x04u, 0u, 0x0026u, tlvs, (uint16_t)tp, NULL, &reg_ok, NULL);
         tp = 0; svc_tlv_put_u32(tlvs, sizeof(tlvs), &tp, 0x01u, 1u);
-        modem_loc_handle_rx(0x04u, 0u, 0x002bu, tlvs, (uint16_t)tp, &reg_ok, NULL);
-        modem_loc_handle_rx(0x04u, 0u, 0x002cu, tlvs, (uint16_t)tp, &reg_ok, NULL);
+        modem_loc_handle_rx(0x04u, 0u, 0x002bu, tlvs, (uint16_t)tp, NULL, &reg_ok, NULL);
+        modem_loc_handle_rx(0x04u, 0u, 0x002cu, tlvs, (uint16_t)tp, NULL, &reg_ok, NULL);
+
+        char loc_st[128] = {{ 0 }};
+        modem_format_loc_status(loc_st, sizeof(loc_st), reg_ok, true);
+        assert(strcmp(loc_st, "dms_mode=3 dms_err=58 uim_card=1 uim_err=0 loc_reg=1 loc_fb=1 loc_err=0 loc_rev=3 loc_sv=6 loc_eng=1 loc_fix=1") == 0);
     }}
 
     for (unsigned i = 0; i < RMTFS_PART_COUNT; i++) {{
@@ -1059,31 +1088,15 @@ int main(void) {{
     reject_init_0x82 = false;
 
     /* 1c. With lowdma enabled, three distinct < 4 GiB slots (pas=38 slot 0, pas=4 slot 1, assign slot 2) with VM_WIMG_DEFAULT. */
-    for (unsigned s = 0; s < IPA_TZ_HDR_SLOTS; s++) {{
-        ipa_tz_hdr_va[s] = 0;
-        ipa_tz_hdr_pa[s] = 0;
-    }}
-    lowdma_enabled = true;
-    lowdma_map_calls = 0;
-    smc_count = 0;
-    last_init_count = 0;
-    map_calls = 0;
-    unmap_calls = 0;
-    assert(annibale_load_mdt_image("ipa_fws", 38, 0, 0x9b080000ULL, 0x10000ULL, &used_pas));
-    assert(used_pas == 38);
+    for (unsigned s = 0; s < IPA_TZ_HDR_SLOTS; s++) {{ ipa_tz_hdr_va[s] = 0; ipa_tz_hdr_pa[s] = 0; }}
+    lowdma_enabled = true; lowdma_map_calls = 0; smc_count = 0; last_init_count = 0; map_calls = 0; unmap_calls = 0;
+    assert(annibale_load_mdt_image("ipa_fws", 38, 0, 0x9b080000ULL, 0x10000ULL, &used_pas) && used_pas == 38);
     assert(lowdma_map_calls == 1 && lowdma_map_fl == VM_WIMG_DEFAULT);
-    assert(annibale_load_mdt_image("ipa_fws", 4, 0, 0x9b080000ULL, 0x10000ULL, &used_pas));
-    assert(used_pas == 4);
-    assert(lowdma_map_calls == 1); /* pooled once */
-    assert(last_init_count == 2);
-    assert(last_init_hdr_pas[0] >= 0x80000000ULL && last_init_hdr_pas[0] < 0x100000000ULL);
-    assert(last_init_hdr_pas[1] >= 0x80000000ULL && last_init_hdr_pas[1] < 0x100000000ULL);
-    assert(last_init_hdr_pas[0] == 0xcf6fc000ULL);
-    assert(last_init_hdr_pas[1] == 0xcf70c000ULL);
-    assert(ipa_tz_hdr_pa[2] == 0xcf71c000ULL);
+    assert(annibale_load_mdt_image("ipa_fws", 4, 0, 0x9b080000ULL, 0x10000ULL, &used_pas) && used_pas == 4);
+    assert(lowdma_map_calls == 1 && last_init_count == 2);
+    assert(last_init_hdr_pas[0] == 0xcf6fc000ULL && last_init_hdr_pas[1] == 0xcf70c000ULL && ipa_tz_hdr_pa[2] == 0xcf71c000ULL);
     assert(smc_count == 4 && strcmp(smc_seq[0], "INIT:38:0x82") == 0 && strcmp(smc_seq[2], "INIT:4:0x82") == 0);
-    assert(memcmp(mock_lowdma + 0, mdt, mdt_sz) == 0);
-    assert(memcmp(mock_lowdma + IPA_TZ_HDR_SLOT_SZ, mdt, mdt_sz) == 0);
+    assert(memcmp(mock_lowdma + 0, mdt, mdt_sz) == 0 && memcmp(mock_lowdma + IPA_TZ_HDR_SLOT_SZ, mdt, mdt_sz) == 0);
 
     /* 1d. annibale_tz_assign_mem uses slot 2 for BOTH exclusive (DSM 1&2, dst_sz=24) and shared (memshare/rmtfs, dst_sz=48). */
     const uint64_t slot2_pa = 0xcf71c000ULL;
@@ -1095,36 +1108,19 @@ int main(void) {{
     }};
     for (unsigned r = 0; r < 3; r++) {{
         uint64_t res1 = 0xdeadbeefULL;
-        smc_count = 0;
-        cacheclean_calls = 0;
-        cacheclean_addr_count = 0;
-        host_dsb_count = 0;
-        mock_assign_rc = 0;
-        mock_assign_res1 = 0;
-        assert(annibale_tz_assign_mem(regions[r].pa, regions[r].sz, 15u, regions[r].shared, &res1) == 0);
-        assert(res1 == 0);
+        smc_count = 0; cacheclean_calls = 0; cacheclean_addr_count = 0; host_dsb_count = 0;
+        mock_assign_rc = 0; mock_assign_res1 = 0;
+        assert(annibale_tz_assign_mem(regions[r].pa, regions[r].sz, 15u, regions[r].shared, &res1) == 0 && res1 == 0);
         assert(smc_count == 1 && strcmp(smc_seq[0], "ASSIGN:0x1117") == 0);
-        assert(last_assign_smc.fn == SCM_MP_ASSIGN);
-        assert(last_assign_smc.arginfo == 0x1117ULL);
-        assert(last_assign_smc.a0 == slot2_pa + 0x040ULL);
-        assert(last_assign_smc.a1 == 16ULL);
-        assert(last_assign_smc.a2 == slot2_pa + 0x000ULL);
-        assert(last_assign_smc.a3 == slot2_pa + 0x100ULL);
-        assert(last_assign_smc.cacheclean_before_smc == 8u);
-        assert(last_assign_smc.dsb_before_smc == 1u);
-        for (unsigned c = 0; c < 8u; c++) {{
-            assert(cacheclean_addrs[c] == (uintptr_t)(slot2 + c * 64u));
-        }}
-        uint32_t src_v = 0;
-        struct tz_assign_mem mem_v;
-        struct tz_assign_perm dst_v[2];
-        uint64_t ext_v[7];
-        memcpy(&src_v, slot2 + 0x000u, sizeof(src_v));
-        memcpy(&mem_v, slot2 + 0x040u, sizeof(mem_v));
-        memcpy(dst_v, slot2 + 0x080u, sizeof(dst_v));
-        memcpy(ext_v, slot2 + 0x100u, sizeof(ext_v));
-        assert(src_v == 3u);
-        assert(mem_v.addr == regions[r].pa && mem_v.size == regions[r].sz);
+        assert(last_assign_smc.fn == SCM_MP_ASSIGN && last_assign_smc.arginfo == 0x1117ULL);
+        assert(last_assign_smc.a0 == slot2_pa + 0x040ULL && last_assign_smc.a1 == 16ULL);
+        assert(last_assign_smc.a2 == slot2_pa + 0x000ULL && last_assign_smc.a3 == slot2_pa + 0x100ULL);
+        assert(last_assign_smc.cacheclean_before_smc == 8u && last_assign_smc.dsb_before_smc == 1u);
+        for (unsigned c = 0; c < 8u; c++) assert(cacheclean_addrs[c] == (uintptr_t)(slot2 + c * 64u));
+        uint32_t src_v = 0; struct tz_assign_mem mem_v; struct tz_assign_perm dst_v[2]; uint64_t ext_v[7];
+        memcpy(&src_v, slot2 + 0x000u, sizeof(src_v)); memcpy(&mem_v, slot2 + 0x040u, sizeof(mem_v));
+        memcpy(dst_v, slot2 + 0x080u, sizeof(dst_v)); memcpy(ext_v, slot2 + 0x100u, sizeof(ext_v));
+        assert(src_v == 3u && mem_v.addr == regions[r].pa && mem_v.size == regions[r].sz);
         if (regions[r].shared) {{
             assert(dst_v[0].vmid == 3u && dst_v[0].perm == 6u && !dst_v[0].ctx && !dst_v[0].ctx_size && !dst_v[0].pad);
             assert(dst_v[1].vmid == 15u && dst_v[1].perm == 6u && !dst_v[1].ctx && !dst_v[1].ctx_size && !dst_v[1].pad);
