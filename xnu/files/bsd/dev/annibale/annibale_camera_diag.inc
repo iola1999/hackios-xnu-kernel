@@ -38,8 +38,14 @@ cam_qchannel_active(uint32_t ctrl_off, uint32_t stat_off)
 	return false;
 }
 
+/*
+ * cam_cpastop_poweron on this target (enable-secure-qos-update): both QChannels, then TrustZone
+ * writes the static CAMNOC QoS tables. qcom_scm_camera_update_camnoc_qos(0, 0, NULL) passes
+ * (use case, buffer, bytes) as QCOM_SCM_ARGS(3, VAL, RW, VAL). Without it the RT1 port that
+ * carries IFE-lite keeps priority 0 and its writer overflows once the GPU and CPU load the bus.
+ */
 static void
-cam_diag_cpas_qos_init(void)
+cam_cpas_qos_init(void)
 {
 	bool rt_ok = cam_qchannel_active(0xecu, 0xf0u);
 	bool nrt_ok = cam_qchannel_active(0xf4u, 0xf8u);
@@ -54,7 +60,7 @@ cam_diag_cpas_qos_init(void)
 		    reg_rd(camnoc_rt_base, 0x4848u));
 	}
 	uint64_t ans = ~0ULL;
-	int32_t st = adreno8_scm_call(0x4200180aULL, 1ULL, 0ULL, 0ULL, 0ULL, 0ULL, &ans);
+	int32_t st = adreno8_scm_call(0x4200180aULL, 0x83ULL, 0ULL, 0ULL, 0ULL, 0ULL, &ans);
 	say("scm camnoc_qos(0) st=%d ans=%#llx\n", st, (unsigned long long)ans);
 	if (camnoc_rt_base != 0) {
 		say("camnoc rt1 qos post 4830=%#x 4834=%#x 4838=%#x 4840=%#x 4848=%#x\n",
@@ -78,12 +84,33 @@ cam_diag_midframe_sample(void)
 static void
 cam_diag_bus_debug_enable(void)
 {
-	if (boot_cam_probe != 0 && csid_lite_base != 0) {
+	if (csid_lite_base != 0) {
+		/* cam_vfe_bus_ver3_start_wm: constraint error detection in debug_status_1. */
 		csid_wr(0x177cu, 0xb00u);
 	}
 	if (boot_cam_bcm != 0 && boot_cam_probe != 0 && camnoc_rt_base != 0) {
 		reg_wr(camnoc_rt_base, 0x18u, 1u);
 		reg_wr(camnoc_rt_base, 0x08u, 1u);
+	}
+}
+
+/* What the writer, the bus and CAMNOC hold when a frame did not complete. */
+static void
+cam_diag_capture_failure(uint32_t sof_ms, uint32_t overflow_ms, uint32_t waited_ms)
+{
+	say("capture failure: sof=%u ms overflow=%u ms waited=%u ms ccif=%#x size=%#x dbg=%#x/%#x "
+	    "addr=%#x/%#x/%#x/%#x\n", sof_ms, overflow_ms, waited_ms,
+	    reg_rd(csid_lite_base, 0x1264u), reg_rd(csid_lite_base, 0x1270u),
+	    reg_rd(csid_lite_base, 0x1780u), reg_rd(csid_lite_base, 0x1784u),
+	    reg_rd(csid_lite_base, 0x1790u), reg_rd(csid_lite_base, 0x1794u),
+	    reg_rd(csid_lite_base, 0x1798u), reg_rd(csid_lite_base, 0x179cu));
+	if (camnoc_rt_base != 0) {
+		say("capture failure: camnoc errvld=%#x log0=%#x log1=%#x sbm=%#x rt1 maxwr=%#x qos=%#x/%#x/%#x/%#x/%#x\n",
+		    reg_rd(camnoc_rt_base, 0x10u), reg_rd(camnoc_rt_base, 0x20u),
+		    reg_rd(camnoc_rt_base, 0x28u), reg_rd(camnoc_rt_base, 0x248u),
+		    reg_rd(camnoc_rt_base, 0x4820u), reg_rd(camnoc_rt_base, 0x4830u),
+		    reg_rd(camnoc_rt_base, 0x4834u), reg_rd(camnoc_rt_base, 0x4838u),
+		    reg_rd(camnoc_rt_base, 0x4840u), reg_rd(camnoc_rt_base, 0x4848u));
 	}
 }
 

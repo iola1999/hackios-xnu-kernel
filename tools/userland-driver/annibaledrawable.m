@@ -504,6 +504,7 @@ ann_surface_plane(void *iosurface, unsigned long plane, const struct ann_texture
 	static size_t (*width)(void *, size_t), (*height)(void *, size_t);
 	static size_t (*row)(void *, size_t), (*offset)(void *, size_t), (*element)(void *, size_t);
 	static void *(*address)(void *, size_t);
+	static void (*extended)(void *, size_t, size_t *, size_t *, size_t *, size_t *);
 	static dispatch_once_t once;
 	dispatch_once(&once, ^{
 		*(void **)&count = dlsym(RTLD_DEFAULT, "IOSurfaceGetPlaneCount");
@@ -515,6 +516,7 @@ ann_surface_plane(void *iosurface, unsigned long plane, const struct ann_texture
 		*(void **)&offset = dlsym(RTLD_DEFAULT, "IOSurfaceGetOffsetOfPlane");
 		*(void **)&element = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerElementOfPlane");
 		*(void **)&address = dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddressOfPlane");
+		*(void **)&extended = dlsym(RTLD_DEFAULT, "IOSurfaceGetExtendedPixelsOfPlane");
 	});
 	if (iosurface == NULL || want == NULL || selected == NULL || count == NULL || size == NULL ||
 	    format == NULL || width == NULL || height == NULL || row == NULL || offset == NULL ||
@@ -553,8 +555,9 @@ ann_surface_plane(void *iosurface, unsigned long plane, const struct ann_texture
 		view_bpp = bpp;
 	} else if ((fourcc == 'x420' || fourcc == 'xf20' || fourcc == 'x422' || fourcc == 'xf22') && planes == 2) {
 		unsigned pf = want->pixel_format;
-		bool native_p0 = plane == 0 && (pf == 20 || pf == 22 || pf == 23 || pf == 24 || pf == 25);
-		bool native_p1 = plane == 1 && (pf == 60 || pf == 62 || pf == 63 || pf == 64 || pf == 65);
+		/* 576/578 are R10Unorm_X6/RG10Unorm_X12, what LumaChromaImage binds the planes of 'x420'/'xf20' as. */
+		bool native_p0 = plane == 0 && (pf == 20 || pf == 22 || pf == 23 || pf == 24 || pf == 25 || pf == 576);
+		bool native_p1 = plane == 1 && (pf == 60 || pf == 62 || pf == 63 || pf == 64 || pf == 65 || pf == 578);
 		bool packed_p0 = plane == 0 && (pf == 60 || pf == 63);
 		if (!native_p0 && !native_p1 && !packed_p0 && pf != 123) {
 			ann_say(why, why_size, "P010 plane %lu requires Metal format %u%s; requested %u",
@@ -588,27 +591,39 @@ ann_surface_plane(void *iosurface, unsigned long plane, const struct ann_texture
 	}
 	size_t w = width(iosurface, plane), h = height(iosurface, plane);
 	size_t stride = row(iosurface, plane), begin = offset(iosurface, plane);
+	/*
+	 * FigMetalContext rounds a plane up to its alignment and asks for the texture when the
+	 * surface's extended pixels on the right and at the bottom hold the difference: a
+	 * 2352x1764 plane with 12 extended rows is bound as 2352x1776. The same rule here.
+	 */
+	size_t left = 0, right = 0, top = 0, bottom = 0;
+	if (extended != NULL && (want->width > w || want->height > h)) {
+		extended(iosurface, plane, &left, &right, &top, &bottom);
+	}
+	size_t most_w = w + right, most_h = h + bottom;
 	uintptr_t pixels = (uintptr_t)address(iosurface, plane);
 	/* Affine and VTMetalTransferSession use packed BGRA8/RG16/RGBA32Uint row views.
 	 * The IOSurface element size and physical plane bounds still describe the original storage. */
 	if (w == 0 || h == 0 || w > UINT32_MAX || h > UINT32_MAX || stride > UINT32_MAX ||
 	    begin > UINT32_MAX || pixels == 0 || pixels < begin || element(iosurface, plane) != bpp ||
 	    stride % view_bpp != 0 ||
-	    want->width == 0 || want->height == 0 || want->width > w || want->height > h ||
-	    (uint64_t)want->width * view_bpp > (uint64_t)w * bpp ||
+	    want->width == 0 || want->height == 0 || want->width > most_w || want->height > most_h ||
+	    (uint64_t)want->width * view_bpp > (uint64_t)most_w * bpp ||
 	    want->type != 2 || want->depth != 1 || want->array_length != 1 ||
 	    want->mip_levels != 1 || want->sample_count != 1) {
 		ann_say(why, why_size, "invalid surface plane %lu geometry or texture shape: "
-		    "FourCC %#x, %zux%zu, element %zu (expected %u), row %zu, offset %zu, alloc %zu; "
+		    "FourCC %#x, %zux%zu (extended to %zux%zu), element %zu (expected %u), row %zu, offset %zu, alloc %zu; "
 		    "texture format %u type %u %ux%ux%u, layers %u, mips %u, samples %u",
-		    plane, fourcc, w, h, element(iosurface, plane), bpp, stride, begin, size(iosurface),
+		    plane, fourcc, w, h, most_w, most_h, element(iosurface, plane), bpp, stride, begin, size(iosurface),
 		    want->pixel_format, want->type, want->width, want->height, want->depth,
 		    want->array_length, want->mip_levels, want->sample_count);
 		return -1;
 	}
 	*selected = (struct ann_surface){ .surface = ann_surface_id(iosurface), .size = size(iosurface),
-	    .offset = (uint32_t)begin, .rowBytes = (uint32_t)stride, .width = (uint32_t)w,
-	    .height = (uint32_t)h, .pixelFormat = fourcc, .planes = (uint32_t)planes };
+	    .offset = (uint32_t)begin, .rowBytes = (uint32_t)stride,
+	    .width = (uint32_t)(want->width > w ? want->width : w),
+	    .height = (uint32_t)(want->height > h ? want->height : h),
+	    .pixelFormat = fourcc, .planes = (uint32_t)planes };
 	if (selected->surface == 0 || ann_surface_fits_adreno(selected, bpp, why, why_size) != 0)
 		return -1;
 	if (allocation_base != NULL)

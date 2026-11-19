@@ -74,6 +74,7 @@ bool annibale_mic_gpr_event(uint32_t src_port, uint32_t dst_port, uint32_t opcod
 #define OP_GRAPH_PREPARE        0x01001001u
 #define OP_GRAPH_START          0x01001002u
 #define OP_GRAPH_STOP           0x01001003u
+#define OP_GRAPH_CLOSE          0x01001004u
 #define OP_SET_CFG              0x01001006u
 #define OP_READ_BUF             0x0400100bu
 #define OP_READ_BUF_DONE        0x05001005u
@@ -118,7 +119,7 @@ static uint32_t mic_ring_head;
 static uint32_t mic_ring_tail;
 
 static uint32_t mic_open_clients;
-static bool mic_graphs_opened;
+static uint32_t mic_graphs_opened; /* bit 0 SG_MIC, bit 1 SG_CAPTURE */
 static bool mic_graphs_started;
 static int mic_capture_error;
 static bool mic_hw_prepared;
@@ -131,6 +132,7 @@ static volatile uint8_t *mic_slot_dma_va;
 static volatile bool mic_async_failed;
 static uint32_t mic_sent_count;
 static uint32_t mic_done_count;
+static uint32_t mic_last_bytes, mic_peak;
 
 /* ---- Packet builder helpers ------------------------------------------------------------------ */
 
@@ -485,6 +487,88 @@ mic_hw_prepare(void)
 }
 
 static bool
+open_capture_graphs(void)
+{
+	static const struct mic_mod mic_mods[] = {
+		{ MOD_CODEC_DMA_SOURCE, IID_MIC_SOURCE, 0, 1 }
+	};
+	static const struct mic_mod cap_mods[] = {
+		{ MOD_RD_SHMEM, IID_CAP_SHMEM, 1, 0 },
+		{ MOD_PCM_ENC,  IID_CAP_ENC,   1, 1 },
+		{ MOD_PCM_CNV,  IID_CAP_CNV,   1, 1 }
+	};
+	static const struct mic_link cap_links[] = {
+		{ IID_MIC_SOURCE, IID_CAP_CNV },
+		{ IID_CAP_CNV,    IID_CAP_ENC },
+		{ IID_CAP_ENC,    IID_CAP_SHMEM }
+	};
+	struct mic_pkt p;
+
+	/* 1. Open SG_MIC (0x4007) */
+	mpkt_graph_open(&p, SG_MIC, 1, mic_mods, 1, NULL, 0);
+	if (!annibale_audio_reach_send_cmd(p.buf, p.len, "OPEN SG_MIC (0x4007)", NULL, NULL, 0)) return false;
+	mic_graphs_opened |= 1u;
+
+	/* 2. Codec DMA source as audioreach_codec_dma_set_media_format: VA TX0, 48 kHz 16-bit mono */
+	mpkt_begin(&p, OUR_MIC_PORT, APM_IID, OP_SET_CFG);
+	uint32_t cmd = mpkt_cmd_begin(&p);
+	uint32_t at = mpkt_param_begin(&p, IID_MIC_SOURCE, 0x08001063); /* CODEC_DMA_INTF_CFG */
+	mpkt_put32(&p, 3); /* lpaif_type: 1 RXTX, 2 WSA, 3 VA, 4 AXI */
+	mpkt_put32(&p, 1); /* intf_index: TX0 */
+	mpkt_put32(&p, 1); /* active_channels_mask = ch 0 */
+	mpkt_param_end(&p, at);
+	at = mpkt_param_begin(&p, IID_MIC_SOURCE, 0x08001018); /* HW_EP_FRAME_SIZE_FACTOR */
+	mpkt_put32(&p, 1);
+	mpkt_param_end(&p, at);
+	at = mpkt_param_begin(&p, IID_MIC_SOURCE, 0x08001017); /* HW_EP_MF */
+	mpkt_put32(&p, MIC_RATE);
+	mpkt_put16(&p, 16);
+	mpkt_put16(&p, 1);
+	mpkt_put32(&p, 1);
+	mpkt_param_end(&p, at);
+	mpkt_cmd_end(&p, cmd);
+	mpkt_finish(&p);
+	if (!annibale_audio_reach_send_cmd(p.buf, p.len, "SET_CFG MIC_SOURCE", NULL, NULL, 0)) return false;
+
+	/* 3. Open SG_CAPTURE (0x4003) */
+	mpkt_graph_open(&p, SG_CAPTURE, 1, cap_mods, 3, cap_links, 3);
+	if (!annibale_audio_reach_send_cmd(p.buf, p.len, "OPEN SG_CAPTURE (0x4003)", NULL, NULL, 0)) return false;
+	mic_graphs_opened |= 2u;
+
+	/*
+	 * 4. PCM_OUTPUT_FORMAT_CFG for the converter and the encoder, the layout the playback graph
+	 * sends its PCM modules: 16-bit Q15 little-endian interleaved mono. The payload size excludes padding.
+	 */
+	mpkt_begin(&p, OUR_MIC_PORT, APM_IID, OP_SET_CFG);
+	cmd = mpkt_cmd_begin(&p);
+	const uint32_t pcm_iids[] = { IID_CAP_CNV, IID_CAP_ENC };
+	for (unsigned i = 0; i < 2; i++) {
+		at = mpkt_param_begin(&p, pcm_iids[i], 0x08001008);
+		mpkt_put32(&p, 1); mpkt_put32(&p, 0x09001000); mpkt_put32(&p, 17);
+		mpkt_put16(&p, 16); mpkt_put16(&p, 1); mpkt_put16(&p, 16); mpkt_put16(&p, 15);
+		mpkt_put16(&p, 1);  mpkt_put16(&p, 1); mpkt_put16(&p, 0);  mpkt_put16(&p, 1);
+		mpkt_put8(&p, 1);
+		mpkt_param_end(&p, at);
+	}
+	mpkt_cmd_end(&p, cmd);
+	mpkt_finish(&p);
+	return annibale_audio_reach_send_cmd(p.buf, p.len, "SET_CFG CAP_CNV & ENC", NULL, NULL, 0);
+}
+
+/* A sub-graph left open after a failed setup answers the next OPEN with AR_EALREADY. */
+static void
+close_capture_graphs(void)
+{
+	if ((mic_graphs_opened & 2u) != 0) {
+		(void)mic_graph_cmd(OP_GRAPH_CLOSE, SG_CAPTURE, "CLOSE SG_CAPTURE");
+	}
+	if ((mic_graphs_opened & 1u) != 0) {
+		(void)mic_graph_cmd(OP_GRAPH_CLOSE, SG_MIC, "CLOSE SG_MIC");
+	}
+	mic_graphs_opened = 0;
+}
+
+static bool
 start_capture_graphs(void)
 {
 	if (mic_graphs_started) {
@@ -492,65 +576,11 @@ start_capture_graphs(void)
 	}
 	if (!mic_hw_prepare()) return false;
 
-	if (!mic_graphs_opened) {
-		static const struct mic_mod mic_mods[] = {
-			{ MOD_CODEC_DMA_SOURCE, IID_MIC_SOURCE, 0, 1 }
-		};
-		static const struct mic_mod cap_mods[] = {
-			{ MOD_RD_SHMEM, IID_CAP_SHMEM, 1, 0 },
-			{ MOD_PCM_ENC,  IID_CAP_ENC,   1, 1 },
-			{ MOD_PCM_CNV,  IID_CAP_CNV,   1, 1 }
-		};
-		static const struct mic_link cap_links[] = {
-			{ IID_MIC_SOURCE, IID_CAP_CNV },
-			{ IID_CAP_CNV,    IID_CAP_ENC },
-			{ IID_CAP_ENC,    IID_CAP_SHMEM }
-		};
-
-		struct mic_pkt p;
-
-		/* 1. Open SG_MIC (0x4007) */
-		mpkt_graph_open(&p, SG_MIC, 2, mic_mods, 1, NULL, 0);
-		if (!annibale_audio_reach_send_cmd(p.buf, p.len, "OPEN SG_MIC (0x4007)", NULL, NULL, 0)) return false;
-
-		/* 2. Configure CODEC DMA Source (TX0, 48 kHz 16-bit mono) */
-		mpkt_begin(&p, OUR_MIC_PORT, APM_IID, OP_SET_CFG);
-		uint32_t cmd = mpkt_cmd_begin(&p);
-		uint32_t at = mpkt_param_begin(&p, IID_MIC_SOURCE, 0x08001063); /* CODEC_DMA_INTF_CFG */
-		mpkt_put32(&p, 3); /* lpaif_type = LPASS_TX */
-		mpkt_put32(&p, 1); /* intf_idx = TX0 */
-		mpkt_put32(&p, 1); /* active_channels_mask = ch 0 */
-		mpkt_param_end(&p, at);
-		at = mpkt_param_begin(&p, IID_MIC_SOURCE, 0x08001017); /* HW_EP_MF */
-		mpkt_put32(&p, MIC_RATE);
-		mpkt_put16(&p, 16);
-		mpkt_put16(&p, 1);
-		mpkt_put32(&p, 1);
-		mpkt_param_end(&p, at);
-		mpkt_cmd_end(&p, cmd);
-		mpkt_finish(&p);
-		if (!annibale_audio_reach_send_cmd(p.buf, p.len, "SET_CFG MIC_SOURCE", NULL, NULL, 0)) return false;
-
-		/* 3. Open SG_CAPTURE (0x4003) */
-		mpkt_graph_open(&p, SG_CAPTURE, 1, cap_mods, 3, cap_links, 3);
-		if (!annibale_audio_reach_send_cmd(p.buf, p.len, "OPEN SG_CAPTURE (0x4003)", NULL, NULL, 0)) return false;
-
-		/* 4. Configure PCM converter & encoder for 48 kHz 16-bit mono */
-		mpkt_begin(&p, OUR_MIC_PORT, APM_IID, OP_SET_CFG);
-		cmd = mpkt_cmd_begin(&p);
-		at = mpkt_param_begin(&p, IID_CAP_ENC, 0x08001006);
-		mpkt_put32(&p, 0); mpkt_put32(&p, 0);
-		mpkt_put32(&p, 0x09001000); mpkt_put32(&p, 20);
-		mpkt_put32(&p, MIC_RATE);
-		mpkt_put16(&p, 16); mpkt_put16(&p, 16); mpkt_put16(&p, 15);
-		mpkt_put16(&p, 1);  mpkt_put16(&p, 1);  mpkt_put16(&p, 0);
-		mpkt_put16(&p, 1);  mpkt_put8(&p, 1);   mpkt_put8(&p, 0);
-		mpkt_param_end(&p, at);
-		mpkt_cmd_end(&p, cmd);
-		mpkt_finish(&p);
-		if (!annibale_audio_reach_send_cmd(p.buf, p.len, "SET_CFG CAP_ENC", NULL, NULL, 0)) return false;
-
-		mic_graphs_opened = true;
+	if (mic_graphs_opened != 3u) {
+		if (!open_capture_graphs()) {
+			close_capture_graphs();
+			return false;
+		}
 	}
 
 	/* 5. Prepare & Start SG_MIC and SG_CAPTURE */
@@ -570,6 +600,9 @@ static void
 stop_capture_graphs(void)
 {
 	if (mic_graphs_started) {
+		say("capture stops: %u reads asked, %u done, the last of %u bytes, loudest sample %u\n",
+		    mic_sent_count, mic_done_count, mic_last_bytes, mic_peak);
+		mic_peak = 0;
 		(void)mic_graph_cmd(OP_GRAPH_STOP, SG_CAPTURE, "STOP SG_CAPTURE");
 		(void)mic_graph_cmd(OP_GRAPH_STOP, SG_MIC, "STOP SG_MIC");
 		mic_graphs_started = false;
@@ -634,7 +667,12 @@ harvest_capture_period(uint32_t slot, volatile uint8_t *dma_va, uint32_t valid_b
 		volatile int16_t *hw = (volatile int16_t *)(volatile void *)(dma_va + MIC_OFFSET + slot * MIC_PERIOD_BYTES);
 		for (uint32_t i = 0; i < valid_samples; i++) {
 			period_mono[i] = hw[i];
+			uint32_t level = period_mono[i] < 0 ? (uint32_t)-(int32_t)period_mono[i] : (uint32_t)period_mono[i];
+			if (level > mic_peak) {
+				mic_peak = level;
+			}
 		}
+		mic_last_bytes = valid_bytes;
 	}
 
 	lck_spin_lock(amic_ring_lock);
@@ -689,6 +727,13 @@ annibale_mic_gpr_event(uint32_t src_port, uint32_t dst_port, uint32_t opcode,
 	if (!addr_ok || (mask & (1u << slot)) == 0 || words[0] != 0 ||
 	    words[3] != map_handle || words[4] > MIC_PERIOD_BYTES ||
 	    (words[4] % sizeof(int16_t)) != 0 || words[9] != 0 || words[13] != 0) {
+		static bool refused_logged;
+		if (!refused_logged) {
+			refused_logged = true;
+			say("read done refused: status %#x addr %#x:%#x handle %#x (ours %#x) size %u w5 %#x flags %#x "
+			    "w9 %#x w13 %#x inflight %#x\n", words[0], words[2], words[1], words[3], map_handle,
+			    words[4], words[5], words[8], words[9], words[13], mask);
+		}
 		__atomic_store_n(&mic_async_failed, true, __ATOMIC_RELEASE);
 		if (addr_ok) {
 			lck_spin_lock(amic_ring_lock);

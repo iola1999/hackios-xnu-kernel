@@ -135,7 +135,8 @@ static vm_offset_t ml_io_map(uintptr_t at, uintptr_t size) {
 
 static int16_t storage[65536], *mic_ring = storage;
 static uint32_t mic_ring_head, mic_ring_tail, mic_open_clients, mic_token = 500;
-static bool mic_graphs_opened, mic_graphs_started, mic_hw_prepared;
+static uint32_t mic_graphs_opened;
+static bool mic_graphs_started, mic_hw_prepared;
 static int mic_capture_error;
 static uint64_t last_blocking_read_ns;
 static volatile uint32_t mic_inflight_mask;
@@ -143,7 +144,7 @@ static uint32_t mic_slot_map_handle;
 static uint64_t mic_slot_dsp_base;
 static volatile uint8_t *mic_slot_dma_va;
 static volatile bool mic_async_failed;
-static uint32_t mic_sent_count, mic_done_count;
+static uint32_t mic_sent_count, mic_done_count, mic_last_bytes, mic_peak;
 
 static bool recording = false, dma_available = true;
 static uint32_t fed_frames;
@@ -232,7 +233,8 @@ static void reset_state(void) {
     queued_slot_count = 0;
     in_flight_mask = reach_done_count = reach_sent_count = 0;
     reach_write_failed = false;
-    mic_hw_prepared = mic_graphs_opened = mic_graphs_started = false;
+    mic_hw_prepared = mic_graphs_started = false;
+    mic_graphs_opened = 0;
     memset(tlmm_memory, 0, sizeof(tlmm_memory));
     memset(lpi_memory, 0, sizeof(lpi_memory));
     memset(va_memory, 0, sizeof(va_memory));
@@ -243,7 +245,7 @@ static void reset_state(void) {
     mic_slot_dsp_base = 0;
     mic_slot_dma_va = NULL;
     mic_async_failed = false;
-    mic_sent_count = mic_done_count = 0;
+    mic_sent_count = mic_done_count = mic_last_bytes = mic_peak = 0;
     last_blocking_read_ns = 0;
     idle_waits = wakeups = 0;
     mic_ring = storage;
@@ -397,7 +399,8 @@ def main():
     source += extract_function(REACH, "gpr_set32") + extract_function(REACH, "gpr_finish")
     source += extract_function(REACH, "annibale_audio_reach_send_cmd") + builders
     for name in ("mic_prm_vote_hw_core", "mic_prm_set_clk", "mic_configure_dmic_pins",
-                 "mic_configure_va_macro", "mic_hw_prepare", "start_capture_graphs",
+                 "mic_configure_va_macro", "mic_hw_prepare", "open_capture_graphs",
+                 "close_capture_graphs", "start_capture_graphs",
                  "stop_capture_graphs", "queue_capture_slot_async", "harvest_capture_period",
                  "annibale_mic_gpr_event", "mic_capture_thread", "annibale_mic_read",
                  "mic_cdev_open", "mic_cdev_close"):

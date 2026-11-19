@@ -52,6 +52,8 @@ static bool stale_reset, stale_buf, missing_finish_reset, fail_global_reset;
 static bool wrong_address, stuck_fifo, fail_smmu_stop, fail_smmu_restore;
 static bool fail_phy_stop, fail_clock_stop, bad_contiguity, invalid_status;
 static bool wrong_group, fail_sensor_on, fail_sensor_off, fail_init, fatal_frame;
+static bool bus_overflow, sticky_overflow;
+static unsigned buf_polls, deliver_after;
 
 static bool cam_capture_resources_held(void);
 static void fake_dma(void);
@@ -67,7 +69,8 @@ static uint32_t reg_rd(vm_offset_t base, uint32_t offset)
             vblank_eof_seen = true;
         }
     }
-    if (offset == 0x08c && cam_sensor_streaming && regs[0x1700 / 4] == 1 && !delivered) fake_dma();
+    if (offset == 0x08c && cam_sensor_streaming && regs[0x1700 / 4] == 1 && !delivered &&
+        buf_polls++ >= deliver_after) fake_dma();
     if (invalid_status && cam_sensor_streaming && offset == 0x08c) return UINT32_MAX;
     if (stuck_fifo && address_writes && offset == 0x1798) return 1;
     return regs[offset / 4];
@@ -94,10 +97,15 @@ static void reg_wr(vm_offset_t base, uint32_t offset, uint32_t value)
         bool no_eof = (value == 1 && !cam_sensor_streaming && regs[0x500 / 4] == 0);
         if (!fail_global_reset && !no_eof && !(missing_finish_reset && resets > 1)) regs[0x07c / 4] |= 1;
     }
+    if (offset == 0x1260) {
+        if (!sticky_overflow) regs[0x1268 / 4] &= ~value;
+        return;
+    }
     if (offset == 0x1704) {
         CHECK(!delivered);
         CHECK((physical >> 8) == value);
         address_writes++;
+        buf_polls = 0;
         regs[0x1798 / 4] = 1;
     }
     regs[offset / 4] = value;
@@ -150,6 +158,7 @@ static bool cam_native_apply_exposure_regs(bool force __unused) { return true; }
 static void cam_diag_bus_debug_enable(void) { }
 static void cam_diag_midframe_sample(void) { }
 static void cam_diag_capture_probe(const char *tag __unused) { }
+static void cam_diag_capture_failure(uint32_t sof __unused, uint32_t overflow __unused, uint32_t waited __unused) { }
 static bool cam_native_register_table(uint32_t table, uint32_t count)
 {
     CHECK(table < 4 && count);
@@ -225,8 +234,12 @@ static void fake_dma(void)
             memset(line + active_bytes, 0xa5, profile_data.stride - active_bytes);
         }
     }
-    regs[0x08c / 4] |= wrong_group ? 1u : 2u;
-    regs[0x1790 / 4] = regs[0x1704 / 4] + (wrong_address ? 1u : 0u);
+    if (bus_overflow) {
+        regs[0x1268 / 4] |= 1u;
+    } else {
+        regs[0x08c / 4] |= wrong_group ? 1u : 2u;
+        regs[0x1790 / 4] = regs[0x1704 / 4] + (wrong_address ? 1u : 0u);
+    }
     regs[0x1798 / 4] = 0;
     if (fatal_frame) regs[0x09c / 4] |= 0x800u;
     delivered = true; completed_frames++;
@@ -266,6 +279,8 @@ static void reset_fixture(void)
     wrong_address = stuck_fifo = fail_smmu_stop = fail_smmu_restore = false;
     fail_phy_stop = fail_clock_stop = bad_contiguity = invalid_status = false;
     wrong_group = fail_sensor_on = fail_sensor_off = fail_init = fatal_frame = false;
+    bus_overflow = sticky_overflow = false;
+    buf_polls = deliver_after = 0;
 }
 
 static void check_no_frame(int expected)
@@ -285,6 +300,23 @@ static void check_held(void)
     CHECK(annibale_cam_close(0, 0, 0, NULL) == 0);
     CHECK(profile_frees == 0 && region_frees == 0 && cam_region_vbase && cam_profile);
     CHECK(annibale_cam_open(0, 0, 0, NULL) == EBUSY);
+}
+
+/* A frame without comp_done ends as FAILED with everything released, and the next capture starts over. */
+static void check_recovered(uint32_t error, unsigned frames_before)
+{
+    CHECK(cam_capture.state == ANNIBALE_CAM_CAPTURE_FAILED && cam_capture.error == error);
+    CHECK((cam_capture.flags & ANNIBALE_CAM_CAPTURE_BUF_DONE) == 0 && !cam_hw_dma_verified);
+    CHECK(!cam_native_submitted && !cam_sensor_streaming && route_stops == frames_before + 1);
+    CHECK(!clocks_owned && !phy_owned && !smmu_owned && regs[0x200 / 4] == 0);
+    memset(output, 0xcc, sizeof(output));
+    check_no_frame((int)error);
+    wrong_group = bus_overflow = delivered = false;
+    cam_native_capture();
+    CHECK(cam_capture.state == ANNIBALE_CAM_CAPTURE_STOPPED && cam_capture.error == 0);
+    CHECK(cam_capture.flags == ANNIBALE_CAM_CAPTURE_COMPLETE && cam_hw_dma_verified);
+    CHECK(cam_capture.sequence == frames_before + 1 && table_writes[0] == 2 && table_writes[1] == 2);
+    CHECK(annibale_cam_close(0, 0, 0, NULL) == 0 && region_frees == 1);
 }
 
 static void check_success(void)
@@ -333,8 +365,14 @@ int main(void)
 
     reset_fixture(); wrong_address = true; cam_native_capture(); check_held();
     CHECK(route_stops == 0 && address_writes == 1); cases++;
-    reset_fixture(); wrong_group = true; cam_native_capture(); check_held();
+    reset_fixture(); wrong_group = true; cam_native_capture(); check_recovered(ETIMEDOUT, 0); cases++;
+    reset_fixture(); bus_overflow = true; cam_native_capture(); check_recovered(ENOBUFS, 0); cases++;
+    reset_fixture(); boot_cam_keep_stream = 1; cam_native_capture(); check_success();
+    delivered = false; bus_overflow = true; cam_native_capture();
+    CHECK(table_writes[3] == 1); check_recovered(ENOBUFS, 1); cases++;
+    reset_fixture(); wrong_group = stuck_fifo = true; cam_native_capture(); check_held();
     CHECK(cam_capture.error == ETIMEDOUT && route_stops == 0); cases++;
+    reset_fixture(); sticky_overflow = true; deliver_after = 3; regs[0x1268 / 4] = 1; cam_native_capture(); check_success(); cases++;
     reset_fixture(); missing_finish_reset = true; cam_native_capture(); check_held();
     CHECK(route_stops == 0 && cam_native_reset_failed); cases++;
     reset_fixture(); fail_global_reset = true; cam_native_capture(); check_held();

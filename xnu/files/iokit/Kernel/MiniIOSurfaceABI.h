@@ -166,7 +166,11 @@ minisurfWriteResult(void * output, uint32_t capacity, minisurf_abi abi,
         minisurfPut64(p, 0x28, planes[i].size);
         __builtin_memcpy(p + 0x30, &planes[i].bytesPerElement, 0x1c);
         p[0x6c] = planes[i].compression;
-        __builtin_memcpy(p + 0x88, planes[i].extendedPixels, sizeof(planes[i].extendedPixels));
+        /* IOSurfaceClientGetExtendedPixelsOfPlane (23G90) reads right, bottom, left, top from here. */
+        minisurfPut32(p, 0x88, planes[i].extendedPixels[1]);
+        minisurfPut32(p, 0x8c, planes[i].extendedPixels[3]);
+        minisurfPut32(p, 0x90, planes[i].extendedPixels[0]);
+        minisurfPut32(p, 0x94, planes[i].extendedPixels[2]);
     }
     return size;
 }

@@ -116,7 +116,9 @@ static void test_result(unsigned count)
             for (unsigned j = 0; j < 4; ++j) {
                 assert(p[0x38+j] == 8+j && p[0x3c+j] == 16+j && p[0x40+j] == 24+j);
                 assert(p[0x44+j] == 32+j && p[0x48+j] == 40+j);
-                assert(read(p, 0x88+4*j, 4) == 100*i+j);
+                /* extendedPixels[] holds left, right, top, bottom; the result holds right, bottom, left, top. */
+                static const unsigned order[4] = {1, 3, 0, 2};
+                assert(read(p, 0x88+4*j, 4) == 100*i+order[j]);
             }
         }
     }

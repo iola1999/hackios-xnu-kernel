@@ -104,11 +104,11 @@ static vm_offset_t ml_io_map(uintptr_t at,uintptr_t size) {
 }
 static int16_t storage[65536], *mic_ring=storage;
 static uint32_t mic_ring_head,mic_ring_tail,mic_open_clients,mic_token;
-static bool mic_graphs_opened,mic_graphs_started,mic_hw_prepared;
+static uint32_t mic_graphs_opened;static bool mic_graphs_started,mic_hw_prepared;
 static int mic_capture_error;
 static uint64_t last_blocking_read_ns;
 static volatile uint32_t mic_inflight_mask;
-static uint32_t mic_slot_map_handle,mic_sent_count,mic_done_count;
+static uint32_t mic_slot_map_handle,mic_sent_count,mic_done_count,mic_last_bytes,mic_peak;
 static uint64_t mic_slot_dsp_base;
 static volatile uint8_t *mic_slot_dma_va;
 static volatile bool mic_async_failed;
@@ -157,10 +157,10 @@ MAIN = r'''
 static void reset(void) {
     assert(locked==0);thread_test=false;tlmm_base=0;hw_up=true;reach_active=true;
     map_calls=fail_map=commands=fail_command=read_requests=0;
-    mic_hw_prepared=mic_graphs_opened=mic_graphs_started=false;mic_capture_error=0;mic_open_clients=0;
+    mic_hw_prepared=mic_graphs_started=false;mic_graphs_opened=0;mic_capture_error=0;mic_open_clients=0;
     memset(tlmm_memory,0,sizeof(tlmm_memory));memset(lpi_memory,0,sizeof(lpi_memory));memset(va_memory,0,sizeof(va_memory));
     mic_inflight_mask=0;mic_slot_map_handle=0;mic_slot_dsp_base=0;mic_slot_dma_va=NULL;
-    mic_async_failed=false;mic_sent_count=mic_done_count=0;last_blocking_read_ns=0;
+    mic_async_failed=false;mic_sent_count=mic_done_count=mic_last_bytes=mic_peak=0;last_blocking_read_ns=0;
     mic_ring=storage;mic_ring_head=mic_ring_tail=0;moves=fed_frames=0;
     fault=0;reply_bytes=1920;recording=dma_available=true;
     memset(storage,0x55,sizeof(storage));memset(dma_buffer,0,sizeof(dma_buffer));
@@ -206,7 +206,12 @@ int main(void) {
     unsigned saved=commands;assert(mic_hw_prepare() && commands==saved);
     for(unsigned failure=1;failure<=10;failure++) {
         reset();fail_command=failure;
-        assert(!start_capture_graphs() && !mic_graphs_started && commands==failure);
+        /* A failure after an OPEN closes what was opened: one CLOSE after SG_MIC, two after SG_CAPTURE. */
+        unsigned closes=failure==4||failure==5 ? 1u : failure==6 ? 2u : 0u;
+        assert(!start_capture_graphs() && !mic_graphs_started && commands==failure+closes);
+        assert(mic_graphs_opened==(failure<=6 ? 0u : 3u));
+        fail_command=0;commands=0;
+        assert(start_capture_graphs() && mic_graphs_started && commands==(failure<=2 ? 10u : failure<=6 ? 8u : 4u));
     }
     reset();assert(start_capture_graphs() && mic_graphs_started && commands==10);
     for(unsigned i=0;i<=10;i++) {
@@ -253,7 +258,8 @@ def main():
     source += function(REACH, 'annibale_audio_reach_send_cmd') + builders
     source += ''.join(function(MIC, name) for name in (
         'mic_prm_vote_hw_core', 'mic_prm_set_clk', 'mic_configure_dmic_pins',
-        'mic_configure_va_macro', 'mic_hw_prepare', 'start_capture_graphs', 'stop_capture_graphs',
+        'mic_configure_va_macro', 'mic_hw_prepare', 'open_capture_graphs', 'close_capture_graphs',
+        'start_capture_graphs', 'stop_capture_graphs',
         'queue_capture_slot_async', 'harvest_capture_period', 'annibale_mic_gpr_event',
         'mic_capture_thread', 'annibale_mic_read', 'mic_cdev_open', 'mic_cdev_close'))
     source += MAIN

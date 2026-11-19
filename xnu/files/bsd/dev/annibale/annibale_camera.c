@@ -330,13 +330,11 @@ cam_hardware_power_up(void)
 	    cam_nrt_axi_ok ? 1u : 0u, camcc_base != 0 ? reg_rd(camcc_base, CAMCC_CAMNOC_AXI_NRT_CBCR) : 0u,
 	    camcc_base != 0 ? reg_rd(camcc_base, CAMCC_CPAS_FAST_AHB_CBCR) : 0u);
 
-	/* 5. Read CAM-CPAS (0x0ac04000, HW_VERSION / HW_CAPABILITY) and optionally init QChannel + QoS */
+	/* 5. Read CAM-CPAS (0x0ac04000, HW_VERSION / HW_CAPABILITY), then QChannel + static QoS */
 	if (cpas_base != 0 && titan_top_on && cpas_ahb_ok && core_ahb_ok) {
 		cached_cpas_ver = reg_rd(cpas_base, 0x00u);
 		cached_cpas_cap = reg_rd(cpas_base, 0x04u);
-		if (boot_cam_bcm != 0) {
-			cam_diag_cpas_qos_init();
-		}
+		cam_cpas_qos_init();
 	}
 
 	/* 6. Configure TLMM GPIOs and enable cambistmclkcc MCLK1 (Wide) & MCLK4 (Front) */

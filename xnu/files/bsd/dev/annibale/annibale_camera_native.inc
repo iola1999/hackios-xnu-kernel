@@ -45,6 +45,8 @@
 #define CAM980_WM_ADDR_CONFIG    0x1770u
 #define CAM980_WM_CONSUMED       0x1790u
 #define CAM980_WM_FIFO           0x1798u
+#define CAM980_BUS_OVERFLOW_CLEAR 0x1260u
+#define CAM980_BUS_OVERFLOW      0x1268u
 #define CAM980_RDI0_DONE         2u
 #define CAM980_PATH_INPUT_EOF    0x200u
 #define CAM980_RX_FATAL          0x019fa800u
@@ -57,6 +59,17 @@ extern boolean_t ml_set_interrupts_enabled(boolean_t enable);
 static bool cam_native_initialized, cam_native_sensor_powered, cam_native_submitted;
 static bool cam_native_path_configured, cam_native_reset_failed;
 static uint32_t cam_native_dma_bytes;
+static uint32_t cam_native_sof_ms, cam_native_overflow_ms, cam_native_overflow_stale;
+
+/*
+ * Errors after which no comp_done can arrive. The sensor is stopped and CSID is reset globally;
+ * the disabled path and writer and the empty FIFO then end the DMA in place of comp_done.
+ */
+static bool
+cam_native_recoverable(uint32_t error)
+{
+	return error == ETIMEDOUT || error == ENOBUFS;
+}
 
 static bool
 cam_native_front_mode4(void)
@@ -303,6 +316,9 @@ cam_native_configure(void)
 	csid_wr(CAM980_WM_CACHE, 0);
 	csid_wr(CAM980_WM_ADDR_CONFIG, (uint32_t)(cam_capture.dma_address & 0xffu));
 	cam_diag_bus_debug_enable();
+	/* Bits that survive the clear are an earlier frame's and do not fail this one. */
+	csid_wr(CAM980_BUS_OVERFLOW_CLEAR, UINT32_MAX);
+	cam_native_overflow_stale = reg_rd(csid_lite_base, CAM980_BUS_OVERFLOW);
 	return reg_rd(csid_lite_base, CAM980_PATH_CFG0) == (path | (1u << 31)) &&
 	       reg_rd(csid_lite_base, CAM980_WM_IMAGE_CFG0) ==
 	       ((cam_profile->height << 16) | (cam_profile->stride / 16u)) &&
@@ -337,6 +353,7 @@ cam_native_wait_vblank(void)
 static int
 cam_native_wait_frame(void)
 {
+	cam_native_sof_ms = cam_native_overflow_ms = UINT32_MAX;
 	for (uint32_t elapsed = 0; elapsed < 1000000u; elapsed += 1000u) {
 		if (elapsed == 10000u) {
 			cam_diag_midframe_sample();
@@ -363,6 +380,15 @@ cam_native_wait_frame(void)
 			return (cam_capture.rx_irq & CAM980_RX_FATAL) != 0 ||
 			       (cam_capture.path_irq & CAM980_PATH_FATAL) != 0 ? EIO : 0;
 		}
+		if (cam_native_sof_ms == UINT32_MAX && (path & 0x10u) != 0) {
+			cam_native_sof_ms = elapsed / 1000u;
+		}
+		uint32_t overflow = reg_rd(csid_lite_base, CAM980_BUS_OVERFLOW);
+		if (overflow != UINT32_MAX && (overflow & ~cam_native_overflow_stale) != 0) {
+			/* The writer dropped the frame: comp_done will not come. */
+			cam_native_overflow_ms = elapsed / 1000u;
+			return ENOBUFS;
+		}
 		/* Wait for WM0's RDI0_DONE output fence so transient C-PHY errors retire DMA cleanly instead of entering HELD. */
 		delay_for_interval(1000, NSEC_PER_USEC);
 	}
@@ -384,7 +410,8 @@ cam_native_finish(void)
 			cam_native_phy_configured = false;
 		}
 	}
-	if (!cam_native_reset(false)) {
+	bool stopped = sensor_off && cam_native_recoverable(cam_capture.error);
+	if (!cam_native_reset(stopped)) {
 		return false;
 	}
 	cam_capture.flags |= ANNIBALE_CAM_CAPTURE_HALTED;
@@ -408,7 +435,7 @@ cam_native_finish(void)
 	cam_capture.flags |= ANNIBALE_CAM_CAPTURE_FIFO_EMPTY;
 	/* Ordinary comp_done is the native output fence; no later address or virtual frame was queued. */
 	uint32_t completed = ANNIBALE_CAM_CAPTURE_BUF_DONE | ANNIBALE_CAM_CAPTURE_ADDR_MATCH;
-	if ((cam_capture.flags & completed) != completed || !cam_smmu_route(false)) {
+	if (((cam_capture.flags & completed) != completed && !stopped) || !cam_smmu_route(false)) {
 		return false;
 	}
 	cam_capture.flags |= ANNIBALE_CAM_CAPTURE_DMA_STOPPED | ANNIBALE_CAM_CAPTURE_SMMU_SYNC;
@@ -489,6 +516,7 @@ cam_native_capture(void)
 		}
 	}
 	cam_native_submitted = true;
+	uint64_t armed = mach_absolute_time();
 #ifdef KERNEL
 	boolean_t arm_istate = ml_set_interrupts_enabled(FALSE);
 #endif
@@ -527,6 +555,8 @@ cam_native_capture(void)
 		    reg_rd(csid_lite_base, CAM980_WM_CFG), reg_rd(csid_lite_base, CAM980_WM_FIFO),
 		    reg_rd(csid_lite_base, CAM980_WM_CONSUMED), reg_rd(csid_lite_base, 0x568u),
 		    cam_native_frame_lines, cam_native_exposure_lines, cam_native_gain);
+		cam_diag_capture_failure(cam_native_sof_ms, cam_native_overflow_ms,
+		    (uint32_t)((mach_absolute_time() - armed) / 24000u));
 	}
 	cam_native_trace("capture frame error=%d buf=%#x consumed=%#x top=%#x rx=%#x path=%#x\n",
 	    error, cam_capture.buf_done, cam_capture.consumed_addr, cam_capture.top_irq,
