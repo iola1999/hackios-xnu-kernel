@@ -20,6 +20,7 @@
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <pexpert/pexpert.h>
+#include <sys/sysctl.h>
 
 #include "annibale_bt_private.h"
 
@@ -69,6 +70,11 @@ static struct {
 	uint16_t patch, rom, board;
 	uint8_t rom_ver;
 } chip;
+
+SYSCTL_DECL(_kern_annibale);
+static uint32_t bt_piece;
+SYSCTL_UINT(_kern_annibale, OID_AUTO, bt_piece, CTLFLAG_RD | CTLFLAG_LOCKED, &bt_piece, 0,
+    "Bluetooth firmware pieces sent");
 
 static void
 ms(uint32_t n)
@@ -338,6 +344,7 @@ download(const char *name, bool nvm)
 	bt_say("bt: %s: sending %u bytes in %u pieces, %s\n", name, size, (size + EDL_SEGMENT - 1) / EDL_SEGMENT,
 	    nvm || mode == 0 ? "each answered" : "unanswered");
 	cmd[0] = EDL_PATCH_TLV;
+	__atomic_store_n(&bt_piece, 0, __ATOMIC_RELAXED);
 	while (sent < size) {
 		uint32_t piece = size - sent < EDL_SEGMENT ? size - sent : EDL_SEGMENT, n;
 		bool answer = nvm || mode == 0;
@@ -364,6 +371,7 @@ download(const char *name, bool nvm)
 		}
 		sent += piece;
 		pieces++;
+		__atomic_store_n(&bt_piece, pieces, __ATOMIC_RELAXED);
 		if (sent * 100 / size >= next) {
 			bt_say("bt: %s: %u%%\n", name, sent * 100 / size);
 			next += 25;
@@ -661,10 +669,14 @@ bt_thread(void *parameter, __unused wait_result_t result)
 void
 annibale_bt_start(void)
 {
+	static int bt_started;
 	uint32_t steps = 0, bt_en = 0;
 	thread_t thread;
 
 	if (!PE_parse_boot_argn("bt", &steps, sizeof(steps)) || steps == 0) {
+		return;
+	}
+	if (__atomic_exchange_n(&bt_started, 1, __ATOMIC_ACQ_REL)) {
 		return;
 	}
 	if (!PE_parse_boot_argn("pcie_bt_en", &bt_en, sizeof(bt_en)) || bt_en == 0) {

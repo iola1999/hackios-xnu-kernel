@@ -8,6 +8,9 @@
 #include "adreno8_hwsched_private.h"
 #include "adreno8_gpu_private.h"
 #include "adreno8_context_private.h"
+#ifdef KERNEL
+#include <sys/proc.h>
+#endif
 
 #define printf adreno8_say
 #define CONTEXT_ID 1u
@@ -32,6 +35,14 @@ static struct adreno8_memory *context_queue, *context_timestamps, *test_ib, *tes
 static vm_offset_t context_queue_view, context_timestamp_view;
 static uint32_t context_last, context_sequence;
 static bool context_tested;
+
+#define SUBMIT_HISTORY 16u
+struct submit_record {
+	uint32_t timestamp, count, ib0_addr, ib0_words, ib_last_addr;
+	int pid;
+};
+static struct submit_record submit_history[SUBMIT_HISTORY];
+static uint32_t submit_history_next;
 
 static bool
 context_fail(const char *what)
@@ -284,6 +295,14 @@ adreno8_context_submit(const uint64_t *addresses, const uint32_t *words, uint32_
 	adreno8_settle();
 	/* No sync objects or preemption: normal RB0 dispatch uses interrupt bit 2. */
 	context_last = timestamp;
+	submit_history[submit_history_next++ % SUBMIT_HISTORY] = (struct submit_record){
+		.timestamp = timestamp,
+		.count = count,
+		.ib0_addr = (uint32_t)addresses[0],
+		.ib0_words = words[0],
+		.ib_last_addr = (uint32_t)addresses[count - 1],
+		.pid = proc_selfpid(),
+	};
 	adreno8_wr(adreno8_gmu.base + GMU_HOST2GMU_SET, 1u << 2);
 	return timestamp;
 }
@@ -300,6 +319,28 @@ uint32_t
 adreno8_context_retired(void)
 {
 	return context_timestamp_view ? adreno8_rd(context_timestamp_view + CONTEXT_EOP) : 0;
+}
+
+void
+adreno8_context_describe_inflight(void)
+{
+	static bool described;
+	uint32_t sop, eop;
+
+	if (described)
+		return;
+	described = true;
+	sop = context_timestamp_view ? adreno8_rd(context_timestamp_view + CONTEXT_SOP) : 0;
+	eop = context_timestamp_view ? adreno8_rd(context_timestamp_view + CONTEXT_EOP) : 0;
+	printf("adreno8: context inflight: SOP %u EOP %u last %u\n", sop, eop, context_last);
+	for (uint32_t i = 1; i <= SUBMIT_HISTORY; i++) {
+		const struct submit_record *s = &submit_history[(submit_history_next - i) % SUBMIT_HISTORY];
+
+		if (s->timestamp == 0)
+			continue;
+		printf("adreno8: submit ts %u pid %d count %u ib0 %#x+%#x ib_last %#x\n",
+		    s->timestamp, s->pid, s->count, s->ib0_addr, s->ib0_words, s->ib_last_addr);
+	}
 }
 
 bool

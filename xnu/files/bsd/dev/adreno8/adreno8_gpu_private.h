@@ -72,6 +72,7 @@ struct a8_protect_span { uint32_t reg, start, end, noaccess; };
 #define GEN8_CP_MRB_BASE_PIPE 0x910
 #define GEN8_CP_SQE_STAT_ADDR_PIPE 0x8f0
 #define GEN8_CP_SQE_STAT_DATA_PIPE 0x8f1
+#define GEN8_CP_RESERVED_REG_0 0x958
 #define GEN8_GMUAO_CGC_DELAY_CNTL 0x23b0a
 #define GEN8_GMUAO_CGC_HYST_CNTL 0x23b0b
 #define GEN8_GMUAO_CGC_MODE_CNTL 0x23b09

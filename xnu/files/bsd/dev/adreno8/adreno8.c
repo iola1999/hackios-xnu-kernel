@@ -54,8 +54,9 @@
  *                  20 registers (SCTLR, TTBR0, TCR, FSR) and read context 3's SCTLR twice;
  *                  read-only, the values enter no decision, off unless asked
  * gpu_coherent=1     map user buffers and surfaces into the GPU as cacheable, inner-shareable memory
- *                  (MAIR index 1), so the GPU snoops the processors' caches (vendor dt: kgsl_smmu is
- *                  dma-coherent) and AnnibaleGPU stops cleaning caches before each submission
+ *                  (MAIR index 1) and skip submission cache cleans; defaults to 0 because on SM8750
+ *                  only kgsl_smmu (page-table walk) carries dma-coherent, while kgsl-3d0/gfx3d_user
+ *                  are non-coherent and no LLCC slices are allocated
  * adreno8_gpu_stall=1  diagnostic only: stall faults in GPU contexts 0 and 3; poll fault
  *                  registers with context fault interrupts disabled; GMU context 2 is unchanged
  * adreno8_arc_read=1  stage-1 diagnostic: Apps DRV2 cx.lvl then mx.lvl reads; requires explicit

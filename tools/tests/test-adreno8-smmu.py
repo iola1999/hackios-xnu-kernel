@@ -784,6 +784,31 @@ int main(void) {
     reject_value = 0x80000001;
     assert(!adreno8_space_route(&space, 1, 3) && write_log_count == 2);
     assert((regs[SMMU_S2CR(3) / 4] & 0x30000) == SMMU_S2CR_FAULT);
+    /* gpu_coherent=1 uses stage-1 PTE shareability (SHCFG=0) on adreno8_gpu_space only. */
+    reset(&space, false);
+    adreno8_gpu_coherent = true;
+    map_one(&adreno8_gpu_space);
+    assert(adreno8_space_on(&adreno8_gpu_space, 0, 0));
+    assert(regs[SMMU_S2CR(0) / 4] == 0u);
+    assert(adreno8_space_check(&adreno8_gpu_space, 0, 0));
+    regs[SMMU_S2CR(0) / 4] = SMMU_S2CR_SHCFG_NSH;
+    assert(!adreno8_space_check(&adreno8_gpu_space, 0, 0));
+    regs[SMMU_S2CR(0) / 4] = 0u;
+    assert(adreno8_space_route(&adreno8_gpu_space, 1, 3));
+    assert(regs[SMMU_S2CR(3) / 4] == 0u);
+    assert(adreno8_space_route_check(&adreno8_gpu_space, 1, 3));
+    adreno8_space_off(&adreno8_gpu_space, 3);
+    adreno8_space_off(&adreno8_gpu_space, 0);
+    memset(&adreno8_gpu_space, 0, sizeof(adreno8_gpu_space));
+    adreno8_gpu_space.name = "gpu";
+    map_one(&adreno8_gmu_space);
+    assert(adreno8_space_on(&adreno8_gmu_space, 5, 1));
+    assert(regs[SMMU_S2CR(1) / 4] == (SMMU_S2CR_SHCFG_NSH | GMU_CONTEXT));
+    adreno8_space_off(&adreno8_gmu_space, 1);
+    memset(&adreno8_gmu_space, 0, sizeof(adreno8_gmu_space));
+    adreno8_gmu_space.name = "gmu";
+    adreno8_gmu_space.context = GMU_CONTEXT;
+    adreno8_gpu_coherent = false;
     release_all();
     puts("SMMU mapping, register writes, ATOS capability and failure cleanup: PASS");
 }

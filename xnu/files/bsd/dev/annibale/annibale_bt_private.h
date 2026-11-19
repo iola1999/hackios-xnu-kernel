@@ -29,6 +29,7 @@ bool annibale_bt_uart_write(const uint8_t *data, uint32_t length);
 /* the RX FIFO into the receive buffer, whole words while there is room; how many bytes came */
 uint32_t annibale_bt_uart_poll(void);
 void annibale_bt_uart_irq_clear(void);
+void annibale_bt_uart_enable_irq(void);
 /* the received bytes nobody has taken yet, oldest first; valid until the next poll or take */
 const uint8_t *annibale_bt_uart_rx(uint32_t *length);
 void annibale_bt_uart_take(uint32_t length);

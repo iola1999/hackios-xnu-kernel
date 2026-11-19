@@ -31,5 +31,7 @@ void adreno8_bo_dump_tree(uint64_t base, uint32_t count);
 /* After an SMMU fault in the GPU space, once per boot: the BOs that held the faulting address
  * in the last reservations, live or released, and the nearest live ones below and above it. */
 void adreno8_bo_describe_fault(uint32_t fault);
+/* Look up the owning BO (live or recently released) for a GPU VA such as CP IB1/IB2. */
+void adreno8_bo_describe_owner(const char *what, uint32_t address);
 
 #endif

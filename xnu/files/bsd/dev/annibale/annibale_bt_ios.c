@@ -48,12 +48,14 @@ static uint32_t bt_ring_in, bt_ring_out, bt_rx_lost;
 static lck_mtx_t *bt_ring_lock;
 static struct selinfo bt_sel;
 static int bt_serving;
-static volatile int bt_ended;           /* the bring-up thread finished without serving: nothing will come */
+static int bt_ended;                    /* the bring-up thread finished without serving: nothing will come */
 static bool bt_ibs_asleep;
 static volatile uint32_t bt_irq_event;
 
 SYSCTL_INT(_kern_annibale, OID_AUTO, bt_ready, CTLFLAG_RD | CTLFLAG_LOCKED, &bt_serving, 0,
     "whether the WCN7850 Bluetooth firmware and reset are ready");
+SYSCTL_INT(_kern_annibale, OID_AUTO, bt_ended, CTLFLAG_RD | CTLFLAG_LOCKED, &bt_ended, 0,
+    "whether Bluetooth bring-up ended without serving");
 
 static void
 ms(uint32_t n)
@@ -208,6 +210,10 @@ static errno_t
 btsk_pre_connect(kern_nexus_provider_t nxprov __unused, proc_t p __unused, kern_nexus_t nexus,
     nexus_port_t port, kern_channel_t channel __unused, void **ch_ctx)
 {
+	if (!__atomic_load_n(&bt_serving, __ATOMIC_ACQUIRE)) {
+		*ch_ctx = NULL;
+		return ENXIO;
+	}
 	kern_pbufpool_t tx_pp = NULL;
 	errno_t error = kern_nexus_get_pbufpool(nexus, &tx_pp, &btsk_rx_pp);
 
@@ -443,15 +449,17 @@ bt_kctl_connect(kern_ctl_ref ref __unused, struct sockaddr_ctl *sac, void **unit
 {
 	int waited;
 
-	for (waited = 0; !bt_serving && !bt_ended && waited < 40000; waited += 50) {
+	for (waited = 0; !__atomic_load_n(&bt_serving, __ATOMIC_ACQUIRE) &&
+	    !__atomic_load_n(&bt_ended, __ATOMIC_ACQUIRE) && waited < 40000; waited += 50) {
 		ms(50);
 	}
+	int ready = __atomic_load_n(&bt_serving, __ATOMIC_ACQUIRE);
 	bt_kctl_unit = sac->sc_unit;
 	*unitinfo = NULL;
 	bt_kctl_up = 1;
 	bt_say("bt: connected to com.apple.uart.sk.bluetooth (unit %u, waited %d ms, ready %d)\n",
-	    sac->sc_unit, waited, bt_serving);
-	return bt_serving ? 0 : ENXIO;
+	    sac->sc_unit, waited, ready);
+	return ready ? 0 : ENXIO;
 }
 
 static errno_t
@@ -465,6 +473,10 @@ bt_kctl_disconnect(kern_ctl_ref ref __unused, u_int32_t unit __unused, void *uni
 static errno_t
 bt_kctl_send(kern_ctl_ref ref __unused, u_int32_t unit __unused, void *unitinfo __unused, mbuf_t m, int flags __unused)
 {
+	if (!__atomic_load_n(&bt_serving, __ATOMIC_ACQUIRE)) {
+		mbuf_freem(m);
+		return ENXIO;
+	}
 	static uint32_t said;
 	uint8_t buf[1100];
 	size_t n = mbuf_pkthdr_len(m);
@@ -543,6 +555,9 @@ bt_kctl_register(void)
 static void
 bt_ios_put(const uint8_t *p, uint32_t n)
 {
+	if (!__atomic_load_n(&bt_serving, __ATOMIC_ACQUIRE)) {
+		return;
+	}
 	static uint32_t said;
 
 	if (said++ < 120) {
@@ -871,12 +886,14 @@ bt_dev_open(dev_t dev __unused, int flags, int devtype __unused, struct proc *p 
 
 	if (bt_opens < 8) {
 		bt_opens++;
-		bt_say("bt: /dev/uart.bluetooth opened (flags %#x; chip %s)\n", flags, bt_serving ? "up" : "not up yet");
+		bt_say("bt: /dev/uart.bluetooth opened (flags %#x; chip %s)\n", flags,
+		    __atomic_load_n(&bt_serving, __ATOMIC_ACQUIRE) ? "up" : "not up yet");
 	}
-	for (waited = 0; !bt_serving && !bt_ended && waited < 40000; waited += 50) {
+	for (waited = 0; !__atomic_load_n(&bt_serving, __ATOMIC_ACQUIRE) &&
+	    !__atomic_load_n(&bt_ended, __ATOMIC_ACQUIRE) && waited < 40000; waited += 50) {
 		ms(50);
 	}
-	return bt_serving ? 0 : ENXIO;
+	return __atomic_load_n(&bt_serving, __ATOMIC_ACQUIRE) ? 0 : ENXIO;
 }
 
 static int
@@ -920,6 +937,9 @@ bt_dev_read(dev_t dev __unused, struct uio *uio, int ioflag)
 static int
 bt_dev_write(dev_t dev __unused, struct uio *uio, int ioflag __unused)
 {
+	if (!__atomic_load_n(&bt_serving, __ATOMIC_ACQUIRE)) {
+		return ENXIO;
+	}
 	uint8_t buf[512];
 	int error = 0;
 
@@ -1034,8 +1054,8 @@ annibale_bt_ios_early(void)
 void
 annibale_bt_ios_ended(void)
 {
-	if (!bt_serving) {
-		bt_ended = 1;
+	if (!__atomic_load_n(&bt_serving, __ATOMIC_ACQUIRE)) {
+		__atomic_store_n(&bt_ended, 1, __ATOMIC_RELEASE);
 		bt_say("bt: bring-up ended without the chip; /dev/uart.bluetooth and the control socket answer ENXIO\n");
 	}
 }
@@ -1056,11 +1076,12 @@ annibale_bt_ios_serve(const uint8_t addr[6])
 	AnnibaleBTSetPowerState(true);
 	lck_mtx_lock(bt_ring_lock);
 	bt_ring_fill();
-	bt_serving = 1;
+	__atomic_store_n(&bt_serving, 1, __ATOMIC_RELEASE);
 	lck_mtx_unlock(bt_ring_lock);
 	if (kernel_thread_start(bt_pump_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_set_thread_name(thread, "bt-uart-pump");
 		thread_deallocate(thread);
 	}
+	annibale_bt_uart_enable_irq();
 	bt_say("bt: /dev/uart.bluetooth and com.apple.uart.sk.bluetooth serving; iOS's bluetoothd drives the chip now\n");
 }

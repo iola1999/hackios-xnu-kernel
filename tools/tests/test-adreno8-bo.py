@@ -23,6 +23,8 @@ static uint64_t bo_test_clock(void) { return bo_clock += bo_clock_step; }
 static bool commands_verified, context_verified, memory_healthy, hfi_healthy;
 static bool adreno8_reset_required;
 static int proc_selfpid(void) { return 1; }
+void adreno8_context_describe_inflight(void) {}
+void adreno8_gpu_hang_dump(void) {}
 /* Only the hang-report dumps read BO words; no case reaches them. */
 unsigned int ml_phys_read_word(vm_offset_t paddr) { assert(false); return 0; }
 static unsigned closed, idle_calls;
@@ -100,6 +102,7 @@ static void stays_closed(uint64_t address, uint64_t size) {
 int main(int argc, char **argv) {
     unsigned mode = argc > 1 ? (unsigned)atoi(argv[1]) : NORMAL;
     assert(mode < MODES);
+    adreno8_gpu_coherent = mode == COHERENT;
     fresh();
     unsigned old_writes = writes, old_allocations = allocation_count;
     assert(!adreno8_bo_ready() && !adreno8_bo_map(ADRENO8_GPU_IOVA_START, 0x50000000, false));
@@ -167,7 +170,6 @@ int main(int argc, char **argv) {
         assert(adreno8_bo_reserve(4096) == a && adreno8_bo_ready() && !closed);
         release_all(); return 0;
     }
-    adreno8_gpu_coherent = mode == COHERENT;
     uint64_t size = mode == TWO_LEAVES ? (2u << 20) + 4096 : 3 * 4096;
     uint64_t address = adreno8_bo_reserve(size);
     assert(address == ADRENO8_GPU_IOVA_START + PAGE_SIZE);

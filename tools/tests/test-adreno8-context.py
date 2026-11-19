@@ -85,6 +85,7 @@ static void thread_block(int continuation) { (void)continuation; assert(false); 
 static bool PE_parse_boot_argn(const char *name, void *out, int size) { (void)name; (void)out; (void)size; return false; }
 bool adreno8_gpu_faulted(void) { return hardware_fault; }
 void adreno8_gpu_hang_dump(void) {}
+static int proc_selfpid(void) { return 1; }
 static void adreno8_gmu_post_mortem(void) { snapshots++; }
 void adreno8_hwsched_memory_failed(void) { failures++; closed = true; }
 bool adreno8_hwsched_ready(void) { return !closed; }

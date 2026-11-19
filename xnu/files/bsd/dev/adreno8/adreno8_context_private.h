@@ -23,6 +23,7 @@ bool adreno8_context_done(uint32_t timestamp);
 uint32_t adreno8_context_last(void);
 uint32_t adreno8_context_retired(void);
 uint32_t adreno8_context_depth(void);
+void adreno8_context_describe_inflight(void);
 bool adreno8_context_close(void);
 bool adreno8_context_test(void);
 /* Require the completed stage-22 self-test, latest EOP and GPU idle. The caller

@@ -225,6 +225,9 @@ pins(void)
 	    rd(PIN_CTL(24)), rd(PIN_CTL(25)), rd(PIN_CTL(26)), rd(PIN_CTL(27)));
 }
 
+#define SE14_GIC_SPI_ID 0x1cdu
+#define SE14_GIC_INTID  (32u + SE14_GIC_SPI_ID)
+
 bool
 annibale_bt_uart_open(void)
 {
@@ -273,14 +276,6 @@ annibale_bt_uart_open(void)
 		return false;
 	}
 	pins();
-#define SE14_GIC_SPI_ID 0x1cdu
-#define SE14_GIC_INTID  (32u + SE14_GIC_SPI_ID)
-	extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
-	if (gic_v3_spi_attach(SE14_GIC_INTID, false, annibale_bt_uart_isr, NULL) == KERN_SUCCESS) {
-		bt_say("bt: attached to GIC SPI 0x1cd (INTID %u)\n", SE14_GIC_INTID);
-	} else {
-		bt_say("bt: warning: failed to attach to GIC SPI 0x1cd (INTID %u)\n", SE14_GIC_INTID);
-	}
 	return true;
 }
 
@@ -333,8 +328,8 @@ annibale_bt_uart_config(uint32_t oversampling)
 	wr(se + SE_DMA_GENERAL_CFG, rd(se + SE_DMA_GENERAL_CFG) | 0xf);
 	wr(se + SE_GENI_OUTPUT_CTRL, 0x7f);
 	wr(se + SE_GENI_FORCE_DEFAULT, 1);
-	wr(se + SE_IRQ_EN, rd(se + SE_IRQ_EN) | 0xf);
-	wr(se + SE_GENI_S_IRQ_EN, 0xffffffffu);
+	wr(se + SE_IRQ_EN, 0);
+	wr(se + SE_GENI_S_IRQ_EN, 0);
 	wr(se + SE_GENI_M_IRQ_EN, 0);
 	wr(se + SE_GENI_DMA_MODE, rd(se + SE_GENI_DMA_MODE) & ~1u);
 	packing();
@@ -465,6 +460,29 @@ annibale_bt_uart_irq_clear(void)
 	}
 }
 
+/* Polled bring_up() runs without SE14 IRQs; attach SPI 493 only once bt_pump_thread is live. */
+void
+annibale_bt_uart_enable_irq(void)
+{
+	static int irq_attached;
+	extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge,
+	    void (*handler)(void *context, uint32_t intid), void *context);
+
+	if (se == 0) {
+		return;
+	}
+	wr(se + SE_GENI_M_IRQ_EN, 0);
+	wr(se + SE_GENI_S_IRQ_EN, 0xffffffffu);
+	wr(se + SE_IRQ_EN, rd(se + SE_IRQ_EN) | 0xf);
+	if (!__atomic_exchange_n(&irq_attached, 1, __ATOMIC_ACQ_REL)) {
+		if (gic_v3_spi_attach(SE14_GIC_INTID, false, annibale_bt_uart_isr, NULL) == KERN_SUCCESS) {
+			bt_say("bt: attached to GIC SPI 0x1cd (INTID %u)\n", SE14_GIC_INTID);
+		} else {
+			bt_say("bt: warning: failed to attach to GIC SPI 0x1cd (INTID %u)\n", SE14_GIC_INTID);
+		}
+	}
+}
+
 uint32_t
 annibale_bt_uart_poll(void)
 {
@@ -508,8 +526,11 @@ bool
 annibale_bt_uart_write(const uint8_t *data, uint32_t length)
 {
 	uint32_t depth = rd(se + SE_HW_PARAM_0) >> 16 & 0x3f;
+	uint64_t span, deadline;
 
 	depth = depth ? depth : 16;
+	nanoseconds_to_absolutetime(1000ULL * NSEC_PER_MSEC, &span);
+	deadline = mach_absolute_time() + span;
 	wr(se + SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
 	wr(se + SE_UART_TX_TRANS_LEN, length);
 	wr(se + SE_GENI_M_CMD0, UART_START_TX << OPCODE_SHIFT);
@@ -517,21 +538,26 @@ annibale_bt_uart_write(const uint8_t *data, uint32_t length)
 		uint32_t word = 0;
 
 		for (int t = 0; (rd(se + SE_GENI_TX_FIFO_STATUS) & 0x0fffffffu) + 1 >= depth; t++) {
-			if (t > 20000) {
+			if (mach_absolute_time() >= deadline) {
 				bt_say("bt: uart: TX FIFO stays at %u words after %u of %u bytes (CTS held?)\n",
 				    rd(se + SE_GENI_TX_FIFO_STATUS) & 0x0fffffffu, i, length);
+				annibale_bt_uart_status("tx deadline");
 				stop_command(SE_GENI_M_CMD_CTRL, GENI_M_ACTIVE);
 				return false;
 			}
 			(void)annibale_bt_uart_poll();
-			us(50);
+			if (t < 8) {
+				delay(50);
+			} else {
+				us(200);
+			}
 		}
 		for (uint32_t k = 0; k < 4 && i + k < length; k++) {
 			word |= (uint32_t)data[i + k] << (8 * k);
 		}
 		wr(se + SE_GENI_TX_FIFO, word);
 	}
-	for (int t = 0; t < 10000; t++) {
+	for (int t = 0;; t++) {
 		if (rd(se + SE_GENI_M_IRQ_STATUS) & CMD_DONE) {
 			wr(se + SE_GENI_M_IRQ_CLEAR, CMD_DONE);
 			return true;
@@ -541,11 +567,19 @@ annibale_bt_uart_write(const uint8_t *data, uint32_t length)
 			wr(se + SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
 			return true;
 		}
+		if (mach_absolute_time() >= deadline) {
+			break;
+		}
 		(void)annibale_bt_uart_poll();
-		us(50);
+		if (t < 8) {
+			delay(50);
+		} else {
+			us(200);
+		}
 	}
 	bt_say("bt: uart: TX of %u bytes not done (TX FIFO %#x, M IRQ %#x)\n", length, rd(se + SE_GENI_TX_FIFO_STATUS),
 	    rd(se + SE_GENI_M_IRQ_STATUS));
+	annibale_bt_uart_status("tx deadline");
 	stop_command(SE_GENI_M_CMD_CTRL, GENI_M_ACTIVE);
 	return false;
 }

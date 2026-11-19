@@ -165,6 +165,7 @@ static thread_call_t    gSurfaceClearing;
 static uint32_t         gSurfacesGivenAgain;    /* for MiniIOSurfaceCost() */
 /* boot-arg surf_clear=0: kept memory is given out as it is (to see what the clearing costs; a surface is then not all zeroes) */
 static TUNABLE(uint32_t, gSurfaceClear, "surf_clear", 1);
+extern "C" void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
 
 void
 MiniIOSurfaceClearKept(void)
@@ -182,6 +183,7 @@ MiniIOSurfaceClearKept(void)
 		gSurfaceKept[i].busy = true;
 		IOLockUnlock(gSurfaceKeptLock);
 		bzero(memory->getBytesNoCopy(), memory->getCapacity());
+		FlushPoC_DcacheRegion((vm_offset_t) memory->getBytesNoCopy(), memory->getCapacity());
 		IOLockLock(gSurfaceKeptLock);
 		gSurfaceKept[i].busy = false;
 		gSurfaceKept[i].clear = true;
@@ -219,11 +221,15 @@ surfaceMemory(vm_size_t bytes)
 		IOLockUnlock(gSurfaceKeptLock);
 		if (memory != NULL && !clear) {
 			bzero(memory->getBytesNoCopy(), gSurfaceClear ? bytes : PAGE_SIZE);
+			FlushPoC_DcacheRegion((vm_offset_t) memory->getBytesNoCopy(), gSurfaceClear ? bytes : PAGE_SIZE);
 		}
 	}
 	if (memory == NULL) {
 		memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, bytes,
 		    PAGE_SIZE);
+		if (memory != NULL) {
+			FlushPoC_DcacheRegion((vm_offset_t) memory->getBytesNoCopy(), bytes);
+		}
 	}
 	return memory;
 }
@@ -946,7 +952,7 @@ class IOSurfaceRootUserClient : public IOUserClient
 	IOReturn trapSignalSharedEvent(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
 	IOReturn trapRemoveCoreVideoBridgedValues(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
 	IOReturn trapRemoveBulkAttachments(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
-	IOReturn lockCommon(uint32_t sid, uint32_t options, user_addr_t seedOut);
+	IOReturn lockCommon(uint32_t sid, uint32_t options, user_addr_t seedOut, bool unlock);
 	IOReturn useCountCommon(uint32_t sid, uint32_t category, int delta);
 
 public:

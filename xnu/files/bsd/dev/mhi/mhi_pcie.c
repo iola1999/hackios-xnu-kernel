@@ -1015,7 +1015,7 @@ static void
 pcie_thread(void *parameter, __unused wait_result_t result)
 {
 	uint32_t steps = (uint32_t)(uintptr_t)parameter;
-	bool readable;
+	bool readable = false;
 
 	mhi_pcie_pause("map the windows");
 	printf("pcie: step 1: map root complex 0 (%#lx, %#lx, %#lx) and read what the boot loader left\n",
@@ -1044,7 +1044,6 @@ pcie_thread(void *parameter, __unused wait_result_t result)
 			printf("pcie: the power-up stopped; nothing more is read\n");
 			goto out;
 		}
-		annibale_bt_start();
 		readable = show_power();
 	}
 	if (!readable) {
@@ -1089,6 +1088,9 @@ pcie_thread(void *parameter, __unused wait_result_t result)
 	}
 
 out:
+	if (power && readable) {
+		annibale_bt_start();
+	}
 	printf("pcie: the survey is over: %s%s; %s\n",
 	    link_up ? "the link is up" : "the link is down", ep_alive ? " and the card identified itself" : "",
 	    power ? "the power-up and BAR0 stay until the reset" : "everything written was given back");

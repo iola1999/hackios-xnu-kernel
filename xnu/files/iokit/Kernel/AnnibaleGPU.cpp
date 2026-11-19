@@ -287,11 +287,21 @@ MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds)
 {
 	uint32_t fence = surface->drawn;
 	bool done = true;
+	bool syncCache = false;
 
 	if (gGPULock != NULL) {
 		IOLockLock(gGPULock);
 		done = !gGPUReported && (fence == 0 || (annibale_gpu_ready() && gpuWait(fence, milliseconds)));
+		if (done && fence != 0 && surface->cpuSyncedFence != fence) {
+			surface->cpuSyncedFence = fence;
+			syncCache = !gGPUCoherent && surface->client == NULL && surface->kbase != NULL &&
+			    surface->info.allocSize != 0;
+		}
 		IOLockUnlock(gGPULock);
+		if (syncCache) {
+			/* Clean/invalidate stale CPU cache lines before CPU reads GPU-rendered DRAM pixels. */
+			annibale_gpu_to_memory(surface->kbase + PAGE_SIZE, round_page_64(surface->info.allocSize));
+		}
 	}
 	return done;
 }

@@ -485,11 +485,25 @@ IOSurfaceRootUserClient::trapDecrementUseCount(void * p1, void * p2, void * p3, 
  * What matters is the seed, which tells readers that the pixels may have changed.
  */
 IOReturn
-IOSurfaceRootUserClient::lockCommon(uint32_t sid, uint32_t options, user_addr_t seedOut)
+IOSurfaceRootUserClient::lockCommon(uint32_t sid, uint32_t options, user_addr_t seedOut, bool unlock)
 {
 	struct minisurf_client_ref * ref;
+	MiniIOSurface * waitSurface = NULL;
 	uint32_t seed = 0;
 
+	if (!unlock) {
+		IOLockLock(gSurfaceLock);
+		ref = findRef(sid, false);
+		if (ref != NULL && ref->surface->drawn != 0 && ref->surface->cpuSyncedFence != ref->surface->drawn) {
+			waitSurface = ref->surface;
+			surfaceHold(waitSurface);
+		}
+		IOLockUnlock(gSurfaceLock);
+		if (waitSurface != NULL) {
+			(void) MiniIOSurfaceDrawn(waitSurface, 250);
+			MiniIOSurfaceDrop(waitSurface);
+		}
+	}
 	IOLockLock(gSurfaceLock);
 	ref = findRef(sid, false);
 	if (ref != NULL) {
@@ -513,13 +527,13 @@ IOSurfaceRootUserClient::lockCommon(uint32_t sid, uint32_t options, user_addr_t 
 IOReturn
 IOSurfaceRootUserClient::trapLock(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6)
 {
-	return lockCommon((uint32_t) (uintptr_t) p1, (uint32_t) (uintptr_t) p2, (user_addr_t) (uintptr_t) p3);
+	return lockCommon((uint32_t) (uintptr_t) p1, (uint32_t) (uintptr_t) p2, (user_addr_t) (uintptr_t) p3, false);
 }
 
 IOReturn
 IOSurfaceRootUserClient::trapUnlock(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6)
 {
-	return lockCommon((uint32_t) (uintptr_t) p1, (uint32_t) (uintptr_t) p2, (user_addr_t) (uintptr_t) p3);
+	return lockCommon((uint32_t) (uintptr_t) p1, (uint32_t) (uintptr_t) p2, (user_addr_t) (uintptr_t) p3, true);
 }
 
 /*

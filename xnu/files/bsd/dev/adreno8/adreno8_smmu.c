@@ -895,6 +895,16 @@ adreno8_space_registers(struct adreno8_gpu_space *space)
 	return ok;
 }
 
+/* Arm IHI 0062D.c 9.6.20: SHCFG=0 uses the stage-1 PTE shareability attribute so
+ * gpu_coherent=1 inner-shareable BO mappings snoop processor caches. */
+static uint32_t
+adreno8_space_s2cr(const struct adreno8_gpu_space *space)
+{
+	uint32_t shcfg = (space == &adreno8_gpu_space && adreno8_gpu_coherent) ?
+	    SMMU_S2CR_SHCFG_DEF : SMMU_S2CR_SHCFG_NSH;
+	return shcfg | space->context;
+}
+
 bool
 adreno8_space_check(struct adreno8_gpu_space *space, uint32_t stream, uint32_t match)
 {
@@ -908,7 +918,7 @@ adreno8_space_check(struct adreno8_gpu_space *space, uint32_t stream, uint32_t m
 	bool ok = adreno8_space_registers(space);
 	ok &= adreno8_get(&adreno8_smmu, "smr check", SMMU_SMR(match)) == (SMR_VALID | SMR_MASK << 16 | stream);
 	ok &= (adreno8_get(&adreno8_smmu, "s2cr check", SMMU_S2CR(match)) & 0x30303ff) ==
-	    (SMMU_S2CR_SHCFG_NSH | space->context);
+	    adreno8_space_s2cr(space);
 	ok &= adreno8_space_verify(space, false);
 	ok &= !adreno8_space_faulted(space);
 	if (!ok) {
@@ -922,7 +932,7 @@ adreno8_space_on(struct adreno8_gpu_space *space, uint32_t stream, uint32_t matc
 {
 	uint64_t root;
 	uint32_t cb, idr0, idr1, idr2, smr = SMR_VALID | SMR_MASK << 16 | stream;
-	uint32_t s2cr = SMMU_S2CR_SHCFG_NSH | space->context;
+	uint32_t s2cr = adreno8_space_s2cr(space);
 	uint32_t sctlr = adreno8_smmu_sctlr(space->context);
 	bool atos;
 
@@ -1017,7 +1027,7 @@ adreno8_space_route_check(struct adreno8_gpu_space *space, uint32_t stream, uint
 	return space->is_on && match < adreno8_smmu_matches &&
 	    adreno8_get(&adreno8_smmu, "route smr check", SMMU_SMR(match)) == (SMR_VALID | SMR_MASK << 16 | stream) &&
 	    (adreno8_get(&adreno8_smmu, "route s2cr check", SMMU_S2CR(match)) & 0x30303ff) ==
-	    (SMMU_S2CR_SHCFG_NSH | space->context);
+	    adreno8_space_s2cr(space);
 }
 
 /*
@@ -1046,7 +1056,7 @@ adreno8_space_route(struct adreno8_gpu_space *space, uint32_t stream, uint32_t m
 	if ((adreno8_get(&adreno8_smmu, "route s2cr fault", SMMU_S2CR(match)) & 0x30000) != SMMU_S2CR_FAULT ||
 	    adreno8_get(&adreno8_smmu, "route smr", SMMU_SMR(match)) != smr)
 		return false;
-	adreno8_put(&adreno8_smmu, "route s2cr translate", SMMU_S2CR(match), SMMU_S2CR_SHCFG_NSH | space->context);
+	adreno8_put(&adreno8_smmu, "route s2cr translate", SMMU_S2CR(match), adreno8_space_s2cr(space));
 	adreno8_settle();
 	if (!adreno8_space_route_check(space, stream, match) || adreno8_space_faulted(space)) {
 		adreno8_put(&adreno8_smmu, "route s2cr fault", SMMU_S2CR(match), SMMU_S2CR_FAULT | SMMU_S2CR_SHCFG_NSH);
@@ -1092,9 +1102,9 @@ adreno8_space_faulted(struct adreno8_gpu_space *space)
 	if (fsr == 0) {
 		return false;
 	}
-	printf("adreno8: %u: %s SMMU fault %#x at %#x:%#x, syndrome %#x\n", adreno8_step, space->name, fsr,
+	printf("adreno8: %u: %s SMMU fault %#x at %#x:%#x, syndrome %#x fsynr1 %#x\n", adreno8_step, space->name, fsr,
 	    adreno8_rd(adreno8_smmu.base + cb + SMMU_CB_FAR_HI), adreno8_rd(adreno8_smmu.base + cb + SMMU_CB_FAR_LO),
-	    adreno8_rd(adreno8_smmu.base + cb + SMMU_CB_FSYNR0));
+	    adreno8_rd(adreno8_smmu.base + cb + SMMU_CB_FSYNR0), adreno8_rd(adreno8_smmu.base + cb + SMMU_CB_FSYNR1));
 	/* Secure diagnostics read registers only. Ownership transfer forbids CPU
 	 * access to data pages; this path also leaves shared table contents untouched. */
 	if (space == &adreno8_secure_space) {

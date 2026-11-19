@@ -211,6 +211,7 @@ struct adreno8_gpu_space {
 #define SMMU_CB_FAR_LO          0x60
 #define SMMU_CB_FAR_HI          0x64
 #define SMMU_CB_FSYNR0          0x68
+#define SMMU_CB_FSYNR1          0x6c
 #define SMMU_CB_TLBIVA          0x600
 #define SMMU_CB_TLBASID         0x610
 #define SMMU_CB_TLBSYNC         0x7f0

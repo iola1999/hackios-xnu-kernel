@@ -120,6 +120,7 @@ struct MiniIOSurface {
     uint8_t *kbase;
     unsigned held = 1;
     uint32_t drawn = 0;
+    uint32_t cpuSyncedFence = 0;
     void *client = nullptr;
     struct { uint64_t allocSize; uint32_t offset, bytesPerRow, width, height, pixelFormat, planeCount; } info{};
     struct Shared { uint32_t seed = 0; } state;
@@ -167,7 +168,16 @@ static uint32_t adreno8_context_depth() { return context_depth; }
 static uint32_t annibale_gpu_submit(const uint64_t *, const uint32_t *, uint32_t count) {
     assert(count); ++submit_calls; return submit_answer;
 }
-static void annibale_gpu_to_memory(void *, uint64_t) {}
+static unsigned flush_calls;
+static void *last_flush_ptr;
+static uint64_t last_flush_size;
+static void annibale_gpu_to_memory(void *start, uint64_t size) {
+    if (start != nullptr || size != 0) {
+        ++flush_calls;
+        last_flush_ptr = start;
+        last_flush_size = size;
+    }
+}
 static void annibale_gpu_report(const char *) {}
 static bool annibale_gpu_recover() { return recover_ok; }
 static void annibale_gpu_worked(uint64_t *time, uint32_t *count, uint32_t by[7]) {
@@ -190,7 +200,8 @@ static void reset() {
     map_calls = unmap_calls = freed_addresses = done_calls = submit_calls = map_fail_at = 0;
     wrong_pages = busy_for = 0; context_depth = 4;
     submit_answer = 17; next_address = 0x40000000; now = 0;
-    gGPUReported = gGPUCached = false; gGPUKeep = 0;
+    gGPUReported = gGPUCached = gGPUCoherent = false; gGPUKeep = 0;
+    flush_calls = 0; last_flush_ptr = nullptr; last_flush_size = 0;
     IOBufferMemoryDescriptor::next_segment_limit = UINT64_MAX;
     surface_lookup = nullptr; memset(&gGPUStat, 0, sizeof(gGPUStat));
 }
@@ -356,6 +367,18 @@ static void display() {
     reset(); MiniIOSurface s{}; s.drawn = 7; ready = false;
     assert(!MiniIOSurfaceDrawn(&s, 0) && done_calls == 0);
     ready = true; assert(MiniIOSurfaceDrawn(&s, 0));
+
+    reset();
+    auto *m = new IOMemoryDescriptor(2 * PAGE_SIZE);
+    MiniIOSurface s2{}; s2.memory = m; s2.kbase = m->bytes;
+    s2.info.allocSize = PAGE_SIZE; s2.drawn = 7;
+    assert(MiniIOSurfaceDrawn(&s2, 0) && flush_calls == 1);
+    assert(last_flush_ptr == m->bytes + PAGE_SIZE && last_flush_size == PAGE_SIZE);
+    assert(s2.cpuSyncedFence == 7);
+    assert(MiniIOSurfaceDrawn(&s2, 0) && flush_calls == 1);
+
+    gGPUCoherent = true; s2.drawn = 8;
+    assert(MiniIOSurfaceDrawn(&s2, 0) && flush_calls == 1);
 }
 int main() {
     healthy(); stopped(); failed_reap(); completed_reap(); failed_free(); partial_map(); segments(); kept();

@@ -418,6 +418,10 @@ bool adreno8_hfi_poll(void) {
     if (!poll_ok || adreno8_gpu_faulted()) { ordinary_ok=false; return false; }
     return true;
 }
+void adreno8_bo_dump_words(const char *w, uint64_t a, uint32_t c) { (void)w; (void)a; (void)c; }
+void adreno8_bo_dump_tree(uint64_t b, uint32_t c) { (void)b; (void)c; }
+void adreno8_bo_describe_owner(const char *w, uint32_t a) { (void)w; (void)a; }
+void adreno8_context_describe_inflight(void) {}
 bool adreno8_hwsched_raw(const uint32_t *pm4_words, uint32_t words, const char *name)
 {
     (void)name;

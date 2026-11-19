@@ -186,6 +186,29 @@ adreno8_bo_describe_fault(uint32_t fault)
 		bo_say_record(fault, "nearest live below:", below, now);
 	if (above)
 		bo_say_record(fault, "nearest live above:", above, now);
+	adreno8_gpu_hang_dump();
+	adreno8_context_describe_inflight();
+}
+
+void
+adreno8_bo_describe_owner(const char *what, uint32_t address)
+{
+	uint64_t now = mach_absolute_time();
+	unsigned matches = 0;
+
+	for (uint32_t i = 1; i <= BO_HISTORY; i++) {
+		const struct bo_record *r = &bo_history[(bo_history_next - i) % BO_HISTORY];
+
+		if (r->reserved == 0)
+			continue;
+		if (address >= r->address && address - r->address < r->size) {
+			bo_say_record(address, what, r, now);
+			if (++matches >= 2)
+				return;
+		}
+	}
+	if (matches == 0)
+		printf("adreno8: %s %#x: no matching BO in last %u reservations\n", what, address, BO_HISTORY);
 }
 
 /* The pages entered since the last commit, which cleans just their entries out of the cache. */
@@ -342,34 +365,117 @@ adreno8_bo_dump_words(const char *what, uint64_t address, uint32_t count)
 }
 
 /* Packet opcodes and registers the walk follows (Mesa adreno_pm4.xml and a6xx.xml, A8XX). */
+#define PM4_LOAD_STATE6 0x30
+#define PM4_LOAD_STATE6_GEOM 0x32
+#define PM4_LOAD_STATE6_FRAG 0x34
 #define PM4_INDIRECT_BUFFER 0x3f
 #define PM4_INDIRECT_BUFFER_CHAIN 0x57
 #define PM4_SET_DRAW_STATE 0x43
 #define PM4_CONTEXT_REG_BUNCH 0x5c
+#define PM4_STATE_SRC_INDIRECT 2
+#define PM4_STATE_TYPE_CONSTANTS 1
 #define DRAW_STATE_DISABLE (1u << 17)
-/* SP_GFX_BINDLESS_BASE[4].DESCRIPTOR, the fragment stage's set; bits 0-1 are the descriptor size. */
-#define BINDLESS_BASE_FS 0xab12
+#define BINDLESS_SETS 8
+#define BINDLESS_SLOTS 64
+#define BINDLESS_BASE_CS 0xa9e8
+#define BINDLESS_BASE_GFX 0xab0a
+#define BINDLESS_SEEN_MAX 32
+#define INDIRECT_SEEN_MAX 256
+#define INDIRECT_MAX_DWORDS 1024
 /* Mesa's fb-read descriptors: IR3_BINDLESS_DESC_COUNT - 1 - A6XX_MAX_RENDER_TARGETS, 16 dwords each. */
 #define FB_READ_FIRST_SLOT 55
 #define FB_READ_SLOTS 4
-#define TREE_BUFFERS 96
-#define TREE_WORDS 12288
+#define TREE_BUFFERS 2048
+#define TREE_WORDS 49152
 #define TREE_DEPTH 3
+
+struct bo_bindless_rec {
+	uint64_t base;
+	uint8_t set;
+	bool cs;
+};
+
+struct bo_indirect_rec {
+	uint64_t base;
+	uint32_t words;
+	uint8_t state_type;
+};
 
 struct bo_tree {
 	uint64_t seen[TREE_BUFFERS];
 	unsigned buffers;
 	uint32_t words;
-	uint64_t bindless_fs;
+	uint64_t gfx_bindless_cur[BINDLESS_SETS];
+	uint64_t cs_bindless_cur[BINDLESS_SETS];
+	struct bo_bindless_rec bindless_seen[BINDLESS_SEEN_MAX];
+	unsigned bindless_count;
+	struct bo_indirect_rec indirect_seen[INDIRECT_SEEN_MAX];
+	unsigned indirect_count;
 };
+
+static void
+bo_tree_record_bindless(struct bo_tree *tree, uint64_t base, uint8_t set, bool cs)
+{
+	if (!base)
+		return;
+	for (unsigned i = 0; i < tree->bindless_count; i++) {
+		if (tree->bindless_seen[i].base == base &&
+		    tree->bindless_seen[i].set == set &&
+		    tree->bindless_seen[i].cs == cs)
+			return;
+	}
+	if (tree->bindless_count < BINDLESS_SEEN_MAX) {
+		tree->bindless_seen[tree->bindless_count++] = (struct bo_bindless_rec){
+			.base = base, .set = set, .cs = cs,
+		};
+	}
+}
+
+static void
+bo_tree_record_indirect(struct bo_tree *tree, uint64_t base, uint32_t words, uint8_t state_type)
+{
+	if (!base || !words)
+		return;
+	for (unsigned i = 0; i < tree->indirect_count; i++) {
+		if (tree->indirect_seen[i].base == base &&
+		    tree->indirect_seen[i].words == words)
+			return;
+	}
+	if (tree->indirect_count < INDIRECT_SEEN_MAX) {
+		tree->indirect_seen[tree->indirect_count++] = (struct bo_indirect_rec){
+			.base = base, .words = words, .state_type = state_type,
+		};
+	}
+}
 
 static void
 bo_tree_reg(struct bo_tree *tree, uint32_t reg, uint32_t value)
 {
-	if (reg == BINDLESS_BASE_FS)
-		tree->bindless_fs = (tree->bindless_fs & ~0xffffffffull) | (value & ~3u);
-	else if (reg == BINDLESS_BASE_FS + 1)
-		tree->bindless_fs = (tree->bindless_fs & 0xffffffffull) | (uint64_t)value << 32;
+	uint64_t *cur;
+	uint8_t set;
+	bool is_hi, is_cs;
+
+	if (reg >= BINDLESS_BASE_GFX && reg < BINDLESS_BASE_GFX + BINDLESS_SETS * 2) {
+		uint32_t off = reg - BINDLESS_BASE_GFX;
+		set = (uint8_t)(off / 2);
+		is_hi = (off & 1u) != 0;
+		is_cs = false;
+		cur = &tree->gfx_bindless_cur[set];
+	} else if (reg >= BINDLESS_BASE_CS && reg < BINDLESS_BASE_CS + BINDLESS_SETS * 2) {
+		uint32_t off = reg - BINDLESS_BASE_CS;
+		set = (uint8_t)(off / 2);
+		is_hi = (off & 1u) != 0;
+		is_cs = true;
+		cur = &tree->cs_bindless_cur[set];
+	} else {
+		return;
+	}
+	if (is_hi) {
+		*cur = (*cur & 0xffffffffull) | ((uint64_t)value << 32);
+		bo_tree_record_bindless(tree, *cur, set, is_cs);
+	} else {
+		*cur = (*cur & ~0xffffffffull) | (value & ~3u);
+	}
 }
 
 static void
@@ -378,16 +484,19 @@ bo_tree_walk(struct bo_tree *tree, uint64_t base, uint32_t count, unsigned depth
 	for (unsigned i = 0; i < tree->buffers; i++)
 		if (tree->seen[i] == base)
 			return;
-	if (tree->buffers == TREE_BUFFERS || tree->words + count > TREE_WORDS) {
-		printf("adreno8: tree %#llx (%u words) not printed: over the dump's size\n", base, count);
+	if (tree->buffers == TREE_BUFFERS) {
+		printf("adreno8: tree %#llx (%u words) skipped: over %u buffers\n", base, count, TREE_BUFFERS);
 		return;
 	}
 	tree->seen[tree->buffers++] = base;
-	tree->words += count;
-
-	char what[32];
-	snprintf(what, sizeof(what), "tree %u of %u", depth, count);
-	adreno8_bo_dump_words(what, base, count);
+	if (tree->words + count <= TREE_WORDS) {
+		char what[32];
+		tree->words += count;
+		snprintf(what, sizeof(what), "tree %u of %u", depth, count);
+		adreno8_bo_dump_words(what, base, count);
+	} else {
+		printf("adreno8: tree %#llx (%u words) not printed: over the dump's size\n", base, count);
+	}
 
 	for (uint32_t at = 0; at < count;) {
 		uint32_t header, size, a, b, c;
@@ -419,6 +528,19 @@ bo_tree_walk(struct bo_tree *tree, uint64_t base, uint32_t count, unsigned depth
 			     bo_word(body + 4ull * (i + 1), &b) && bo_word(body + 4ull * (i + 2), &c); i += 3)
 				if ((a & 0xffff) && !(a & DRAW_STATE_DISABLE))
 					bo_tree_walk(tree, b | (uint64_t)c << 32, a & 0xffff, depth + 1);
+		} else if ((opcode == PM4_LOAD_STATE6 || opcode == PM4_LOAD_STATE6_GEOM ||
+		    opcode == PM4_LOAD_STATE6_FRAG) && size >= 3 && bo_word(body, &a) &&
+		    bo_word(body + 4, &b) && bo_word(body + 8, &c)) {
+			uint32_t state_src = (a >> 16) & 3u;
+			uint32_t state_type = (a >> 14) & 3u;
+			uint32_t num_unit = (a >> 22) & 0x3ffu;
+			if (state_src == PM4_STATE_SRC_INDIRECT && num_unit > 0) {
+				uint32_t dwords = num_unit * (state_type == PM4_STATE_TYPE_CONSTANTS ? 16u : 4u);
+				if (dwords > INDIRECT_MAX_DWORDS)
+					dwords = INDIRECT_MAX_DWORDS;
+				bo_tree_record_indirect(tree, b | ((uint64_t)c << 32), dwords,
+				    (uint8_t)state_type);
+			}
 		}
 		at += size + 1;
 	}
@@ -429,8 +551,41 @@ adreno8_bo_dump_tree(uint64_t base, uint32_t count)
 {
 	static struct bo_tree tree;
 
+	memset(&tree, 0, sizeof(tree));
 	bo_tree_walk(&tree, base, count, 0);
-	if (!tree.bindless_fs) {
+	for (uint8_t s = 0; s < BINDLESS_SETS; s++) {
+		bo_tree_record_bindless(&tree, tree.gfx_bindless_cur[s], s, false);
+		bo_tree_record_bindless(&tree, tree.cs_bindless_cur[s], s, true);
+	}
+	for (unsigned i = 0; i < tree.indirect_count; i++) {
+		const char *kind = tree.indirect_seen[i].state_type == PM4_STATE_TYPE_CONSTANTS ?
+		    "indirect tex" : "indirect samp";
+		adreno8_bo_dump_words(kind, tree.indirect_seen[i].base, tree.indirect_seen[i].words);
+	}
+	for (unsigned i = 0; i < tree.bindless_count; i++) {
+		const struct bo_bindless_rec *rec = &tree.bindless_seen[i];
+		for (unsigned slot = 0; slot < BINDLESS_SLOTS; slot++) {
+			uint64_t addr = rec->base + 64ull * slot;
+			bool any = false, all_ok = true;
+			for (uint32_t w = 0; w < 16; w++) {
+				uint32_t word = 0;
+				if (!bo_word(addr + 4ull * w, &word)) {
+					all_ok = false;
+					break;
+				}
+				if (word != 0)
+					any = true;
+			}
+			if (any || (!all_ok && slot == 0)) {
+				char what[48];
+				snprintf(what, sizeof(what), "%s bindless %u slot %u",
+				    rec->cs ? "cs" : "gfx", rec->set, slot);
+				adreno8_bo_dump_words(what, addr, 16);
+			}
+		}
+	}
+	uint64_t bindless_fs = tree.gfx_bindless_cur[4];
+	if (!bindless_fs) {
 		printf("adreno8: tree: no write to SP_GFX_BINDLESS_BASE[4]\n");
 		return;
 	}
@@ -438,7 +593,7 @@ adreno8_bo_dump_tree(uint64_t base, uint32_t count)
 		char what[48];
 
 		snprintf(what, sizeof(what), "fs bindless slot %u", slot);
-		adreno8_bo_dump_words(what, tree.bindless_fs + 64ull * slot, 16);
+		adreno8_bo_dump_words(what, bindless_fs + 64ull * slot, 16);
 	}
 }
 

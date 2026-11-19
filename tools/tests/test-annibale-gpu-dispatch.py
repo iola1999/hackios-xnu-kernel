@@ -272,8 +272,9 @@ def run(source, directory, label, cpp=True, success=True):
 
 def boundaries(source, fixture):
     unit=fixture["unit"](source,(IOKIT/"AnnibaleGPUMemory.inc").read_text())
-    unit=unit.replace('static void annibale_gpu_to_memory(void *, uint64_t) {}',
-        'static unsigned cache_pushes;\nstatic void annibale_gpu_to_memory(void *, uint64_t) { cache_pushes++; }',1)
+    hook='static void annibale_gpu_to_memory(void *start, uint64_t size) {'
+    assert hook in unit
+    unit=unit.replace(hook, 'static unsigned cache_pushes;\n'+hook+'\n    cache_pushes++;', 1)
     return unit.replace('int main() {',BOUNDARIES.replace('static unsigned cache_pushes;','')
                         +'\nint main() {\n    a830_boundaries();',1)
 

@@ -352,6 +352,7 @@ card_power_up(void)
 	ms(10);
 	printf("pcie: step 7: after the MHI reset: status %#x, execution environment %u\n", rd(bar + 0x48),
 	    rd(bar + rd(bar + 0x28) + 0x28));
+	annibale_bt_start();
 }
 
 /* ASPM off while it loads; MSI on, its writes landing in SINK (UniXNU endpointLinkSetup) */
