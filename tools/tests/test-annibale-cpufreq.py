@@ -37,6 +37,31 @@ typedef struct { unsigned int num_cpus; ml_topology_cpu_t cpus[2]; } ml_topology
 #define os_atomic_load(p, order) (*(p))
 #define os_atomic_store(p, v, order) (*(p) = (v))
 #define os_atomic_xchg(p, v, order) ({ __typeof__(*(p)) _old = *(p); *(p) = (v); _old; })
+#define os_atomic_cmpxchg(p, e, v, order) (*(p) == (e) ? (*(p) = (v), true) : false)
+#define os_atomic_inc(p, order) (++*(p))
+/* The scheduler's performance-control interface, as far as annibale_cpufreq.c names it. */
+#define WORK_INTERVAL_TYPE_MASK 0xf0000000u
+#define WORK_INTERVAL_TYPE_COREAUDIO 0x10000000u
+#define WORK_INTERVAL_TYPE_CA_RENDER_SERVER 0x20000000u
+#define WORK_INTERVAL_TYPE_CA_CLIENT 0x30000000u
+#define WORK_INTERVAL_TYPE_HID_DELIVERY 0x50000000u
+#define WORK_INTERVAL_TYPE_FRAME_COMPOSITOR 0x80000000u
+#define QUANTUM_EXPIRY 4
+#define PERFCONTROL_CLASS_USER_INITIATED 5
+#define SCHED_PERFCONTROL_CALLBACKS_VERSION_7 7
+typedef struct perfcontrol_state *perfcontrol_state_t;
+typedef struct perfcontrol_work_interval { uint32_t create_flags; uint64_t start, finish, deadline; } *perfcontrol_work_interval_t;
+typedef int perfcontrol_event;
+struct perfcontrol_thread_data { int perfctl_class; };
+struct sched_perfcontrol_callbacks {
+    unsigned long version;
+    void (*work_interval_notify)(perfcontrol_state_t, perfcontrol_work_interval_t);
+    void (*state_update)(perfcontrol_event, uint32_t, uint64_t, uint32_t, struct perfcontrol_thread_data *, uint64_t *);
+};
+static struct sched_perfcontrol_callbacks *perfcontrol_registered;
+static void sched_perfcontrol_register_callbacks(struct sched_perfcontrol_callbacks *callbacks, unsigned long size) {
+    (void)size; perfcontrol_registered = callbacks;
+}
 
 static const uint32_t device_khz[16] = { 1017600, 1209600, 1401600, 1689600, 1958400, 2246400, 2438400, 2649600,
     2841600, 3072000, 3283200, 3513600, 3801600, 4089600, 4204800, 4320000 };

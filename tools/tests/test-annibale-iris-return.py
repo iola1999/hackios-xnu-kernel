@@ -162,6 +162,7 @@ static void annibale_wifi_quiesce(void) { }
 static void annibale_haptic_quiesce(void) { }
 static void annibale_torch_quiesce(void) { }
 static bool annibale_camera_return_quiesce(void) { return !named("camera_unquiesced"); }
+static bool annibale_modem_return_quiesce(void) { return true; }
 static void MiniIOMobileFramebufferPowerOff(void) { display_calls++; }
 static void MiniIOMobileFramebufferQuiesce(void) { display_calls++; }
 static void hv_wdt_pet_NOW(void) { }

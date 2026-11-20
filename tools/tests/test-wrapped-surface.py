@@ -28,11 +28,14 @@ PREFIX = r'''
 #define DIV_ROUND_UP(a,b) (((a)+(b)-1)/(b))
 #define RWA_LOCKED
 struct rwa_buffer_texture;
-struct rwa_device { struct rwa_buffer_texture *buffer_textures; };
+struct rwa_device { struct rwa_buffer_texture *buffer_textures; unsigned written_buffer_textures, buffer_textures_count; };
 struct rwa_buffer { struct rwa_device *device; void *map,*mirror; size_t size; uint64_t mirror_hash; bool mirror_hashed; };
 struct pipe_resource { unsigned height0,width0; };
-struct rwa_texture { struct pipe_resource *res; struct rwa_buffer_texture *backing; char *pixels; const char *format_name; };
+struct rwa_texture { struct rwa_device *device; struct pipe_resource *res; struct rwa_buffer_texture *backing; char *pixels; const char *format_name; };
 struct rwa_buffer_texture { struct rwa_texture *texture; struct rwa_buffer *source; size_t offset; unsigned row_bytes; uint64_t hash; bool hashed,written; struct rwa_buffer_texture *next; };
+static inline void buffer_texture_clear_written(struct rwa_device *device, struct rwa_buffer_texture *backing) {
+ if (backing && backing->written) { backing->written = false; __atomic_fetch_sub(&device->written_buffer_textures, 1u, __ATOMIC_RELEASE); }
+}
 static unsigned checks, failures, imports, buffers, released_buffers, released_textures;
 static bool reject_buffer, reject_texture, reject_import, no_import;
 static int kernel_result;
@@ -78,6 +81,8 @@ static void texture_destroy(struct rwa_texture *t) {
   struct rwa_buffer_texture **p=&t->backing->source->device->buffer_textures;
   while(*p && *p!=t->backing)p=&(*p)->next;
   if(*p)*p=(*p)->next;
+  buffer_texture_clear_written(t->backing->source->device,t->backing);
+  t->backing->source->device->buffer_textures_count--;
   free(t->backing);
  }
  free(t->res);free(t->pixels);free(t);released_textures++;
@@ -106,7 +111,8 @@ static struct { void (*texture_destroy)(struct rwa_texture *); } mesa={texture_d
  t->pixels=calloc(t->res->width0*t->res->height0,4);
  struct rwa_buffer_texture *b=calloc(1,sizeof(*b));
  *b=(struct rwa_buffer_texture){.texture=t,.source=&storage,.offset=o,.row_bytes=r,.next=storage.device->buffer_textures};
- storage.device->buffer_textures=b;t->backing=b;
+ storage.device->buffer_textures=b;t->backing=b;t->device=storage.device;
+ storage.device->buffer_textures_count++;
  char why[256];if(buffer_texture_upload(b,why,sizeof(why))) {texture_destroy(t);return nil;}
  struct rwa_texture_shape s={.pixel_format=[d pixelFormat],.width=[d width],.height=[d height],.usage=[d usage]};
  AnnibaleMetalTexture *tex=[[AnnibaleMetalTexture alloc] initWithAnnibaleDevice:owner texture:t shape:&s iosurface:NULL plane:0];
@@ -151,7 +157,7 @@ int main(void) { @autoreleasepool {
  uint8_t *base=(uint8_t *)IOSurfaceGetBaseAddress(s)-64;size_t n=IOSurfaceGetAllocSize(s);
  memset(base,0x5a,n);rwa_buffer_textures_refresh(&gpu);
  check("CPU edits refresh active pixels",t->_texture->pixels[0]==0x5a && t->_texture->pixels[339]==0x5a);
- memset(t->_texture->pixels,0x26,340);back->written=true;rwa_buffer_textures_writeback(&gpu);
+ memset(t->_texture->pixels,0x26,340);back->written=true;gpu.written_buffer_textures++;rwa_buffer_textures_writeback(&gpu);
  bool pixels=true,guards=true;
  for(size_t i=0;i<n;i++) {
   bool active=i>=64 && i<64+128*5 && (i-64)%128<68;
@@ -163,7 +169,7 @@ int main(void) { @autoreleasepool {
  id c=[dev newTextureWithDescriptor:d iosurface:s plane:0];
  check("wider usage creates a supported wrapper",c!=nil && ([c usage]&MTLTextureUsageShaderWrite));
  struct rwa_texture *other=((AnnibaleMetalTexture *)c)->_texture;
- memset(other->pixels,0x39,340);other->backing->written=true;
+ memset(other->pixels,0x39,340);other->backing->written=true;gpu.written_buffer_textures++;
  rwa_buffer_textures_writeback(&gpu);rwa_buffer_textures_refresh(&gpu);
  check("different usage wrapper observes completed writes",t->_texture->pixels[0]==0x39 && t->_texture->pixels[339]==0x39);
  [c release];d.usage=MTLTextureUsageShaderRead;
