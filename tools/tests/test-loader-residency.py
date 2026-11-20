@@ -66,7 +66,11 @@ static uint64_t smc_call(uint64_t id, uint64_t a, uint64_t b, void *d, void *e)
 { assert(id == VIRT_WDT_PET); (void)a; (void)b; (void)d; (void)e; pets++; return 0; }
 static void reboot(void) { resets++; if (entry_active) longjmp(entry_return, 1); }
 static void slot_detect(void) {}
-static void slot_set_active_other(void) {}
+static int fail_slot_switch;
+static const char *slot_set_active_other(void)
+{ return fail_slot_switch ? "UFS Boot LUN update failed" : NULL; }
+static void __attribute__((unused)) set_result(const char *result, uint64_t a, uint64_t b)
+{ (void)a; (void)b; strcpy(last_result, result); }
 static void slot_maintain_current(void) {}
 static void spmi_buttons_init(struct spmi_btn_ctx *ctx) { memset(ctx, 0, sizeof(*ctx)); }
 static int spmi_obsrv_read(int ch, uint8_t reg, uint8_t *buf, unsigned n)
@@ -147,14 +151,19 @@ int main(int argc, char **argv)
         assert(kernels == 1 && !usb_menu_interrupted);
         elapsed(181); assert(!pets);
     } else {
+        fail_slot_switch = !strcmp(name, "android-switch-failed");
         int choice = !strcmp(name, "manual") ? MENU_CHOICE_FASTBOOT :
-            !strcmp(name, "android") ? MENU_CHOICE_ANDROID : MENU_CHOICE_IOS;
-        int have = !strcmp(name, "standalone"), usb_mode = !strcmp(name, "usb-mode");
+            (!strcmp(name, "android") || fail_slot_switch) ? MENU_CHOICE_ANDROID : MENU_CHOICE_IOS;
+        int have = !strcmp(name, "standalone") || fail_slot_switch;
+        int usb_mode = !strcmp(name, "usb-mode");
         entry_active = 1;
         if (!setjmp(entry_return)) entry_after_menu(choice, have || usb_mode, usb_mode);
         entry_active = 0;
         if (!strcmp(name, "android")) {
             assert(resets == 1 && !command_loops && !usb_menu_interrupted);
+        } else if (fail_slot_switch) {
+            assert(!resets && !kernels && command_loops == 1 && usb_menu_interrupted);
+            assert(!strcmp(last_result, "android-slot-failed"));
         } else if (have) {
             assert(kernels == 1 && command_loops == 1 && boot_fallback_active);
             elapsed(181); assert(resets == 1 && !pets);
@@ -187,7 +196,7 @@ def harness(sources):
 
 
 CASES = ['recovery', 'fallback', 'unselected', 'ownership', 'menu-draw', 'menu-poll',
-         'run-revokes', 'manual', 'android', 'standalone', 'loader-only', 'usb-mode']
+         'run-revokes', 'manual', 'android', 'android-switch-failed', 'standalone', 'loader-only', 'usb-mode']
 
 
 def run(sources, path):
@@ -219,7 +228,7 @@ def verify(args, directory):
             'fallback_not_cleared': (UI, '\tboot_fallback_active = 0;', ''),
             'fallback_keeps_residency': (UI, '\tboot_fallback_active = 1;\n\tusb_menu_interrupted = 0;', '\tboot_fallback_active = 1;'),
             'watchdog_silence': (WDT, 'fastboot_idle_resident() ||', ''),
-            'manual_not_resident': (USB, '} else if (menu_choice == MENU_CHOICE_FASTBOOT) {\n\t\t(void)menu_enter_fastboot();', '} else if (menu_choice == MENU_CHOICE_FASTBOOT) {'),
+            'manual_not_resident': (USB,  '\t\tif (menu_choice == MENU_CHOICE_FASTBOOT) slot_maintain_current();\n\t\t(void)menu_enter_fastboot();', '\t\tif (menu_choice == MENU_CHOICE_FASTBOOT) slot_maintain_current();'),
             'loader_only_not_resident': (USB, '\t\tif (!boot_fallback_active) (void)menu_enter_fastboot();', ''),
             'run_keeps_residency': (USB, '\t\t\tusb_menu_interrupted = 0;', ''),
             'menu_draw_clears': (UI, '\tusb_menu_interrupted = 0;\n\tui_fill', '\tui_fill'),

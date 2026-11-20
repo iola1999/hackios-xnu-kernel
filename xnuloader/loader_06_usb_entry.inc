@@ -94,6 +94,42 @@ usb_start(void)
 
 #include "loader_06a_screen_ui.inc"
 
+/* Qualcomm UFSDxe exposes Boot LUN independently of the GPT slot metadata. */
+typedef struct qcom_ufs_boot_lun {
+	uint64_t revision;
+	void *get_device_info;
+	efi_status (EFIAPI *get)(struct qcom_ufs_boot_lun *, uint32_t *lun);
+	efi_status (EFIAPI *set)(struct qcom_ufs_boot_lun *, uint32_t lun);
+} qcom_ufs_boot_lun;
+
+static const char *
+slot_set_active_other(void)
+{
+	if (!android_slot) return NULL;
+	if (PLAT != &platform_annibale)
+		return slot_apply_active(android_slot) ? NULL : "Android slot GPT update failed";
+
+	static const efi_guid guid = { 0x85c1f7d2, 0xbce6, 0x4f31,
+		{ 0x8f, 0x4d, 0xd3, 0x7e, 0x03, 0xd0, 0x5e, 0xaa } };
+	qcom_ufs_boot_lun *ufs = NULL;
+	if (EFI_ERROR(BS->locate_protocol(&guid, NULL, (void **)&ufs)) ||
+	    !ufs || ufs->revision <= 0x10002 || !ufs->get || !ufs->set)
+		return "UFS Boot LUN protocol unavailable";
+
+	uint32_t lun = 0;
+	uint32_t target = android_slot == 'a' ? 1 : 2;
+	if (EFI_ERROR(ufs->get(ufs, &lun))) return "UFS Boot LUN read failed";
+	if (!slot_apply_active(android_slot)) return "Android slot GPT update failed";
+	if (lun != target) {
+		if (EFI_ERROR(ufs->set(ufs, target))) return "UFS Boot LUN update failed";
+		lun = 0;
+		if (EFI_ERROR(ufs->get(ufs, &lun)) || lun != target)
+			return "UFS Boot LUN verification failed";
+	}
+	print("slot: Android Boot LUN %d verified\n", (uint64_t)lun);
+	return NULL;
+}
+
 /*
  * Pump controller events until a transfer on `endpoint` finishes.
  * Returns the byte count, or -1 if the transfer was cancelled or the cable
@@ -880,9 +916,9 @@ fb_command(char *cmd)
 			if (kernel_resources_held) {
 				fb_reply("FAIL", "kernel resources held: run oem stop first");
 			} else {
-				slot_set_active_other();
-				fb_reply("OKAY", "");
-				reboot();
+				const char *err = slot_set_active_other();
+				fb_reply(err ? "FAIL" : "OKAY", err ? err : "");
+				if (!err) reboot();
 			}
 		} else if (starts_with(cmd, "oem log")) {
 			if (running_live != NULL) {
@@ -1104,10 +1140,13 @@ efi_main(efi_handle image, efi_system_table *st)
 	(void)usb_start();
 	int menu_choice = nvram_fastboot_consume() ? MENU_CHOICE_FASTBOOT : ui_boot_menu();
 	if (menu_choice == MENU_CHOICE_ANDROID) {
-		slot_set_active_other();
-		reboot();
-	} else if (menu_choice == MENU_CHOICE_FASTBOOT) {
-		slot_maintain_current();
+		const char *err = slot_set_active_other();
+		if (!err) reboot();
+		print("slot: Android boot failed: %s\n", err);
+		set_result("android-slot-failed", 0, 0);
+	}
+	if (menu_choice != MENU_CHOICE_IOS) {
+		if (menu_choice == MENU_CHOICE_FASTBOOT) slot_maintain_current();
 		(void)menu_enter_fastboot();
 		if (USB != NULL || usb_start()) {
 			flush_log();
@@ -1118,7 +1157,7 @@ efi_main(efi_handle image, efi_system_table *st)
 	}
 
 	/* One-shot mode: run the kernel that came with the image, then fall back to Fastboot if it returns. */
-	if (have_payload && !pi.usb_mode) {
+	if (menu_choice == MENU_CHOICE_IOS && have_payload && !pi.usb_mode) {
 		run_kernel(0, 0);
 		boot_fallback_enter();
 	}
