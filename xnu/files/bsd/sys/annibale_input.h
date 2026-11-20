@@ -125,6 +125,7 @@ uint32_t annibale_gpu_irqs(void);                /* the GPU's completion interru
 /* Between two looks at annibale_gpu_done(): until the next interrupt after `seen`, at most longest_us; without interrupts poll_us. */
 void annibale_gpu_pause(uint32_t seen, uint32_t poll_us, uint32_t longest_us);
 uint32_t annibale_gpu_last(void);
+uint32_t annibale_gpu_retired(void);
 void annibale_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]);
 void annibale_gpu_speed(uint32_t *mhz, uint32_t *changes);      /* the A830's speed and its changes; 0 and 0 elsewhere */
 void annibale_gpu_report(const char *why);

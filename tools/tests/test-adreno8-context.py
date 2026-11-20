@@ -310,7 +310,12 @@ int main(void) {
     assert(adreno8_context_wait_idle("after self-test") && idle_calls == 5);
     context_last = 0;
     assert(adreno8_context_wait_idle("without a pending timestamp") && idle_calls == 6);
+    /* A submission still running: the bounded drain says no and closes nothing. */
+    context_last = 3; unsigned idle_before = idle_calls;
+    assert(!adreno8_context_drained("GPU speed", 1000) && !closed && context_state != CONTEXT_FAILED);
+    assert(idle_calls == idle_before);
     context_last = 2;
+    assert(adreno8_context_drained("GPU speed", 1000) && idle_calls == idle_before + 1);
     assert(allocations[0].publishes == 1 && allocations[1].publishes == 1);
     assert(allocations[0].acquires == 0 && allocations[1].acquires == 0);
     assert(!adreno8_context_done(3) && adreno8_context_done(2));
@@ -342,7 +347,7 @@ int main(void) {
     reset(NORMAL);
     assert(adreno8_context_submit(addresses, lengths, 83) == 0 && allocation_count == 0 && command_count == 0);
 
-    reset(RETIRE_ONLY); assert(!adreno8_context_test() && dispatches == 1 && clock_ns == 2000000000ULL);
+    reset(RETIRE_ONLY); assert(!adreno8_context_test() && dispatches == 1 && clock_ns == 30000000000ULL);
     assert(allocation_count == 4 && closed && context_last == 1 && !adreno8_context_done(1));
     assert(!adreno8_context_prepare() && !adreno8_context_close() && command_count == 2);
     reset(BAD_ACK); assert(!adreno8_context_test() && command_count == 1 && clock_ns == 1000000000ULL);

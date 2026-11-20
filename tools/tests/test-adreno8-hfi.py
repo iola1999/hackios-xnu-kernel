@@ -334,8 +334,8 @@ static bool context_idle_ok = true, gpu_idle_for_speed;
 static int adreno8_say(const char *format, ...) { return 0; }
 #define printf adreno8_say
 static bool adreno8_cx_ready(void) { return true; }
-static bool __attribute__((unused)) adreno8_context_wait_idle(const char *what) {
-    assert(!strcmp(what, "GPU speed"));
+static bool __attribute__((unused)) adreno8_context_drained(const char *what, uint32_t limit_us) {
+    assert(!strcmp(what, "GPU speed") && limit_us == 20000);
     wait_idle_calls++;
     gpu_idle_for_speed = context_idle_ok;
     return context_idle_ok;
@@ -578,7 +578,7 @@ speed_mutations = [
     ("missing reading kept at speed", "if (!annibale_gpu_temperature(&tenths) ||", "if ((annibale_gpu_temperature(&tenths), false) ||"),
     ("speed vote without rate limit", "since < SPEED_TICK_NS", "since < 0"),
     ("bus row of the slowest speed", "adreno8_speeds[want - 1].bus", "adreno8_speeds[0].bus"),
-    ("speed change without pipeline idle drain", 'if (!adreno8_context_wait_idle("GPU speed"))', "if (false)"),
+    ("speed change without pipeline idle drain", 'if (!adreno8_context_drained("GPU speed", SPEED_DRAIN_US))', "if (false)"),
 ]
 for label, before, after in vote_mutations + speed_mutations:
     assert STAGE_SOURCE.count(before) == 1, label

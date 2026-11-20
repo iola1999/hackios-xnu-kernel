@@ -26,6 +26,10 @@
  * (HFI 150, with the timestamps and a CP dump) has arrived on device both before and after two
  * seconds; a wait that gives up sooner closes submissions with neither. */
 #define CONTEXT_WAIT_NS 2000000000ULL
+/* A submission may run for seconds (the camera's still-image passes at the lowest GPU speed), so
+ * a wait for a timestamp fails only after the end-of-pipe timestamp has stood still this long.
+ * A real hang is reported by the GMU (HFI 150) and ends the wait through the completion poll. */
+#define CONTEXT_STALL_NS 30000000000ULL
 #define CONTEXT_INFLIGHT_MAX 8u
 #define CONTEXT_CONSUME_NS 20000000ULL
 
@@ -174,10 +178,16 @@ static bool
 context_wait(uint32_t timestamp)
 {
 	uint64_t start = mach_absolute_time(), elapsed;
+	uint32_t seen = adreno8_rd(context_timestamp_view + CONTEXT_EOP);
 	while (!adreno8_context_done(timestamp)) {
 		if (context_state == CONTEXT_FAILED) return false;
+		uint32_t eop = adreno8_rd(context_timestamp_view + CONTEXT_EOP);
+		if (eop != seen) {
+			seen = eop;
+			start = mach_absolute_time();
+		}
 		absolutetime_to_nanoseconds(mach_absolute_time() - start, &elapsed);
-		if (elapsed >= CONTEXT_WAIT_NS) {
+		if (elapsed >= CONTEXT_STALL_NS) {
 			printf("adreno8: EOP timeout waiting for %u: last %u, EOP %u\n", timestamp, context_last,
 			    adreno8_rd(context_timestamp_view + CONTEXT_EOP));
 			adreno8_gpu_hang_dump();
@@ -243,6 +253,21 @@ adreno8_context_wait_idle(const char *what)
 	if ((context_last && !context_wait(context_last)) || !adreno8_gpu_wait_idle(what))
 		return context_fail("external buffer idle");
 	return true;
+}
+
+/*
+ * For a change that needs the pipeline empty and can be put off (the GPU's speed): waits at most
+ * limit_us for what is outstanding, and false without closing anything when it is still running.
+ */
+bool
+adreno8_context_drained(const char *what, uint32_t limit_us)
+{
+	if (!context_tested || !context_health()) return false;
+	for (uint32_t waited = 0; context_last && !adreno8_context_done(context_last); waited += 100) {
+		if (context_state == CONTEXT_FAILED || waited >= limit_us) return false;
+		adreno8_sleep_us(100);
+	}
+	return adreno8_gpu_wait_idle(what) || context_fail("external buffer idle");
 }
 
 uint32_t

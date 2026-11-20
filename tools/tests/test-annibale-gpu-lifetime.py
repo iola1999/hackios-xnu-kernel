@@ -166,6 +166,8 @@ static bool annibale_gpu_unmap(uint64_t, uint64_t) { ++unmap_calls; return unmap
 static unsigned busy_for;                       /* annibale_gpu_done() says no so many times first */
 static bool annibale_gpu_done(uint32_t) { ++done_calls; return fence_done && done_calls > busy_for; }
 static uint32_t annibale_gpu_last() { return 7; }
+static uint32_t retired_now;
+static uint32_t annibale_gpu_retired() { return retired_now; }
 static uint32_t context_depth = 4;
 static uint32_t adreno8_context_depth() { return context_depth; }
 static uint32_t annibale_gpu_submit(const uint64_t *, const uint32_t *, uint32_t count) {
