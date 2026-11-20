@@ -178,6 +178,14 @@ cam_diag_capture_probe(const char *tag)
 		    reg_rd(cam_smmu_base, 0x048u), reg_rd(cam_smmu_base, 0x050u),
 		    reg_rd(cam_smmu_base, 0x054u), reg_rd(cam_smmu_base, 0x058u),
 		    cam_smmu_bank, actlr, sctlr, fsr);
+		if (cam_smmu_bank != 0xffu) {   /* the address and syndrome of the context's last fault */
+			say("probe[%s] smmu fault far=%#x:%#x fsynr0=%#x fsynr1=%#x ttbr0=%#x:%#x tcr=%#x tcr2=%#x mair0=%#x\n", tag,
+			    reg_rd(cam_smmu_base, cam_smmu_cb_offset + 0x064u), reg_rd(cam_smmu_base, cam_smmu_cb_offset + 0x060u),
+			    reg_rd(cam_smmu_base, cam_smmu_cb_offset + 0x068u), reg_rd(cam_smmu_base, cam_smmu_cb_offset + 0x06cu),
+			    reg_rd(cam_smmu_base, cam_smmu_cb_offset + 0x024u), reg_rd(cam_smmu_base, cam_smmu_cb_offset + 0x020u),
+			    reg_rd(cam_smmu_base, cam_smmu_cb_offset + 0x030u), reg_rd(cam_smmu_base, cam_smmu_cb_offset + 0x010u),
+			    reg_rd(cam_smmu_base, cam_smmu_cb_offset + 0x038u));
+		}
 		for (uint32_t i = 0; i < cam_smmu_stream_count && i < 256u; i++) {
 			uint32_t smr = reg_rd(cam_smmu_base, CAM_SMMU_SMR(i));
 			uint32_t sid = smr & 0x7fffu;
