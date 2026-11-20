@@ -29,6 +29,8 @@ assert '(int64_t)rx0 == -12' in ipa_src
 assert '(int64_t)rx0 == -12' in adsp_fw_src
 assert 'kmem_alloc_contig(' in ipa_src
 assert '#define MPSS_DSM1_MEM_PHYS              0x84a00000ULL' in modem_src
+# QMI_LOC REG_EVENTS names its client: TLV 0x10 clientStrId "gps" and TLV 0x11 clientType 1 follow both masks.
+assert modem_src.count("0x10, 0x04, 0x00, 'g', 'p', 's', 0, 0x11, 0x04, 0x00, 0x01, 0, 0, 0 };") == 2
 assert '#define MPSS_DSM1_MEM_SIZE              0x04900000ULL' in modem_src
 assert '#define MPSS_DSM2_MEM_PHYS              0x89300000ULL' in modem_src
 assert '#define MPSS_DSM2_MEM_SIZE              0x00a80000ULL' in modem_src

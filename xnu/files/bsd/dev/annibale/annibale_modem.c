@@ -835,14 +835,18 @@ modem_qmi_rx_cb(void *context, uint32_t from_node, uint32_t from_port, const voi
 			loc_rev_done = true;
 		}
 		if (loc_rev_done && !loc_reg_sent) {
-			static const uint8_t loc_reg_tlvs[] = { 0x01, 0x08, 0x00, 0x87, 0x01, 0, 0, 0, 0, 0, 0 };
+			/* The event mask, then who registers: clientStrId "gps" and clientType 1. Without the
+			 * two the engine refuses the registration (error 48, then 3). */
+			static const uint8_t loc_reg_tlvs[] = { 0x01, 0x08, 0x00, 0x87, 0x01, 0, 0, 0, 0, 0, 0,
+				0x10, 0x04, 0x00, 'g', 'p', 's', 0, 0x11, 0x04, 0x00, 0x01, 0, 0, 0 };
 			loc_reg_sent = true;
 			if (modem_qmi_send(SLOT_LOC, QMI_LOC_REG_EVENTS, loc_reg_tlvs, sizeof(loc_reg_tlvs)) == 0) {
 				printf("annibale-modem: QMI LOC REG_EVENTS mask=0x187\n");
 			}
 		}
 		if (retry_min && !loc_min_retried) {
-			static const uint8_t min_tlvs[] = { 0x01, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0 };
+			static const uint8_t min_tlvs[] = { 0x01, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0,
+				0x10, 0x04, 0x00, 'g', 'p', 's', 0, 0x11, 0x04, 0x00, 0x01, 0, 0, 0 };
 			loc_min_retried = true;
 			if (modem_qmi_send(SLOT_LOC, QMI_LOC_REG_EVENTS, min_tlvs, sizeof(min_tlvs)) == 0) {
 				printf("annibale-modem: QMI LOC fallback REG_EVENTS mask=0x01\n");
