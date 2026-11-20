@@ -1,4 +1,8 @@
-/* Host MMIO model for the production one-address capture and close paths. */
+/*
+ * Host MMIO model for the production capture, stream and close paths. The writer is modelled as the
+ * device showed it: it takes one queued address per frame at a register update (RUP_AUP) and writes
+ * nothing when no address is queued.
+ */
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -11,7 +15,8 @@
 #define NSEC_PER_USEC 1000u
 #define NSEC_PER_MSEC 1000000u
 #define PAGE_SIZE 16384u
-#define CAMERA_REGION_SIZE (8u * 1024u * 1024u)
+#define CAMERA_SLOT_SIZE (8u * 1024u * 1024u)
+#define CAMERA_REGION_SIZE (2u * CAMERA_SLOT_SIZE)
 #define CAM_NATIVE_PROFILE_BYTES 6440u
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #undef bzero
@@ -19,7 +24,7 @@
 #ifndef __unused
 #define __unused __attribute__((unused))
 #endif
-#define say(...) ((void)0)
+static inline void say(const char *format, ...) { (void)format; }
 #define cam_native_trace(...) ((void)0)
 
 typedef uintptr_t vm_offset_t;
@@ -29,7 +34,7 @@ struct uio { uint8_t *next; user_ssize_t residual; };
 
 static struct annibale_camera_profile profile_data, *cam_profile;
 static struct annibale_camera_capture cam_capture;
-static uint8_t region[CAMERA_REGION_SIZE], output[CAMERA_REGION_SIZE];
+static uint8_t region[CAMERA_REGION_SIZE], output[CAMERA_SLOT_SIZE];
 static vm_offset_t cam_region_vbase, csid_lite_base = 1;
 static vm_offset_t gcc_base = 2, mclkcc_base = 3, camcc_base = 4, tlmm_base = 5;
 static void *kernel_map, *cam_lock;
@@ -42,7 +47,7 @@ static bool cam_is_open, cam_hw_dma_verified, cam_sensor_streaming, cci_ready, c
 static bool cam_native_phy_configured;
 static uint32_t regs[0x2800 / 4];
 static uint32_t top_clear, buf_clear, rx_clear, path_clear;
-static uint64_t physical;
+static uint64_t physical, second_physical;   /* second_physical: the second slot elsewhere, when set */
 static unsigned address_writes, resets, table_writes[4], cache_flushes, vblank_polls;
 static unsigned clock_starts, clock_stops, phy_starts, phy_stops;
 static unsigned route_stops, smmu_restores, region_frees, profile_frees, power_stops;
@@ -54,6 +59,8 @@ static bool fail_phy_stop, fail_clock_stop, bad_contiguity, invalid_status;
 static bool wrong_group, fail_sensor_on, fail_sensor_off, fail_init, fatal_frame;
 static bool bus_overflow, sticky_overflow;
 static unsigned buf_polls, deliver_after;
+static uint32_t queued[4], queued_count, taken_address, flushed_slots;
+static bool taken, lose_update;
 
 static bool cam_capture_resources_held(void);
 static void fake_dma(void);
@@ -62,14 +69,7 @@ static uint32_t reg_rd(vm_offset_t base, uint32_t offset)
 {
     if (base != csid_lite_base) return 0;
     CHECK(offset < sizeof(regs));
-    if (offset == 0x0ec && cam_sensor_streaming && regs[0x1700 / 4] == 0) {
-        vblank_polls++;
-        if (vblank_polls >= 2u) {
-            regs[0x0ec / 4] |= 0x200u;
-            vblank_eof_seen = true;
-        }
-    }
-    if (offset == 0x08c && cam_sensor_streaming && regs[0x1700 / 4] == 1 && !delivered &&
+    if (offset == 0x08c && cam_sensor_streaming && regs[0x1700 / 4] == 1 && taken &&
         buf_polls++ >= deliver_after) fake_dma();
     if (invalid_status && cam_sensor_streaming && offset == 0x08c) return UINT32_MAX;
     if (stuck_fifo && address_writes && offset == 0x1798) return 1;
@@ -94,7 +94,8 @@ static void reg_wr(vm_offset_t base, uint32_t offset, uint32_t value)
     }
     if (offset == 0x010) {
         resets++;
-        bool no_eof = (value == 1 && !cam_sensor_streaming && regs[0x500 / 4] == 0);
+        /* A path reset waits for the end of a frame: none comes with the path off, or for a frame cut short. */
+        bool no_eof = (value == 1 && !cam_sensor_streaming && (regs[0x500 / 4] == 0 || taken));
         if (!fail_global_reset && !no_eof && !(missing_finish_reset && resets > 1)) regs[0x07c / 4] |= 1;
     }
     if (offset == 0x1260) {
@@ -102,13 +103,24 @@ static void reg_wr(vm_offset_t base, uint32_t offset, uint32_t value)
         return;
     }
     if (offset == 0x1704) {
-        CHECK(!delivered);
-        CHECK((physical >> 8) == value);
+        CHECK(value == (uint32_t)(physical >> 8) || value == (uint32_t)((physical + CAMERA_SLOT_SIZE) >> 8));
+        CHECK(queued_count < 4);
+        queued[queued_count++] = value;
         address_writes++;
-        buf_polls = 0;
-        regs[0x1798 / 4] = 1;
+        regs[0x1798 / 4] = queued_count;
+    }
+    if (offset == 0x018 && !taken && queued_count != 0 && !lose_update) {
+        /* The register update hands the writer its next address. */
+        taken_address = queued[0];
+        memmove(queued, queued + 1, sizeof(queued) - sizeof(queued[0]));
+        queued_count--; taken = true; buf_polls = 0;
+    }
+    if (offset == 0x010 || (offset == 0x1700 && value == 0)) {
+        if (offset == 0x1700 || value == 2) { queued_count = 0; taken = false; }
     }
     regs[offset / 4] = value;
+    if (offset == 0x1704 || offset == 0x018 || offset == 0x010 || offset == 0x1700)
+        regs[0x1798 / 4] = stuck_fifo && address_writes ? 1 : queued_count;
 }
 
 static void csid_wr(uint32_t offset, uint32_t value) { reg_wr(csid_lite_base, offset, value); }
@@ -117,11 +129,14 @@ static uint64_t mach_absolute_time(void) { return 1000u + completed_frames; }
 static uint64_t kvtophys(vm_offset_t va)
 {
     uint64_t offset = va - cam_region_vbase;
+    if (second_physical != 0 && offset >= CAMERA_SLOT_SIZE) return second_physical + offset - CAMERA_SLOT_SIZE;
     return physical + offset + (bad_contiguity && offset >= PAGE_SIZE ? PAGE_SIZE : 0);
 }
 void FlushPoC_DcacheRegion(vm_offset_t va, size_t bytes)
 {
-    CHECK(va == cam_region_vbase && bytes >= profile_data.stride * profile_data.height);
+    CHECK((va == cam_region_vbase || va == cam_region_vbase + CAMERA_SLOT_SIZE) &&
+          bytes >= profile_data.stride * profile_data.height);
+    flushed_slots |= va == cam_region_vbase ? 1u : 2u;
     cache_flushes++;
 }
 
@@ -173,8 +188,7 @@ static bool cam_smmu_configure_bypass(void) { smmu_owned = true; return true; }
 static bool cam_smmu_route(bool allow)
 {
     CHECK(!allow && smmu_owned);
-    CHECK((cam_sensor_streaming ? regs[0x200 / 4] != 0 : regs[0x200 / 4] == 0) &&
-          regs[0x500 / 4] == 0 && regs[0x1700 / 4] == 0);
+    CHECK(regs[0x200 / 4] == 0 && regs[0x204 / 4] == 0 && regs[0x500 / 4] == 0 && regs[0x1700 / 4] == 0);
     CHECK(regs[0x1798 / 4] == 0 && resets >= 2);
     route_stops++;
     return !fail_smmu_stop;
@@ -214,21 +228,23 @@ static void cam_vote_rpmh_supplies(bool enable) { CHECK(!enable); power_stops++;
 static bool cam_hardware_power_up(void) { return power_up_ok; }
 
 #include "annibale_camera_exposure.inc"
+#include "camera-production-slots.inc"
 #include "annibale_camera_native.inc"
 #include "camera-production-read-close.inc"
 
 static void fake_dma(void)
 {
-    CHECK(address_writes && clocks_owned && phy_owned && smmu_owned);
+    CHECK(taken && clocks_owned && phy_owned && smmu_owned);
     CHECK(regs[0x1700 / 4] == 1 && regs[0x504 / 4] == 1);
     CHECK(regs[0x510 / 4] == 0x8000 && regs[0x1718 / 4] == 0);
     CHECK(regs[0x170c / 4] == ((profile_data.height << 16) | (profile_data.stride / 16u)) &&
           regs[0x1714 / 4] == profile_data.stride);
-    CHECK(cache_flushes == 2u * completed_frames + 1u);
-    CHECK(!cam_hw_dma_verified && cam_capture.state == ANNIBALE_CAM_CAPTURE_RUNNING);
+    uint32_t slot = taken_address == (uint32_t)(physical >> 8) ? 0 : 1;
+    /* The buffer the caller was last given is not written while it may be read. */
+    CHECK(cam_capture.state != ANNIBALE_CAM_CAPTURE_STREAMING || slot != cam_native_ready);
     uint32_t active_bytes = (profile_data.width * 5u) / 4u;
     for (uint32_t y = 0; y < profile_data.height; y++) {
-        uint8_t *line = region + y * profile_data.stride;
+        uint8_t *line = region + slot * CAMERA_SLOT_SIZE + y * profile_data.stride;
         memset(line, (int)(0x30u + completed_frames), active_bytes);
         if (profile_data.stride > active_bytes) {
             memset(line + active_bytes, 0xa5, profile_data.stride - active_bytes);
@@ -238,11 +254,10 @@ static void fake_dma(void)
         regs[0x1268 / 4] |= 1u;
     } else {
         regs[0x08c / 4] |= wrong_group ? 1u : 2u;
-        regs[0x1790 / 4] = regs[0x1704 / 4] + (wrong_address ? 1u : 0u);
+        regs[0x1790 / 4] = taken_address + (wrong_address ? 1u : 0u);
     }
-    regs[0x1798 / 4] = 0;
     if (fatal_frame) regs[0x09c / 4] |= 0x800u;
-    delivered = true; completed_frames++;
+    taken = false; flushed_slots = 0; delivered = true; completed_frames++;
 }
 
 static void reset_fixture(void)
@@ -260,7 +275,7 @@ static void reset_fixture(void)
     memset(regs, 0, sizeof(regs)); memset(region, 0xcc, sizeof(region));
     memset(output, 0xcc, sizeof(output));
     top_clear = buf_clear = rx_clear = path_clear = 0;
-    cam_region_vbase = (vm_offset_t)region; physical = 0x123400000ULL;
+    cam_region_vbase = (vm_offset_t)region; physical = 0x123400000ULL; second_physical = 0;
     cam_is_open = power_up_ok = true; cam_hw_mmio = 1; current_sensor = 2;
     front_chip_id = 0x2042; front_slave_addr = 0x10;
     cached_csid_ver = 0x30000004; cached_ife_ver = 0x20050000;
@@ -281,11 +296,14 @@ static void reset_fixture(void)
     wrong_group = fail_sensor_on = fail_sensor_off = fail_init = fatal_frame = false;
     bus_overflow = sticky_overflow = false;
     buf_polls = deliver_after = 0;
+    queued_count = taken_address = flushed_slots = 0; taken = lose_update = false;
+    cam_native_writing = cam_native_ready = 0;
 }
 
 static void check_no_frame(int expected)
 {
     struct uio uio = {output, sizeof(output)};
+    memset(output, 0xcc, sizeof(struct annibale_camera_frame));
     CHECK(cam_native_read(&uio) == expected);
     CHECK(uio.residual == sizeof(output) && output[0] == 0xcc);
 }
@@ -324,7 +342,7 @@ static void check_success(void)
     CHECK(cam_capture.state == ANNIBALE_CAM_CAPTURE_STOPPED && cam_capture.error == 0);
     CHECK(cam_capture.flags == ANNIBALE_CAM_CAPTURE_COMPLETE && cam_hw_dma_verified);
     CHECK(cam_capture.dma_address == physical && cam_capture.consumed_addr == (physical >> 8));
-    CHECK(cam_capture.sequence == completed_frames && cache_flushes == 2u * completed_frames);
+    CHECK(cam_capture.sequence == completed_frames && (flushed_slots & 1u) != 0);
     struct uio uio = {output, sizeof(output)};
     CHECK(cam_native_read(&uio) == 0);
     struct annibale_camera_frame frame;
@@ -340,13 +358,34 @@ static void check_success(void)
     CHECK(output[sizeof(frame) + 3240] == 0xa5 && output[sizeof(frame) + 3248] == 0x2fu + completed_frames);
 }
 
+/* A stream's frame: in the slot the writer just left, flushed, readable, and the other slot queued and taken. */
+static void check_stream(unsigned frame)
+{
+    uint32_t slot = (frame - 1u) & 1u;
+    uint64_t address = physical + slot * CAMERA_SLOT_SIZE, other = physical + (slot ^ 1u) * CAMERA_SLOT_SIZE;
+    CHECK(cam_capture.state == ANNIBALE_CAM_CAPTURE_STREAMING && cam_capture.error == 0 && cam_hw_dma_verified);
+    CHECK(cam_capture.flags == (ANNIBALE_CAM_CAPTURE_BUF_DONE | ANNIBALE_CAM_CAPTURE_ADDR_MATCH));
+    CHECK(ANNIBALE_CAM_CAPTURE_HAS_FRAME(&cam_capture) && !cam_capture_resources_held());
+    CHECK(cam_capture.dma_address == address && cam_capture.consumed_addr == (uint32_t)(address >> 8));
+    CHECK(cam_capture.sequence == frame && completed_frames == frame && (flushed_slots & (1u << slot)) != 0);
+    CHECK(taken && taken_address == (uint32_t)(other >> 8) && queued_count == 0 && (regs[0x08c / 4] & 2u) == 0);
+    CHECK(cam_sensor_streaming && regs[0x200 / 4] != 0 && regs[0x500 / 4] != 0 && regs[0x1700 / 4] == 1);
+    CHECK(table_writes[2] >= 1 && cam_native_submitted);
+    struct uio uio = {output, sizeof(output)};
+    CHECK(cam_native_read(&uio) == 0);
+    struct annibale_camera_frame header;
+    memcpy(&header, output, sizeof(header));
+    CHECK(header.sequence == frame && header.width == profile_data.width && header.stride == profile_data.stride);
+    CHECK(output[sizeof(header)] == 0x2fu + frame && output[sizeof(header) + profile_data.stride] == 0x2fu + frame);
+}
+
 int main(void)
 {
     unsigned cases = 0;
     reset_fixture(); cam_native_capture(); check_success(); cases++;
     CHECK(clock_starts == 1 && phy_starts == 1 && table_writes[0] == 1 && table_writes[1] == 1);
     delivered = false; cam_native_capture(); check_success(); cases++;
-    CHECK(table_writes[0] == 1 && table_writes[1] == 1 && address_writes == 2);
+    CHECK(table_writes[0] == 1 && table_writes[1] == 1 && address_writes == 2 && table_writes[3] == 2);
     CHECK(annibale_cam_close(0, 0, 0, NULL) == 0);
     CHECK(profile_frees == 1 && region_frees == 1 && power_stops == 2);
     CHECK(clock_stops == 1 && phy_stops == 1 && smmu_restores == 1); cases++;
@@ -362,14 +401,62 @@ int main(void)
     check_no_frame(EAGAIN); cases++;
     cam_hw_dma_verified = true; cam_capture.state = ANNIBALE_CAM_CAPTURE_RUNNING;
     check_no_frame(EAGAIN); cases++;
+    /* A stream's frame needs comp_done at the queued address; the stop flags belong to a single capture. */
+    cam_capture.state = ANNIBALE_CAM_CAPTURE_STREAMING;
+    cam_capture.flags = ANNIBALE_CAM_CAPTURE_COMPLETE & ~ANNIBALE_CAM_CAPTURE_ADDR_MATCH;
+    check_no_frame(EAGAIN);
+    cam_capture.flags = ANNIBALE_CAM_CAPTURE_COMPLETE & ~ANNIBALE_CAM_CAPTURE_BUF_DONE;
+    check_no_frame(EAGAIN); cases++;
 
     reset_fixture(); wrong_address = true; cam_native_capture(); check_held();
     CHECK(route_stops == 0 && address_writes == 1); cases++;
     reset_fixture(); wrong_group = true; cam_native_capture(); check_recovered(ETIMEDOUT, 0); cases++;
     reset_fixture(); bus_overflow = true; cam_native_capture(); check_recovered(ENOBUFS, 0); cases++;
-    reset_fixture(); boot_cam_keep_stream = 1; cam_native_capture(); check_success();
-    delivered = false; bus_overflow = true; cam_native_capture();
-    CHECK(table_writes[3] == 1); check_recovered(ENOBUFS, 1); cases++;
+    /* A stream: frames alternate between the two slots without the sensor or the path stopping. */
+    reset_fixture(); boot_cam_keep_stream = 1;
+    for (unsigned frame = 1; frame <= 5; frame++) { cam_native_capture(); check_stream(frame); }
+    CHECK(table_writes[2] == 1 && table_writes[3] == 0 && resets == 1 && address_writes == 6 && route_stops == 0);
+    /* Close gives up the frame in flight: sensor off, global reset, everything released. */
+    CHECK(annibale_cam_close(0, 0, 0, NULL) == 0);
+    CHECK(!cam_sensor_streaming && table_writes[3] == 1 && regs[0x200 / 4] == 0 && regs[0x1700 / 4] == 0);
+    CHECK(route_stops == 1 && smmu_restores == 1 && region_frees == 1 && profile_frees == 1 && !clocks_owned); cases++;
+    /* ... and the camera opens and streams again. */
+    cam_region_vbase = (vm_offset_t)region; completed_frames = 0;
+    CHECK(annibale_cam_open(0, 0, 0, NULL) == 0);
+    cam_profile = &profile_data;
+    cam_native_capture(); check_stream(1); cam_native_capture(); check_stream(2);
+    CHECK(annibale_cam_close(0, 0, 0, NULL) == 0); cases++;
+    /* A stream frame the writer drops, or that never completes: FAILED and released, the next call starts over. */
+    for (unsigned kind = 0; kind < 2; kind++) {
+        reset_fixture(); boot_cam_keep_stream = 1; cam_native_capture(); check_stream(1);
+        if (kind == 0) bus_overflow = true; else wrong_group = true;
+        cam_native_capture();
+        CHECK(cam_capture.state == ANNIBALE_CAM_CAPTURE_FAILED && cam_capture.error == (kind == 0 ? ENOBUFS : ETIMEDOUT));
+        CHECK(!cam_hw_dma_verified || !ANNIBALE_CAM_CAPTURE_HAS_FRAME(&cam_capture));
+        CHECK(!cam_native_submitted && !cam_sensor_streaming && !clocks_owned && !smmu_owned && table_writes[3] == 1);
+        check_no_frame((int)cam_capture.error);
+        bus_overflow = wrong_group = false; regs[0x1268 / 4] = 0;
+        cam_native_capture();
+        /* The stream starts over in the first slot; the frame count goes on from the last good frame. */
+        CHECK(cam_capture.state == ANNIBALE_CAM_CAPTURE_STREAMING && ANNIBALE_CAM_CAPTURE_HAS_FRAME(&cam_capture));
+        CHECK(cam_capture.dma_address == physical && cam_capture.sequence == 2 && cam_hw_dma_verified);
+        CHECK(table_writes[0] == 2 && table_writes[2] == 2);
+        CHECK(annibale_cam_close(0, 0, 0, NULL) == 0 && region_frees == 1); cases++;
+    }
+    /* A stream frame done at another address than the queued one keeps everything. */
+    reset_fixture(); boot_cam_keep_stream = 1; cam_native_capture(); check_stream(1);
+    wrong_address = true; cam_native_capture(); check_held(); CHECK(route_stops == 0); cases++;
+    /* The register update lost: no frame follows, and the call fails instead of handing out an old buffer. */
+    reset_fixture(); boot_cam_keep_stream = 1; cam_native_capture(); check_stream(1);
+    lose_update = true; cam_native_capture();
+    CHECK(cam_capture.state == ANNIBALE_CAM_CAPTURE_STREAMING); lose_update = false;
+    cam_native_capture(); CHECK(cam_capture.state == ANNIBALE_CAM_CAPTURE_FAILED && cam_capture.error == ETIMEDOUT);
+    CHECK(annibale_cam_close(0, 0, 0, NULL) == 0 && region_frees == 1); cases++;
+    /* Close during a stream with the FIFO stuck: held, nothing freed. */
+    reset_fixture(); boot_cam_keep_stream = 1; cam_native_capture(); check_stream(1);
+    stuck_fifo = true; CHECK(annibale_cam_close(0, 0, 0, NULL) == 0);
+    CHECK(cam_capture.state == ANNIBALE_CAM_CAPTURE_HELD && region_frees == 0 && profile_frees == 0);
+    CHECK(annibale_cam_open(0, 0, 0, NULL) == EBUSY); cases++;
     reset_fixture(); wrong_group = stuck_fifo = true; cam_native_capture(); check_held();
     CHECK(cam_capture.error == ETIMEDOUT && route_stops == 0); cases++;
     reset_fixture(); sticky_overflow = true; deliver_after = 3; regs[0x1268 / 4] = 1; cam_native_capture(); check_success(); cases++;
@@ -399,7 +486,12 @@ int main(void)
     CHECK(cam_capture.error == EOVERFLOW && address_writes == 0 && clock_starts == 0); cases++;
     reset_fixture(); physical = 1ULL << 36; cam_native_capture();
     CHECK(cam_capture.error == EOVERFLOW && address_writes == 0); cases++;
-    reset_fixture(); physical = (1ULL << 36) - 0x10000u; cam_native_capture();
+    reset_fixture(); physical = (1ULL << 36) - 0x10000u; second_physical = 0x123400000ULL; cam_native_capture();
+    CHECK(cam_capture.error == EOVERFLOW && address_writes == 0); cases++;
+    /* The second slot is checked like the first. */
+    reset_fixture(); second_physical = (1ULL << 36) - 0x10000u; cam_native_capture();
+    CHECK(cam_capture.error == EOVERFLOW && address_writes == 0); cases++;
+    reset_fixture(); second_physical = 0x200000001ULL; cam_native_capture();
     CHECK(cam_capture.error == EOVERFLOW && address_writes == 0); cases++;
     reset_fixture(); physical++; cam_native_capture();
     CHECK(cam_capture.error == EOVERFLOW && address_writes == 0); cases++;
@@ -449,69 +541,15 @@ int main(void)
     cam_native_exposure_reset();
     cases++;
 
-    /* Verify continuous MIPI RX keep-stream across 3 front D-PHY frames and clean close. */
+    /* The rear wide camera streams the same way. */
     reset_fixture();
     boot_cam_keep_stream = 1;
-    for (unsigned f = 0; f < 3; f++) {
-        delivered = false;
-        cam_native_capture();
-        check_success();
-        CHECK(cam_sensor_streaming && regs[0x200 / 4] != 0 && regs[0x204 / 4] != 0);
-        CHECK(table_writes[2] == 1 && table_writes[3] == 0);
-    }
-    CHECK(annibale_cam_close(0, 0, 0, NULL) == 0);
-    CHECK(!cam_sensor_streaming && regs[0x200 / 4] == 0 && table_writes[3] == 1 && region_frees == 1);
-    /* Verify re-open and capture succeed immediately after keep-stream close. */
-    cam_region_vbase = (vm_offset_t)region;
-    completed_frames = cache_flushes = 0;
-    CHECK(annibale_cam_open(0, 0, 0, NULL) == 0);
-    wide_bus_mode = 1;
-    cam_profile = &profile_data;
-    delivered = false;
-    cam_native_capture();
-    check_success();
-    CHECK(annibale_cam_close(0, 0, 0, NULL) == 0);
-    cases++;
-
-    /* Verify continuous MIPI RX keep-stream across 3 rear wide C-PHY frames, clean close, and re-open. */
-    reset_fixture();
-    boot_cam_keep_stream = 1;
-    wide_chip_id = WIDE_SENSOR_ID_EXPECTED;
-    wide_slave_addr = 0x10;
-    wide_bus_mode = 1;
+    wide_chip_id = WIDE_SENSOR_ID_EXPECTED; wide_slave_addr = 0x10; wide_bus_mode = 1;
     profile_data.sensor = 1; profile_data.mode = 24;
     profile_data.width = 2560; profile_data.height = 1920; profile_data.stride = 3200;
-    for (unsigned f = 0; f < 3; f++) {
-        delivered = false;
-        cam_native_capture();
-        CHECK(cam_capture.state == ANNIBALE_CAM_CAPTURE_STOPPED && cam_capture.error == 0);
-        CHECK(cam_sensor_streaming && regs[0x200 / 4] != 0 && regs[0x204 / 4] != 0);
-        CHECK(table_writes[2] == 1 && table_writes[3] == 0);
-    }
+    for (unsigned frame = 1; frame <= 3; frame++) { cam_native_capture(); check_stream(frame); }
     CHECK(annibale_cam_close(0, 0, 0, NULL) == 0);
     CHECK(!cam_sensor_streaming && regs[0x200 / 4] == 0 && table_writes[3] == 1 && region_frees == 1);
-    cam_region_vbase = (vm_offset_t)region;
-    completed_frames = cache_flushes = 0;
-    CHECK(annibale_cam_open(0, 0, 0, NULL) == 0);
-    wide_bus_mode = 1;
-    cam_profile = &profile_data;
-    delivered = false;
-    cam_native_capture();
-    CHECK(cam_capture.state == ANNIBALE_CAM_CAPTURE_STOPPED && cam_capture.error == 0);
-    CHECK(annibale_cam_close(0, 0, 0, NULL) == 0);
-    cases++;
-
-    /* Verify VBLANK EOF synchronization before keep-stream WM0 arming and clean status reset. */
-    reset_fixture();
-    boot_cam_keep_stream = 1;
-    cam_native_capture();
-    check_success();
-    CHECK(vblank_polls == 0 && !vblank_eof_seen);
-    delivered = false;
-    cam_native_capture();
-    check_success();
-    CHECK(vblank_polls >= 2u && vblank_eof_seen && (regs[0x0ec / 4] & 0x200u) == 0);
-    CHECK(annibale_cam_close(0, 0, 0, NULL) == 0);
     cases++;
 
     /* Verify cam_wm_prefetch=0 vs 1 writes IFE-lite0 WM0 0x1760/0x1764 accordingly. */

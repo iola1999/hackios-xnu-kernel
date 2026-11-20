@@ -1,6 +1,15 @@
 /*
- * One native front-mode frame: one WM0 FIFO address, ordinary comp_done,
- * consumed-address match, CSID path reset, WM disable, then SMMU fault/sync.
+ * Native frames through IFE-lite0 RDI0 and write master 0.
+ *
+ * cam_keep_stream=1 (the default): the path is configured once and stays enabled. The writer takes
+ * one address per frame from its FIFO and writes nothing when the FIFO is empty, so each
+ * CAMIOC_CAPTURE waits for the frame in flight, queues the other of two buffers with a register
+ * update (RUP_AUP), and hands back the finished one. A caller slower than the sensor loses frames,
+ * never a buffer it is reading. The stream ends at release, or at the first frame that fails.
+ *
+ * cam_keep_stream=0: one frame per call: one address, comp_done, consumed-address match, sensor off,
+ * CSID reset, writer disabled, then SMMU fault/sync.
+ *
  * A missing completion keeps DMA memory and hardware resources owned here.
  */
 #include "annibale_camera_clock.inc"
@@ -59,6 +68,7 @@ extern boolean_t ml_set_interrupts_enabled(boolean_t enable);
 static bool cam_native_initialized, cam_native_sensor_powered, cam_native_submitted;
 static bool cam_native_path_configured, cam_native_reset_failed;
 static uint32_t cam_native_dma_bytes;
+static uint64_t cam_native_slot_address[2];
 static uint32_t cam_native_sof_ms, cam_native_overflow_ms, cam_native_overflow_stale;
 
 /*
@@ -138,32 +148,42 @@ cam_native_idle(void)
 	return true;
 }
 
-/* No address is published until the complete DMA range has been checked. */
+/* No address is published until both slots' complete DMA ranges have been checked. */
 static bool
 cam_native_buffer(void)
 {
 	cam_native_dma_bytes = (cam_capture.bytes + 511u) & ~511u;
 	if (cam_region_vbase == 0 || cam_native_dma_bytes == 0 ||
-	    cam_native_dma_bytes > CAMERA_REGION_SIZE) {
+	    cam_native_dma_bytes > CAMERA_SLOT_SIZE) {
 		return false;
 	}
-	uint64_t first = kvtophys(cam_region_vbase);
-	if (first == 0 || (first & 511u) != 0 ||
-	    first >= (1ULL << 36) || cam_native_dma_bytes > (1ULL << 36) - first) {
-		return false;
-	}
-	for (uint32_t offset = 0; offset < cam_native_dma_bytes; offset += PAGE_SIZE) {
-		if (kvtophys(cam_region_vbase + offset) != first + offset) {
+	for (unsigned slot = 0; slot < 2u; slot++) {
+		vm_offset_t base = cam_region_vbase + slot * CAMERA_SLOT_SIZE;
+		uint64_t first = kvtophys(base);
+		if (first == 0 || (first & 511u) != 0 ||
+		    first >= (1ULL << 36) || cam_native_dma_bytes > (1ULL << 36) - first) {
 			return false;
 		}
+		for (uint32_t offset = 0; offset < cam_native_dma_bytes; offset += PAGE_SIZE) {
+			if (kvtophys(base + offset) != first + offset) {
+				return false;
+			}
+		}
+		cam_native_slot_address[slot] = first;
 	}
-	cam_capture.dma_address = first;
+	cam_capture.dma_address = cam_native_slot_address[0];
 	return true;
 }
+
+static bool cam_native_finish(bool abandon);
 
 static bool
 cam_native_release(void)
 {
+	if (cam_capture.state == ANNIBALE_CAM_CAPTURE_STREAMING) {
+		/* The frame in flight is given up: sensor off, CSID reset, writer and FIFO checked empty. */
+		cam_capture.state = cam_native_finish(true) ? ANNIBALE_CAM_CAPTURE_STOPPED : ANNIBALE_CAM_CAPTURE_HELD;
+	}
 	if (cam_native_submitted || cam_native_reset_failed || cam_capture_resources_held()) {
 		say("release blocked: submitted=%u reset_fail=%u state=%u\n",
 		    cam_native_submitted ? 1u : 0u, cam_native_reset_failed ? 1u : 0u, cam_capture.state);
@@ -261,7 +281,7 @@ cam_native_configure(void)
 		return false;
 	}
 	cam_native_path_configured = true;
-	if (!cam_native_reset(!cam_sensor_streaming)) {
+	if (!cam_native_reset(true)) {
 		return false;
 	}
 	csid_wr(CAM980_TOP_CLEAR, UINT32_MAX);
@@ -279,13 +299,11 @@ cam_native_configure(void)
 	csid_wr(0x1218u, 0);
 	csid_wr(0x1220u, UINT32_MAX);
 	csid_wr(0x1230u, 1u);
-	if (!cam_sensor_streaming) {
-		bool back = cam_profile->sensor == 1u;
-		uint32_t receive = (cam_profile->lane_count - 1u) | (cam_profile->lane_assign << 4) |
-		    ((back ? 4u : 5u) << 20) | (back ? 1u << 24 : 0);
-		csid_wr(CAM980_RX_CFG0, receive);
-		csid_wr(CAM980_RX_CFG1, (1u << 6) | 1u);
-	}
+	bool back = cam_profile->sensor == 1u;
+	uint32_t receive = (cam_profile->lane_count - 1u) | (cam_profile->lane_assign << 4) |
+	    ((back ? 4u : 5u) << 20) | (back ? 1u << 24 : 0);
+	csid_wr(CAM980_RX_CFG0, receive);
+	csid_wr(CAM980_RX_CFG1, (1u << 6) | 1u);
 	/* Native RAW10 -> MIPI RAW10: decode 2, packing 1; timestamp strobe 2. */
 	uint32_t path = (cam_profile->virtual_channel << 22) | (cam_profile->data_type << 16) |
 	    (2u << 12) | (1u << 6) | (2u << 8);
@@ -325,31 +343,6 @@ cam_native_configure(void)
 	       reg_rd(csid_lite_base, CAM980_WM_IMAGE_CFG2) == cam_profile->stride;
 }
 
-/*
- * Wait for an incoming sensor EOF edge so keep-stream WM0/RDI0 arming always
- * runs inside VBLANK rather than mid-frame (which causes bus_ovf=0x1 / consumed=0).
- */
-static bool
-cam_native_wait_vblank(void)
-{
-	csid_wr(CAM980_PATH_CLEAR, CAM980_PATH_INPUT_EOF);
-	csid_wr(CAM980_IRQ_COMMAND, 1u);
-	for (uint32_t elapsed = 0; elapsed < 100000u; elapsed += 250u) {
-		uint32_t st = reg_rd(csid_lite_base, CAM980_PATH_STATUS);
-		if (st == UINT32_MAX) {
-			return false;
-		}
-		if ((st & CAM980_PATH_INPUT_EOF) != 0) {
-			csid_wr(CAM980_PATH_CLEAR, UINT32_MAX);
-			csid_wr(CAM980_RX_CLEAR, UINT32_MAX);
-			csid_wr(CAM980_IRQ_COMMAND, 1u);
-			return true;
-		}
-		delay_for_interval(250, NSEC_PER_USEC);
-	}
-	return false;
-}
-
 static int
 cam_native_wait_frame(void)
 {
@@ -372,7 +365,7 @@ cam_native_wait_frame(void)
 		if ((cam_capture.buf_done & CAM980_RDI0_DONE) != 0) {
 			cam_capture.flags |= ANNIBALE_CAM_CAPTURE_BUF_DONE;
 			cam_capture.consumed_addr = reg_rd(csid_lite_base, CAM980_WM_CONSUMED);
-			if (cam_capture.consumed_addr != (uint32_t)(cam_capture.dma_address >> 8)) {
+			if (cam_capture.consumed_addr != (uint32_t)(cam_native_slot_address[cam_native_writing] >> 8)) {
 				return EIO;
 			}
 			cam_capture.flags |= ANNIBALE_CAM_CAPTURE_ADDR_MATCH;
@@ -395,35 +388,31 @@ cam_native_wait_frame(void)
 	return ETIMEDOUT;
 }
 
+/*
+ * Ends the DMA: sensor off, CSID reset, receiver, path and writer disabled, FIFO empty, SMMU stopped.
+ * With `abandon`, or after an error no comp_done can follow, the frame in flight need not have finished.
+ */
 static bool
-cam_native_finish(void)
+cam_native_finish(bool abandon)
 {
 	cam_diag_capture_probe("pre-finish");
-	/* Keep CSID RX + MIPI HS lanes locked across frames while streaming succeeds. */
-	bool keep_stream = boot_cam_keep_stream != 0 && cam_profile != NULL;
-	bool sensor_off = true;
-	if (!keep_stream || cam_capture.error != 0) {
-		sensor_off = cam_native_register_table(3u, cam_profile->off_count);
-		if (sensor_off) {
-			cam_sensor_streaming = false;
-			delay_for_interval(40000, NSEC_PER_USEC);
-			cam_native_phy_configured = false;
-		}
+	bool sensor_off = cam_native_register_table(3u, cam_profile->off_count);
+	if (sensor_off) {
+		cam_sensor_streaming = false;
+		delay_for_interval(40000, NSEC_PER_USEC);
+		cam_native_phy_configured = false;
 	}
-	bool stopped = sensor_off && cam_native_recoverable(cam_capture.error);
+	bool stopped = sensor_off && (abandon || cam_native_recoverable(cam_capture.error));
 	if (!cam_native_reset(stopped)) {
 		return false;
 	}
 	cam_capture.flags |= ANNIBALE_CAM_CAPTURE_HALTED;
-	if (!cam_sensor_streaming) {
-		csid_wr(CAM980_RX_CFG0, 0);
-		csid_wr(CAM980_RX_CFG1, 0);
-	}
+	csid_wr(CAM980_RX_CFG0, 0);
+	csid_wr(CAM980_RX_CFG1, 0);
 	csid_wr(CAM980_PATH_CFG0, 0);
 	csid_wr(CAM980_WM_CFG, 0);
 	cam_capture.wm_cfg = reg_rd(csid_lite_base, CAM980_WM_CFG);
-	if ((!cam_sensor_streaming &&
-	    (reg_rd(csid_lite_base, CAM980_RX_CFG0) != 0 || reg_rd(csid_lite_base, CAM980_RX_CFG1) != 0)) ||
+	if (reg_rd(csid_lite_base, CAM980_RX_CFG0) != 0 || reg_rd(csid_lite_base, CAM980_RX_CFG1) != 0 ||
 	    reg_rd(csid_lite_base, CAM980_PATH_CFG0) != 0 || cam_capture.wm_cfg != 0 ||
 	    !cam_poll(csid_lite_base, CAM980_WM_FIFO, UINT32_MAX, 0, 100000u)) {
 		return false;
@@ -448,11 +437,107 @@ cam_native_finish(void)
 	csid_wr(CAM980_TOP_MASK, 0);
 	csid_wr(CAM980_IRQ_COMMAND, 1u);
 	/* DMA was preceded by a clean/invalidate; CPU did not access these lines while hardware owned them. */
-	FlushPoC_DcacheRegion(cam_region_vbase, cam_native_dma_bytes);
+	FlushPoC_DcacheRegion(cam_native_slot_base(0), cam_native_dma_bytes);
+	FlushPoC_DcacheRegion(cam_native_slot_base(1), cam_native_dma_bytes);
 	if (!sensor_off && cam_capture.error == 0) {
 		cam_capture.error = EIO;
 	}
 	return true;
+}
+
+static void
+cam_native_report_failure(int error, uint64_t sequence, uint64_t began)
+{
+#ifdef CAM_SMMU_FSR
+	uint32_t fsr = cam_smmu_bank != 0xffu ?
+	    reg_rd(cam_smmu_base, cam_smmu_cb_offset + CAM_SMMU_FSR) : 0u;
+#else
+	uint32_t fsr = 0u;
+#endif
+	(void)fsr;
+	say("capture error=%d seq=%llu buf=%#x consumed=%#x top=%#x rx=%#x path=%#x fsr=%#x "
+	    "bus_ovf=%#x bus_oob=%#x wm_cfg=%#x wm_fifo=%#x wm_dbg=%#x halt=%#x "
+	    "fll=%u exp=%u gain=%u\n",
+	    error, (unsigned long long)sequence, cam_capture.buf_done,
+	    cam_capture.consumed_addr, cam_capture.top_irq, cam_capture.rx_irq,
+	    cam_capture.path_irq, fsr,
+	    reg_rd(csid_lite_base, 0x1268u), reg_rd(csid_lite_base, 0x1270u),
+	    reg_rd(csid_lite_base, CAM980_WM_CFG), reg_rd(csid_lite_base, CAM980_WM_FIFO),
+	    reg_rd(csid_lite_base, CAM980_WM_CONSUMED), reg_rd(csid_lite_base, 0x568u),
+	    cam_native_frame_lines, cam_native_exposure_lines, cam_native_gain);
+	cam_diag_capture_failure(cam_native_sof_ms, cam_native_overflow_ms,
+	    (uint32_t)((mach_absolute_time() - began) / 24000u));
+}
+
+/* After a frame's wait: ends the DMA, then on an error gives the hardware up for a fresh start. */
+static void
+cam_native_end(int error)
+{
+	cam_capture.error = (uint32_t)error;
+	if (!cam_native_finish(false)) {
+		cam_capture.state = ANNIBALE_CAM_CAPTURE_HELD;
+		if (cam_capture.error == 0) {
+			cam_capture.error = EIO;
+		}
+		cam_native_trace("capture finish held flags=%#x error=%u reset=%#x wm=%#x fifo=%#x\n",
+		    cam_capture.flags, cam_capture.error, cam_capture.reset_status, cam_capture.wm_cfg,
+		    cam_capture.fifo_count);
+		return;
+	}
+	if (cam_capture.error != 0) {
+		cam_capture.state = ANNIBALE_CAM_CAPTURE_FAILED;
+		if (!cam_native_release()) {
+			cam_capture.state = ANNIBALE_CAM_CAPTURE_HELD;
+		}
+		return;
+	}
+	cam_capture.state = ANNIBALE_CAM_CAPTURE_STOPPED;
+}
+
+/*
+ * The frame in the slot the writer has is done: the other slot is queued for the next frame, taken at
+ * this register update, and the finished one is the caller's until the call after next.
+ */
+static void
+cam_native_stream_advance(void)
+{
+	uint32_t finished = cam_native_writing;
+
+	cam_native_writing = finished ^ 1u;
+	csid_wr(CAM980_BUF_CLEAR, CAM980_RDI0_DONE);
+	csid_wr(CAM980_IRQ_COMMAND, 1u);
+	csid_wr(CAM980_WM_ADDRESS, (uint32_t)(cam_native_slot_address[cam_native_writing] >> 8));
+	csid_wr(CAM980_RUP_AUP, 0x100010u);
+	FlushPoC_DcacheRegion(cam_native_slot_base(finished), cam_native_dma_bytes);
+	cam_native_ready = finished;
+	cam_capture.dma_address = cam_native_slot_address[finished];
+	cam_capture.state = ANNIBALE_CAM_CAPTURE_STREAMING;
+	cam_capture.sequence++;
+	cam_hw_dma_verified = true;
+}
+
+/* One more frame of a running stream. */
+static void
+cam_native_stream_next(void)
+{
+	uint64_t began = mach_absolute_time();
+	int error = 0;
+
+	cam_capture.flags = cam_capture.buf_done = cam_capture.top_irq = cam_capture.rx_irq = cam_capture.path_irq = 0;
+	if (!cam_native_apply_exposure_regs(false)) {
+		error = EIO;
+	}
+	if (error == 0) {
+		error = cam_native_wait_frame();
+	}
+	if (error == 0) {
+		cam_native_stream_advance();
+		return;
+	}
+	cam_native_report_failure(error, cam_capture.sequence, began);
+	cam_hw_dma_verified = false;                    /* (the frame handed out before is no longer offered) */
+	cam_capture.state = ANNIBALE_CAM_CAPTURE_RUNNING;
+	cam_native_end(error);
 }
 
 static void
@@ -464,6 +549,10 @@ cam_native_capture(void)
 	if (!cam_is_open || cam_profile == NULL) {
 		cam_capture.state = ANNIBALE_CAM_CAPTURE_NO_PROFILE;
 		cam_capture.error = ENXIO;
+		return;
+	}
+	if (cam_capture.state == ANNIBALE_CAM_CAPTURE_STREAMING) {
+		cam_native_stream_next();
 		return;
 	}
 	uint64_t sequence = cam_capture.sequence;
@@ -478,13 +567,11 @@ cam_native_capture(void)
 	cam_native_trace("capture prepare bytes=%u dma=%#llx\n", cam_capture.bytes, cam_capture.dma_address);
 	int error = cam_native_prepare();
 	cam_native_trace("capture prepared error=%d dma=%#llx\n", error, cam_capture.dma_address);
-	bool keep_active = cam_sensor_streaming && boot_cam_keep_stream != 0;
-	if (error == 0 && keep_active && !cam_native_apply_exposure_regs(false)) {
-		error = EIO;
-	}
 	if (error == 0) {
-		bzero((void *)cam_region_vbase, cam_native_dma_bytes);
-		FlushPoC_DcacheRegion(cam_region_vbase, cam_native_dma_bytes);
+		for (unsigned slot = 0; slot < 2u; slot++) {
+			bzero((void *)cam_native_slot_base(slot), cam_native_dma_bytes);
+			FlushPoC_DcacheRegion(cam_native_slot_base(slot), cam_native_dma_bytes);
+		}
 	}
 	if (error == 0 && !cam_native_configure()) {
 		error = EIO;
@@ -503,88 +590,39 @@ cam_native_capture(void)
 		cam_native_trace("capture prepare release state=%u error=%u\n", cam_capture.state, cam_capture.error);
 		return;
 	}
-	if (keep_active) {
-		if (!cam_native_wait_vblank()) {
-			static bool vblank_miss_logged;
-			if (!vblank_miss_logged) {
-				vblank_miss_logged = true;
-				say("vblank wait timeout seq=%llu path=%#x rx=%#x\n",
-				    (unsigned long long)sequence,
-				    reg_rd(csid_lite_base, CAM980_PATH_STATUS),
-				    reg_rd(csid_lite_base, CAM980_RX_STATUS));
-			}
-		}
-	}
 	cam_native_submitted = true;
+	cam_native_writing = 0;
 	uint64_t armed = mach_absolute_time();
 #ifdef KERNEL
 	boolean_t arm_istate = ml_set_interrupts_enabled(FALSE);
 #endif
-	csid_wr(CAM980_WM_ADDRESS, (uint32_t)(cam_capture.dma_address >> 8));
+	csid_wr(CAM980_WM_ADDRESS, (uint32_t)(cam_native_slot_address[0] >> 8));
 	csid_wr(CAM980_WM_CFG, 1u);
 	csid_wr(CAM980_RUP_AUP, 0x100010u);
 	csid_wr(CAM980_PATH_CONTROL, 1u);
 #ifdef KERNEL
 	ml_set_interrupts_enabled(arm_istate);
 #endif
-	bool stream_ok = true;
-	if (!keep_active) {
-		cam_sensor_streaming = true;
-		stream_ok = cam_native_register_table(2u, cam_profile->on_count);
-	}
-	if (!stream_ok) {
+	cam_sensor_streaming = true;
+	if (!cam_native_register_table(2u, cam_profile->on_count)) {
 		error = EIO;
 	} else {
 		error = cam_native_wait_frame();
 	}
 	if (error != 0) {
-#ifdef CAM_SMMU_FSR
-		uint32_t fsr = cam_smmu_bank != 0xffu ?
-		    reg_rd(cam_smmu_base, cam_smmu_cb_offset + CAM_SMMU_FSR) : 0u;
-#else
-		uint32_t fsr = 0u;
-#endif
-		(void)fsr;
-		say("capture error=%d seq=%llu buf=%#x consumed=%#x top=%#x rx=%#x path=%#x fsr=%#x "
-		    "bus_ovf=%#x bus_oob=%#x wm_cfg=%#x wm_fifo=%#x wm_dbg=%#x halt=%#x "
-		    "fll=%u exp=%u gain=%u\n",
-		    error, (unsigned long long)sequence, cam_capture.buf_done,
-		    cam_capture.consumed_addr, cam_capture.top_irq, cam_capture.rx_irq,
-		    cam_capture.path_irq, fsr,
-		    reg_rd(csid_lite_base, 0x1268u), reg_rd(csid_lite_base, 0x1270u),
-		    reg_rd(csid_lite_base, CAM980_WM_CFG), reg_rd(csid_lite_base, CAM980_WM_FIFO),
-		    reg_rd(csid_lite_base, CAM980_WM_CONSUMED), reg_rd(csid_lite_base, 0x568u),
-		    cam_native_frame_lines, cam_native_exposure_lines, cam_native_gain);
-		cam_diag_capture_failure(cam_native_sof_ms, cam_native_overflow_ms,
-		    (uint32_t)((mach_absolute_time() - armed) / 24000u));
+		cam_native_report_failure(error, sequence, armed);
 	}
 	cam_native_trace("capture frame error=%d buf=%#x consumed=%#x top=%#x rx=%#x path=%#x\n",
 	    error, cam_capture.buf_done, cam_capture.consumed_addr, cam_capture.top_irq,
 	    cam_capture.rx_irq, cam_capture.path_irq);
-	cam_native_trace("capture SMMU fault bank=%u fsr=%#x far=%#x:%#x\n", cam_smmu_bank,
-	    reg_rd(cam_smmu_base, cam_smmu_cb_offset + CAM_SMMU_FSR),
-	    reg_rd(cam_smmu_base, cam_smmu_cb_offset + CAM_SMMU_FAR + 4u),
-	    reg_rd(cam_smmu_base, cam_smmu_cb_offset + CAM_SMMU_FAR));
-	cam_capture.error = (uint32_t)error;
-	if (!cam_native_finish()) {
-		cam_capture.state = ANNIBALE_CAM_CAPTURE_HELD;
-		if (cam_capture.error == 0) {
-			cam_capture.error = EIO;
-		}
-		cam_native_trace("capture finish held flags=%#x error=%u reset=%#x wm=%#x fifo=%#x\n",
-		    cam_capture.flags, cam_capture.error, cam_capture.reset_status, cam_capture.wm_cfg,
-		    cam_capture.fifo_count);
+	if (error == 0 && boot_cam_keep_stream != 0) {
+		cam_native_stream_advance();
 		return;
 	}
-	if (cam_capture.error != 0) {
-		cam_capture.state = ANNIBALE_CAM_CAPTURE_FAILED;
-		if (!cam_native_release()) {
-			cam_capture.state = ANNIBALE_CAM_CAPTURE_HELD;
-		}
-		return;
+	cam_native_end(error);
+	if (cam_capture.state == ANNIBALE_CAM_CAPTURE_STOPPED) {
+		cam_native_ready = 0;
+		cam_capture.sequence = sequence + 1u;
+		cam_hw_dma_verified = true;
 	}
-	cam_capture.state = ANNIBALE_CAM_CAPTURE_STOPPED;
-	cam_capture.sequence = sequence + 1u;
-	cam_hw_dma_verified = true;
-	cam_native_trace("capture stopped flags=%#x sequence=%llu\n", cam_capture.flags, cam_capture.sequence);
 }

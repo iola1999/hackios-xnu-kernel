@@ -410,6 +410,7 @@ static unsigned camera_smmu_cases(void)
         reset_fixture(); smmu_regs[0x028u / 4u] = 0x5111u;
         physical = kind == 0u ? dma_limit - rounded_bytes :
                    kind == 1u ? dma_limit - rounded_bytes + 512u : 0;
+        second_physical = 0x8d7f24000ULL;       /* the limit is the first slot's alone */
         cam_native_capture();
         if (kind == 0u) {
             check_success();

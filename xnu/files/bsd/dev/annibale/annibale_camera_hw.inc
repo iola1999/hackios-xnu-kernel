@@ -38,7 +38,8 @@
 #define APPS_SMMU_PHYS          0x15000000UL
 #define APPS_SMMU_SIZE          0x00100000UL
 
-#define CAMERA_REGION_SIZE      0x00800000UL    /* 8 MB kernel frame buffer */
+#define CAMERA_SLOT_SIZE        0x00800000UL    /* 8 MB: one frame */
+#define CAMERA_REGION_SIZE      (2u * CAMERA_SLOT_SIZE) /* the two frame buffers a stream alternates between */
 
 /* GCC camera branch registers (base: 0x00100000, verified against gcc-sun.ko & annibale.dts) */
 #define GCC_APSS_VOTE_1                 0x52010u

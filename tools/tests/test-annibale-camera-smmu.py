@@ -100,6 +100,8 @@ def main():
         (directory / "annibale_camera_native.inc").write_text(native)
         (directory / "annibale_camera_clock.inc").write_text(native_test.function((DRIVER / "annibale_camera_clock.inc").read_text(), "cam_poll"))
         (directory / "annibale_camera_phy.inc").write_text("")
+        slots = profile[profile.index("/* The two frame buffers of the region"):profile.index("static int\ncam_native_read(")]
+        (directory / "camera-production-slots.inc").write_text(slots)
         (directory / "camera-production-read-close.inc").write_text(read_close)
         result = run(directory, smmu, "production")
         if result.returncode:

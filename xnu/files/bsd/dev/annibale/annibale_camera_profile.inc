@@ -92,12 +92,20 @@ cam_profile_install(struct annibale_camera_profile *profile)
 	cam_capture.bytes = profile->stride * profile->height;
 }
 
+/* The two frame buffers of the region: the slot the writer has, and the one last finished. */
+static uint32_t cam_native_writing, cam_native_ready;
+
+static vm_offset_t
+cam_native_slot_base(uint32_t slot)
+{
+	return cam_region_vbase + slot * CAMERA_SLOT_SIZE;
+}
+
 static int
 cam_native_read(struct uio *uio)
 {
 	struct annibale_camera_frame frame;
-	if (cam_capture.state != ANNIBALE_CAM_CAPTURE_STOPPED || !cam_hw_dma_verified ||
-	    (cam_capture.flags & ANNIBALE_CAM_CAPTURE_COMPLETE) != ANNIBALE_CAM_CAPTURE_COMPLETE) {
+	if (!cam_hw_dma_verified || !ANNIBALE_CAM_CAPTURE_HAS_FRAME(&cam_capture)) {
 		return cam_capture.error != 0 ? (int)cam_capture.error : EAGAIN;
 	}
 	if (uio_resid(uio) < (user_ssize_t)sizeof(frame)) {
@@ -120,7 +128,7 @@ cam_native_read(struct uio *uio)
 	int error = uiomove((caddr_t)&frame, sizeof(frame), uio);
 	user_ssize_t bytes = MIN(uio_resid(uio), (user_ssize_t)cam_capture.bytes);
 	if (error == 0 && bytes > 0) {
-		error = uiomove((caddr_t)cam_region_vbase, (int)bytes, uio);
+		error = uiomove((caddr_t)cam_native_slot_base(cam_native_ready), (int)bytes, uio);
 	}
 	return error;
 }

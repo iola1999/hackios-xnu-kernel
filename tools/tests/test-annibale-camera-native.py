@@ -52,7 +52,7 @@ def main():
     ])
     mutations = {
         "ordinary-group": ("#define CAM980_RDI0_DONE         2u", "#define CAM980_RDI0_DONE         1u"),
-        "consumed-address": ("cam_capture.consumed_addr != (uint32_t)(cam_capture.dma_address >> 8)", "false"),
+        "consumed-address": ("cam_capture.consumed_addr != (uint32_t)(cam_native_slot_address[cam_native_writing] >> 8)", "false"),
         "stale-buffer": ("!cam_poll(csid_lite_base, CAM980_BUF_STATUS, CAM980_RDI0_DONE, 0, 5000u)", "false"),
         "stale-reset": ("!cam_poll(csid_lite_base, CAM980_TOP_STATUS, 1u, 0, 5000u)", "false"),
         "reset-completion": ("if (!cam_native_reset(stopped)) {", "if (false) {"),
@@ -60,7 +60,13 @@ def main():
         "stale-overflow": ("(overflow & ~cam_native_overflow_stale) != 0", "overflow != 0"),
         "release-immediate-reset": ("if (!cam_native_reset(true)) {", "if (!cam_native_reset(false)) {"),
         "dma-range": ("cam_native_dma_bytes > (1ULL << 36) - first", "false"),
-        "contiguity": ("kvtophys(cam_region_vbase + offset) != first + offset", "false"),
+        "contiguity": ("kvtophys(base + offset) != first + offset", "false"),
+        "stream-next-address": ("\tcsid_wr(CAM980_WM_ADDRESS, (uint32_t)(cam_native_slot_address[cam_native_writing] >> 8));\n\tcsid_wr(CAM980_RUP_AUP, 0x100010u);\n\tFlushPoC", "\tcsid_wr(CAM980_RUP_AUP, 0x100010u);\n\tFlushPoC"),
+        "stream-register-update": ("\tcsid_wr(CAM980_RUP_AUP, 0x100010u);\n\tFlushPoC", "\tFlushPoC"),
+        "stream-other-slot": ("cam_native_writing = finished ^ 1u;", "cam_native_writing = finished;"),
+        "stream-flush": ("\tFlushPoC_DcacheRegion(cam_native_slot_base(finished), cam_native_dma_bytes);\n", ""),
+        "stream-done-clear": ("\tcsid_wr(CAM980_BUF_CLEAR, CAM980_RDI0_DONE);\n\tcsid_wr(CAM980_IRQ_COMMAND, 1u);\n\tcsid_wr(CAM980_WM_ADDRESS", "\tcsid_wr(CAM980_WM_ADDRESS"),
+        "abandoned-frame": ("bool stopped = sensor_off && (abandon || cam_native_recoverable(cam_capture.error));", "bool stopped = sensor_off && ((abandon && false) || cam_native_recoverable(cam_capture.error));"),
     }
     with tempfile.TemporaryDirectory(prefix="annibale-camera-native-") as temp:
         directory = Path(temp)
@@ -71,6 +77,8 @@ def main():
         (directory / "fixture.c").write_text("#include <errno.h>\n" + constants + "\n" + FIXTURE.read_text())
         (directory / "annibale_camera_clock.inc").write_text(function(clock, "cam_poll"))
         (directory / "annibale_camera_phy.inc").write_text("")
+        slots = profile[profile.index("/* The two frame buffers of the region"):profile.index("static int\ncam_native_read(")]
+        (directory / "camera-production-slots.inc").write_text(slots)
         baseline = run(directory, native, read_close, "production")
         if baseline.returncode:
             raise AssertionError(baseline.stderr)
@@ -83,8 +91,10 @@ def main():
             if result.returncode == 0:
                 raise AssertionError("mutation was accepted: " + name)
             rejected.append(name)
-        read_mutation = read_close.replace("(cam_capture.flags & ANNIBALE_CAM_CAPTURE_COMPLETE) != ANNIBALE_CAM_CAPTURE_COMPLETE",
-                                          "false")
+        anchor = "!ANNIBALE_CAM_CAPTURE_HAS_FRAME(&cam_capture)"
+        if anchor not in read_close:
+            raise AssertionError("mutation anchor missing: incomplete-read")
+        read_mutation = read_close.replace(anchor, "false")
         result = run(directory, native, read_mutation, "incomplete-read")
         if result.returncode == 0:
             raise AssertionError("incomplete read mutation was accepted")

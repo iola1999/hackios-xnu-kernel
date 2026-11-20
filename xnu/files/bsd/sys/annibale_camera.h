@@ -114,6 +114,7 @@ enum {
 	ANNIBALE_CAM_CAPTURE_STOPPED,
 	ANNIBALE_CAM_CAPTURE_FAILED,
 	ANNIBALE_CAM_CAPTURE_HELD,
+	ANNIBALE_CAM_CAPTURE_STREAMING,         /* a frame is ready and the writer is on the next one */
 };
 
 #define ANNIBALE_CAM_CAPTURE_BUF_DONE   (1u << 0)
@@ -125,6 +126,14 @@ enum {
 #define ANNIBALE_CAM_CAPTURE_COMPLETE  (ANNIBALE_CAM_CAPTURE_BUF_DONE | ANNIBALE_CAM_CAPTURE_ADDR_MATCH | \
     ANNIBALE_CAM_CAPTURE_FIFO_EMPTY | ANNIBALE_CAM_CAPTURE_HALTED | ANNIBALE_CAM_CAPTURE_DMA_STOPPED | \
     ANNIBALE_CAM_CAPTURE_SMMU_SYNC)
+
+/* A frame to read: a single capture ended whole, or a stream's frame done at the address queued for it. */
+#define ANNIBALE_CAM_CAPTURE_HAS_FRAME(c) ((c)->error == 0 && \
+    (((c)->state == ANNIBALE_CAM_CAPTURE_STOPPED && \
+    ((c)->flags & ANNIBALE_CAM_CAPTURE_COMPLETE) == ANNIBALE_CAM_CAPTURE_COMPLETE) || \
+    ((c)->state == ANNIBALE_CAM_CAPTURE_STREAMING && \
+    ((c)->flags & (ANNIBALE_CAM_CAPTURE_BUF_DONE | ANNIBALE_CAM_CAPTURE_ADDR_MATCH)) == \
+    (ANNIBALE_CAM_CAPTURE_BUF_DONE | ANNIBALE_CAM_CAPTURE_ADDR_MATCH))))
 
 /* CAMIOC_CAPTURE has no input. error is a positive errno; the ioctl copies status on failure too. */
 struct annibale_camera_capture {
