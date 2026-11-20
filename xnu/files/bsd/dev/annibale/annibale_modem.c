@@ -39,6 +39,7 @@ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, u
 extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 extern uint64_t kvtophys(vm_offset_t va);
 extern int annibale_ufs_part_read(const char *part_name, uint64_t offset, void *buf, uint64_t len);
+extern bool annibale_ufs_fat16_path_read(const char *path, uint64_t *size_out, volatile void *dst_buf, uint64_t dst_cap);
 extern kern_return_t thread_terminate(thread_t thread);
 extern lck_mtx_t annibale_smem_alloc_lock;
 
@@ -365,6 +366,7 @@ modem_sync_sysctls(void)
 
 #include "annibale_modem_boot.inc"
 #include "annibale_modem_svc.inc"
+#include "annibale_modem_tftp.inc"
 
 /* ---- SMEM GLINK IPCRTR transport with MPSS (partition 0 <-> 1) ------------------------------------- */
 
@@ -961,6 +963,7 @@ modem_worker_thread(__unused void *arg, __unused wait_result_t wres)
 
 	modem_open_qmi_clients();
 	modem_start_local_services();
+	modem_start_tftp();
 	modem_bringup_sequence();
 	bool smp2p_seen = false;
 	uint32_t smp2p_last_val = 0, smp2p_last_flags = 0;
@@ -1003,6 +1006,7 @@ modem_worker_thread(__unused void *arg, __unused wait_result_t wres)
 
 		if (is_open) {
 			annibale_qrtr_fresh();
+			modem_tftp_poll();
 		}
 		modem_sleep_ms(is_open ? 25 : 200);
 	}

@@ -582,14 +582,57 @@ ufs_lfn_feed(const uint8_t *ent, char lfn[256])
 	}
 }
 
+/*
+ * One directory of a FAT16 volume (dir_clus 0: the root directory): the entry called `name`, by its
+ * 8.3 or its long name in either case, a directory or a file as asked. `sec` is 4096 bytes to read into.
+ */
+static bool
+ufs_fat16_lookup(const char *part, uint32_t fat_off, uint32_t root_off, uint32_t root_sz, uint32_t data_off,
+    uint32_t csize, uint8_t *sec, uint16_t dir_clus, const char *name, bool want_dir, uint16_t *clus, uint32_t *size)
+{
+	char target11[11], lfn[256] = { 0 };
+	bool has_83 = ufs_fat83_name(name, target11);
+	uint16_t cur = dir_clus;
+
+	for (unsigned hop = 0; hop < 4096; hop++) {
+		uint64_t base = dir_clus == 0 ? root_off : data_off + (uint64_t)(cur - 2u) * csize;
+		uint32_t span = dir_clus == 0 ? root_sz : csize;
+
+		for (uint32_t off = 0; off < span; off += 4096) {
+			uint32_t ask = span - off > 4096 ? 4096 : span - off;
+			if (annibale_ufs_part_read(part, base + off, sec, ask) != 0) return false;
+			for (uint32_t e = 0; e < ask; e += 32) {
+				if (sec[e] == 0x00) return false;
+				if (sec[e] == 0xe5) { lfn[0] = '\0'; continue; }
+				if (sec[e + 11] == 0x0f) { ufs_lfn_feed(sec + e, lfn); continue; }
+				if ((sec[e + 11] & 0x08) == 0 && ((sec[e + 11] & 0x10) != 0) == want_dir &&
+				    ((has_83 && memcmp(sec + e, target11, 11) == 0) || (lfn[0] != '\0' && ufs_lfn_eq(lfn, name)))) {
+					*clus = (uint16_t)(sec[e + 26] | (sec[e + 27] << 8));
+					memcpy(size, sec + e + 28, 4);
+					return true;
+				}
+				lfn[0] = '\0';
+			}
+		}
+		if (dir_clus == 0) return false;
+		uint8_t fe[2];
+		if (annibale_ufs_part_read(part, fat_off + (uint32_t)cur * 2u, fe, 2) != 0) return false;
+		cur = (uint16_t)(fe[0] | (fe[1] << 8));
+		if (cur < 2 || cur >= 0xfff8) return false;
+	}
+	return false;
+}
+
+/*
+ * A file of the modem firmware volume by its path from the volume's root, components separated by
+ * '/': its size, and its bytes when dst_buf is given. The first of the four partitions that has it.
+ */
 bool
-annibale_ufs_fat16_fw_read(const char *name, uint64_t *size_out, volatile void *dst_buf, uint64_t dst_cap)
+annibale_ufs_fat16_path_read(const char *path, uint64_t *size_out, volatile void *dst_buf, uint64_t dst_cap)
 {
 	static const char *const parts[4] = {
 		"modem_a", "modemfirmware_a", "modem_b", "modemfirmware_b"
 	};
-	char target11[11], image11[11] = { 'I','M','A','G','E',' ',' ',' ',' ',' ',' ' };
-	bool has_83 = ufs_fat83_name(name, target11);
 
 	uint8_t *sec = kalloc_data(8192, Z_WAITOK);
 	if (sec == NULL) return false;
@@ -610,54 +653,22 @@ annibale_ufs_fat16_fw_read(const char *name, uint64_t *size_out, volatile void *
 		uint32_t data_off = root_off + ((root_sz + bps - 1u) & ~(bps - 1u));
 		uint32_t csize = (uint32_t)spc * bps;
 
-		uint16_t img_clus = 0;
-		char lfn[256] = { 0 };
-		for (uint32_t off = 0; off < root_sz && img_clus == 0; off += 4096) {
-			uint32_t ask = root_sz - off > 4096 ? 4096 : root_sz - off;
-			if (annibale_ufs_part_read(parts[p], root_off + off, sec, ask) != 0) break;
-			for (uint32_t e = 0; e < ask; e += 32) {
-				if (sec[e] == 0x00) break;
-				if (sec[e] == 0xe5) { lfn[0] = '\0'; continue; }
-				if (sec[e + 11] == 0x0f) { ufs_lfn_feed(sec + e, lfn); continue; }
-				if ((sec[e + 11] & 0x10) &&
-				    (memcmp(sec + e, image11, 11) == 0 || (lfn[0] != '\0' && ufs_lfn_eq(lfn, "image")))) {
-					img_clus = (uint16_t)(sec[e + 26] | (sec[e + 27] << 8));
-					break;
-				}
-				lfn[0] = '\0';
-			}
-		}
-		if (img_clus < 2) continue;
-
-		uint16_t file_clus = 0;
+		uint16_t file_clus = 0, cur;
 		uint32_t file_sz = 0;
-		uint16_t cur = img_clus;
-		memset(lfn, 0, sizeof(lfn));
-		for (unsigned hop = 0; hop < 256 && cur >= 2 && cur < 0xfff8 && file_clus == 0; hop++) {
-			uint64_t clus_off = data_off + (uint64_t)(cur - 2u) * csize;
-			for (uint32_t off = 0; off < csize && file_clus == 0; off += 4096) {
-				uint32_t ask = csize - off > 4096 ? 4096 : csize - off;
-				if (annibale_ufs_part_read(parts[p], clus_off + off, sec, ask) != 0) break;
-				for (uint32_t e = 0; e < ask; e += 32) {
-					if (sec[e] == 0x00) { cur = 0xffff; break; }
-					if (sec[e] == 0xe5) { lfn[0] = '\0'; continue; }
-					if (sec[e + 11] == 0x0f) { ufs_lfn_feed(sec + e, lfn); continue; }
-					if ((sec[e + 11] & 0x18) != 0) { lfn[0] = '\0'; continue; }
-					if ((has_83 && memcmp(sec + e, target11, 11) == 0) ||
-					    (lfn[0] != '\0' && ufs_lfn_eq(lfn, name))) {
-						file_clus = (uint16_t)(sec[e + 26] | (sec[e + 27] << 8));
-						memcpy(&file_sz, sec + e + 28, 4);
-						break;
-					}
-					lfn[0] = '\0';
-				}
-			}
-			if (file_clus != 0 || cur >= 0xfff8) break;
-			uint8_t fe[2];
-			if (annibale_ufs_part_read(parts[p], fat_off + (uint32_t)cur * 2u, fe, 2) != 0) break;
-			cur = (uint16_t)(fe[0] | (fe[1] << 8));
+		bool found = true;
+		for (const char *at = path; found && *at != '\0';) {
+			char name[256];
+			size_t n = 0;
+
+			while (at[n] != '\0' && at[n] != '/') n++;
+			if (n == 0 || n >= sizeof(name)) { found = false; break; }
+			memcpy(name, at, n);
+			name[n] = '\0';
+			found = ufs_fat16_lookup(parts[p], fat_off, root_off, root_sz, data_off, csize, sec, file_clus, name,
+			    at[n] == '/', &file_clus, &file_sz) && file_clus >= 2;
+			at += n + (at[n] == '/' ? 1u : 0u);
 		}
-		if (file_clus < 2 || file_sz == 0) continue;
+		if (!found || file_sz == 0) continue;
 		if (size_out != NULL) *size_out = file_sz;
 		if (dst_buf == NULL) {
 			kfree_data(sec, 8192);
@@ -753,6 +764,18 @@ annibale_ufs_fat16_fw_read(const char *name, uint64_t *size_out, volatile void *
 	}
 	kfree_data(sec, 8192);
 	return false;
+}
+
+/* A firmware image by name: image/NAME on that volume. */
+bool
+annibale_ufs_fat16_fw_read(const char *name, uint64_t *size_out, volatile void *dst_buf, uint64_t dst_cap)
+{
+	char path[160];
+
+	if ((size_t)snprintf(path, sizeof(path), "image/%s", name) >= sizeof(path)) {
+		return false;
+	}
+	return annibale_ufs_fat16_path_read(path, size_out, dst_buf, dst_cap);
 }
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
