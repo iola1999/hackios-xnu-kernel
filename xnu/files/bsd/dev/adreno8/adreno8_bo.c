@@ -381,6 +381,10 @@ adreno8_bo_dump_words(const char *what, uint64_t address, uint32_t count)
 #define BINDLESS_BASE_GFX 0xab0a
 #define BINDLESS_SEEN_MAX 32
 #define INDIRECT_SEEN_MAX 256
+#define CODE_SEEN_MAX 96
+#define CODE_WORDS 128        /* the preamble and the start of the body: where a shader loads from its UBOs */
+#define SP_VS_BASE_LO 0xa81c
+#define SP_PS_BASE_LO 0xa983
 #define INDIRECT_MAX_DWORDS 1024
 /* Mesa's fb-read descriptors: IR3_BINDLESS_DESC_COUNT - 1 - A6XX_MAX_RENDER_TARGETS, 16 dwords each. */
 #define FB_READ_FIRST_SLOT 55
@@ -411,6 +415,8 @@ struct bo_tree {
 	unsigned bindless_count;
 	struct bo_indirect_rec indirect_seen[INDIRECT_SEEN_MAX];
 	unsigned indirect_count;
+	uint32_t code_seen[CODE_SEEN_MAX];      /* SP_VS_BASE and SP_PS_BASE values, low words */
+	unsigned code_count;
 };
 
 static void
@@ -467,6 +473,13 @@ bo_tree_reg(struct bo_tree *tree, uint32_t reg, uint32_t value)
 		is_hi = (off & 1u) != 0;
 		is_cs = true;
 		cur = &tree->cs_bindless_cur[set];
+	} else if (reg == SP_VS_BASE_LO || reg == SP_PS_BASE_LO) {
+		for (unsigned i = 0; i < tree->code_count; i++)
+			if (tree->code_seen[i] == value)
+				return;
+		if (value != 0 && tree->code_count < CODE_SEEN_MAX)
+			tree->code_seen[tree->code_count++] = value;
+		return;
 	} else {
 		return;
 	}
@@ -584,6 +597,8 @@ adreno8_bo_dump_tree(uint64_t base, uint32_t count)
 			}
 		}
 	}
+	for (unsigned i = 0; i < tree.code_count; i++)
+		adreno8_bo_dump_words("code", tree.code_seen[i], CODE_WORDS);
 	uint64_t bindless_fs = tree.gfx_bindless_cur[4];
 	if (!bindless_fs) {
 		printf("adreno8: tree: no write to SP_GFX_BINDLESS_BASE[4]\n");

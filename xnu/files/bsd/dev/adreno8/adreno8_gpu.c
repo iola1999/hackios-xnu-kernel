@@ -359,6 +359,12 @@ gpu_register_config(void)
 	gpu_write(GEN8_UCHE_TRAP_BASE_HI, 0x1ffff);
 	gpu_write(GEN8_UCHE_WRITE_THRU_BASE_LO, 0xfffff000);
 	gpu_write(GEN8_UCHE_WRITE_THRU_BASE_HI, 0x1ffff);
+	/* The colour cache has a trap and write-through base of its own; Linux a8xx_gpu.c hw_init
+	 * writes all four bases with the same value. */
+	gpu_write(GEN8_UCHE_CCHE_TRAP_BASE_LO, 0xfffff000);
+	gpu_write(GEN8_UCHE_CCHE_TRAP_BASE_HI, 0x1ffff);
+	gpu_write(GEN8_UCHE_CCHE_WRITE_THRU_BASE_LO, 0xfffff000);
+	gpu_write(GEN8_UCHE_CCHE_WRITE_THRU_BASE_HI, 0x1ffff);
 	gpu_gmu_write(GMU(GEN8_GMUCX_POWER_COUNTER_SELECT_XOCLK_1), 4);
 	/* sun-gpu.dtsi: UBWC 5, min-access-length 32; gen8_0_0 highest_bank_bit 16. */
 	if (!gpu_pipe_write(2, GEN8_GRAS_NC_MODE_CNTL, 0x60) ||
@@ -500,7 +506,9 @@ adreno8_gpu_hang_dump(void)
 	static const uint32_t global[] = { GEN8_RBBM_STATUS, GEN8_RBBM_STATUS1, GEN8_RBBM_GFX_STATUS,
 		GEN8_RBBM_GFX_BR_STATUS, GEN8_RBBM_GFX_BV_STATUS, GEN8_RBBM_MISC_STATUS, GEN8_CP_CP2GMU_STATUS,
 		GEN8_CP_RL_ERROR_DETAILS_0, GEN8_CP_RL_ERROR_DETAILS_1, GEN8_CP_INTERRUPT_STATUS_GLOBAL,
-		GEN8_UCHE_CLIENT_PF, GEN8_UCHE_CCHE_GC_GMEM_RANGE_MIN_LO, GEN8_SP_HLSQ_GC_GMEM_RANGE_MIN_LO };
+		GEN8_UCHE_CLIENT_PF, GEN8_UCHE_CCHE_GC_GMEM_RANGE_MIN_LO, GEN8_SP_HLSQ_GC_GMEM_RANGE_MIN_LO,
+		GEN8_UCHE_CCHE_TRAP_BASE_LO, GEN8_UCHE_CCHE_TRAP_BASE_HI, GEN8_UCHE_CCHE_WRITE_THRU_BASE_LO,
+		GEN8_UCHE_CCHE_WRITE_THRU_BASE_HI };
 	static const uint32_t piped[] = { GEN8_CP_PIPE_STATUS_PIPE, GEN8_CP_SQE_STATUS_PIPE,
 		GEN8_CP_HW_FAULT_STATUS_PIPE, GEN8_CP_INTERRUPT_STATUS_PIPE, GEN8_CP_PROTECT_STATUS_PIPE };
 	static const uint32_t pipes[] = { A8_PIPE_BR, A8_PIPE_BV, A8_PIPE_DDE_BR, A8_PIPE_DDE_BV };
@@ -522,14 +530,18 @@ adreno8_gpu_hang_dump(void)
 		return;
 	}
 	/* Dump BR's command tree first so the compact register/pipe summary sits at the ring tail. */
+	uint64_t br_ib1_base = 0;
+	uint32_t br_ib1_init = 0;
 	if (gpu_aperture(A8_PIPE_BR)) {
-		uint64_t br_ib1_base = gpu_read(GEN8_CP_IB1_BASE_PIPE) |
+		br_ib1_base = gpu_read(GEN8_CP_IB1_BASE_PIPE) |
 		    ((uint64_t)gpu_read(GEN8_CP_IB1_BASE_PIPE + 1) << 32);
 		uint32_t br_ib1_rem = gpu_read(GEN8_CP_IB1_BASE_PIPE + 2);
-		uint32_t br_ib1_init = gpu_read(GEN8_CP_IB1_BASE_PIPE + 3);
+		br_ib1_init = gpu_read(GEN8_CP_IB1_BASE_PIPE + 3);
 		(void)gpu_aperture(0);
 		if (br_ib1_base != 0 && br_ib1_rem <= br_ib1_init)
 			adreno8_bo_dump_tree(br_ib1_base, br_ib1_init);
+		else
+			br_ib1_base = 0;
 	}
 	(void)gpu_aperture(0);
 	for (unsigned i = 0; i < A8_COUNT(global); i++)
@@ -567,6 +579,37 @@ adreno8_gpu_hang_dump(void)
 		}
 	}
 	(void)gpu_aperture(0);
+	/* The program BR's registers name now: its instructions say which memory the shader reads
+	 * itself (private memory, buffers), which the command tree does not. */
+	if (gpu_aperture(A8_PIPE_BR)) {
+		static const struct { const char *name; uint32_t base, length, private_base; } stages[] = {
+			{ "vs", 0xa81c, 0xa824, 0xa81f }, { "fs", 0xa983, 0xab05, 0xa986 } };
+		for (unsigned i = 0; i < A8_COUNT(stages); i++) {
+			uint64_t base = gpu_read(stages[i].base) | (uint64_t)gpu_read(stages[i].base + 1) << 32;
+			uint32_t length = gpu_read(stages[i].length);
+			char what[32];
+
+			printf("adreno8: hang shader %s base %#llx instrlen %u private %#x:%#x param %#x size %#x\n",
+			    stages[i].name, base, length, gpu_read(stages[i].private_base + 1),
+			    gpu_read(stages[i].private_base), gpu_read(stages[i].private_base - 1),
+			    gpu_read(stages[i].private_base + 2));
+			if (base == 0 || length == 0 || length > 64)
+				continue;
+			snprintf(what, sizeof(what), "shader %s", stages[i].name);
+			adreno8_bo_dump_words(what, base, length * 32u);
+		}
+		(void)gpu_aperture(0);
+	}
+	/* The tree is larger than the log ring keeps once the programs start reporting their
+	 * timeouts, and its root is the first to go: say the root and the fault once more, last. */
+	if (br_ib1_base != 0) {
+		char what[32];
+
+		snprintf(what, sizeof(what), "tree 0 of %u", br_ib1_init);
+		adreno8_bo_dump_words(what, br_ib1_base, br_ib1_init < 2048u ? br_ib1_init : 2048u);
+	}
+	if (adreno8_gpu_space.is_on)
+		(void)adreno8_space_faulted(&adreno8_gpu_space);
 	adreno8_context_describe_inflight();
 }
 
