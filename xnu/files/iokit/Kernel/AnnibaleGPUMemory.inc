@@ -25,8 +25,21 @@ AnnibaleGPUUserClient::freeBuffer(struct gpu_buffer * b)
 	uint32_t last = annibale_gpu_ready() ? annibale_gpu_last() : 0;
 	bool busy = gGPUReported || !annibale_gpu_ready() || (last != 0 && !annibale_gpu_done(last));
 
+	/*
+	 * Nowhere to keep it: wait until `last` retires. One of the camera's still-image passes runs
+	 * for seconds, so a wait that runs out here is tried again; gpuWait() reports a core whose
+	 * retired timestamp stood still for GPU_STALL_MS and closes submissions, which ends this loop.
+	 * The wait lets go of the lock, so a reap() meanwhile may make room.
+	 */
 	if (busy && fLeftCount == GPU_LEFT && !gGPUReported && annibale_gpu_ready()) {
-		busy = !gpuWait(last, 1000);            /* (nowhere to keep it: this one is waited for) */
+		uint64_t began = mach_absolute_time(), ns;
+
+		do {
+			busy = !gpuWait(last, GPU_PATIENCE_MS);
+		} while (busy && fLeftCount == GPU_LEFT && !gGPUReported && annibale_gpu_ready());
+		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+		IOLog("AnnibaleGPU: %u buffers given back wait for the GPU; one more waited %llu ms for submission %u: %s\n",
+		    GPU_LEFT, ns / NSEC_PER_MSEC, last, busy ? "not done" : "done");
 	}
 	if (busy && fLeftCount < GPU_LEFT) {
 		struct gpu_left * left = &fLeft[fLeftCount++];

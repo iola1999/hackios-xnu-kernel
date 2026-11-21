@@ -113,6 +113,11 @@ void            MiniIOSurfaceCost(uint32_t * made, uint64_t * making, uint32_t *
 void            MiniIOSurfaceClearKept(void);
 /* Wait, for so many milliseconds at most, until the GPU is done with a surface's pixels (AnnibaleGPU.cpp). */
 bool            MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds);
+/*
+ * True once GPU submissions are closed, by the backend after a fault or by AnnibaleGPU after a
+ * failed wait or unmap: a surface the GPU has not finished by then never will be.
+ */
+bool            MiniIOSurfaceGPUStopped(void);
 MiniIOSurface * MiniIOSurfaceCreateSimple(uint32_t width, uint32_t height, uint32_t pixelFormat);
 void            MiniIOSurfaceDrop(MiniIOSurface * surface);
 /* A Mach send right for the surface in the task (what IOSurfaceCreateMachPort gives); 0 on failure. */

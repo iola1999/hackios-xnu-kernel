@@ -410,6 +410,19 @@ MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds)
 	return done;
 }
 
+bool
+MiniIOSurfaceGPUStopped(void)
+{
+	bool stopped = !annibale_gpu_ready();
+
+	if (gGPULock != NULL) {
+		IOLockLock(gGPULock);
+		stopped = stopped || gGPUReported;
+		IOLockUnlock(gGPULock);
+	}
+	return stopped;
+}
+
 /*
  * Boot-arg touch_lat=1: a line for every wait of a program's for the GPU that took a millisecond or
  * more ("tl: f KIND US at US"), for telling apart what holds a frame up (tools/frames.py).

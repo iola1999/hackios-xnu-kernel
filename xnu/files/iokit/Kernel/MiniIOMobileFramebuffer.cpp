@@ -56,7 +56,6 @@ micros(uint64_t absolute)
 
 extern "C" void annibale_tl(const char * format, ...) __printflike(1, 2);
 extern "C" uint32_t annibale_frames_shown;        /* (bsd/sys/annibale_input.h) */
-extern "C" bool annibale_gpu_ready(void);       /* (bsd/sys/annibale_input.h): false once GPU submissions are closed */
 
 /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5) */
 enum {
@@ -778,7 +777,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	/* (MiniIOSurfaceDrawn() answers at once when the GPU has stopped: only a working one is waited for) */
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 		if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS)) {
-			gpu_up = unfinished ? gpu_up : annibale_gpu_ready();
+			gpu_up = unfinished ? gpu_up : !MiniIOSurfaceGPUStopped();
 			unfinished = true;
 			if (gpu_up) {
 				IOLog("MiniIOMobileFramebuffer: swap %u: the GPU is not done with surface %u after %u ms; shown as it is\n",
@@ -787,9 +786,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 	}
 	/*
-	 * Once the kernel has closed GPU submissions after a fault, no surface still waiting for the GPU
-	 * will ever be finished. The window server goes on swapping between two such surfaces, and putting
-	 * them on the panel as they are turned the whole screen bright and dark many times a second. The
+	 * Once the kernel has closed GPU submissions (MiniIOSurfaceGPUStopped()), no surface still waiting
+	 * for the GPU will ever be finished. The window server goes on swapping between two such surfaces,
+	 * and putting them on the panel as they are turned the whole screen bright and dark many times a second. The
 	 * swap is taken and let go without drawing: the panel keeps its last finished frame, as a display
 	 * controller waiting on the GPU's fence would.
 	 */

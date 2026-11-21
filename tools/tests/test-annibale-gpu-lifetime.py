@@ -334,6 +334,36 @@ static void full_pending() {
     for (auto *m : backing) assert(!m->freed && m->refs == 1);
     assert(done_calls == 0 && freed_addresses == 0);
 }
+static void long_pass() {
+    /* fLeft is full while one submission runs for about 7 s (a camera still-image pass): the next
+       free waits it out across more than one GPU_PATIENCE_MS wait and nothing is reported */
+    reset(); auto c = client(); std::vector<IOMemoryDescriptor *> backing;
+    for (unsigned i = 0; i <= GPU_LEFT; ++i) {
+        auto *b = allocate(c); b->fence = 7; backing.push_back(b->memory);
+    }
+    busy_for = 7 * 5000;                        /* gpuWait() looks every 200 us */
+    IOLockLock(gGPULock);
+    for (unsigned i = 0; i <= GPU_LEFT; ++i) c.freeBuffer(&c.fBuffers[i]);
+    c.reap();
+    IOLockUnlock(gGPULock);
+    assert(!gGPUReported && !MiniIOSurfaceGPUStopped() && now > GPU_PATIENCE_MS * NSEC_PER_MSEC);
+    assert(c.fLeftCount == 0 && c.fBufferCount == 0);
+    for (auto *m : backing) assert(m->freed);
+    c.free();
+
+    /* a core whose retired timestamp stands still: reported after GPU_STALL_MS, the last buffer kept */
+    reset(); c = client(); backing.clear(); retired_now++;
+    for (unsigned i = 0; i <= GPU_LEFT; ++i) {
+        auto *b = allocate(c); b->fence = 7; backing.push_back(b->memory);
+    }
+    fence_done = false;
+    IOLockLock(gGPULock);
+    for (unsigned i = 0; i <= GPU_LEFT; ++i) c.freeBuffer(&c.fBuffers[i]);
+    IOLockUnlock(gGPULock);
+    assert(gGPUReported && MiniIOSurfaceGPUStopped() && now >= GPU_STALL_MS * NSEC_PER_MSEC);
+    assert(c.fLeftCount == GPU_LEFT && c.fBufferCount == 1 && !backing.back()->freed);
+    c.clientClose(); c.free();
+}
 static void failed_submit() {
     for (bool recovered : {false, true}) {
         reset(); auto c = client(); auto *b = allocate(c); auto *m = b->memory;
@@ -370,8 +400,9 @@ static void queue_room() {
 }
 static void display() {
     reset(); MiniIOSurface s{}; s.drawn = 7; ready = false;
-    assert(!MiniIOSurfaceDrawn(&s, 0) && done_calls == 0);
-    ready = true; assert(MiniIOSurfaceDrawn(&s, 0));
+    assert(!MiniIOSurfaceDrawn(&s, 0) && done_calls == 0 && MiniIOSurfaceGPUStopped());
+    ready = true; assert(MiniIOSurfaceDrawn(&s, 0) && !MiniIOSurfaceGPUStopped());
+    gGPUReported = true; assert(!MiniIOSurfaceDrawn(&s, 0) && MiniIOSurfaceGPUStopped());
 
     reset();
     auto *m = new IOMemoryDescriptor(2 * PAGE_SIZE);
@@ -387,8 +418,8 @@ static void display() {
 }
 int main() {
     healthy(); stopped(); failed_reap(); completed_reap(); failed_free(); partial_map(); segments(); kept();
-    failed_surface(); surface_ownership(); full_pending(); failed_submit(); queue_room(); display(); reset();
-    printf("AnnibaleGPU production lifecycle: 30 scenarios at %llu-byte pages passed\n", (unsigned long long)PAGE_SIZE);
+    failed_surface(); surface_ownership(); full_pending(); long_pass(); failed_submit(); queue_room(); display(); reset();
+    printf("AnnibaleGPU production lifecycle: 32 scenarios at %llu-byte pages passed\n", (unsigned long long)PAGE_SIZE);
 }
 '''
 
@@ -403,6 +434,7 @@ def unit(source, memory):
             + "\nstruct AnnibaleGPUUserClient : IOUserClient {\n" + fields
             + "\nIOReturn clientClose(); void free();\n};\n"
             + function(source, "gpuWait") + function(source, "MiniIOSurfaceDrawn")
+            + function(source, "MiniIOSurfaceGPUStopped")
             + memory + function(source, "AnnibaleGPUUserClient::submit") + CASES)
 
 
@@ -478,6 +510,8 @@ def main():
                 ("one_lookup", memory, "phys += 4096, length -= 4096", "length -= 4096", False),
                 ("queue_wait_held", source, "if (!gpuWait(last - depth + 1, GPU_PATIENCE_MS)) {", "if (true) {", True),
                 ("submit_zero", source, "gGPUReported = true;\n\t}\n\tif (gpu_log", "gGPUReported = false;\n\t}\n\tif (gpu_log", True),
+                ("one_free_wait", memory, "} while (busy && fLeftCount == GPU_LEFT && !gGPUReported && annibale_gpu_ready());", "} while (false);", False),
+                ("stopped_ignores_reported", source, "stopped = stopped || gGPUReported;", "stopped = stopped;", True),
                 ("display_stopped", source, "(annibale_gpu_ready() && gpuWait(fence, milliseconds))", "(!annibale_gpu_ready() || gpuWait(fence, milliseconds))", True),
             ]
             for name, original, old, new, in_source in changes:
