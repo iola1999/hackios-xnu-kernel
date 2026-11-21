@@ -42,6 +42,8 @@ typedef struct task * task_t;
 #endif
 
 static void IOLog(const char *fmt, ...) { (void)fmt; }
+static bool PE_parse_boot_argn(const char *, void *, int) { return false; }
+extern "C" void proc_selfname(char *buf, int size) { snprintf(buf, (size_t)size, "test"); }
 static int copyout(const void *kaddr, user_addr_t uaddr, size_t len) {
     memcpy((void *)(uintptr_t)uaddr, kaddr, len);
     return 0;
@@ -403,10 +405,48 @@ int main(void) {
     assert(dr[3 * dstRotBGRA->info.bytesPerRow + 1 * 4] == 4);
     assert(uc->externalMethod(kM2MethodAbortTransfers, &args, nullptr, nullptr, nullptr) == kIOReturnSuccess);
 
+    /* 6. '444f' (4:4:4 biplanar, AppleJPEG's output for a 4:4:4 JPEG) -> RGBA: one CbCr pair per pixel */
+    auto * src444 = makeBiplanar(8, FOURCC('4','4','4','f'), 4, 2, false);
+    src444->planes[1].width = 4; src444->planes[1].height = 2; src444->planes[1].bytesPerRow = 64;
+    src444->planes[1].size = 64 * 2;
+    free(src444->kpixels);
+    src444->info.allocSize = 512 + src444->planes[0].size + src444->planes[1].size;
+    src444->kpixels = (uint8_t *)calloc(1, src444->info.allocSize);
+    for (unsigned y = 0; y < 2; y++)
+        for (unsigned x = 0; x < 4; x++) {
+            src444->kpixels[src444->planes[0].offset + y * src444->planes[0].bytesPerRow + x] = (uint8_t)(40 + 50 * x + 20 * y);
+            src444->kpixels[src444->planes[1].offset + y * 64 + x * 2] = 128;
+            src444->kpixels[src444->planes[1].offset + y * 64 + x * 2 + 1] = 128;
+        }
+    auto * dstRGBA = makeSingle(9, FOURCC('R','G','B','A'), 4, 2, 4);
+    memset(rawReq, 0, sizeof(rawReq));
+    req->srcSurfaceID = 8;
+    req->dstSurfaceID = 9;
+    req->flags = kM2FlagSkipAsyncCallback;
+    assert(uc->externalMethod(kM2MethodTransformSurface, &args, nullptr, nullptr, nullptr) == kIOReturnSuccess);
+    for (unsigned y = 0; y < 2; y++)
+        for (unsigned x = 0; x < 4; x++) {
+            const uint8_t * px = dstRGBA->kpixels + dstRGBA->info.offset + y * dstRGBA->info.bytesPerRow + x * 4;
+            uint8_t luma = (uint8_t)(40 + 50 * x + 20 * y);
+            assert(px[0] == luma && px[1] == luma && px[2] == luma && px[3] == 255);
+        }
+
+    /* 7. A format without texel access ('y420', three planes) is refused, not read as BGRA */
+    auto * srcPlanar = makeSingle(10, FOURCC('y','4','2','0'), 4, 2, 1);
+    auto * dstRefused = makeSingle(11, FOURCC('B','G','R','A'), 4, 2, 4);
+    memset(rawReq, 0, sizeof(rawReq));
+    req->srcSurfaceID = 10;
+    req->dstSurfaceID = 11;
+    req->flags = kM2FlagSkipAsyncCallback;
+    assert(uc->externalMethod(kM2MethodTransformSurface, &args, nullptr, nullptr, nullptr) == kIOReturnUnsupported);
+    (void)srcPlanar;
+    (void)dstRefused;
+
     assert(uc->clientClose() == kIOReturnSuccess);
     uc->release();
-    for (int i = 1; i <= 7; i++) { gSurfs[i]->release(); gSurfs[i] = nullptr; }
-    printf("MiniM2Scaler host test: P010->NV12, NV12->BGRA CSC, L00h half-float, ZeroFill, CW90, SharedEvent & AsyncCallback PASS\n");
+    for (int i = 1; i <= 11; i++) { gSurfs[i]->release(); gSurfs[i] = nullptr; }
+    printf("MiniM2Scaler host test: P010->NV12, NV12->BGRA CSC, L00h half-float, ZeroFill, CW90, 444f->RGBA, "
+           "unsupported refusal, SharedEvent & AsyncCallback PASS\n");
     return 0;
 }
 '''

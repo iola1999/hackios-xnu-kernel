@@ -116,8 +116,40 @@ m2IsBiplanarYUV(uint32_t fmt, uint32_t * hsub, uint32_t * vsub, bool * wide, boo
 		*hsub = 2; *vsub = 1; *wide = true; *full = false; return true;
 	case FOURCC('x', 'f', '2', '2'):
 		*hsub = 2; *vsub = 1; *wide = true; *full = true; return true;
+	case FOURCC('4', '4', '4', 'v'):
+		*hsub = 1; *vsub = 1; *wide = false; *full = false; return true;
+	case FOURCC('4', '4', '4', 'f'):
+		*hsub = 1; *vsub = 1; *wide = false; *full = true; return true;
+	case FOURCC('x', '4', '4', '4'):
+		*hsub = 1; *vsub = 1; *wide = true; *full = false; return true;
+	case FOURCC('x', 'f', '4', '4'):
+		*hsub = 1; *vsub = 1; *wide = true; *full = true; return true;
 	default:
 		return false;
+	}
+}
+
+/* The formats whose texels m2SampleRGBA16 reads and m2StoreSinglePlaneRGBA16 writes. */
+static bool
+m2HasTexelAccess(uint32_t fmt)
+{
+	uint32_t hsub, vsub;
+	bool wide, full;
+
+	switch (fmt) {
+	case FOURCC('B', 'G', 'R', 'A'):
+	case FOURCC('R', 'G', 'B', 'A'):
+	case FOURCC('L', '0', '0', '8'):
+	case FOURCC('A', '0', '0', '8'):
+	case 0x00000008:
+	case FOURCC('L', 'A', '0', '8'):
+	case FOURCC('L', '0', '1', '6'):
+	case FOURCC('L', '0', '0', 'h'):
+	case FOURCC('1', 'C', '0', 'h'):
+	case FOURCC('R', 'G', 'h', 'A'):
+		return true;
+	default:
+		return m2IsBiplanarYUV(fmt, &hsub, &vsub, &wide, &full);
 	}
 }
 
@@ -504,7 +536,7 @@ m2SampleRGBA16(uint32_t fmt, const uint8_t * p0, uint32_t w0, uint32_t h0, uint3
 		out[3] = halfToUnorm16(s[3]);
 		break;
 	}
-	default: { /* BGRA and compatible 4-byte RGB formats */
+	default: { /* BGRA */
 		const uint8_t * s = px + x * 4u;
 		out[0] = (uint16_t) (s[2] << 8);
 		out[1] = (uint16_t) (s[1] << 8);
@@ -659,7 +691,21 @@ m2ExecuteTransfer(const struct m2scaler_req * req, MiniIOSurface * src, MiniIOSu
 		return kIOReturnSuccess;
 	}
 
-	/* General path: handles CSC (YUV <-> BGRA/RGBA), half-float, flips, and CW rotations. */
+	/*
+	 * General path: handles CSC (YUV <-> BGRA/RGBA), half-float, flips, and CW rotations. A format it
+	 * has no texel access for is refused, as the scaler refuses formats it does not support, and the
+	 * caller converts another way; read as BGRA, a one-byte luma plane came out as four narrow copies.
+	 */
+	if (!m2HasTexelAccess(sfmt) || !m2HasTexelAccess(dfmt)) {
+		static uint32_t refused;
+
+		if (refused++ < 16) {
+			IOLog("MiniM2Scaler: %c%c%c%c -> %c%c%c%c refused: no texel access for that format\n",
+			    (char) (sfmt >> 24), (char) (sfmt >> 16), (char) (sfmt >> 8), (char) sfmt,
+			    (char) (dfmt >> 24), (char) (dfmt >> 16), (char) (dfmt >> 8), (char) dfmt);
+		}
+		return kIOReturnUnsupported;
+	}
 	bool rot90 = (xform & kM2FlagRotate90) != 0;
 	bool flipH = (xform & kM2FlagFlipH) != 0;
 	bool flipV = (xform & kM2FlagFlipV) != 0;
