@@ -56,6 +56,7 @@ micros(uint64_t absolute)
 
 extern "C" void annibale_tl(const char * format, ...) __printflike(1, 2);
 extern "C" uint32_t annibale_frames_shown;        /* (bsd/sys/annibale_input.h) */
+extern "C" bool annibale_gpu_ready(void);       /* (bsd/sys/annibale_input.h): false once GPU submissions are closed */
 
 /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5) */
 enum {
@@ -307,6 +308,16 @@ public:
 	bool            fRecDone;
 	bool            fRecWrapped;            /* (rec_ring) the memory has been full once: frames go over the oldest */
 	bool            fRecScanout;
+	bool            fGPUStopSaid;           /* show(): swaps stopped going on the panel once the GPU stopped */
+	/*
+	 * kern.annibale.rec_stream (MiniFramebufferRecord.inc): at most this many frames a second, over the
+	 * oldest without end, each one flushed for the host to read while the kernel runs; 0 when off.
+	 */
+	uint32_t        fRecStreamFps;
+	uint64_t        fRecLastAt;             /* mach time of the newest frame recorded */
+	bool            fRecHeld;               /* a frame was shown too soon after it and not recorded */
+	thread_call_t   fRecTail;               /* records the panel once a held frame stays the last */
+	uint32_t *      fRecRow;                /* one panel row read from the scanout buffer at once */
 	int32_t         fLastBy0, fLastBy1;
 	uint32_t        fLastBufSeqBefore, fLastBufSeqAfter;
 	bool            fLastAllDirty;
@@ -346,6 +357,8 @@ public:
 	void resetRecHeader(uint64_t durationNs, uint64_t startDelayNs, bool scanout);
 	void flushRecCache(void);
 	void recordFrame(const uint8_t * swap, MiniIOSurface * s, bool clearedBlack, bool drewPanel, uint64_t now);
+	void recordScanout(uint8_t * to, uint32_t width, uint32_t height);
+	static void recTailMain(thread_call_param_t self, thread_call_param_t unused);
 };
 
 OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
@@ -760,11 +773,38 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	MiniIOSurface * recorded = NULL;
 	bool report, has_latch, cleared_black = false, drew_panel;
 
+	bool unfinished = false, gpu_up = true;
+
+	/* (MiniIOSurfaceDrawn() answers at once when the GPU has stopped: only a working one is waited for) */
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 		if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS)) {
-			IOLog("MiniIOMobileFramebuffer: swap %u: the GPU is not done with surface %u after %u ms; shown as it is\n",
-			    swapWord(swap, SWAP_ID), swapWord(swap, SWAP_SURFACE(layer)), SWAP_GPU_MS);
+			gpu_up = unfinished ? gpu_up : annibale_gpu_ready();
+			unfinished = true;
+			if (gpu_up) {
+				IOLog("MiniIOMobileFramebuffer: swap %u: the GPU is not done with surface %u after %u ms; shown as it is\n",
+				    swapWord(swap, SWAP_ID), swapWord(swap, SWAP_SURFACE(layer)), SWAP_GPU_MS);
+			}
 		}
+	}
+	/*
+	 * Once the kernel has closed GPU submissions after a fault, no surface still waiting for the GPU
+	 * will ever be finished. The window server goes on swapping between two such surfaces, and putting
+	 * them on the panel as they are turned the whole screen bright and dark many times a second. The
+	 * swap is taken and let go without drawing: the panel keeps its last finished frame, as a display
+	 * controller waiting on the GPU's fence would.
+	 */
+	if (unfinished && !gpu_up) {
+		if (!fGPUStopSaid) {
+			fGPUStopSaid = true;
+			IOLog("MiniIOMobileFramebuffer: swap %u and later ones with surfaces the GPU never finished are not shown: "
+			    "the GPU has stopped; the panel keeps its last frame\n", swapWord(swap, SWAP_ID));
+		}
+		IOLockLock(fSwapLock);
+		fSwapFirst = (fSwapFirst + 1) % SWAP_QUEUE;
+		fSwapsWaiting--;
+		IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
+		IOLockUnlock(fSwapLock);
+		return;
 	}
 	fStatWaiting += mach_absolute_time() - began;
 	began = ready = mach_absolute_time();

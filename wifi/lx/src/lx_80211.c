@@ -572,10 +572,15 @@ linuxkpi_ieee80211_scan_completed(struct ieee80211_hw *hw, struct cfg80211_scan_
 	lx_os_unlock();
 }
 
-/* What was heard, the strongest first. Names and addresses of other people's networks: for the log of the run only. */
+/*
+ * What was heard, the strongest first. Names and addresses of other people's networks: for the log of the run only.
+ * Boot-arg wifi_quiet=1 keeps only the summary line: wifid scans every few seconds, and the list of every network
+ * at each scan pushes everything else out of the kernel's log in about a minute.
+ */
 static void
 say_heard(struct lx_radio *radio)
 {
+	bool quiet = lx_os_option("wifi_quiet") != 0;
 	unsigned on_channel[200] = { 0 }, low = 0, high = 0, open = 0, nameless = 0;
 	int strongest = -128, weakest = 127;
 	char line[400] = "";
@@ -610,6 +615,9 @@ say_heard(struct lx_radio *radio)
 		/* (the network that is wanted is the user's own: its name is not said even here) */
 		wanted = radio->want_length != 0 && network->name_length == radio->want_length &&
 		    memcmp(network->name, radio->want, radio->want_length) == 0;
+		if (quiet) {
+			continue;
+		}
 		printf("lx: heard: channel %3u (%u MHz) %4d dBm  %02x:%02x:%02x:%02x:%02x:%02x  %s, %u times  \"%s\"\n", channel,
 		    network->frequency, network->signal, network->sender[0], network->sender[1], network->sender[2], network->sender[3],
 		    network->sender[4], network->sender[5], !(network->capability & 0x10) ? "open" : network->protected ? "RSN" :
