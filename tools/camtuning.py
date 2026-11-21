@@ -4,7 +4,7 @@ isp_load_tuning), out of the camera's tuning file of Android's camera stack
 (/odm/lib64/camera/com.qti.tuned.<name>.bin of the phone: the vendor's, kept in fw-camera/ and never in
 the repository; so is what this makes of it).
 
-usage: camtuning.py TUNED.bin OUT.isp     (camtuning.py TUNED.bin -   lists what is there only)
+usage: camtuning.py TUNED.bin OUT.isp [MODULE.bin MODE]     (camtuning.py TUNED.bin -   lists what is there only)
 
 The tuning file is a "QTI Chromatix Header" / "Parameter Parser V3.0.1" file, laid out as the sensors'
 module files are (see camsensor.py): a table of symbols { id, name[32], kind, ?, parent, offset, size }
@@ -28,8 +28,16 @@ wide camera under a warm white LED: its colour shading measured on a white sheet
 within 3 %, the 2550-2900 K one's is 12 % off in red).
 
 This phone (SM8750) has "Parameter Parser V5.2.1" files instead, read by v5_tables(): the colour matrix
-of the IPE (cc14_ipe_v2) and the same refPtV1. Its lens shading (lsc502) is laid out on another grid and
-not read: OUT.isp then has no lens shading ranges, and the processor shades nothing.
+of the IPE (cc14_ipe_v2), the lens shading of the TFE (lsc502_tfe_v2, the front end the back camera's
+frames take on Android) and the same refPtV1. lsc502's leaves begin with the same four 17 x 13 grids as
+lsc34's, R, Gr, Gb, B, the middle point 1.
+
+The lens shading grids are laid over the whole of the sensor. A mode that reads part of it (the back
+camera's mode 24: the middle 5120 x 3840 of 8192 x 6144) needs them laid over that part: given the
+sensor's module file (com.qti.sensormodule.<name>.bin) and the mode, window() finds the part from the
+mode's stream (where it starts and its size, in the mode's binned pixels) and mode 0's (the whole sensor,
+unbinned), and on_window() takes each grid's gains there, between the file's points bilinear as the
+processor takes them. Without them OUT.isp has the grids as the file has them.
 
 OUT.isp: "RWCISP02"; the number of the matrices' light ranges and per range { lux index from, to (two
 floats), the number of temperature ranges, per range { CCT from, to, the matrix (9 floats) } }; the
@@ -91,7 +99,8 @@ def references(syms):
 
 
 def v5_tables(data):
-    """(colour matrix tree, reference lights) of a V5.2.1 tuning file, as module() and references() give them
+    """(colour matrix tree, lens shading tree, reference lights) of a V5.2.1 tuning file, as module() and
+    references() give them
 
     The file: a header, then sections by kind: 0 named symbols (60 bytes: id, name[32], six words, the
     5th and 4th the size and pool offset of the module's header), 1 the data pool, 3 numbered values (16
@@ -117,29 +126,72 @@ def v5_tables(data):
     def depth(node):
         return 0 if node[2] == 0 else 1 + depth(children(node)[0])
 
-    header = first('cc14_ipe_v2')
-    node = struct.unpack('<2f4I', value[struct.unpack_from('<I', header, len(header) - 4)[0]])
-    # The levels above the lux index and the colour temperature (DRC gain, exposure ratio, flash...) are
-    # taken where they hold 1, or else 0 (the flash off): a preview's, assumed from their ranges only.
-    while depth(node) > 2:
-        nodes = children(node)
-        node = next((n for n in nodes if n[0] <= 1 <= n[1]), next((n for n in nodes if n[0] <= 0 <= n[1]), nodes[0]))
-    ccm = [(lux[0], lux[1], [(c[0], c[1], struct.unpack_from('<9f', value[c[5]])) for c in children(lux)])
-           for lux in children(node)]
+    def tree(name, floats):
+        header = first(name)
+        node = struct.unpack('<2f4I', value[struct.unpack_from('<I', header, len(header) - 4)[0]])
+        # The levels above the lux index and the colour temperature (DRC gain, exposure ratio, flash...) are
+        # taken where they hold 1, or else 0 (the flash off): a preview's, assumed from their ranges only.
+        while depth(node) > 2:
+            nodes = children(node)
+            node = next((n for n in nodes if n[0] <= 1 <= n[1]), next((n for n in nodes if n[0] <= 0 <= n[1]), nodes[0]))
+        return [(lux[0], lux[1], [(c[0], c[1], struct.unpack_from('<%df' % floats, value[c[5]])) for c in children(lux)])
+                for lux in children(node)]
+
+    ccm = tree('cc14_ipe_v2', 9)
+    lsc = tree('lsc502_tfe_v2', 4 * GRID)
+    for _, _, ranges in lsc:
+        for _, _, grids in ranges:
+            if any(not 0.9 <= grids[c * GRID + GRID // 2] <= 1.1 for c in range(4)):
+                sys.exit('camtuning.py: a lens shading grid of the file without 1 in its middle')
     for _, _, ranges in ccm:
         for _, _, m in ranges:
             if any(abs(sum(m[3 * r:3 * r + 3]) - 1) > 0.02 for r in range(3)):
                 sys.exit('camtuning.py: a colour matrix of the file whose rows do not sum to 1')
-    return ccm, references({0: ('refPtV1', first('refPtV1'))})
+    return ccm, lsc, references({0: ('refPtV1', first('refPtV1'))})
+
+
+def window(module_data, mode_index):
+    """(left, top, width, height) of the sensor mode's picture, each as a fraction of the whole sensor"""
+    from camsensor_v5 import Module
+
+    modes = Module(module_data).inspect()['resolutionInfo'][0]['resolutionData']
+    whole, mode = modes[0], modes[mode_index]
+    a, s = whole['streams'][0], mode['streams'][0]
+    if whole['horizontalBinning'] != 1 or whole['verticalBinning'] != 1 or a['xStart'] or a['yStart']:
+        sys.exit('camtuning.py: mode 0 of the module is not the whole sensor')
+    h, v = mode['horizontalBinning'], mode['verticalBinning']
+    part = (s['xStart'] * h / a['width'], s['yStart'] * v / a['height'], s['width'] * h / a['width'],
+            s['height'] * v / a['height'])
+    if part[0] + part[2] > 1 or part[1] + part[3] > 1:
+        sys.exit('camtuning.py: the mode\'s picture is not within the sensor')
+    return part
+
+
+def on_window(grids, part):
+    """the four 17 x 13 grids laid over part (window()'s) of the sensor instead of the whole of it"""
+    left, top, width, height = part
+    out = []
+    for c in range(4):
+        g = grids[c * GRID:(c + 1) * GRID]
+        for j in range(13):
+            y = (top + height * j / 12) * 12
+            y0 = min(int(y), 11)
+            fy = y - y0
+            for i in range(17):
+                x = (left + width * i / 16) * 16
+                x0 = min(int(x), 15)
+                fx = x - x0
+                at = y0 * 17 + x0
+                out.append((g[at] * (1 - fx) + g[at + 1] * fx) * (1 - fy) + (g[at + 17] * (1 - fx) + g[at + 18] * fx) * fy)
+    return out
 
 
 def main():
-    if len(sys.argv) < 3:
+    if len(sys.argv) not in (3, 5):
         sys.exit(__doc__)
     data = open(sys.argv[1], 'rb').read()
     if data.startswith(b'QTI Chromatix Header') and b'Parameter Parser V5.2.1' in data[:0x60]:
-        ccm, refs = v5_tables(data)
-        lsc = []
+        ccm, lsc, refs = v5_tables(data)
     elif data.startswith(b'QTI Chromatix Header') and b'Parameter Parser V3.0.1' in data[:0x60]:
         syms = symbols(data)
         ccm = module(syms, 'cc13', 9)
@@ -147,6 +199,11 @@ def main():
         refs = references(syms)
     else:
         sys.exit('camtuning.py: not a tuning file of the kind known here')
+    if len(sys.argv) == 5:
+        part = window(open(sys.argv[3], 'rb').read(), int(sys.argv[4]))
+        print('the mode\'s picture: from %.4f, %.4f of the sensor, %.4f x %.4f of it' % part)
+        lsc = [(lux_from, lux_to, [(cct_from, cct_to, on_window(v, part)) for cct_from, cct_to, v in ranges])
+               for lux_from, lux_to, ranges in lsc]
 
     for what, tree in (('colour matrix', ccm), ('lens shading', lsc)):
         for lux_from, lux_to, ranges in tree:
@@ -175,4 +232,5 @@ def main():
     open(sys.argv[2], 'wb').write(out)
 
 
-main()
+if __name__ == '__main__':
+    main()
