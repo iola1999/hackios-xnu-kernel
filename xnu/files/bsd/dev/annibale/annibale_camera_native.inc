@@ -331,7 +331,11 @@ cam_native_configure(void)
 	csid_wr(CAM980_WM_IRQ_PATTERN, 1u);
 	csid_wr(CAM980_WM_PREFETCH, boot_cam_wm_prefetch != 0 ? 1u : 0u);
 	csid_wr(CAM980_WM_PREFETCH_MASK, boot_cam_wm_prefetch != 0 ? UINT32_MAX : 0u);
-	csid_wr(CAM980_WM_CACHE, 0);
+	/*
+	 * system_cache_cfg (CAM980_WM_CACHE) keeps its reset value: the vendor bus driver
+	 * (cam_vfe_bus_ver3.c) never writes it. With 0 written, every 256-byte block whose address
+	 * has bit 8 set ended in a CAMNOC decode error and stayed unwritten.
+	 */
 	csid_wr(CAM980_WM_ADDR_CONFIG, (uint32_t)(cam_capture.dma_address & 0xffu));
 	cam_diag_bus_debug_enable();
 	/* Bits that survive the clear are an earlier frame's and do not fail this one. */
