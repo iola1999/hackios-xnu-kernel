@@ -638,6 +638,15 @@ annibale_cam_write(dev_t dev __unused, struct uio *uio, int ioflag __unused)
 			lck_mtx_unlock(cam_lock);
 			return error;
 		}
+		if (cam_profile != NULL && cmd.command == ANNIBALE_CAMERA_FOCUS) {
+			if (cam_capture_resources_held()) {
+				error = EBUSY;
+			} else if (!cam_native_focus_set(cam_profile, cmd.a)) {
+				error = ENOTSUP;
+			}
+			lck_mtx_unlock(cam_lock);
+			return error;
+		}
 		if (cam_profile != NULL || cam_hw_mmio != 0) {
 			error = cam_capture_resources_held() ? EBUSY : ENOTSUP;
 			lck_mtx_unlock(cam_lock);

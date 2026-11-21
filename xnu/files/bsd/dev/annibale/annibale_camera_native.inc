@@ -212,6 +212,7 @@ cam_native_release(void)
 		return false;
 	}
 	if (cam_native_sensor_powered) {
+		cam_native_lens_down();
 		if (!cam_native_sensor_power(false)) {
 			say("release failed: sensor power off\n");
 			return false;
@@ -252,6 +253,7 @@ cam_native_prepare(void)
 	}
 	cam_native_sensor_powered = true;
 	/* Open's identity probe is powered down before applying the module's sequence. */
+	cam_native_lens_down();
 	if (!cam_native_sensor_power(false) || !cam_native_sensor_power(true)) {
 		return EIO;
 	}
@@ -270,6 +272,7 @@ cam_native_prepare(void)
 	    !cam_native_register_table(1u, cam_profile->mode_count)) {
 		return EIO;
 	}
+	cam_native_lens_up();
 	cam_native_initialized = true;
 	return 0;
 }
@@ -531,6 +534,7 @@ cam_native_stream_next(void)
 	if (!cam_native_apply_exposure_regs(false)) {
 		error = EIO;
 	}
+	cam_native_apply_focus(false);
 	cam_native_exposure_shown(false);
 	if (error == 0) {
 		error = cam_native_wait_frame();

@@ -453,6 +453,60 @@ cam_native_apply_exposure_regs(bool force)
 	return true;
 }
 
+/*
+ * Back camera lens, as the module's actuatorDriver gives it: a GT9764V at 0x0c on the sensor's bus,
+ * set up with 0x02=0x02, 0x06=0x40, 0x07=0x07, 0x0b=0x03; the position is a 16-bit write at 0x03
+ * (0 the furthest to 1023); before its supply goes off it gets 0x02=0x01 and 200 us. A lens that
+ * does not answer leaves the frames without a focus position; the camera works on.
+ */
+#define OVX8000_LENS_SLAVE      0x0cu
+
+static bool cam_native_lens_ready;
+
+static void
+cam_native_apply_focus(bool force)
+{
+	if (!cam_native_lens_ready || (!force && cam_native_focus == cam_native_applied_focus)) {
+		return;
+	}
+	if (!wide_bus_write(OVX8000_LENS_SLAVE, 0x03u, (uint8_t)(cam_native_focus >> 8),
+	    (uint8_t)cam_native_focus, 3u)) {
+		say("lens position %u failed\n", cam_native_focus);
+		cam_native_lens_ready = false;
+		cam_native_applied_focus = ANNIBALE_CAMERA_NO_FOCUS;
+		return;
+	}
+	cam_native_applied_focus = cam_native_focus;
+}
+
+static void
+cam_native_lens_up(void)
+{
+	static const uint8_t setup[][2] = { { 0x02u, 0x02u }, { 0x06u, 0x40u }, { 0x07u, 0x07u }, { 0x0bu, 0x03u } };
+
+	if (!cam_native_is_ovx8000_m24(cam_profile)) {
+		return;
+	}
+	cam_native_lens_ready = true;
+	for (size_t i = 0; cam_native_lens_ready && i < sizeof(setup) / sizeof(setup[0]); i++) {
+		cam_native_lens_ready = wide_bus_write(OVX8000_LENS_SLAVE, setup[i][0], setup[i][1], 0, 2u);
+	}
+	if (!cam_native_lens_ready) {
+		say("lens set-up failed\n");
+	}
+	cam_native_apply_focus(true);
+}
+
+static void
+cam_native_lens_down(void)
+{
+	if (cam_native_lens_ready && wide_bus_write(OVX8000_LENS_SLAVE, 0x02u, 0x01u, 0, 2u)) {
+		delay_for_interval(200, NSEC_PER_USEC);
+	}
+	cam_native_lens_ready = false;
+	cam_native_applied_focus = ANNIBALE_CAMERA_NO_FOCUS;
+}
+
 static bool
 cam_native_register_table(uint32_t table, uint32_t count)
 {

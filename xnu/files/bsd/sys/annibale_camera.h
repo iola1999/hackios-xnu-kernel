@@ -37,7 +37,7 @@ struct annibale_camera_frame {
 	uint32_t        frame_lines_max; /* the longest frame it may be given */
 	uint32_t        margin;         /* exposure_lines is at most frame_lines - margin */
 	uint32_t        sensor;         /* which: 0 the macro, 1 the wide, 2 the front, 3 the ultra-wide camera */
-	uint32_t        focus;          /* the lens's position as last set, 0 (the furthest) to 1023: ANNIBALE_CAMERA_NO_FOCUS where it
+	uint32_t        focus;          /* the lens's position it was taken at, 0 (the furthest) to 1023: ANNIBALE_CAMERA_NO_FOCUS where it
 	                                 * has no motor (or it does not answer) */
 	uint32_t        reserved[5];
 };

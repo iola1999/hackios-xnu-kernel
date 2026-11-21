@@ -31,6 +31,8 @@
 #define OVX8000_M24_GAIN_UNITY  256u
 #define OVX8000_M24_GAIN_MAX    4096u
 #define OVX8000_M24_BLACK_10BIT 64u
+#define OVX8000_FOCUS_DEFAULT   512u
+#define OVX8000_FOCUS_MAX       1023u
 
 static uint32_t cam_native_exposure_lines;
 static uint32_t cam_native_gain;
@@ -38,13 +40,16 @@ static uint32_t cam_native_frame_lines;
 static uint32_t cam_native_applied_exposure_lines;
 static uint32_t cam_native_applied_gain;
 static uint32_t cam_native_applied_frame_lines;
+static uint32_t cam_native_focus = OVX8000_FOCUS_DEFAULT;      /* back lens position asked for */
+static uint32_t cam_native_applied_focus = ANNIBALE_CAMERA_NO_FOCUS;   /* ... written; no lens yet */
 /*
- * The exposure the frames show, newest first: lines, gain, frame lines as written before each of
- * the last three frames. A frame's pixels follow what was written two frames before it (measured
- * on the back camera, docs/progress/2026-11-21-user-test-issues.md); its metadata reports that,
- * so auto exposure waits for a change to be in the frames before it measures again.
+ * The exposure and lens position the frames show, newest first: lines, gain, frame lines, focus as
+ * written before each of the last three frames. A frame's pixels follow what was written two frames
+ * before it (measured on the back camera, docs/progress/2026-11-21-user-test-issues.md); its
+ * metadata reports that, so auto exposure and focus wait for a change to be in the frames before
+ * they measure again.
  */
-static uint32_t cam_native_shown[3][3];
+static uint32_t cam_native_shown[3][4];
 
 static bool
 cam_native_is_ov20b_m4(const struct annibale_camera_profile *p)
@@ -72,8 +77,9 @@ cam_native_exposure_invalidate(void)
 static void
 cam_native_exposure_shown(bool restart)
 {
-	const uint32_t now[3] = {
+	const uint32_t now[4] = {
 		cam_native_applied_exposure_lines, cam_native_applied_gain, cam_native_applied_frame_lines,
+		cam_native_applied_focus,
 	};
 
 	for (uint32_t i = 2; i > 0; i--) {
@@ -135,6 +141,17 @@ cam_native_exposure_set(const struct annibale_camera_profile *p,
 	return false;
 }
 
+/* Back camera only: the front one is fixed focus (its module has no actuator). */
+static bool
+cam_native_focus_set(const struct annibale_camera_profile *p, uint32_t position)
+{
+	if (!cam_native_is_ovx8000_m24(p)) {
+		return false;
+	}
+	cam_native_focus = MIN(position, OVX8000_FOCUS_MAX);
+	return true;
+}
+
 static void
 cam_native_frame_exposure(const struct annibale_camera_profile *p,
     struct annibale_camera_frame *f)
@@ -166,6 +183,7 @@ cam_native_frame_exposure(const struct annibale_camera_profile *p,
 		f->frame_lines_min = OVX8000_M24_FLL_MIN;
 		f->frame_lines_max = OVX8000_M24_FLL_MAX;
 		f->margin = OVX8000_M24_MARGIN;
+		f->focus = cam_native_shown[2][3];
 	}
 }
 
