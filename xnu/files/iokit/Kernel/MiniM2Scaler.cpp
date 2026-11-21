@@ -15,6 +15,7 @@
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSNumber.h>
 #include <sys/systm.h>
+#include <pexpert/pexpert.h>
 
 #include "MiniDrivers.h"
 #include "MiniIOSurface.h"
@@ -200,6 +201,49 @@ static inline bool
 m2Aborted(const volatile uint32_t * abortGen, uint32_t startGen)
 {
 	return abortGen != NULL && __atomic_load_n(abortGen, __ATOMIC_ACQUIRE) != startGen;
+}
+
+extern "C" void proc_selfname(char * buf, int size);
+
+/*
+ * Boot-arg m2_log=1: one line for each kind of transfer a process asks for (flags, formats and sizes),
+ * the first time it asks, to tell which rotation and flips a picture went through.
+ */
+static void
+m2LogTransfer(const struct m2scaler_req * req, uint32_t sfmt, uint32_t sw, uint32_t sh, uint32_t dfmt,
+    uint32_t dw0, uint32_t dh0, uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh)
+{
+	static int enabled = -1;
+	static uint64_t seen[64];
+	static uint32_t nseen;
+	char name[32] = "";
+	uint64_t key;
+
+	if (enabled < 0) {
+		uint32_t on = 0;
+
+		enabled = PE_parse_boot_argn("m2_log", &on, sizeof(on)) && on != 0;
+	}
+	if (!enabled) {
+		return;
+	}
+	proc_selfname(name, sizeof(name));
+	key = ((req->flags & 0xffffULL) << 48) ^ ((uint64_t) sfmt << 16) ^ dfmt ^ ((uint64_t) sw << 32) ^
+	    ((uint64_t) dw << 20) ^ name[0] ^ ((uint64_t) name[1] << 8);
+	for (uint32_t i = 0; i < nseen; i++) {
+		if (seen[i] == key) {
+			return;
+		}
+	}
+	if (nseen < sizeof(seen) / sizeof(seen[0])) {
+		seen[nseen++] = key;
+	}
+	IOLog("MiniM2Scaler: %s: flags 0x%llx (h %u v %u rot90 %u) src %c%c%c%c %ux%u [%llu,%llu %llux%llu] -> "
+	    "dst %c%c%c%c %ux%u [%u,%u %ux%u]\n", name, req->flags, (unsigned) (req->flags & 1),
+	    (unsigned) ((req->flags >> 1) & 1), (unsigned) ((req->flags >> 2) & 1),
+	    (char) (sfmt >> 24), (char) (sfmt >> 16), (char) (sfmt >> 8), (char) sfmt, sw, sh,
+	    req->srcXFixed16 >> 16, req->srcYFixed16 >> 16, req->srcWFixed16 >> 16, req->srcHFixed16 >> 16,
+	    (char) (dfmt >> 24), (char) (dfmt >> 16), (char) (dfmt >> 8), (char) dfmt, dw0, dh0, dx, dy, dw, dh);
 }
 
 /* Fast integer bilinear/nearest plane resampler for 1- or 2-component 8/16-bit YUV planes. */
@@ -578,6 +622,8 @@ m2ExecuteTransfer(const struct m2scaler_req * req, MiniIOSurface * src, MiniIOSu
 
 	bool nearest = (req->flags & kM2FlagNearestFilter) != 0;
 	uint32_t xform = (uint32_t) (req->flags & 7ULL);
+
+	m2LogTransfer(req, sfmt, sw0, sh0, dfmt, dw0, dh0, dx0, dy0, dw, dh);
 
 	/* Fast biplanar YUV -> YUV path (covers 420f/420v/xf20/x420 pyramid, rotation & encoder transfers). */
 	if (sbi && dbi && sfull == dfull) {

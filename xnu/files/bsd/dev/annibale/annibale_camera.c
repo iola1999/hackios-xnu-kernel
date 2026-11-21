@@ -172,18 +172,30 @@ render_dynamic_tpg_frame(uint8_t *dest, uint64_t seq, uint32_t exp_lines, uint32
 	}
 }
 
-/* RPMh, apps_smmu, GCC, sun-camcc, CAM-CPAS, cambistmclkcc, TLMM, CCI0, and SE9 I2C bring-up */
+/*
+ * The two frame buffers, in one physically contiguous piece below 64 GiB: CSID/VFE write physical
+ * addresses (cam_hf_qtb's Stage 1 is bypassed). They are taken while the system starts and kept:
+ * after some use no 16 MB run of free pages is left, the open fails and CMCapture keeps asking
+ * for the back camera's stream and giving it back. Each capture clears both before the DMA.
+ */
 static bool
-cam_hardware_power_up(void)
+cam_region_alloc(void)
 {
 	if (cam_region_vbase == 0 && kmem_alloc_contig(kernel_map, &cam_region_vbase,
 	    CAMERA_REGION_SIZE, PAGE_MASK, (ppnum_t)((1ULL << (36 - PAGE_SHIFT)) - 1u), 0,
 	    KMA_KOBJECT | KMA_ZERO | KMA_DATA,
 	    VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
 		cam_region_vbase = 0;
-	}
-	if (cam_region_vbase == 0) {
 		say("failed to allocate camera frame buffer\n");
+	}
+	return cam_region_vbase != 0;
+}
+
+/* RPMh, apps_smmu, GCC, sun-camcc, CAM-CPAS, cambistmclkcc, TLMM, CCI0, and SE9 I2C bring-up */
+static bool
+cam_hardware_power_up(void)
+{
+	if (!cam_region_alloc()) {
 		return false;
 	}
 	if (cam_hw_mmio == 0) {
@@ -426,10 +438,6 @@ annibale_cam_open(dev_t dev __unused, int flags __unused, int devtype __unused, 
 		return EBUSY;
 	}
 	if (!cam_hardware_power_up()) {
-		if (cam_region_vbase != 0) {
-			kmem_free(kernel_map, cam_region_vbase, CAMERA_REGION_SIZE);
-			cam_region_vbase = 0;
-		}
 		lck_mtx_unlock(cam_lock);
 		return EIO;
 	}
@@ -457,10 +465,6 @@ annibale_cam_close(dev_t dev __unused, int flags __unused, int devtype __unused,
 					kfree_data(cam_profile, cam_profile->bytes ? cam_profile->bytes : CAM_NATIVE_PROFILE_BYTES);
 					cam_profile = NULL;
 					cam_native_exposure_reset();
-				}
-				if (cam_region_vbase != 0) {
-					kmem_free(kernel_map, cam_region_vbase, CAMERA_REGION_SIZE);
-					cam_region_vbase = 0;
 				}
 				bzero(&cam_capture, sizeof(cam_capture));
 				cam_hw_dma_verified = false;
@@ -974,6 +978,7 @@ annibale_camera_init(void)
 
 	cam_lock_grp = lck_grp_alloc_init("annibale-cam", LCK_GRP_ATTR_NULL);
 	cam_lock = lck_mtx_alloc_init(cam_lock_grp, LCK_ATTR_NULL);
+	(void)cam_region_alloc();
 
 	int major = cdevsw_add(-1, &annibale_cam_cdevsw);
 	if (major >= 0) {
