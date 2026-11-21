@@ -87,8 +87,12 @@ def export(data, mode_index):
     require(stream['width'] % 4 == 0, 'partial RAW10 group')
     # Native line-based RDI with PLAIN_128 packs 16-byte WM units.
     stride = (row_bytes + 15) & ~15
+    # The module numbers colorFilterArrangement from 1 in camxsensordriver.xsd order (1 BGGR, 2 GBRG,
+    # 3 GRBG, 4 RGGB); the profile's bayer is 0 RGGB, 1 GRBG, 2 GBRG, 3 BGGR. Back mode 24 says 4,
+    # front mode 4 says 1: a front frame has its greens at (0,1) and (1,0), blue at (0,0).
     cfa = mode['colorFilterArrangement']
-    bayer = {1: 3, 2: 2, 3: 1, 4: 0}[cfa] if back else {0: 3, 1: 2, 2: 1, 3: 0}[cfa]
+    require(cfa in (1, 2, 3, 4), 'unsupported colour filter arrangement')
+    bayer = {1: 3, 2: 2, 3: 1, 4: 0}[cfa]
     fields = (
         HEADER.size + len(payload), 1 if back else 2, mode_index, stream['width'], stream['height'], stride,
         bayer,
