@@ -30,6 +30,7 @@
 
 struct apfs_node;
 struct apfs_wmount;
+struct apfs_graft;
 
 /*
  * What one round of vnop_read reads.  Alone on the volume, am_iobuf_size (boot-arg
@@ -176,6 +177,28 @@ struct apfs_mount {
 	struct apfs_synth *am_synth;        /* APFS_SYNTH_MAX of them, made at the first */
 	uint32_t           am_nsynth;
 	struct apfs_wmount *am_w;           /* a writable mount's transaction; NULL: read only */
+	/*
+	 * Grafts (apfs_graft.inc): a volume shown in a directory of another one, the way iOS puts
+	 * a cryptex into the Preboot volume.  A grafted volume's vnodes belong to the host's mount
+	 * (its am_mp is the host's) while its objects are read from its own container.
+	 */
+	struct apfs_graft *am_graft;        /* a grafted volume: where it is shown; NULL: not one */
+	struct apfs_graft *am_grafts;       /* a host: its grafts, the newest first; NULL: none */
+};
+
+/*
+ * One graft.  User space sees the grafted objects under host inode numbers: g_dir for the
+ * graft's root, g_inum_base + id for the rest (apfs_graft_ino).  Made once, kept until the
+ * host is unmounted.
+ */
+struct apfs_graft {
+	struct apfs_mount *g_am;            /* the grafted volume */
+	struct apfs_mount *g_host;
+	uint64_t           g_dir;           /* the host directory it is shown in, and that one's parent */
+	uint64_t           g_parent;
+	uint64_t           g_inum_base;
+	uint64_t           g_inum_len;
+	struct apfs_graft *g_next;          /* the host's next older graft */
 };
 
 /* The private part of a vnode: which object it is. */
@@ -226,6 +249,10 @@ const struct apfs_synth *apfs_synth_find(struct apfs_mount *am, uint64_t parent,
 
 #define APFS_VP(vp)       ((struct apfs_node *)vnode_fsnode(vp))
 #define APFS_VP_MOUNT(vp) (APFS_VP(vp)->an_mount)
+
+/* apfs_graft.inc */
+uint64_t apfs_graft_ino(const struct apfs_mount *am, uint64_t id);    /* the inode number user space sees */
+int apfs_graft_ioctl(vnode_t vp, u_long command, caddr_t data, vfs_context_t ctx);
 
 /* apfs_vfsops.c */
 extern struct vfsops apfs_vfsops;

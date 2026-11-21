@@ -475,6 +475,8 @@ apfs_hash_index(uint64_t obj_id)
 	return (uint32_t)((obj_id ^ (obj_id >> 17)) % APFS_HASH_BUCKETS);
 }
 
+static struct apfs_mount *apfs_graft_route(struct apfs_mount *am, uint64_t *id);
+
 /* The vnode for an object, making one if there is not one already. */
 int
 apfs_node_vnode(struct apfs_mount *am, uint64_t obj_id, vnode_t dvp,
@@ -483,11 +485,13 @@ apfs_node_vnode(struct apfs_mount *am, uint64_t obj_id, vnode_t dvp,
 	struct vnode_fsparam vfsp;
 	struct apfs_node *an;
 	struct apfs_inode ino;
-	uint32_t b = apfs_hash_index(obj_id);
+	uint32_t b;
 	uint64_t size = 0;
 	enum vtype vtype;
 	int error;
 
+	am = apfs_graft_route(am, &obj_id);
+	b = apfs_hash_index(obj_id);
 	/* already have one? */
 	apfs_lock(am);
 	for (an = am->am_hash[b]; an != NULL; an = an->an_next) {
@@ -613,7 +617,7 @@ apfs_node_vnode(struct apfs_mount *am, uint64_t obj_id, vnode_t dvp,
 	vfsp.vnfs_dvp = dvp;
 	vfsp.vnfs_fsnode = an;
 	vfsp.vnfs_vops = apfs_vnodeop_p;
-	vfsp.vnfs_markroot = (obj_id == am->am_root_id);
+	vfsp.vnfs_markroot = (obj_id == am->am_root_id && am->am_graft == NULL);
 	vfsp.vnfs_marksystem = 0;
 	vfsp.vnfs_rdev = (vtype == VCHR || vtype == VBLK) ? (dev_t)ino.rdev : 0;
 	vfsp.vnfs_filesize = size;
@@ -1003,4 +1007,5 @@ apfs_pool_start(void)
 
 #include "apfs_vfsops_write.inc"
 #include "apfs_vfsops_mount.inc"
+#include "apfs_graft.inc"
 #include "apfs_vfsops_sync.inc"

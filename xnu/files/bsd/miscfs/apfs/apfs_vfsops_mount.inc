@@ -28,15 +28,17 @@ apfs_free_mount(struct apfs_mount *am)
  * saying in its superblock how big it is (nx_block_count blocks of nx_block_size), so the
  * N-th starts where the one before it ends -- the RAM disks of this port hold several (the
  * boot volume, a cryptex) and so may the phone's darwin partition.  volume < 0: the first
- * that has a root directory.
+ * that has a root directory.  The volume's vnodes belong to mp: its own mount
+ * (apfs_mount_common), or for a graft the mount of the volume it is grafted into
+ * (apfs_graft.inc), and a graft is never written.
  */
 static int
-apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t container, int volume)
+apfs_volume_open(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t container, int volume,
+    bool graft, struct apfs_mount **amp, struct apfs_devctx **dcp)
 {
 	struct apfs_mount *am;
 	struct apfs_devctx *dc;
 	struct apfs_dev dev;
-	struct vfsstatfs *sp;
 	uint32_t devblock = 0;
 	uint64_t devblocks = 0, nx_size = 0;
 	int error;
@@ -124,7 +126,9 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 	dev.size = nx_size;
 	dev.read = apfs_dev_read;
 	dev.read_data = apfs_dev_read_data;
-	apfs_mount_check_rw(mp, &dev);
+	if (!graft) {
+		apfs_mount_check_rw(mp, &dev);
+	}
 
 	error = apfs_nx_open(&am->am_nx, &dev);
 	if (error) {
@@ -208,7 +212,22 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 		}
 	}
 	am->am_root_id = APFS_ROOT_DIR_INO_NUM;
+	*amp = am;
+	*dcp = dc;
+	return 0;
+}
 
+static int
+apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t container, int volume)
+{
+	struct apfs_mount *am;
+	struct apfs_devctx *dc;
+	struct vfsstatfs *sp;
+	int error = apfs_volume_open(mp, devvp, ctx, container, volume, false, &am, &dc);
+
+	if (error) {
+		return error;
+	}
 	vfs_setfsprivate(mp, am);
 	vfs_setflags(mp, MNT_LOCAL);
 	/*
@@ -264,6 +283,60 @@ apfs_mountroot(mount_t mp, vnode_t devvp, vfs_context_t ctx)
 	return apfs_mount_common(mp, devvp, ctx, c, v);
 }
 
+/* "DEVICE[,c=N][,v=M]": the container (from 0) and the volume (by index); path is cut to DEVICE */
+static int
+apfs_parse_spec(char *path, uint32_t *container, int *volume)
+{
+	char *opt = strchr(path, ',');
+
+	while (opt != NULL) {
+		char *next = strchr(opt + 1, ',');
+
+		*opt = '\0';
+		if (strncmp(opt + 1, "c=", 2) == 0) {
+			*container = (uint32_t)strtoul(opt + 3, NULL, 10);
+		} else if (strncmp(opt + 1, "v=", 2) == 0) {
+			*volume = (int)strtoul(opt + 3, NULL, 10);
+		} else {
+			return EINVAL;
+		}
+		opt = next;
+	}
+	return 0;
+}
+
+/*
+ * The block device at path, opened with mode.  *shared: it was mounted already -- by us,
+ * another container of it (the root's RAM disk and the cryptex after the boot volume) -- and
+ * is read through as it is open, not opened again; anything else mounted on a device stays
+ * EBUSY.  On success the iocount from the lookup is the caller's, kept for as long as the
+ * volume is in use, and the device is closed again (unless shared) when it no longer is.
+ */
+static int
+apfs_open_device(const char *path, int mode, vfs_context_t ctx, vnode_t *vpp, bool *shared)
+{
+	vnode_t vp = NULLVP;
+	int error = vnode_lookup(path, 0, &vp, ctx);
+
+	*shared = false;
+	if (error == 0 && !vnode_isblk(vp)) {
+		error = ENOTBLK;
+	}
+	if (error == 0) {
+		error = VNOP_OPEN(vp, mode, ctx);
+		if (error == EBUSY && apfs_device_held(vnode_specrdev(vp))) {
+			*shared = true;
+			error = 0;
+		}
+	}
+	if (error != 0 && vp != NULLVP) {
+		vnode_put(vp);
+		vp = NULLVP;
+	}
+	*vpp = vp;
+	return error;
+}
+
 /*
  * mount(2), and kernel_mount().  The mount data is the path of the block device holding
  * the container, as a string.  VFS does not resolve it for us the way it does for a
@@ -303,49 +376,15 @@ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
 	} else {
 		error = copyinstr(data, path, MAXPATHLEN, &len);
 	}
-	/* "DEVICE[,c=N][,v=M]": the container (from 0) and the volume (by index) */
 	if (error == 0) {
-		char *opt = strchr(path, ',');
-
-		while (opt != NULL) {
-			char *next = strchr(opt + 1, ',');
-
-			*opt = '\0';
-			if (strncmp(opt + 1, "c=", 2) == 0) {
-				container = (uint32_t)strtoul(opt + 3, NULL, 10);
-			} else if (strncmp(opt + 1, "v=", 2) == 0) {
-				volume = (int)strtoul(opt + 3, NULL, 10);
-			} else {
-				error = EINVAL;
-			}
-			opt = next;
-		}
-	}
-	if (error == 0) {
-		error = vnode_lookup(path, 0, &vp, ctx);
-	}
-	if (error == 0 && !vnode_isblk(vp)) {
-		error = ENOTBLK;
+		error = apfs_parse_spec(path, &container, &volume);
 	}
 	if (error == 0) {
 		bool shared = false;
 
 		mode = vfs_isrdonly(mp) ? FREAD : FREAD | FWRITE;
-		error = VNOP_OPEN(vp, mode, ctx);
-		if (error == EBUSY && apfs_device_held(vnode_specrdev(vp))) {
-			/*
-			 * Mounted already -- by us, another container of it (the root's RAM disk and the
-			 * cryptex after the boot volume): read through it as it is open, not opened
-			 * again.  Anything else mounted on a device stays EBUSY.
-			 */
-			shared = true;
-			error = 0;
-		}
+		error = apfs_open_device(path, mode, ctx, &vp, &shared);
 		if (error == 0) {
-			/*
-			 * The iocount from the lookup is kept for as long as the volume is
-			 * mounted; apfs_unmount() closes and drops it.
-			 */
 			error = apfs_mount_common(mp, vp, ctx, container, volume);
 			if (error == 0) {
 				APFS_MP(mp)->am_owns_devvp = true;
@@ -369,17 +408,40 @@ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
 						snprintf(opts + strlen(opts), sizeof(opts) - strlen(opts), ",v=%d", volume);
 					snprintf(vfs_statfs(mp)->f_mntfromname, MAXPATHLEN, "%s%s", path, opts);
 				}
-			} else if (!shared) {
-				(void)VNOP_CLOSE(vp, mode, ctx);
+			} else {
+				if (!shared) {
+					(void)VNOP_CLOSE(vp, mode, ctx);
+				}
+				vnode_put(vp);
 			}
 		}
-		if (error != 0)
-			vnode_put(vp);
-	} else if (vp != NULLVP) {
-		vnode_put(vp);
 	}
 	kfree_data(path, MAXPATHLEN);
 	return error;
+}
+
+/* A volume no longer in use: out of apfs_mounts, its device closed (unless shared) and let go. */
+static void
+apfs_volume_close(struct apfs_mount *am, vfs_context_t ctx)
+{
+	if (apfs_the_mount == am) {
+		apfs_the_mount = NULL;
+	}
+	lck_mtx_lock(&apfs_pool_lock);
+	for (struct apfs_mount **pp = &apfs_mounts; *pp != NULL; pp = &(*pp)->am_next) {
+		if (*pp == am) {
+			*pp = am->am_next;
+			break;
+		}
+	}
+	lck_mtx_unlock(&apfs_pool_lock);
+	if (am->am_owns_devvp && am->am_devvp != NULLVP) {
+		if (!am->am_shares_devvp) {
+			(void)VNOP_CLOSE(am->am_devvp, am->am_open_mode, ctx);
+		}
+		vnode_put(am->am_devvp);
+	}
+	apfs_free_mount(am);
 }
 
 static int
@@ -395,24 +457,15 @@ apfs_unmount(mount_t mp, int mntflags, vfs_context_t ctx)
 	if (error) {
 		printf("apfs: unmount of \"%s\": the last commit failed (%d)\n", am->am_vol.name, error);
 	}
-	if (apfs_the_mount == am) {
-		apfs_the_mount = NULL;
+	/* vflush let go of the grafted volumes' vnodes too: they are this mount's */
+	while (am->am_grafts != NULL) {
+		struct apfs_graft *g = am->am_grafts;
+
+		am->am_grafts = g->g_next;
+		apfs_volume_close(g->g_am, ctx);
+		kfree_type(struct apfs_graft, g);
 	}
-	lck_mtx_lock(&apfs_pool_lock);
-	for (struct apfs_mount **pp = &apfs_mounts; *pp != NULL; pp = &(*pp)->am_next) {
-		if (*pp == am) {
-			*pp = am->am_next;
-			break;
-		}
-	}
-	lck_mtx_unlock(&apfs_pool_lock);
 	vfs_setfsprivate(mp, NULL);
-	if (am->am_owns_devvp && am->am_devvp != NULLVP) {
-		if (!am->am_shares_devvp) {
-			(void)VNOP_CLOSE(am->am_devvp, am->am_open_mode, ctx);
-		}
-		vnode_put(am->am_devvp);
-	}
-	apfs_free_mount(am);
+	apfs_volume_close(am, ctx);
 	return 0;
 }

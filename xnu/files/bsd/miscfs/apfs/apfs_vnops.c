@@ -414,9 +414,9 @@ apfs_vnop_getattr(struct vnop_getattr_args *ap)
 	VATTR_RETURN(vap, va_gid, ino.group);
 	VATTR_RETURN(vap, va_mode, ino.mode & 07777);
 	VATTR_RETURN(vap, va_flags, ino.bsd_flags);
-	VATTR_RETURN(vap, va_fileid, an->an_id);
-	VATTR_RETURN(vap, va_linkid, an->an_id);
-	VATTR_RETURN(vap, va_parentid, ino.parent_id);
+	VATTR_RETURN(vap, va_fileid, apfs_graft_ino(am, an->an_id));
+	VATTR_RETURN(vap, va_linkid, apfs_graft_ino(am, an->an_id));
+	VATTR_RETURN(vap, va_parentid, apfs_graft_ino(am, ino.parent_id));
 	VATTR_RETURN(vap, va_fsid, (uint32_t)vfs_statfs(am->am_mp)->f_fsid.val[0]);
 	VATTR_RETURN(vap, va_filerev, 0);
 	VATTR_RETURN(vap, va_gen, 0);
@@ -874,6 +874,7 @@ apfs_vnop_pagein(struct vnop_pagein_args *ap)
 	((sizeof(struct dirent) - (MAXNAMLEN + 1)) + (((namlen) + 1 + 3) & ~3))
 
 struct apfs_rd_ctx {
+	struct apfs_mount *rd_am;       /* whose identifiers the entries carry (apfs_graft_ino) */
 	struct uio *rd_uio;
 	off_t       rd_start;           /* where this call is to resume */
 	off_t       rd_pos;             /* where we are in the stream of entries */
@@ -892,7 +893,7 @@ apfs_vnop_readdir_one(struct apfs_rd_ctx *rc, const char *name, size_t name_len,
 		return 0;               /* cannot be named through this interface; skip it */
 	}
 	bzero(&de, sizeof(de));
-	de.d_fileno = (ino_t)file_id;
+	de.d_fileno = (ino_t)apfs_graft_ino(rc->rd_am, file_id);
 	de.d_type = d_type;
 	de.d_namlen = (uint8_t)name_len;
 	de.d_reclen = (uint16_t)APFS_DIRSIZ(name_len);
@@ -936,6 +937,7 @@ apfs_vnop_readdir(struct vnop_readdir_args *ap)
 		return ENOTDIR;
 	}
 	bzero(&rc, sizeof(rc));
+	rc.rd_am = am;
 	rc.rd_uio = ap->a_uio;
 	rc.rd_start = uio_offset(ap->a_uio);
 

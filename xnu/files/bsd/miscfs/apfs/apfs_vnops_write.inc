@@ -432,7 +432,7 @@ apfs_vnop_ioctl(struct vnop_ioctl_args *ap)
 		*(uint64_t *)ap->a_data = apfs_parent_syncroot(am, an);
 		return 0;
 	default:
-		return ENOTTY;
+		return apfs_graft_ioctl(vp, ap->a_command, ap->a_data, ap->a_context);    /* else ENOTTY */
 	}
 }
 

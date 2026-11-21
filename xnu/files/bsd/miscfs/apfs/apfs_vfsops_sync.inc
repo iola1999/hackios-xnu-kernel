@@ -12,7 +12,10 @@ apfs_root(mount_t mp, vnode_t *vpp, __unused vfs_context_t ctx)
 static int
 apfs_vget(mount_t mp, ino64_t ino, vnode_t *vpp, __unused vfs_context_t ctx)
 {
-	return apfs_node_vnode(APFS_MP(mp), (uint64_t)ino, NULLVP, NULL, vpp);
+	uint64_t id;
+	struct apfs_mount *am = apfs_graft_vget(APFS_MP(mp), (uint64_t)ino, &id);
+
+	return apfs_node_vnode(am, id, NULLVP, NULL, vpp);
 }
 
 extern uint64_t ufs_darwin_bytes;      /* bsd/dev/annibale/annibale_ufs.c */
