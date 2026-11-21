@@ -128,12 +128,13 @@ cam_diag_capture_probe(const char *tag)
 		    reg_rd(cpas_base, 0xf4u), reg_rd(cpas_base, 0xf8u));
 	}
 	if (camnoc_rt_base != 0) {
-		say("probe[%s] camnoc_rt err08=%#x 0c=%#x 10=%#x 18=%#x 20=%#x 24=%#x 28=%#x 2c=%#x 30=%#x 34=%#x 248=%#x 300=%#x\n",
+		say("probe[%s] camnoc_rt err08=%#x 0c=%#x 10=%#x 18=%#x 20=%#x 24=%#x 28=%#x 2c=%#x 30=%#x 34=%#x 38=%#x 3c=%#x 248=%#x 300=%#x\n",
 		    tag, reg_rd(camnoc_rt_base, 0x08u), reg_rd(camnoc_rt_base, 0x0cu),
 		    reg_rd(camnoc_rt_base, 0x10u), reg_rd(camnoc_rt_base, 0x18u),
 		    reg_rd(camnoc_rt_base, 0x20u), reg_rd(camnoc_rt_base, 0x24u),
 		    reg_rd(camnoc_rt_base, 0x28u), reg_rd(camnoc_rt_base, 0x2cu),
 		    reg_rd(camnoc_rt_base, 0x30u), reg_rd(camnoc_rt_base, 0x34u),
+		    reg_rd(camnoc_rt_base, 0x38u), reg_rd(camnoc_rt_base, 0x3cu),
 		    reg_rd(camnoc_rt_base, 0x248u), reg_rd(camnoc_rt_base, 0x300u));
 		say("probe[%s] camnoc_rt0=%#x/%#x/%#x rt1=%#x/%#x/%#x/%#x/%#x/%#x rt2=%#x rt3=%#x rt4=%#x\n",
 		    tag, reg_rd(camnoc_rt_base, 0x4620u), reg_rd(camnoc_rt_base, 0x4630u),

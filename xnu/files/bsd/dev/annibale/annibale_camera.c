@@ -181,14 +181,19 @@ render_dynamic_tpg_frame(uint8_t *dest, uint64_t seq, uint32_t exp_lines, uint32
 static bool
 cam_region_alloc(void)
 {
-	if (cam_region_vbase == 0 && kmem_alloc_contig(kernel_map, &cam_region_vbase,
+	if (cam_region_vbase != 0) {
+		return true;
+	}
+	if (kmem_alloc_contig(kernel_map, &cam_region_vbase,
 	    CAMERA_REGION_SIZE, PAGE_MASK, (ppnum_t)((1ULL << (36 - PAGE_SHIFT)) - 1u), 0,
 	    KMA_KOBJECT | KMA_ZERO | KMA_DATA,
 	    VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
 		cam_region_vbase = 0;
 		say("failed to allocate camera frame buffer\n");
+		return false;
 	}
-	return cam_region_vbase != 0;
+	say("camera frame buffers at %#llx\n", (unsigned long long)kvtophys(cam_region_vbase));
+	return true;
 }
 
 /* RPMh, apps_smmu, GCC, sun-camcc, CAM-CPAS, cambistmclkcc, TLMM, CCI0, and SE9 I2C bring-up */
