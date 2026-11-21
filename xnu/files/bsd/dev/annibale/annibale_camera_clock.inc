@@ -410,10 +410,18 @@ cam_native_apply_exposure_regs(bool force)
 	}
 	/* OV20B40 0x3500..0x3502 stores integration lines in Q4 fixed-point ([3:0] fractional). */
 	uint32_t raw_exp = cam_native_is_ov20b_m4(cam_profile) ? (lines << 4u) : lines;
+	bool back = cam_profile->sensor == 1u;
+	/*
+	 * Back sensor, as its vendor plugin's FillExposureSettings writes mode 24: 0x3506 is 0xfb from
+	 * 4x analog gain up and 0xf9 below, and the module's group hold (0x3208 0x00, then 0x10, 0xa0)
+	 * makes the frame take all of them at once. Left at the mode table's 0xf9, gains from 4x up
+	 * came out a quarter as bright, and auto exposure swung between too dark and too bright.
+	 */
 	const struct {
 		uint16_t reg;
 		uint8_t val;
-	} exp_ops[7] = {
+	} exp_ops[] = {
+		{ 0x3208u, 0x00u },
 		{ 0x380eu, (uint8_t)((fll >> 8) & 0xffu) },
 		{ 0x380fu, (uint8_t)(fll & 0xffu) },
 		{ 0x3500u, (uint8_t)((raw_exp >> 16) & 0xffu) },
@@ -421,9 +429,13 @@ cam_native_apply_exposure_regs(bool force)
 		{ 0x3502u, (uint8_t)(raw_exp & 0xffu) },
 		{ 0x3508u, (uint8_t)((gain >> 8) & 0x7fu) },
 		{ 0x3509u, (uint8_t)(gain & 0xffu) },
+		{ 0x3506u, gain >= 4u * OVX8000_M24_GAIN_UNITY ? 0xfbu : 0xf9u },
+		{ 0x3208u, 0x10u },
+		{ 0x3208u, 0xa0u },
 	};
-	for (size_t k = 0; k < 7u; k++) {
-		bool exp_ok = cam_profile->sensor == 1u ?
+	size_t first = back ? 0 : 1u, end = back ? sizeof(exp_ops) / sizeof(exp_ops[0]) : 8u;
+	for (size_t k = first; k < end; k++) {
+		bool exp_ok = back ?
 		    wide_bus_write(wide_slave_addr, (uint8_t)(exp_ops[k].reg >> 8),
 		    (uint8_t)exp_ops[k].reg, exp_ops[k].val, 3u) :
 		    od_i2c_write_bytes(GPIO_SE9_I2C_SDA, GPIO_SE9_I2C_SCL, front_slave_addr,

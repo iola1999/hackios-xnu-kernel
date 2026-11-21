@@ -531,6 +531,7 @@ cam_native_stream_next(void)
 	if (!cam_native_apply_exposure_regs(false)) {
 		error = EIO;
 	}
+	cam_native_exposure_shown(false);
 	if (error == 0) {
 		error = cam_native_wait_frame();
 	}
@@ -611,6 +612,7 @@ cam_native_capture(void)
 	if (!cam_native_register_table(2u, cam_profile->on_count)) {
 		error = EIO;
 	} else {
+		cam_native_exposure_shown(true);
 		error = cam_native_wait_frame();
 	}
 	if (error != 0) {

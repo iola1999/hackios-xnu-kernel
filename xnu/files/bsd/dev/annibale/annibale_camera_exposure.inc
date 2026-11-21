@@ -38,6 +38,13 @@ static uint32_t cam_native_frame_lines;
 static uint32_t cam_native_applied_exposure_lines;
 static uint32_t cam_native_applied_gain;
 static uint32_t cam_native_applied_frame_lines;
+/*
+ * The exposure the frames show, newest first: lines, gain, frame lines as written before each of
+ * the last three frames. A frame's pixels follow what was written two frames before it (measured
+ * on the back camera, docs/progress/2026-11-21-user-test-issues.md); its metadata reports that,
+ * so auto exposure waits for a change to be in the frames before it measures again.
+ */
+static uint32_t cam_native_shown[3][3];
 
 static bool
 cam_native_is_ov20b_m4(const struct annibale_camera_profile *p)
@@ -59,6 +66,20 @@ cam_native_exposure_invalidate(void)
 	cam_native_applied_exposure_lines = 0;
 	cam_native_applied_gain = 0;
 	cam_native_applied_frame_lines = 0;
+}
+
+/* After each frame's register writes; `restart` when the stream starts with them. */
+static void
+cam_native_exposure_shown(bool restart)
+{
+	const uint32_t now[3] = {
+		cam_native_applied_exposure_lines, cam_native_applied_gain, cam_native_applied_frame_lines,
+	};
+
+	for (uint32_t i = 2; i > 0; i--) {
+		memcpy(cam_native_shown[i], restart ? now : cam_native_shown[i - 1], sizeof(now));
+	}
+	memcpy(cam_native_shown[0], now, sizeof(now));
 }
 
 static void
@@ -118,28 +139,30 @@ static void
 cam_native_frame_exposure(const struct annibale_camera_profile *p,
     struct annibale_camera_frame *f)
 {
-	if (f == NULL || cam_native_exposure_lines == 0 || cam_native_gain == 0) {
+	uint32_t lines = cam_native_shown[2][0], gain = cam_native_shown[2][1], frame_lines = cam_native_shown[2][2];
+
+	if (f == NULL || lines == 0 || gain == 0) {
 		return;
 	}
 	if (cam_native_is_ov20b_m4(p)) {
 		f->black = OV20B_M4_BLACK_10BIT;
-		f->exposure_lines = cam_native_exposure_lines;
+		f->exposure_lines = lines;
 		f->line_ns = OV20B_M4_LINE_NS;
-		f->gain = cam_native_gain;
+		f->gain = gain;
 		f->gain_unity = OV20B_M4_GAIN_UNITY;
 		f->gain_max = OV20B_M4_GAIN_MAX;
-		f->frame_lines = cam_native_frame_lines;
+		f->frame_lines = frame_lines;
 		f->frame_lines_min = OV20B_M4_FLL_MIN;
 		f->frame_lines_max = OV20B_M4_FLL_MAX;
 		f->margin = OV20B_M4_MARGIN;
 	} else if (cam_native_is_ovx8000_m24(p)) {
 		f->black = OVX8000_M24_BLACK_10BIT;
-		f->exposure_lines = cam_native_exposure_lines;
+		f->exposure_lines = lines;
 		f->line_ns = OVX8000_M24_LINE_NS;
-		f->gain = cam_native_gain;
+		f->gain = gain;
 		f->gain_unity = OVX8000_M24_GAIN_UNITY;
 		f->gain_max = OVX8000_M24_GAIN_MAX;
-		f->frame_lines = cam_native_frame_lines;
+		f->frame_lines = frame_lines;
 		f->frame_lines_min = OVX8000_M24_FLL_MIN;
 		f->frame_lines_max = OVX8000_M24_FLL_MAX;
 		f->margin = OVX8000_M24_MARGIN;
