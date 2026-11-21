@@ -381,6 +381,13 @@ static int firmware_fault;              /* UEFI exception handler ran (set in ex
 /* Return stub x2; x3 identifies the device. Iris PAS9 uses code 9. */
 #define LOADER_RETURN_DEVICE_HELD 3
 
+/* Return stub x4 after reason 0 or 3: what iOS asked for when it ended the run, MAGIC with POWEROFF
+ * or RESTART in the low byte (the kernel's copy is in osfmk/arm64/loader_return.c). Anything else
+ * there means nothing asked: older kernels leave their TCR_EL1 in x4. */
+#define LOADER_INTENT_MAGIC     0x52455455524E0000ULL   /* "RETURN" */
+#define LOADER_INTENT_POWEROFF  1
+#define LOADER_INTENT_RESTART   2
+
 /* PSCI return codes as the SMC Calling Convention spells them out, the way TF-A defines
  * them in include/lib/psci/psci.h (PSCI_RET_*). tools/test-loader-lifecycle.py asserts
  * every one of these against raw spec numbers of its own, so a wrong constant here cannot
@@ -396,6 +403,7 @@ static int firmware_fault;              /* UEFI exception handler ran (set in ex
 #define PSCI_E_INVALID_ADDRESS  (-9)
 
 #define PSCI_CPU_ON        0xC4000003u
+#define PSCI_SYSTEM_OFF    0x84000008u
 #define PSCI_SYSTEM_RESET  0x84000009u   /* the reset door the held paths use; psci_call picks SMC or HVC */
 #define PSCI_AFFINITY_OFF  1
 

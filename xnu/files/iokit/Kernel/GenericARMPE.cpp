@@ -451,6 +451,7 @@ GenericARMPE::getMachineName(char * name, int maxLength)
 extern "C" {
 void hv_wdt_pet_NOW(void);
 void loader_return(void);
+void loader_return_for(bool poweroff);
 }
 
 int
@@ -468,6 +469,13 @@ GenericARMPE::haltRestart(unsigned int type)
 		 * Non-terminal panic progress notifications from debugger_collect_diagnostics
 		 * and SavePanicInfo: let XNU finish formatting the backtrace and panic header.
 		 */
+		return 0;
+	case kPEHaltCPU:
+	case kPEUPSDelayHaltCPU:
+	case kPERestartCPU:
+		/* iOS shuts down or restarts: the loader does the same, unless the host started the run */
+		kprintf("GenericARMPE::haltRestart(%u)\n", type);
+		loader_return_for(type != kPERestartCPU);
 		return 0;
 	default:
 		kprintf("GenericARMPE::haltRestart(%u)\n", type);

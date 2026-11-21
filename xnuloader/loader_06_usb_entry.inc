@@ -1156,9 +1156,21 @@ efi_main(efi_handle image, efi_system_table *st)
 		slot_maintain_current();
 	}
 
-	/* One-shot mode: run the kernel that came with the image, then fall back to Fastboot if it returns. */
+	/* One-shot mode: run the kernel that came with the image. When iOS shut down or restarted, do
+	 * the same (a failed power-off ends in the fallback); else fall back to Fastboot. */
 	if (menu_choice == MENU_CHOICE_IOS && have_payload && !pi.usb_mode) {
+		kernel_return_intent = 0;
 		run_kernel(0, 0);
+		if (kernel_return_intent == LOADER_INTENT_RESTART) {
+			reboot();
+		} else if (kernel_return_intent == LOADER_INTENT_POWEROFF) {
+			int64_t status;
+
+			flush_log();
+			status = psci_call(PSCI_SYSTEM_OFF, 0, 0, 0);
+			print("PSCI SYSTEM_OFF returned %d\n", (uint64_t)status);
+			set_result("poweroff-failed", (uint64_t)status, 0);
+		}
 		boot_fallback_enter();
 	}
 	if (USB != NULL || usb_start()) {

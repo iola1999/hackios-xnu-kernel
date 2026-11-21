@@ -537,6 +537,18 @@ static_kvtophys(const void *va)
 }
 
 /*
+ * What iOS asked for when it ended the run (loader_return_for), for the loader in the return
+ * stub's x4, which carries nothing else on an orderly return: LOADER_INTENT_MAGIC with
+ * LOADER_INTENT_POWEROFF or LOADER_INTENT_RESTART in the low byte (xnuloader's copy of these is
+ * in loader_01_base_log_dt.inc).  A loader started from its menu then powers the phone off or
+ * restarts it; one the host started keeps its command loop.  0: nothing asked.
+ */
+#define LOADER_INTENT_MAGIC     0x52455455524E0000ULL   /* "RETURN" */
+#define LOADER_INTENT_POWEROFF  1
+#define LOADER_INTENT_RESTART   2
+static uint64_t loader_return_intent;
+
+/*
  * Jump to the loader's return stub. reason: 0 = orderly end, 2 = checkpoint.
  * Returns only if no loader is listening.
  */
@@ -606,6 +618,7 @@ loader_jump(uint64_t reason, uint64_t code)
 	register uint64_t r_stub __asm__("x5") = stub;
 	register uint64_t r_reason __asm__("x6") = reason;
 	register uint64_t r_code __asm__("x7") = code;
+	register uint64_t r_intent __asm__("x8") = loader_return_intent;
 
 	__asm__ volatile (
                 "msr DAIFSet, #0xf\n"
@@ -620,8 +633,10 @@ loader_jump(uint64_t reason, uint64_t code)
                 "mov x1, x3\n"
                 "mov x2, x6\n"
                 "mov x3, x7\n"
+                "mov x4, x8\n"
                 "br x5\n"
-                : : "r" (r_ttbr0), "r" (r_log), "r" (r_len), "r" (r_tcr), "r" (r_stub), "r" (r_reason), "r" (r_code));
+                : : "r" (r_ttbr0), "r" (r_log), "r" (r_len), "r" (r_tcr), "r" (r_stub), "r" (r_reason), "r" (r_code),
+                "r" (r_intent));
 	__builtin_unreachable();
 #else
 	(void)reason; (void)code;
@@ -727,6 +742,16 @@ loader_return(void)
 	/* reason 3 keeps loader memory held even if every kernel CPU is off. */
 	loader_jump((iris_quiesced && cam_quiesced && modem_quiesced) ? 0 : 3,
 	    !iris_quiesced ? 9 : (!cam_quiesced ? 10 : (modem_quiesced ? 0 : 4)));
+}
+
+/* iOS shuts down (poweroff) or restarts: the loader is told which, then the run ends as loader_return does. */
+void loader_return_for(bool poweroff);
+
+void
+loader_return_for(bool poweroff)
+{
+	loader_return_intent = LOADER_INTENT_MAGIC | (poweroff ? LOADER_INTENT_POWEROFF : LOADER_INTENT_RESTART);
+	loader_return();
 }
 
 /* Bring-up aid: stop here if the loader asked for checkpoint n. */

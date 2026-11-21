@@ -24,6 +24,7 @@ static uint64_t low_dma;
 static uint64_t resident_rd_size;   /* root image kept at win_base + RESIDENT_RD_OFFSET, 0 if none */
 static char last_result[64] = "idle";
 static int usb_run_requested;
+static uint64_t kernel_return_intent;   /* LOADER_INTENT_*: what the last kernel asked for when it ended, 0 none */
 
 static void
 set_result(const char *what, uint64_t a, uint64_t b)
@@ -1081,6 +1082,11 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		} else {
 			if (reason == LOADER_RETURN_DEVICE_HELD) {
 				print("KERNEL DEVICE SHUTDOWN FAILED: device %d; memory and devices stay held until reset\n", loader_ctx[CTX_ESR]);
+			}
+			if ((reason == 0 || reason == LOADER_RETURN_DEVICE_HELD) &&
+			    (loader_ctx[CTX_ELR] & ~0xffULL) == LOADER_INTENT_MAGIC) {
+				kernel_return_intent = loader_ctx[CTX_ELR] & 0xff;
+				print("iOS asked to %s\n", kernel_return_intent == LOADER_INTENT_POWEROFF ? "power off" : "restart");
 			}
 			set_result(kernel_resources_held ? "returned-held" : "returned", klog_len, 0);
 		}
