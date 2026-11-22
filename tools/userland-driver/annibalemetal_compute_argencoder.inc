@@ -198,6 +198,12 @@
 		         (unsigned long)g[2]);
 		return;
 	}
+	static unsigned split_logged;
+	if (__atomic_fetch_add(&split_logged, 1, __ATOMIC_RELAXED) < 16)
+		rw_print("split: compute %p, %lux%lux%lu threads in groups of %lux%lux%lu, threadgroup bytes %u, "
+		         "imageblock %ux%u\n", (void *)[_pipeline compute], (unsigned long)t[0], (unsigned long)t[1],
+		         (unsigned long)t[2], (unsigned long)g[0], (unsigned long)g[1], (unsigned long)g[2],
+		         _threadgroupBytes, _imageblockSize[0], _imageblockSize[1]);
 	for (unsigned part = 0; part < 8; part++) {
 		NSUInteger groups[3], sizes[3];
 		unsigned split[12];

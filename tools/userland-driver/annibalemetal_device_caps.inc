@@ -317,6 +317,8 @@
 				[[function name] UTF8String], &info, why, sizeof(why));
 			if (compute != NULL)
 				rw_compute_pipe_keep(_mesa, key, compute, &info);
+			else
+				air_dump([air bytes], [air length], "compute", [[function name] UTF8String], false);   /* (not counted: MapKit takes the four at boot) */
 		}
 	}
 	if (compute == NULL) {

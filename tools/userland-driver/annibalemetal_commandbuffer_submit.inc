@@ -288,8 +288,8 @@
 		}
 		int rc = work->split
 			    ? mesa.dispatch_split([work->pipeline compute], &bindings, table, work->count,
-						  work->groups, work->size, work->threadgroupBytes, split,
-						  rw_sync_draws(), why, sizeof(why))
+						  work->groups, work->size, work->threadgroupBytes,
+						  work->imageblockSize, split, rw_sync_draws(), why, sizeof(why))
 			    : has_ib
 			    ? mesa.dispatch_nowait_imageblock([work->pipeline compute], &bindings,
 							      table, work->count, work->groups,
@@ -390,6 +390,17 @@ done:
 		/* Retain this submission before another commit or finish changes pending. */
 		if (mesa.fence_take != NULL) {
 			submission_fence = mesa.fence_take([[_queue device] mesaDevice]);
+		}
+		/* A texture over a buffer the library could not lay over the buffer's memory is a copy
+		 * (rwa_texture_from_buffer); what this command buffer wrote into one goes back into the
+		 * buffer here, before the next commit, and not later on the completion thread. Metal's
+		 * texture and buffer are one memory, so the next command buffer and the processor read
+		 * the result through the buffer; with the copy left to completion, Deep Fusion's next
+		 * command buffer read the old bytes and the photograph came out dark green
+		 * (kernel-12377-lens2-w26; waiting for each command buffer, w28, was right). Returns at
+		 * once when no such texture was written; otherwise the download waits for the GPU. */
+		if (mesa.buffer_textures_writeback != NULL) {
+			mesa.buffer_textures_writeback([[_queue device] mesaDevice]);
 		}
 		commit_phase = 0;
 		commit_progress_us = rw_now_us();

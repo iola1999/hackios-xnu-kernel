@@ -72,7 +72,8 @@ static struct {
 	/* rwa_dispatch_split: the split argument is four arrays of three unsigned, as the work holds them */
 	int (*dispatch_split)(struct rwa_compute *, const struct rwa_bindings *,
 			      const struct rwa_buffer_bind *, unsigned, const unsigned[3],
-			      const unsigned[3], unsigned, const unsigned[12], bool, char *, size_t);
+			      const unsigned[3], unsigned, const unsigned[2], const unsigned[12], bool, char *,
+			      size_t);
 	int (*module_argbufs)(struct rwa_device *, const void *, size_t, const char *,
 			      struct rwa_argbuf_layout *, unsigned, unsigned *, char *,
 			      size_t);
