@@ -44,10 +44,13 @@ static uint32_t cam_native_focus = OVX8000_FOCUS_DEFAULT;      /* back lens posi
 static uint32_t cam_native_applied_focus = ANNIBALE_CAMERA_NO_FOCUS;   /* ... written; no lens yet */
 /*
  * The exposure and lens position the frames show, newest first: lines, gain, frame lines, focus as
- * written before each of the last three frames. A frame's pixels follow what was written two frames
- * before it (measured on the back camera, docs/progress/2026-11-21-user-test-issues.md); its
- * metadata reports that, so auto exposure and focus wait for a change to be in the frames before
- * they measure again.
+ * written before each of the last three frames. A frame's pixels follow the exposure written two
+ * frames before it (measured on the back camera, docs/progress/2026-11-21-user-test-issues.md) and
+ * the lens position written one frame before it: the lens moves as soon as it is written, and on
+ * kernel-12377-idle4-w7 (camera_test focus) the frame after the write had the new position's
+ * sharpness (within 5%) at all 96 positions, and the frame exposed during the write was in between
+ * where the sharpness changes steeply. The metadata reports these, so auto
+ * exposure and focus wait for a change to be in the frames before they measure again.
  */
 static uint32_t cam_native_shown[3][4];
 
@@ -183,7 +186,7 @@ cam_native_frame_exposure(const struct annibale_camera_profile *p,
 		f->frame_lines_min = OVX8000_M24_FLL_MIN;
 		f->frame_lines_max = OVX8000_M24_FLL_MAX;
 		f->margin = OVX8000_M24_MARGIN;
-		f->focus = cam_native_shown[2][3];
+		f->focus = cam_native_shown[1][3];
 	}
 }
 
