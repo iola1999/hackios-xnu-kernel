@@ -460,8 +460,36 @@ cam_native_apply_exposure_regs(bool force)
  * does not answer leaves the frames without a focus position; the camera works on.
  */
 #define OVX8000_LENS_SLAVE      0x0cu
+/*
+ * A move longer than OVX8000_LENS_STEP positions goes in steps that far apart in time: the lens
+ * was heard to knock when it was sent in one write from where it rests to the middle as the
+ * camera started, back to rest as it stopped, and across half its travel at the start of a
+ * search. Position 0 is where it rests without current; it is walked there before its supply
+ * goes off.
+ */
+#define OVX8000_LENS_STEP       64u
+#define OVX8000_LENS_STEP_US    3000u
 
 static bool cam_native_lens_ready;
+
+/* The lens from `from` to `to`, OVX8000_LENS_STEP at a time; false when a write failed. */
+static bool
+cam_native_lens_walk(uint32_t from, uint32_t to)
+{
+	while (from != to) {
+		uint32_t next = from < to ? MIN(from + OVX8000_LENS_STEP, to) :
+		    (from - to > OVX8000_LENS_STEP ? from - OVX8000_LENS_STEP : to);
+
+		if (!wide_bus_write(OVX8000_LENS_SLAVE, 0x03u, (uint8_t)(next >> 8), (uint8_t)next, 3u)) {
+			return false;
+		}
+		from = next;
+		if (from != to) {
+			delay_for_interval(OVX8000_LENS_STEP_US, NSEC_PER_USEC);
+		}
+	}
+	return true;
+}
 
 static void
 cam_native_apply_focus(bool force)
@@ -469,8 +497,8 @@ cam_native_apply_focus(bool force)
 	if (!cam_native_lens_ready || (!force && cam_native_focus == cam_native_applied_focus)) {
 		return;
 	}
-	if (!wide_bus_write(OVX8000_LENS_SLAVE, 0x03u, (uint8_t)(cam_native_focus >> 8),
-	    (uint8_t)cam_native_focus, 3u)) {
+	if (!cam_native_lens_walk(cam_native_applied_focus == ANNIBALE_CAMERA_NO_FOCUS ? 0 : cam_native_applied_focus,
+	    cam_native_focus)) {
 		say("lens position %u failed\n", cam_native_focus);
 		cam_native_lens_ready = false;
 		cam_native_applied_focus = ANNIBALE_CAMERA_NO_FOCUS;
@@ -500,6 +528,10 @@ cam_native_lens_up(void)
 static void
 cam_native_lens_down(void)
 {
+	if (cam_native_lens_ready && cam_native_applied_focus != ANNIBALE_CAMERA_NO_FOCUS &&
+	    cam_native_lens_walk(cam_native_applied_focus, 0)) {
+		delay_for_interval(OVX8000_LENS_STEP_US, NSEC_PER_USEC);
+	}
 	if (cam_native_lens_ready && wide_bus_write(OVX8000_LENS_SLAVE, 0x02u, 0x01u, 0, 2u)) {
 		delay_for_interval(200, NSEC_PER_USEC);
 	}

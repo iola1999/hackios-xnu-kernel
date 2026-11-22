@@ -91,6 +91,10 @@ enum RWCopyKind { RW_COPY_NONE, RW_COPY_BUFFER, RW_COPY_TEXTURE, RW_COPY_MIPMAP,
 	unsigned groups[3], size[3];
 	unsigned threadgroupBytes;   /* -setThreadgroupMemoryLength: for threadgroup buffer 0 */
 	unsigned imageblockSize[2];  /* -setImageblockWidth:height:, or {0, 0} */
+	/* a part of a -dispatchThreads: grid the threadgroup size does not divide (struct
+	 * rwa_grid_split in tools/mesa/air/air_metal.h): first group, asked size, grid threads, grid groups */
+	BOOL split;
+	unsigned splitBaseGroup[3], splitNominal[3], splitGridThreads[3], splitGridGroups[3];
 	id sharedEvent;              /* -encodeSignalEvent:value: / -encodeWaitForEvent:value: */
 	uint64_t sharedEventValue;
 }

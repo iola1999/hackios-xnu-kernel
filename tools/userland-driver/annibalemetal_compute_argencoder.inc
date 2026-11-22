@@ -9,6 +9,7 @@
 	unsigned _threadgroupBytes;
 	unsigned _imageblockSize[2];
 	BOOL _ended, _complained, _warnedLodClamp;
+	const unsigned *_split;      /* while -dispatchThreads: records a part of a split grid: 12 counts */
 }
 
 - (instancetype)initWithAnnibaleCommandBuffer:(AnnibaleMetalCommandBuffer *)commandBuffer
@@ -151,31 +152,75 @@
 	work->threadgroupBytes = _threadgroupBytes;
 	work->imageblockSize[0] = _imageblockSize[0];
 	work->imageblockSize[1] = _imageblockSize[1];
+	if (_split != NULL) {
+		work->split = YES;
+		memcpy(work->splitBaseGroup, _split, sizeof(work->splitBaseGroup));
+		memcpy(work->splitNominal, _split + 3, sizeof(work->splitNominal));
+		memcpy(work->splitGridThreads, _split + 6, sizeof(work->splitGridThreads));
+		memcpy(work->splitGridGroups, _split + 9, sizeof(work->splitGridGroups));
+	}
 	[_commandBuffer recordWork:work];
 	[work release];
 }
 
-/* Metal counts threads here and threadgroups above. Rounding the grid up would run threads the
- * application did not ask for, and freedreno has no partial threadgroups, so a grid the size does
- * not divide is served only for a kernel any threadgroup size serves alike (-groupFree): per
- * dimension the size becomes the largest divisor of the grid not above the one asked for. */
+/* Metal counts threads here and threadgroups above, and runs the last threadgroups of a
+ * grid the size does not divide as partial ones; freedreno has no partial threadgroups.
+ * For a kernel any threadgroup size serves alike (-groupFree), per dimension the size
+ * becomes the largest divisor of the grid not above the one asked for. For one that reads
+ * its threadgroup, the grid is cut into at most eight dispatches of whole threadgroups (the
+ * groups that fit in every dimension, and the rest's), each translated with where its groups
+ * sit in the grid (rwa_dispatch_split); camera photographs' noise reduction asked for 588x444,
+ * 294x222 and 74x111 threads in groups of 16x32 and was dropped before (kernel-12377-keep1-w12). */
 - (void)dispatchThreads:(MTLSize)threads threadsPerThreadgroup:(MTLSize)size
 {
 	NSUInteger t[3] = { threads.width, threads.height, threads.depth };
 	NSUInteger g[3] = { size.width, size.height, size.depth };
 
+	if (_ended) return;
 	for (unsigned i = 0; i < 3; i++)
 		while (g[i] > 1 && t[i] % g[i] != 0 && [_pipeline groupFree])
 			g[i]--;
-	if (g[0] == 0 || g[1] == 0 || g[2] == 0 || t[0] % g[0] || t[1] % g[1] || t[2] % g[2]) {
-		rw_print("%lux%lux%lu threads do not divide into groups of %lux%lux%lu, and the kernel "
-		         "reads its threadgroup\n", (unsigned long)t[0], (unsigned long)t[1],
-		         (unsigned long)t[2], (unsigned long)g[0], (unsigned long)g[1],
+	if (g[0] == 0 || g[1] == 0 || g[2] == 0 || t[0] == 0 || t[1] == 0 || t[2] == 0) {
+		rw_print("%lux%lux%lu threads in groups of %lux%lux%lu: nothing to run\n", (unsigned long)t[0],
+		         (unsigned long)t[1], (unsigned long)t[2], (unsigned long)g[0], (unsigned long)g[1],
 		         (unsigned long)g[2]);
 		return;
 	}
-	[self dispatchThreadgroups:MTLSizeMake(t[0] / g[0], t[1] / g[1], t[2] / g[2])
-	     threadsPerThreadgroup:MTLSizeMake(g[0], g[1], g[2])];
+	if (t[0] % g[0] == 0 && t[1] % g[1] == 0 && t[2] % g[2] == 0) {
+		[self dispatchThreadgroups:MTLSizeMake(t[0] / g[0], t[1] / g[1], t[2] / g[2])
+		     threadsPerThreadgroup:MTLSizeMake(g[0], g[1], g[2])];
+		return;
+	}
+	if (mesa.dispatch_split == NULL) {
+		rw_print("%lux%lux%lu threads do not divide into groups of %lux%lux%lu, the kernel reads its "
+		         "threadgroup, and the compiler library has no rwa_dispatch_split\n", (unsigned long)t[0],
+		         (unsigned long)t[1], (unsigned long)t[2], (unsigned long)g[0], (unsigned long)g[1],
+		         (unsigned long)g[2]);
+		return;
+	}
+	for (unsigned part = 0; part < 8; part++) {
+		NSUInteger groups[3], sizes[3];
+		unsigned split[12];
+		bool empty = false;
+
+		for (unsigned i = 0; i < 3; i++) {
+			bool rest = (part >> i) & 1;
+
+			groups[i] = rest ? (t[i] % g[i] != 0) : t[i] / g[i];
+			sizes[i] = rest ? t[i] % g[i] : g[i];
+			empty = empty || groups[i] == 0;
+			split[i] = rest ? (unsigned)(t[i] / g[i]) : 0;
+			split[3 + i] = (unsigned)g[i];
+			split[6 + i] = (unsigned)t[i];
+			split[9 + i] = (unsigned)((t[i] + g[i] - 1) / g[i]);
+		}
+		if (empty)
+			continue;
+		_split = split;
+		[self dispatchThreadgroups:MTLSizeMake(groups[0], groups[1], groups[2])
+		     threadsPerThreadgroup:MTLSizeMake(sizes[0], sizes[1], sizes[2])];
+		_split = NULL;
+	}
 }
 
 - (void)useResource:(id)resource usage:(NSUInteger)usage { (void)resource; (void)usage; }

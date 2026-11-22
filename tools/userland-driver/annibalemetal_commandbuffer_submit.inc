@@ -278,7 +278,19 @@
 		 * dispatch the GPU did not finish. */
 		bool has_ib = (work->imageblockSize[0] != 0 || work->imageblockSize[1] != 0) &&
 			      mesa.dispatch_nowait_imageblock != NULL;
-		int rc = has_ib
+		unsigned split[12];
+
+		if (work->split) {
+			memcpy(split, work->splitBaseGroup, sizeof(work->splitBaseGroup));
+			memcpy(split + 3, work->splitNominal, sizeof(work->splitNominal));
+			memcpy(split + 6, work->splitGridThreads, sizeof(work->splitGridThreads));
+			memcpy(split + 9, work->splitGridGroups, sizeof(work->splitGridGroups));
+		}
+		int rc = work->split
+			    ? mesa.dispatch_split([work->pipeline compute], &bindings, table, work->count,
+						  work->groups, work->size, work->threadgroupBytes, split,
+						  rw_sync_draws(), why, sizeof(why))
+			    : has_ib
 			    ? mesa.dispatch_nowait_imageblock([work->pipeline compute], &bindings,
 							      table, work->count, work->groups,
 							      work->size, work->threadgroupBytes,

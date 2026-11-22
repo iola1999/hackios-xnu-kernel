@@ -69,6 +69,10 @@ static struct {
 	int (*dispatch_nowait)(struct rwa_compute *, const struct rwa_bindings *,
 			       const struct rwa_buffer_bind *, unsigned, const unsigned[3],
 			       const unsigned[3], unsigned, char *, size_t);
+	/* rwa_dispatch_split: the split argument is four arrays of three unsigned, as the work holds them */
+	int (*dispatch_split)(struct rwa_compute *, const struct rwa_bindings *,
+			      const struct rwa_buffer_bind *, unsigned, const unsigned[3],
+			      const unsigned[3], unsigned, const unsigned[12], bool, char *, size_t);
 	int (*module_argbufs)(struct rwa_device *, const void *, size_t, const char *,
 			      struct rwa_argbuf_layout *, unsigned, unsigned *, char *,
 			      size_t);
@@ -176,6 +180,7 @@ mesa_available(void)
 	*(void **)&mesa.dispatch_buffers = dlsym(mesa.handle, "rwa_dispatch_buffers");
 	*(void **)&mesa.dispatch_threadgroup = dlsym(mesa.handle, "rwa_dispatch_threadgroup");
 	*(void **)&mesa.dispatch_nowait = dlsym(mesa.handle, "rwa_dispatch_nowait");
+	*(void **)&mesa.dispatch_split = dlsym(mesa.handle, "rwa_dispatch_split");
 	*(void **)&mesa.module_argbufs = dlsym(mesa.handle, "rwa_module_argbufs");
 	*(void **)&mesa.argbuf_encode_buffer = dlsym(mesa.handle, "rwa_argbuf_encode_buffer");
 	*(void **)&mesa.argbuf_encode_texture = dlsym(mesa.handle, "rwa_argbuf_encode_texture");
