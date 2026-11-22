@@ -486,6 +486,46 @@ static pthread_mutex_t rw_commit_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
  * mean a struct whose fields mean different things depending on a flag. */
 #define RW_COMMIT_SLOW_FOR_IN 500000ULL  /* a commit this old says its draws on entry */
 
+/* ANNIBALE_PIXEL_PROBE=x,y[/x,y...] (at most 4 points of colour attachment 0, with ANNIBALE_SYNC_DRAWS):
+ * after each synchronised draw, the draw that changed one of those pixels, with its pipeline. */
+static void
+rw_pixel_probe(AnnibaleMetalWork *work, unsigned commit, unsigned index)
+{
+	static int points = -1;
+	static unsigned at[4][2];
+	static uint32_t last[4];
+	static unsigned said;
+	char why[128];
+
+	if (points < 0) {
+		const char *env = getenv("ANNIBALE_PIXEL_PROBE");
+		points = 0;
+		while (env != NULL && points < 4 && sscanf(env, "%u,%u", &at[points][0], &at[points][1]) == 2) {
+			points++;
+			env = strchr(env, '/');
+			env = env ? env + 1 : NULL;
+		}
+	}
+	if (points == 0 || mesa.texture_read == NULL || work->colorCount == 0 || work->color[0] == nil ||
+	    said > 400)
+		return;
+	for (int i = 0; i < points; i++) {
+		unsigned origin[3] = { at[i][0], at[i][1], 0 }, size[3] = { 1, 1, 1 };
+		uint32_t pixel = 0;
+		if ([work->color[0] width] <= at[i][0] || [work->color[0] height] <= at[i][1])
+			continue;
+		if (mesa.texture_read([work->color[0] mesaTexture], 0, 0, origin, size, &pixel, 4, why,
+		    sizeof(why)) != 0)
+			continue;
+		if (pixel != last[i]) {
+			rw_print("pixel probe: commit %u work %u pipeline %p (%u,%u) %08x -> %08x\n", commit, index,
+			    (void *)[work->render render], at[i][0], at[i][1], last[i], pixel);
+			last[i] = pixel;
+			said++;
+		}
+	}
+}
+
 /* rw_sync_draws: hand this draw to the GPU and wait for it, naming it when it does not finish. */
 - (BOOL)syncDraw:(AnnibaleMetalWork *)work index:(unsigned)index sample:(BOOL)sample
 	    why:(char *)why size:(size_t)size
@@ -511,6 +551,7 @@ static pthread_mutex_t rw_commit_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 	}
 	if (sample)
 		[self thumbWork:work index:index after:YES];
+	rw_pixel_probe(work, commit_count, index);
 	return YES;
 }
 
