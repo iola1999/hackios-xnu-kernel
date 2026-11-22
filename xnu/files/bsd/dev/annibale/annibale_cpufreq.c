@@ -109,7 +109,14 @@ static vm_offset_t tsens_base[TSENS_GROUPS];
 static uint64_t touch_at;                       /* mach_absolute_time() of the last touch; 0: none yet */
 static uint64_t wi_boost_until, wi_overrun_until, wi_last_wake;
 static uint32_t ui_quantum_expiries;
-static uint64_t wi_min_boost_abs, wi_max_boost_abs, wi_overrun_abs, wi_wake_gap_abs;
+static uint64_t wi_min_boost_abs, wi_max_boost_abs, wi_overrun_abs, wi_wake_gap_abs, wi_run_gap_abs;
+/*
+ * The last two frames of each interactive kind of work interval (render server, client, HID
+ * delivery, compositor). Only frames that follow one another within wi_run_gap_abs raise the
+ * clock: with nothing moving, the home screen is still drawn 10 times a second (kernel-12377-
+ * scanlink-i1), and a boost from each of those frames kept both clusters at 2.4 GHz.
+ */
+static uint64_t wi_frame_at[4][2];
 static bool governing;
 
 /* domain N is cluster N, whose sensors are tsens_groups[N]; levels slowest first */
@@ -795,29 +802,64 @@ perfctl_maybe_wake(uint64_t now, bool need_ceiling)
 	}
 }
 
-static bool
+/* The index of an interactive kind of work interval in wi_frame_at; -1 for the others. */
+static int
 perfctl_wi_interactive(uint32_t wi_type)
 {
-	return wi_type == WORK_INTERVAL_TYPE_CA_RENDER_SERVER ||
-	       wi_type == WORK_INTERVAL_TYPE_CA_CLIENT ||
-	       wi_type == WORK_INTERVAL_TYPE_HID_DELIVERY ||
-	       wi_type == WORK_INTERVAL_TYPE_FRAME_COMPOSITOR;
+	return wi_type == WORK_INTERVAL_TYPE_CA_RENDER_SERVER ? 0 :
+	       wi_type == WORK_INTERVAL_TYPE_CA_CLIENT ? 1 :
+	       wi_type == WORK_INTERVAL_TYPE_HID_DELIVERY ? 2 :
+	       wi_type == WORK_INTERVAL_TYPE_FRAME_COMPOSITOR ? 3 : -1;
+}
+
+/* Are the last two frames of kind k one of a run? */
+static bool
+perfctl_wi_running(int k)
+{
+	uint64_t last = os_atomic_load(&wi_frame_at[k][1], relaxed), before = os_atomic_load(&wi_frame_at[k][0], relaxed);
+
+	return before != 0 && last - before <= wi_run_gap_abs;
+}
+
+/*
+ * A frame of kind k (op 6 when it begins, or op 2 when one is notified as finished): is it one of a
+ * run? Marks closer than wi_wake_gap_abs are taken for the same frame, which a process may report
+ * both ways.
+ */
+static bool
+perfctl_wi_frame(int k, uint64_t now)
+{
+	uint64_t last = os_atomic_load(&wi_frame_at[k][1], relaxed);
+
+	if (last != 0 && now - last < wi_wake_gap_abs) {
+		return perfctl_wi_running(k);
+	}
+	os_atomic_store(&wi_frame_at[k][0], last, relaxed);
+	os_atomic_store(&wi_frame_at[k][1], now, relaxed);
+	return last != 0 && now - last <= wi_run_gap_abs;
 }
 
 static void
 perfctl_record_interval(uint32_t op, uint32_t wi_type, uint64_t start, uint64_t finish, uint64_t deadline)
 {
 	uint64_t now;
+	bool running;
+	int k;
 
 	if (!governing) {
 		return;
 	}
 	now = mach_absolute_time();
-	if ((op == 6u || op == 7u) && perfctl_wi_interactive(wi_type)) {
+	k = perfctl_wi_interactive(wi_type);
+	running = k >= 0 && (op == 6u || op == 2u ? perfctl_wi_frame(k, now) : perfctl_wi_running(k));
+	if ((op == 6u || op == 7u) && k >= 0) {
 		uint64_t min_until = now + wi_min_boost_abs;
 		uint64_t max_until = now + wi_max_boost_abs;
 		uint64_t until = deadline > min_until ? deadline : min_until;
 
+		if (!running) {
+			return;
+		}
 		if (until > max_until) {
 			until = max_until;
 		}
@@ -825,7 +867,7 @@ perfctl_record_interval(uint32_t op, uint32_t wi_type, uint64_t start, uint64_t 
 		perfctl_maybe_wake(now, false);
 		return;
 	}
-	if ((op == 8u || op == 2u) && (perfctl_wi_interactive(wi_type) || wi_type == WORK_INTERVAL_TYPE_COREAUDIO)) {
+	if ((op == 8u || op == 2u) && (running || wi_type == WORK_INTERVAL_TYPE_COREAUDIO)) {
 		uint64_t elapsed = finish > start ? finish - start : 0;
 		uint64_t budget = deadline > start ? deadline - start : 0;
 
@@ -934,6 +976,7 @@ annibale_cpufreq_init(void)
 	nanoseconds_to_absolutetime(25ULL * NSEC_PER_MSEC, &wi_max_boost_abs);
 	nanoseconds_to_absolutetime(32ULL * NSEC_PER_MSEC, &wi_overrun_abs);
 	nanoseconds_to_absolutetime(8ULL * NSEC_PER_MSEC, &wi_wake_gap_abs);
+	nanoseconds_to_absolutetime(50ULL * NSEC_PER_MSEC, &wi_run_gap_abs);
 	governing = mode == 1 || mode == 3;
 	if (governing) {
 		sched_perfcontrol_register_callbacks(&annibale_perfctl_cbs, 0);

@@ -225,24 +225,18 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 			bzero(&fallback, sizeof(fallback));
 			lck_mtx_unlock(&sta_lock);
 		} else if (do_scan) {
-			struct annibale_sta_state *state;
-			bool is_joined = false;
-
+			/*
+			 * Only the scan's end is told, not the link: wifid starts a network session and asks for
+			 * the next scan on every link-up, so a link event after each scan kept the radio scanning
+			 * back to back (kernel-12377-lens-hv1: 815 scans in 1,278 s). A wifid that starts later
+			 * learns the link from its event filter (ioctl 564).
+			 */
 			error = ops->scan(&scan);
 			lck_mtx_lock(&sta_lock);
 			heard_count = 0;
 			lck_mtx_unlock(&sta_lock);
 			ops->heard(heard_one, NULL);
 			annibale_apple80211_event(ANNIBALE_STA_SCAN_DONE, error);
-			state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
-			if (state != NULL) {
-				ops->state(state);
-				is_joined = state->phase == ANNIBALE_STA_JOINED;
-				kfree_data(state, sizeof(*state));
-			}
-			if (is_joined) {
-				annibale_apple80211_event(ANNIBALE_STA_LINK, 1);
-			}
 		}
 
 		lck_mtx_lock(&sta_lock);
