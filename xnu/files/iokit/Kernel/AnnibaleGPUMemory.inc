@@ -305,7 +305,14 @@ AnnibaleGPUUserClient::gemNew(struct msm_gem_new * request)
 	if (size == 0 || size > GPU_BUFFER_MAX) {
 		return kIOReturnBadArgument;
 	}
-	/* one kept of this size and kind, if there is one (the one kept last: likeliest still in the caches' way) */
+	/*
+	 * One kept of this kind and of this size or up to a quarter larger, if there is one: the smallest,
+	 * and of those the one kept last (likeliest still in the caches' way). CoreAnimation's blur
+	 * targets change size from frame to frame of an animation, and with exact sizes only the 160 MB
+	 * kept were given again in none of most 30 s windows of kernel-12377-idle1-w1's gestures while
+	 * backboardd made 218 buffers of 8 MB or more. The program sees the size it asked for; the rest
+	 * is mapped and unused.
+	 */
 	IOLockLock(gGPULock);
 	if (gGPUReported || !annibale_gpu_ready()) {
 		IOLockUnlock(gGPULock);
@@ -323,7 +330,8 @@ AnnibaleGPUUserClient::gemNew(struct msm_gem_new * request)
 			return kIOReturnNotReady;
 		}
 
-		if (k->memory != NULL && k->size == size && k->flags == request->flags && (found == NULL || k->since > found->since)) {
+		if (k->memory != NULL && k->size >= size && k->size - size <= size / 4 && k->flags == request->flags &&
+		    (found == NULL || k->size < found->size || (k->size == found->size && k->since > found->since))) {
 			found = k;
 		}
 	}
@@ -340,10 +348,10 @@ AnnibaleGPUUserClient::gemNew(struct msm_gem_new * request)
 			b->flags = found->flags;
 			fNextBuffer = h + 1;
 			fBufferCount++;
-			fBufferBytes += size;
+			fBufferBytes += found->size;
 			request->handle = h + 1;
 			found->memory = NULL;
-			fKeptBytes -= size;
+			fKeptBytes -= found->size;
 			gGPUStat.given_again++;
 			IOLockUnlock(gGPULock);
 			if (gGPUKeep == 2) {
