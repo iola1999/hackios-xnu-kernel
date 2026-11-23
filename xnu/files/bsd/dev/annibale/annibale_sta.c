@@ -295,6 +295,12 @@ annibale_sta_attach(const struct annibale_sta_ops *ops)
 	lck_mtx_lock(&sta_lock);
 	sta_ops = ops;
 	sta_on = true;
+	/* a driver that comes back attaches again: the standing network is joined then too, as on power-on */
+	annibale_wifi_tell("wifi: attach: rejoin %d, standing %u, asked_join %d\n", sta_rejoin(), standing.ssid_length, asked_join);
+	if (sta_rejoin() && standing.ssid_length != 0 && !asked_join) {
+		asked_join_what = standing;
+		asked_join = true;
+	}
 	lck_mtx_unlock(&sta_lock);
 	thread_wakeup((event_t)&sta_ops);
 	annibale_apple80211_event(ANNIBALE_STA_POWER, 1);
@@ -358,10 +364,9 @@ annibale_sta_ask_scan(const struct annibale_sta_scan *what)
 		lck_mtx_unlock(&sta_lock);
 		return sta_ops == NULL ? ENXIO : ENETDOWN;
 	}
-	if (!asked_join) {
-		asked_scan_what = *what;
-		asked_scan = true;
-	}
+	/* a scan asked for while a join waits still stands: it is run when the join has had its turn */
+	asked_scan_what = *what;
+	asked_scan = true;
 	lck_mtx_unlock(&sta_lock);
 	thread_wakeup((event_t)&sta_ops);
 	return 0;

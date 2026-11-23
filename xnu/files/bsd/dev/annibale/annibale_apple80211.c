@@ -242,7 +242,16 @@ static const char interface_name[16] = "en0";   /* (bsd/dev/annibale_net.c makes
 
 static LCK_GRP_DECLARE(apple80211_lock_group, "annibale-apple80211");
 static LCK_MTX_DECLARE(apple80211_lock, &apple80211_lock_group);
-static unsigned result_next;                    /* which of what the last scan heard a SCAN_RESULT request gets next */
+/*
+ * SCAN_RESULT is asked once per access point until EIO, and the framework keeps the same req_data buffer
+ * through a whole such loop (IO80211 _dispatchAsyncScanEvent), so the buffer's address stands in for the
+ * per-handle iteration cursor the real user client keeps. A loop that reaches the end frees its slot for
+ * whatever reuses the address next; a new scan clears the table.
+ */
+static struct {
+	user_addr_t data;
+	unsigned next;
+} result_readers[16];
 static uint32_t join_result;                    /* of the last join asked for: 0 while it runs, then Apple80211's number */
 
 /* ---- channels ---------------------------------------------------------------------------------------- */
@@ -314,6 +323,13 @@ give_network(const struct apple80211req *request, const struct annibale_sta_bss 
 	result->ssid_length = bss->ssid_length;
 	memcpy(result->ssid, bss->ssid, bss->ssid_length);
 	result->age_ms = bss->age_ms;
+	if (size >= 0x8e0) {
+		/* iOS 26 reads TIMESTAMP as a signed 64-bit number at 0x8d0: the time it was heard, in nanoseconds of continuous time */
+		uint64_t heard_at;
+		absolutetime_to_nanoseconds(mach_absolute_time(), &heard_at);
+		uint64_t age_ns = (uint64_t)bss->age_ms * NSEC_PER_MSEC;
+		*(uint64_t *)((char *)result + 0x8d0) = heard_at > age_ns ? heard_at - age_ns : heard_at;
+	}
 	result->elements_length = (uint16_t)(bss->elements_length <= room ? bss->elements_length : 0);
 	memcpy(result->elements, bss->elements, result->elements_length);
 	/* the rates it says it has (elements 1 and 50: units of 500 kbit/s, the top bit marks the ones everybody must have) */
@@ -472,17 +488,36 @@ get(struct apple80211req *request)
 		return 0;
 	case 11: {                              /* what the last scan heard, one access point a request; EIO: that was all */
 		struct annibale_sta_bss *bss = kalloc_data(sizeof(*bss), Z_WAITOK);
-		unsigned index;
+		unsigned index = 0, r;
 		bool there;
 
 		if (bss == NULL) {
 			return ENOMEM;
 		}
 		lck_mtx_lock(&apple80211_lock);
-		index = result_next++;
+		for (r = 0; r < sizeof(result_readers) / sizeof(result_readers[0]) && result_readers[r].data !=
+		     request->req_data; r++) {
+		}
+		if (r == sizeof(result_readers) / sizeof(result_readers[0])) {
+			for (r = 0; r < sizeof(result_readers) / sizeof(result_readers[0]) && result_readers[r].data != 0;
+			     r++) {
+			}
+			if (r == sizeof(result_readers) / sizeof(result_readers[0])) {
+				r = 0;          /* full: reuse a slot; whatever reader is left on it starts over */
+			}
+			result_readers[r].data = request->req_data;
+			result_readers[r].next = 0;
+		}
+		index = result_readers[r].next++;
 		lck_mtx_unlock(&apple80211_lock);
 		there = annibale_sta_heard(index, bss);
 		error = there ? give_network(request, bss) : EIO;
+		if (!there) {
+			lck_mtx_lock(&apple80211_lock);
+			result_readers[r].data = 0;
+			result_readers[r].next = 0;
+			lck_mtx_unlock(&apple80211_lock);
+		}
 		kfree_data(bss, sizeof(*bss));
 		return error;
 	}
@@ -639,7 +674,7 @@ set_scan(const struct apple80211req *request, char *said, size_t said_size)
 		error = EINVAL;                 /* (nothing of what is asked for is a channel of this radio's) */
 	} else {
 		lck_mtx_lock(&apple80211_lock);
-		result_next = 0;
+		bzero(result_readers, sizeof(result_readers));
 		lck_mtx_unlock(&apple80211_lock);
 		error = annibale_sta_ask_scan(what);
 	}
@@ -874,7 +909,7 @@ annibale_apple80211_event(enum annibale_sta_event event, int status)
 		break;
 	case ANNIBALE_STA_SCAN_DONE:
 		lck_mtx_lock(&apple80211_lock);
-		result_next = 0;
+		bzero(result_readers, sizeof(result_readers));
 		lck_mtx_unlock(&apple80211_lock);
 		post(EVENT_SCAN_DONE, NULL, 0);
 		break;
