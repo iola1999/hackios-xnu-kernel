@@ -79,6 +79,7 @@ bool annibale_mic_gpr_event(uint32_t src_port, uint32_t dst_port, uint32_t opcod
 #define OP_SET_CFG              0x01001006u
 #define OP_READ_BUF             0x0400100bu
 #define OP_READ_BUF_DONE        0x05001005u
+#define GPR_BASIC_RSP_RESULT    0x02001005u
 #define PRM_CMD_REQUEST_HW_RSC      0x0100100fu
 #define PRM_CMD_RSP_REQUEST_HW_RSC  0x02001002u
 #define PARAM_ID_RSC_AUDIO_HW_CLK   0x0800102cu
@@ -138,7 +139,11 @@ static bool mic_graphs_started;
 static int mic_capture_error;
 static bool mic_hw_prepared;
 static uint32_t mic_token = 500;
+static uint32_t mic_intf_index = 1;   /* codec-DMA VA TX interface index; mic_intf= overrides */
 static uint64_t last_blocking_read_ns;
+/* Last read() on any mic entry point: audiomxd polls /dev/annibale-audio when the
+ * dedicated node refused it, and that fd never counts in mic_open_clients. */
+static volatile uint64_t mic_last_read_ns;
 static volatile uint32_t mic_inflight_mask;
 static uint32_t mic_slot_map_handle;
 static uint64_t mic_slot_dsp_base;
@@ -341,6 +346,20 @@ mic_graph_cmd(uint32_t opcode, uint32_t sg, const char *descr)
 	mpkt_cmd_end(&p, cmd);
 	mpkt_finish(&p);
 	return annibale_audio_reach_send_cmd(p.buf, p.len, descr, NULL, NULL, 0);
+}
+
+/* A graph command issued while the DSP still drains the previous transition
+ * answers with a non-zero status; the same command succeeds on retry. */
+static bool
+mic_graph_cmd_retry(uint32_t opcode, uint32_t sg, const char *descr)
+{
+	for (unsigned attempt = 0; attempt < 3; attempt++) {
+		if (mic_graph_cmd(opcode, sg, descr)) {
+			return true;
+		}
+		delay_for_interval(60, NSEC_PER_MSEC);
+	}
+	return false;
 }
 
 /* ---- LPASS PRM Voting, DMIC Pins & VA Macro Setup ---------------------------------------------- */
@@ -558,7 +577,7 @@ open_capture_graphs(void)
 	uint32_t cmd = mpkt_cmd_begin(&p);
 	uint32_t at = mpkt_param_begin(&p, IID_MIC_SOURCE, 0x08001063); /* CODEC_DMA_INTF_CFG */
 	mpkt_put32(&p, 3); /* lpaif_type: 1 RXTX, 2 WSA, 3 VA, 4 AXI */
-	mpkt_put32(&p, 1); /* intf_index: TX0 */
+	mpkt_put32(&p, mic_intf_index); /* intf_index: TX0 by default, mic_intf= boot-arg overrides */
 	mpkt_put32(&p, 1); /* active_channels_mask = ch 0 */
 	mpkt_param_end(&p, at);
 	at = mpkt_param_begin(&p, IID_MIC_SOURCE, 0x08001018); /* HW_EP_FRAME_SIZE_FACTOR */
@@ -649,10 +668,10 @@ start_capture_graphs(void)
 	}
 
 	/* 5. Prepare & Start SG_MIC and SG_CAPTURE */
-	if (!mic_graph_cmd(OP_GRAPH_PREPARE, SG_MIC, "PREPARE SG_MIC") ||
-	    !mic_graph_cmd(OP_GRAPH_START, SG_MIC, "START SG_MIC") ||
-	    !mic_graph_cmd(OP_GRAPH_PREPARE, SG_CAPTURE, "PREPARE SG_CAPTURE") ||
-	    !mic_graph_cmd(OP_GRAPH_START, SG_CAPTURE, "START SG_CAPTURE")) return false;
+	if (!mic_graph_cmd_retry(OP_GRAPH_PREPARE, SG_MIC, "PREPARE SG_MIC") ||
+	    !mic_graph_cmd_retry(OP_GRAPH_START, SG_MIC, "START SG_MIC") ||
+	    !mic_graph_cmd_retry(OP_GRAPH_PREPARE, SG_CAPTURE, "PREPARE SG_CAPTURE") ||
+	    !mic_graph_cmd_retry(OP_GRAPH_START, SG_CAPTURE, "START SG_CAPTURE")) return false;
 
 	__atomic_store_n(&mic_async_failed, false, __ATOMIC_RELEASE);
 	mic_graphs_started = true;
@@ -764,6 +783,20 @@ annibale_mic_gpr_event(uint32_t src_port, uint32_t dst_port, uint32_t opcode,
     const void *payload, uint32_t len)
 {
 	if (src_port != IID_CAP_SHMEM || dst_port != OUR_MIC_PORT || opcode != OP_READ_BUF_DONE) {
+		static int stray_logged;
+		/* While capture slots are in flight, every unmatched packet is suspect:
+		 * the DSP may answer READ_BUF from another port or opcode, and the
+		 * command's own basic response carries its accept/reject status. */
+		if (mic_inflight_mask != 0 && stray_logged < 24) {
+			uint32_t w0 = 0, w1 = 0;
+			if (payload != NULL && len >= 8) {
+				memcpy(&w0, payload, 4);
+				memcpy(&w1, payload + 4, 4);
+			}
+			stray_logged++;
+			say("capture stray packet: src %#x dst %#x opcode %#x len %u w0 %#x w1 %#x\n",
+			    src_port, dst_port, opcode, len, w0, w1);
+		}
 		return false;
 	}
 	if (payload == NULL || len < 56u) {
@@ -820,6 +853,25 @@ annibale_mic_gpr_event(uint32_t src_port, uint32_t dst_port, uint32_t opcode,
 	return true;
 }
 
+/* Capture runs while a client holds the mic node, while the kernel records, or
+ * while reads keep arriving — audiomxd polls /dev/annibale-audio (which never
+ * opens the mic node) when the dedicated fd was refused. */
+static bool
+mic_capture_active(void)
+{
+	uint64_t last, now_ns = 0;
+
+	if (mic_open_clients > 0 || annibale_audio_recording_mic()) {
+		return true;
+	}
+	last = __atomic_load_n(&mic_last_read_ns, __ATOMIC_ACQUIRE);
+	if (last == 0) {
+		return false;
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
+	return now_ns > last && now_ns - last < 3u * NSEC_PER_SEC;
+}
+
 __dead2
 static void
 mic_capture_thread(void *arg __unused, wait_result_t w __unused)
@@ -828,7 +880,7 @@ mic_capture_thread(void *arg __unused, wait_result_t w __unused)
 
 	say("capture feeder thread running\n");
 	for (;;) {
-		bool active = (mic_open_clients > 0) || annibale_audio_recording_mic();
+		bool active = mic_capture_active();
 		if (active) {
 			lck_mtx_lock(&amic_lock);
 			if (mic_capture_error != 0 || (!mic_graphs_started && !start_capture_graphs())) {
@@ -861,6 +913,13 @@ mic_capture_thread(void *arg __unused, wait_result_t w __unused)
 			lck_spin_unlock(amic_ring_lock);
 			uint32_t next_slot = slot;
 			bool failed = false;
+			static int queue_logged;
+			if (queue_logged < 12) {
+				queue_logged++;
+				say("capture queue probe: mask %#x done %u err %d clients %u rec %d\n",
+				    mask, done, mic_capture_error, mic_open_clients,
+				    annibale_audio_recording_mic() ? 1 : 0);
+			}
 
 			for (uint32_t i = 0; i < MIC_SLOTS && mic_graphs_started; i++) {
 				uint32_t s = (slot + i) % MIC_SLOTS;
@@ -902,9 +961,11 @@ mic_capture_thread(void *arg __unused, wait_result_t w __unused)
 			    THREAD_INTERRUPTIBLE, 25, NSEC_PER_MSEC);
 			lck_spin_lock(amic_ring_lock);
 			bool can_step = (__builtin_popcount(mic_inflight_mask) < (int)MIC_SLOTS) ||
-			    __atomic_load_n(&mic_async_failed, __ATOMIC_ACQUIRE) ||
-			    (mic_open_clients == 0 && !annibale_audio_recording_mic());
+			    __atomic_load_n(&mic_async_failed, __ATOMIC_ACQUIRE);
 			lck_spin_unlock(amic_ring_lock);
+			if (!can_step) {
+				can_step = !mic_capture_active();
+			}
 			if (can_step) {
 				clear_wait(current_thread(), THREAD_AWAKENED);
 			} else {
@@ -919,7 +980,7 @@ mic_capture_thread(void *arg __unused, wait_result_t w __unused)
 			last_done = 0;
 			stall_ticks = 0;
 			assert_wait_timeout((event_t)&mic_open_clients, THREAD_INTERRUPTIBLE, 250, NSEC_PER_MSEC);
-			if ((mic_open_clients > 0) || annibale_audio_recording_mic()) {
+			if (mic_capture_active()) {
 				clear_wait(current_thread(), THREAD_AWAKENED);
 			} else {
 				thread_block(THREAD_CONTINUE_NULL);
@@ -944,6 +1005,10 @@ annibale_mic_read(struct uio *uio, int ioflag)
 	if (mic_ring == NULL) {
 		return ENXIO;
 	}
+
+	uint64_t read_at_ns = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time(), &read_at_ns);
+	__atomic_store_n(&mic_last_read_ns, read_at_ns, __ATOMIC_RELEASE);
 
 	lck_mtx_lock(&amic_lock);
 	if (mic_capture_error != 0 || (!mic_graphs_started && !start_capture_graphs())) {
@@ -1025,8 +1090,14 @@ annibale_mic_read(struct uio *uio, int ioflag)
 }
 
 static int
-mic_cdev_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
+mic_cdev_open(__unused dev_t dev, __unused int flags, __unused int devtype, struct proc *p)
 {
+	static int open_logged;
+	char who[32] = "?";
+
+	if (p != NULL) {
+		proc_name(proc_selfpid(), who, sizeof(who));
+	}
 	lck_mtx_lock(&amic_lock);
 	if (mic_ring == NULL) {
 		lck_mtx_unlock(&amic_lock);
@@ -1037,10 +1108,20 @@ mic_cdev_open(__unused dev_t dev, __unused int flags, __unused int devtype, __un
 		mic_capture_error = 0;
 	}
 	if (mic_capture_error != 0 || (!mic_graphs_started && !start_capture_graphs())) {
+		if (open_logged < 12) {
+			open_logged++;
+			say("mic open refused: pid %d (%s) err %d\n",
+			    proc_selfpid(), who, mic_capture_error);
+		}
 		lck_mtx_unlock(&amic_lock);
 		return EIO;
 	}
 	mic_open_clients++;
+	if (open_logged < 12) {
+		open_logged++;
+		say("mic open: pid %d (%s) clients %u\n",
+		    proc_selfpid(), who, mic_open_clients);
+	}
 	lck_mtx_unlock(&amic_lock);
 	thread_wakeup((event_t)&mic_open_clients);
 	return 0;
@@ -1049,9 +1130,21 @@ mic_cdev_open(__unused dev_t dev, __unused int flags, __unused int devtype, __un
 static int
 mic_cdev_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
 {
+	static int close_logged;
+	char who[32] = "?";
+
+	if (p != NULL) {
+		proc_name(proc_selfpid(), who, sizeof(who));
+	}
 	lck_mtx_lock(&amic_lock);
 	if (mic_open_clients > 0) {
 		mic_open_clients--;
+	}
+	if (close_logged < 12) {
+		close_logged++;
+		say("mic close: pid %d (%s) clients %u rec %d\n",
+		    proc_selfpid(), who,
+		    mic_open_clients, annibale_audio_recording_mic() ? 1 : 0);
 	}
 	if (mic_open_clients == 0 && !annibale_audio_recording_mic()) {
 		stop_capture_graphs();
@@ -1104,6 +1197,10 @@ annibale_mic_init(void)
 	uint32_t mic_boot = 0;
 	if (PE_parse_boot_argn("mic", &mic_boot, sizeof(mic_boot)) && mic_boot > 0) {
 		mic_open_clients = 1;
+	}
+	if (PE_parse_boot_argn("mic_intf", &mic_boot, sizeof(mic_boot))) {
+		mic_intf_index = mic_boot;
+		say("codec-DMA interface index forced to %u (mic_intf)\n", mic_intf_index);
 	}
 
 	thread_t th;
