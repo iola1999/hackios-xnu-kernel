@@ -913,6 +913,7 @@ struct gem_close { uint32_t handle, pad; };
 	struct rwa_compute_info _info;
 	unsigned _imageblockDataSize;
 	uint32_t _limitsMaterialized;
+	NSString *_kernelName;
 }
 @end
 

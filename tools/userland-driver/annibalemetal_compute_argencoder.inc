@@ -58,6 +58,16 @@
 		         (unsigned long)index, RW_MAX_BUFFERS);
 		return;
 	}
+	/* Still-capture triage: name an IOSurface a kernel is given, so the emit log's
+	 * surf= field can be told written-from-unwritten apart (A1 first-shot dark). */
+	void *sf = [texture respondsToSelector:sel_registerName("iosurface")] ?
+	    ((void *(*)(id, SEL))objc_msgSend)(texture, sel_registerName("iosurface")) : NULL;
+	static unsigned said_bind;
+	if (sf != NULL && said_bind++ < 96) {
+		rw_print("compute binds surface %u plane %lu at %lu\n", ann_surface_id(sf),
+			 (unsigned long)((NSUInteger(*)(id, SEL))objc_msgSend)(
+			     texture, sel_registerName("iosurfacePlane")), (unsigned long)index);
+	}
 	_textures[index] = texture;
 	if (index + 1 > _highestTexture) {
 		_highestTexture = (unsigned)index + 1;
@@ -133,6 +143,55 @@
 	work->count = _highest;
 	work->textureCount = _highestTexture;
 	work->samplerCount = _highestSampler;
+	/* Still-capture triage: a dispatch that touches an IOSurface prints its whole
+	 * argument table once, so a first-shot pass can be compared with a later one
+	 * slot by slot (A1 first-shot dark). */
+	static unsigned said_layout;
+	for (unsigned i = 0; i < _highestTexture && said_layout < 96; i++) {
+		id t = _textures[i];
+		void *sf = [t respondsToSelector:sel_registerName("iosurface")] ?
+		    ((void *(*)(id, SEL))objc_msgSend)(t, sel_registerName("iosurface")) : NULL;
+		if (sf == NULL)
+			continue;
+		said_layout++;
+		const char *name = "?";
+		if ([_pipeline respondsToSelector:sel_registerName("annibaleKernelName")]) {
+			NSString *kn = ((id (*)(id, SEL))objc_msgSend)(
+			    _pipeline, sel_registerName("annibaleKernelName"));
+			if ([kn isKindOfClass:[NSString class]] && [kn length] != 0)
+				name = [kn UTF8String];
+		}
+		rw_print("dispatch %s pipe %p:", name, _pipeline);
+		for (unsigned b = 0; b < _highest; b++) {
+			size_t len = (size_t)((NSUInteger(*)(id, SEL))objc_msgSend)(
+			    _buffers[b], sel_registerName("length"));
+			rw_print(" buf%u=%zu", b, len);
+			if (len > 0 && len <= 512 && [_buffers[b] respondsToSelector:sel_registerName("contents")]) {
+				const unsigned char *p = (const unsigned char *)((void *(*)(id, SEL))objc_msgSend)(
+				    _buffers[b], sel_registerName("contents"));
+				rw_print("<");
+				for (size_t c = 0; c < len && c < 24; c++)
+					rw_print("%02x", p[c]);
+				rw_print(">");
+			}
+		}
+		for (unsigned x = 0; x < _highestTexture; x++) {
+			id t2 = _textures[x];
+			void *sf2 = [t2 respondsToSelector:sel_registerName("iosurface")] ?
+			    ((void *(*)(id, SEL))objc_msgSend)(t2, sel_registerName("iosurface")) : NULL;
+			unsigned tw = 0, th = 0;
+			if (t2 != nil && [t2 respondsToSelector:@selector(width)]) {
+				tw = (unsigned)[t2 width];
+				th = (unsigned)[t2 height];
+			}
+			rw_print(" tex%u=%s%u:%lu@%ux%u", x, sf2 != NULL ? "s" : "t",
+			         sf2 != NULL ? ann_surface_id(sf2) : (unsigned)(uintptr_t)t2,
+			         sf2 != NULL ? (unsigned long)((NSUInteger(*)(id, SEL))objc_msgSend)(
+			             t2, sel_registerName("iosurfacePlane")) : 0ul, tw, th);
+		}
+		rw_print("\n");
+		break;
+	}
 	for (unsigned i = 0; i < _highest; i++) {
 		work->buffers[i] = _buffers[i];
 		work->bufferOffsets[i] = (size_t)_offsets[i];

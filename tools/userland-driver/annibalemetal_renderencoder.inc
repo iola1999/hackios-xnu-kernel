@@ -50,6 +50,21 @@
 		if (texture == nil) {
 			continue;
 		}
+		/* Still-capture triage: name an IOSurface a draw writes to, so the emit log's
+		 * surf= field can be told written-from-unwritten apart (A1 first-shot dark).
+		 * Internal textures are named by pointer too, so a render pass's output can be
+		 * matched to the fusion dispatch's tex= inputs. */
+		void *sf = [texture respondsToSelector:sel_registerName("iosurface")] ?
+		    ((void *(*)(id, SEL))objc_msgSend)(texture, sel_registerName("iosurface")) : NULL;
+		static unsigned said_target;
+		if (said_target++ < 160) {
+			rw_print("render targets %s%u plane %lu %ux%u as colour %u\n",
+				 sf != NULL ? "surface " : "texture ",
+				 sf != NULL ? ann_surface_id(sf) : (unsigned)(uintptr_t)texture,
+				 sf != NULL ? (unsigned long)((NSUInteger(*)(id, SEL))objc_msgSend)(
+				     texture, sel_registerName("iosurfacePlane")) : 0ul,
+				 (unsigned)[texture width], (unsigned)[texture height], i);
+		}
 		_color[i] = rw_attachment_level(texture, [attachment level]);
 		_colorCount = i + 1;
 		_colorLevel[i] = (unsigned)[attachment level];

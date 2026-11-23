@@ -28,6 +28,75 @@ static pthread_mutex_t rw_completion_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t rw_completion_more = PTHREAD_COND_INITIALIZER;   /* a buffer was queued */
 static pthread_cond_t rw_completion_done = PTHREAD_COND_INITIALIZER;   /* a buffer completed */
 static struct rw_completion *rw_completion_head, **rw_completion_tail = &rw_completion_head;
+static pthread_t rw_completion_tid;
+
+/* A processor read of an IOSurface must see what the GPU wrote into it. The commit path records
+ * which commit touched every surface-bound texture it had (reads over-marked: waiting on one is
+ * a fence that has already fired); a CPU reader asks annibale_surface_writes_wait to stand on
+ * the far side of that commit before it maps the surface. This is how the still pipeline's first
+ * photograph came out black: the encoder read the engine's output surface while the commit that
+ * wrote it was still in flight (kernel-12377-say16-ubo12). */
+#define RW_SURFACE_WRITES 64
+static struct { uint32_t sid; unsigned commit; } rw_surface_writes[RW_SURFACE_WRITES];
+static unsigned rw_completed_commit;
+
+static void
+rw_surface_commit_mark(id texture, unsigned commit)
+{
+	if (texture == nil) {
+		return;
+	}
+	void *sf = [texture respondsToSelector:sel_registerName("iosurface")] ?
+	    ((void *(*)(id, SEL))objc_msgSend)(texture, sel_registerName("iosurface")) : NULL;
+	if (sf == NULL) {
+		return;
+	}
+	uint32_t sid = ann_surface_id(sf);
+	pthread_mutex_lock(&rw_completion_lock);
+	unsigned slot = RW_SURFACE_WRITES, oldest = 0;
+	for (unsigned i = 0; i < RW_SURFACE_WRITES; i++) {
+		if (rw_surface_writes[i].sid == sid || rw_surface_writes[i].sid == 0) {
+			slot = i;
+			break;
+		}
+		if (rw_surface_writes[i].commit < rw_surface_writes[oldest].commit) {
+			oldest = i;
+		}
+	}
+	if (slot == RW_SURFACE_WRITES) {
+		slot = oldest;   /* table full: the oldest pending write is the one a reader misses least */
+	}
+	rw_surface_writes[slot].sid = sid;
+	rw_surface_writes[slot].commit = commit;
+	pthread_mutex_unlock(&rw_completion_lock);
+}
+
+void
+annibale_surface_writes_wait(uint32_t sid)
+{
+	if (pthread_equal(pthread_self(), rw_completion_tid)) {
+		return;   /* the completion thread cannot wait on the work it is announcing */
+	}
+	pthread_mutex_lock(&rw_completion_lock);
+	unsigned target = 0;
+	for (unsigned i = 0; i < RW_SURFACE_WRITES; i++) {
+		if (rw_surface_writes[i].sid == sid) {
+			target = rw_surface_writes[i].commit;
+			break;
+		}
+	}
+	if (target != 0) {
+		struct timespec deadline;
+		clock_gettime(CLOCK_REALTIME, &deadline);
+		deadline.tv_sec += 4;
+		while (rw_completed_commit < target) {
+			if (pthread_cond_timedwait(&rw_completion_done, &rw_completion_lock, &deadline) != 0) {
+				break;
+			}
+		}
+	}
+	pthread_mutex_unlock(&rw_completion_lock);
+}
 
 static dispatch_queue_t
 rw_handler_queue(void)
@@ -154,6 +223,58 @@ static void *rw_completion_main(void *unused);
 		mesa.buffer_textures_writeback(device);
 		writeback_us = rw_now_us() - writeback_began;
 	}
+	/* Still-capture triage (A1 first-shot dark): after the fence, a compute work that
+	 * touched an IOSurface gets every internal texture it bound sampled at the centre
+	 * texel -- written-vs-unwritten separates "the fusion read an empty input" from
+	 * "the fusion read a populated input and still wrote zeros". */
+	static unsigned probe_budget;
+	if (!wait_failed && probe_budget < 128) {
+		for (AnnibaleMetalWork *work in _work) {
+			if (work->pipeline == nil || work->textureCount == 0)
+				continue;
+			BOOL touches_surface = NO;
+			for (unsigned i = 0; i < work->textureCount && !touches_surface; i++) {
+				id t = work->textures[i];
+				void *sf = [t respondsToSelector:sel_registerName("iosurface")] ?
+				    ((void *(*)(id, SEL))objc_msgSend)(t, sel_registerName("iosurface")) : NULL;
+				touches_surface = sf != NULL;
+			}
+			if (!touches_surface)
+				continue;
+			const char *pname = "?";
+			if ([work->pipeline respondsToSelector:sel_registerName("annibaleKernelName")]) {
+				NSString *kn = ((id (*)(id, SEL))objc_msgSend)(
+				    work->pipeline, sel_registerName("annibaleKernelName"));
+				if ([kn isKindOfClass:[NSString class]] && [kn length] != 0)
+					pname = [kn UTF8String];
+			}
+			for (unsigned i = 0; i < work->textureCount && probe_budget < 128; i++) {
+				id t = work->textures[i];
+				if (t == nil || ![t respondsToSelector:@selector(getBytes:bytesPerRow:fromRegion:mipmapLevel:)])
+					continue;
+				unsigned w = (unsigned)[t width], h = (unsigned)[t height];
+				if (w == 0 || h == 0)
+					continue;
+				unsigned char sample[256] = { 0 };
+				MTLRegion region = MTLRegionMake3D(w / 2, h / 2, 0, 4, 8, 1);
+				probe_budget++;
+				[t getBytes:sample bytesPerRow:32 fromRegion:region
+				mipmapLevel:0];
+				unsigned nz = 0, mx = 0, sum = 0;
+				for (unsigned b = 0; b < sizeof(sample); b++) {
+					nz += sample[b] != 0;
+					mx = sample[b] > mx ? sample[b] : mx;
+					sum += sample[b];
+				}
+				void *sf = [t respondsToSelector:sel_registerName("iosurface")] ?
+				    ((void *(*)(id, SEL))objc_msgSend)(t, sel_registerName("iosurface")) : NULL;
+				rw_print("probe %s commit %u tex%u %s%u %ux%u nz=%u mx=%u sum=%u\n", pname, commit, i,
+					 sf != NULL ? "s" : "t",
+					 sf != NULL ? ann_surface_id(sf) : (unsigned)(uintptr_t)t,
+					 w, h, nz, mx, sum);
+			}
+		}
+	}
 	if (!wait_failed) {
 		for (AnnibaleMetalWork *work in _work) {
 			if (work->copyKind == RW_COPY_SIGNAL_EVENT &&
@@ -168,6 +289,7 @@ static void *rw_completion_main(void *unused);
 	completed = _completed;
 	_completed = nil;
 	__atomic_store_n(&_phase, RW_CB_PHASE_FINISHED, __ATOMIC_RELEASE);
+	rw_completed_commit = commit;
 	pthread_cond_broadcast(&rw_completion_done);
 	pthread_mutex_unlock(&rw_completion_lock);
 	rw_timing_completion(commit, began_us - queued_us, fence_us, writeback_us, !_failed);
@@ -232,6 +354,7 @@ rw_completion_main(void *unused)
 {
 	(void)unused;
 	pthread_setname_np("annibale.metal.completion");
+	rw_completion_tid = pthread_self();
 	for (;;) {
 		struct rw_completion *item;
 

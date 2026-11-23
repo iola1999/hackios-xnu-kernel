@@ -254,6 +254,15 @@ protocol_declares(const char *name, SEL selector, struct objc_method_description
 		[self rejectCopy:"texture copy parameters exceed the 32-bit resource contract"];
 		return;
 	}
+	/* Still-capture triage: name an IOSurface a copy writes to (A1 first-shot dark). */
+	static unsigned said_blit;
+	void *sf = [destination respondsToSelector:sel_registerName("iosurface")] ?
+	    ((void *(*)(id, SEL))objc_msgSend)(destination, sel_registerName("iosurface")) : NULL;
+	if (sf != NULL && said_blit++ < 96) {
+		rw_print("blit targets surface %u plane %lu\n", ann_surface_id(sf),
+			 (unsigned long)((NSUInteger(*)(id, SEL))objc_msgSend)(
+			     destination, sel_registerName("iosurfacePlane")));
+	}
 	AnnibaleMetalWork *work = [[AnnibaleMetalWork alloc] init];
 	work->copyKind = RW_COPY_TEXTURE;
 	work->textureCount = 2;

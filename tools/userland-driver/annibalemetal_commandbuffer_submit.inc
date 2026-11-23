@@ -1,4 +1,6 @@
 /* Commit execution retains the existing work order and completion path. */
+static void rw_surface_commit_mark(id texture, unsigned commit);   /* annibalemetal_completion.inc */
+
 - (void)commit
 {
 	char why[512] = { 0 };
@@ -102,6 +104,21 @@
 	unsigned prev_in_flight = commit_in_flight;
 	commit_started = started;
 	unsigned this_commit = ++commit_count;
+	/* Every surface-bound texture this commit touches is recorded so a processor-side reader
+	 * can wait for the write (annibale_surface_writes_wait): the still pipeline's encoder
+	 * reads the engine's IOSurface output on the CPU, and without this the read can land
+	 * while the write is still in flight -- the first shot of a session came out black. */
+	for (AnnibaleMetalWork *mark in _work) {
+		for (unsigned i = 0; i < mark->textureCount; i++)
+			rw_surface_commit_mark(mark->textures[i], this_commit);
+		for (unsigned i = 0; i < mark->vertexTextureCount; i++)
+			rw_surface_commit_mark(mark->vertexTextures[i], this_commit);
+		for (unsigned i = 0; i < mark->colorCount; i++)
+			rw_surface_commit_mark(mark->color[i], this_commit);
+		for (unsigned i = 0; i < 8; i++)
+			rw_surface_commit_mark(mark->resolve[i], this_commit);
+		rw_surface_commit_mark(mark->depth, this_commit);
+	}
 	pthread_once(&rw_watch_once, rw_start_watch);
 	commit_progress_us = rw_now_us();
 	commit_in_flight = commit_count;

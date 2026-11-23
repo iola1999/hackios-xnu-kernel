@@ -332,6 +332,12 @@
 	_info = *info;
 	_imageblockDataSize = mesa.compute_imageblock_data_size != NULL
 	    ? mesa.compute_imageblock_data_size(compute) : 0;
+	if ([descriptor respondsToSelector:sel_registerName("computeFunction")]) {
+		id fn = ((id (*)(id, SEL))objc_msgSend)(descriptor,
+						  sel_registerName("computeFunction"));
+		if (fn != nil && [fn respondsToSelector:@selector(name)])
+			_kernelName = [[fn name] retain];
+	}
 	/* and the same for a kernel with a set, for the same reason */
 	if (_info.argbuf_mask != 0) {
 		RW_ONCE("a compute pipeline declares argument buffers at Metal buffer indices "
@@ -347,11 +353,13 @@
 		rw_compute_pipe_release(_compute);
 		_compute = NULL;
 	}
+	[_kernelName release];
 	[_owner release];
 	[super dealloc];
 }
 
 - (struct rwa_compute *)compute { return _compute; }
+- (NSString *)annibaleKernelName { return _kernelName; }
 - (BOOL)groupFree { return _info.group_free != 0; }
 
 - (void)ensureLimitsMaterialized
