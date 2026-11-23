@@ -5,9 +5,10 @@
  * Whoever wants a network asks from wherever it happens to be: an ioctl of wifid's, the thread
  * that brings the radio up. The station side wants to be called by one thread, one call at a
  * time, and a scan or a join takes seconds. So what is asked for is noted here and done by a
- * thread of this file's; the asker returns at once and hears the outcome as an event. One
- * request of each kind can wait: a second scan asked for while the first has not begun
- * replaces it, as does a second join.
+ * thread of this file's; the asker returns at once and hears the outcome as an event. A join
+ * or a power change can wait alone, a second one replacing the first; scans wait in a small
+ * queue, because each asker's scan is to run -- wifid learns which of its clients' scans came
+ * to an end from their order, so none may be dropped.
  *
  * What the last scan heard is kept here, so that it can be read without entering the station
  * side, and so is the list of channels.
@@ -49,8 +50,10 @@ static unsigned sta_reads;                      /* ... and so many others are in
 static bool sta_on;                             /* the radio's power, as last asked for */
 
 /* what has been asked for and not begun */
-static bool asked_power, asked_power_on, asked_scan, asked_join, asked_leave;
-static struct annibale_sta_scan asked_scan_what;
+static bool asked_power, asked_power_on, asked_join, asked_leave;
+#define ASKED_SCANS_MOST 8
+static struct annibale_sta_scan asked_scans[ASKED_SCANS_MOST];
+static unsigned asked_scans_head, asked_scans_count;
 static struct annibale_sta_join asked_join_what;
 static struct annibale_sta_join standing;        /* the network joined whenever the radio comes on (ssid_length 0: none) */
 static struct annibale_sta_join fallback;        /* ... as it was before a join that has not come through yet */
@@ -127,7 +130,7 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 		int error = 0;
 
 		lck_mtx_lock(&sta_lock);
-		while (sta_ops == NULL || !(asked_power || asked_leave || asked_join || asked_scan)) {
+		while (sta_ops == NULL || !(asked_power || asked_leave || asked_join || asked_scans_count != 0)) {
 			if (sta_ops != NULL && !standing_checked && standing.ssid_length == 0 && !asked_join) {
 				lck_mtx_unlock(&sta_lock);
 				vfs_context_t ctx = vfs_context_kernel();
@@ -176,8 +179,9 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 			asked_join = false;
 		} else {
 			do_scan = true;
-			scan = asked_scan_what;
-			asked_scan = false;
+			scan = asked_scans[asked_scans_head];
+			asked_scans_head = (asked_scans_head + 1) % ASKED_SCANS_MOST;
+			asked_scans_count--;
 		}
 		sta_calls = true;
 		lck_mtx_unlock(&sta_lock);
@@ -267,7 +271,8 @@ annibale_sta_attach(const struct annibale_sta_ops *ops)
 	if (ops == NULL) {
 		lck_mtx_lock(&sta_lock);
 		sta_ops = NULL;
-		asked_power = asked_scan = asked_join = asked_leave = false;
+		asked_power = asked_join = asked_leave = false;
+		asked_scans_count = 0;
 		while (sta_calls || sta_reads != 0) {
 			lck_mtx_sleep(&sta_lock, LCK_SLEEP_DEFAULT, (event_t)&sta_calls, THREAD_UNINT);
 		}
@@ -332,7 +337,7 @@ annibale_sta_busy(void)
 	bool busy;
 
 	lck_mtx_lock(&sta_lock);
-	busy = sta_ops != NULL && (sta_calls || asked_power || asked_leave || asked_join || asked_scan);
+	busy = sta_ops != NULL && (sta_calls || asked_power || asked_leave || asked_join || asked_scans_count != 0);
 	lck_mtx_unlock(&sta_lock);
 	return busy;
 }
@@ -349,7 +354,8 @@ annibale_sta_ask_power(bool on)
 	asked_power = true;
 	asked_power_on = on;
 	if (!on) {
-		asked_scan = asked_join = asked_leave = false;
+		asked_join = asked_leave = false;
+		asked_scans_count = 0;
 	}
 	lck_mtx_unlock(&sta_lock);
 	thread_wakeup((event_t)&sta_ops);
@@ -365,8 +371,12 @@ annibale_sta_ask_scan(const struct annibale_sta_scan *what)
 		return sta_ops == NULL ? ENXIO : ENETDOWN;
 	}
 	/* a scan asked for while a join waits still stands: it is run when the join has had its turn */
-	asked_scan_what = *what;
-	asked_scan = true;
+	if (asked_scans_count == ASKED_SCANS_MOST) {
+		asked_scans_head = (asked_scans_head + 1) % ASKED_SCANS_MOST;
+		asked_scans_count--;
+	}
+	asked_scans[(asked_scans_head + asked_scans_count) % ASKED_SCANS_MOST] = *what;
+	asked_scans_count++;
 	lck_mtx_unlock(&sta_lock);
 	thread_wakeup((event_t)&sta_ops);
 	return 0;
@@ -399,7 +409,7 @@ annibale_sta_ask_join(const struct annibale_sta_join *what)
 	bzero(&standing, sizeof(standing));     /* (whoever asks for a network now has the say) */
 	asked_join_what = *what;
 	asked_join = true;
-	asked_scan = false;
+	asked_scans_count = 0;
 	asked_leave = false;
 	lck_mtx_unlock(&sta_lock);
 	thread_wakeup((event_t)&sta_ops);
