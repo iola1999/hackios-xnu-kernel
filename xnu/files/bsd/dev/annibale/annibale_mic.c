@@ -55,14 +55,14 @@ bool annibale_mic_gpr_event(uint32_t src_port, uint32_t dst_port, uint32_t opcod
 #define PIN_DMIC23_EN           182u
 #define PIN_DMIC01_EN           183u
 
-#define TX_MACRO_PHYS           0x06ae0000UL
-#define TX_MACRO_SIZE           0x00002000UL
-#define SWRM_TX_PHYS            0x07630000UL
-#define SWRM_TX_SIZE            0x00002000UL
 #define VA_MACRO_PHYS           0x07660000UL
 #define VA_MACRO_SIZE           0x00002000UL
 #define LPI_TLMM_PHYS           0x07760000UL
 #define LPI_TLMM_SIZE           0x00030000UL
+#define TX_MACRO_PHYS           0x06AE0000UL
+#define TX_MACRO_SIZE           0x00020000UL
+#define VA_SWRM_PHYS            0x07630000UL  /* va-macro's own SoundWire master (swr2) */
+#define VA_SWRM_SIZE            0x00008000UL
 
 /* AudioReach capture constants */
 #define GPR_DOMAIN_ADSP         2u
@@ -139,7 +139,79 @@ static bool mic_graphs_started;
 static int mic_capture_error;
 static bool mic_hw_prepared;
 static uint32_t mic_token = 500;
-static uint32_t mic_intf_index = 1;   /* codec-DMA VA TX interface index; mic_intf= overrides */
+static uint32_t mic_intf_index = 4;   /* codec-DMA RXTX TX_CDC_DMA_TX_3; mic_intf= overrides */
+static uint32_t mic_lpaif_type = 1;   /* LPAIF block: 1 RXTX, 2 WSA, 3 VA; mic_lpaif= overrides */
+static uint32_t mic_ch_mask = 2;      /* AIF slot bitmask: decimator i feeds slot i upstream */
+static uint32_t mic_v41 = 1;          /* LPASS codec v4.1 register sequence; mic_v41=0 forces legacy */
+static uint32_t mic_dmic_sel = 1;     /* TX DEC1 input-mux index (shift 4 of 0x0108); mic_dmic= overrides */
+static uint32_t mic_pmode = 0;        /* HW_EP power mode, as upstream sends; mic_pmode= overrides */
+static uint32_t mic_noalign = 1;      /* upstream omits DMA_DATA_ALIGN on codec-DMA; mic_noalign=0 keeps it */
+
+/* mic_sweep=1 walks these (lpaif,intf,dec,dmic,swr) combos: on each capture
+ * stall, flat or empty stream and failed graph start the next combo is tried,
+ * so one round covers the whole binding space instead of one boot per guess.
+ * dec selects which VA decimator gets programmed (the TX DMA channel binds a
+ * decimator; intf selects the channel). swr=1 selects SWR_MIC mux mode with
+ * sel in CFG0[3:0]; the K90 dts routes DMICs over the SoundWire pins, so the
+ * SWR_MIC5..10 channels are tried before the pin-DMIC space again. */
+static const struct mic_combo { uint8_t lpaif, intf, dec, dmic, swr, mac; } mic_combos[] = {
+	/* TX_CDC_DMA_TX_3..5 (intf 4..6 on the RXTX LPAIF): redwood's proven mic
+	 * port is TX_CDC_DMA_TX_3 + decimator 1, and K90's own sound card routes
+	 * "TX DMIC0..5" into "RX_TX DECx_INP" -> "TX DECx MUX". These lead since
+	 * every booted sweep starts at index 0. */
+	{1,4,1,1,0,1},{1,4,1,2,0,1},{1,4,1,3,0,1},{1,4,1,4,0,1},
+	{1,4,1,5,0,1},{1,4,1,6,0,1},
+	{1,4,0,1,0,1},{1,4,2,1,0,1},{1,4,3,1,0,1},{1,4,4,1,0,1},{1,4,5,1,0,1},
+	{1,4,0,3,0,1},{1,4,2,3,0,1},{1,4,3,3,0,1},{1,4,4,3,0,1},{1,4,5,3,0,1},
+	{1,4,0,5,0,1},{1,4,2,5,0,1},{1,4,3,5,0,1},{1,4,4,5,0,1},{1,4,5,5,0,1},
+	{1,5,1,1,0,1},{1,5,1,3,0,1},{1,5,1,5,0,1},
+	{1,6,1,1,0,1},{1,6,1,3,0,1},{1,6,1,5,0,1},
+	/* is-used-swr-gpio=1 on the K90 va-macro: its DMICs ride the SoundWire
+	 * pins, decoded by the SWR_MIC5..10 taps (three pairs -> CTL0..2). With
+	 * the master now up these are the dts-prescribed path. */
+	{3,1,0,5,1,0},{3,1,0,7,1,0},{3,1,0,9,1,0},
+	{3,1,1,5,1,0},{3,1,1,7,1,0},{3,1,1,9,1,0},
+	{3,1,2,5,1,0},{3,1,2,7,1,0},{3,1,2,9,1,0},
+	{3,2,0,5,1,0},{3,2,0,7,1,0},{3,2,0,9,1,0},
+	{3,3,0,5,1,0},{3,3,0,7,1,0},{3,3,0,9,1,0},
+	/* Pin probes show live PDM on all three populated DMIC pairs, so the
+	 * missing link is which VA TX interface carries which decimator. Walk
+	 * the full (intf, dec) cross product on the live channel space; the
+	 * diagonal is first since 1:1 mapping is the most likely. */
+	{3,1,0,1,0,0},{3,2,1,3,0,0},{3,3,2,5,0,0},
+	{3,1,0,2,0,0},{3,1,0,3,0,0},{3,1,0,4,0,0},{3,1,0,5,0,0},{3,1,0,6,0,0},
+	{3,1,1,1,0,0},{3,1,1,2,0,0},{3,1,1,3,0,0},{3,1,1,4,0,0},{3,1,1,5,0,0},{3,1,1,6,0,0},
+	{3,1,2,1,0,0},{3,1,2,2,0,0},{3,1,2,3,0,0},{3,1,2,4,0,0},{3,1,2,5,0,0},{3,1,2,6,0,0},
+	{3,1,3,1,0,0},{3,1,3,2,0,0},{3,1,3,3,0,0},{3,1,3,4,0,0},{3,1,3,5,0,0},{3,1,3,6,0,0},
+	{3,2,0,1,0,0},{3,2,0,2,0,0},{3,2,0,3,0,0},{3,2,0,4,0,0},{3,2,0,5,0,0},{3,2,0,6,0,0},
+	{3,2,1,1,0,0},{3,2,1,2,0,0},{3,2,1,4,0,0},{3,2,1,5,0,0},{3,2,1,6,0,0},
+	{3,2,2,1,0,0},{3,2,2,2,0,0},{3,2,2,3,0,0},{3,2,2,4,0,0},{3,2,2,5,0,0},{3,2,2,6,0,0},
+	{3,2,3,1,0,0},{3,2,3,2,0,0},{3,2,3,3,0,0},{3,2,3,4,0,0},{3,2,3,5,0,0},{3,2,3,6,0,0},
+	{3,3,0,1,0,0},{3,3,0,2,0,0},{3,3,0,3,0,0},{3,3,0,4,0,0},{3,3,0,5,0,0},{3,3,0,6,0,0},
+	{3,3,1,1,0,0},{3,3,1,2,0,0},{3,3,1,3,0,0},{3,3,1,4,0,0},{3,3,1,5,0,0},{3,3,1,6,0,0},
+	{3,3,2,1,0,0},{3,3,2,2,0,0},{3,3,2,3,0,0},{3,3,2,4,0,0},{3,3,2,6,0,0},
+	{3,3,3,1,0,0},{3,3,3,2,0,0},{3,3,3,3,0,0},{3,3,3,4,0,0},{3,3,3,5,0,0},{3,3,3,6,0,0},
+	/* TX macro (mac=1): the K90 sound card also routes "TX DMIC0..5" and its
+	 * is-used-swr-gpio=0, so the LPI DMIC lanes may feed tx-macro decimators
+	 * instead of the VA block. Its codec-DMA side is the RXTX LPAIF (type 1);
+	 * AIF1..3 surface as intf 1..3, eight decimators, same mux fields. The
+	 * DMIC lane clock is shared — the VA DMIC_CTL writes above already drive
+	 * the pads, so the TX side only needs its mux + decimator + AIF binding. */
+	{1,1,0,1,0,1},{1,1,0,2,0,1},{1,1,0,3,0,1},{1,1,0,4,0,1},
+	{1,1,0,5,0,1},{1,1,0,6,0,1},{1,1,0,7,0,1},{1,1,0,8,0,1},
+	{1,2,0,1,0,1},{1,2,0,5,0,1},{1,2,1,1,0,1},{1,2,1,5,0,1},
+	{1,2,2,1,0,1},{1,2,2,5,0,1},{1,2,3,1,0,1},{1,2,3,5,0,1},
+	{1,3,0,1,0,1},{1,3,0,5,0,1},{1,3,1,1,0,1},{1,3,1,5,0,1},
+	{1,3,2,1,0,1},{1,3,2,5,0,1},{1,3,3,1,0,1},{1,3,3,5,0,1},
+	{1,1,1,5,0,1},{1,1,2,5,0,1},{1,1,3,5,0,1},
+	{2,1,0,1,0,0},{4,1,0,1,0,0},                           /* WSA / AXI */
+};
+static uint32_t mic_sweep;
+static uint32_t mic_combo_idx;
+static uint32_t mic_combo_fails;
+static int32_t mic_win_min, mic_win_max;  /* min/max sample seen since the current combo */
+static uint32_t mic_win_seen;             /* samples harvested under the current combo */
+static uint32_t mic_win_sig;              /* samples strictly inside the rail values */
 static uint64_t last_blocking_read_ns;
 /* Last read() on any mic entry point: audiomxd polls /dev/annibale-audio when the
  * dedicated node refused it, and that fd never counts in mic_open_clients. */
@@ -451,8 +523,94 @@ mic_configure_dmic_pins(void)
 		}
 		*(volatile uint32_t *)reg = v;
 	}
+	/* VA SoundWire pins from the dts va_swr pinctrl: gpio0 clk, gpio1/2/14
+	 * data0..2, all func 1 at 4 mA. DMICs can ride these lines in SWR_MIC
+	 * mux mode (qcom,is-used-swr-gpio=1 on K90), so they are part of the
+	 * candidate capture path even with the WCD codec disabled. */
+	{
+		static const unsigned swr_data_pins[] = { 1u, 2u, 14u };
+		vm_offset_t clk_reg = lpi_tlmm;
+		uint32_t v = *(volatile uint32_t *)clk_reg;
+		v = (v & ~0x3ffu) | (1u << 9) | (1u << 6) | (1u << 2); /* clk: func1, 4 mA, output */
+		*(volatile uint32_t *)(clk_reg + 4UL) = 2u;
+		*(volatile uint32_t *)clk_reg = v;
+		for (unsigned i = 0; i < sizeof(swr_data_pins) / sizeof(swr_data_pins[0]); i++) {
+			vm_offset_t reg = lpi_tlmm + 0x1000UL * swr_data_pins[i];
+			v = *(volatile uint32_t *)reg;
+			v = (v & ~0x3ffu) | (1u << 6) | (1u << 2) | 3u; /* func1, 4 mA, bus hold */
+			*(volatile uint32_t *)reg = v;
+		}
+	}
 	__builtin_arm_dsb(0xf);
 	return true;
+}
+
+static void mic_program_dec(volatile uint32_t *regs, uint32_t dec, uint32_t sel, uint32_t swr, bool is_tx);
+static void mic_dump_regs(void);
+
+/* Bring up the VA macro's internal SoundWire master (swr2, swrm-io-base
+ * 0x7630000): on K90 the VA AIFs route over VA_SWR_CLK, so a silent bus means
+ * the codec-DMA VA interfaces read an idle lane — matching the constant
+ * captures. Sequence after qcom_swrm_init()/swrm_master_init(): HCTL gate
+ * clear (SWR>=1.6 workaround), component reset, frame 50 rows x 2 columns at
+ * 9.6 MHz, auto-enumeration, 31 no-pings, then the version-specific clock
+ * start and component enable. */
+static void
+mic_swr_master_on(void)
+{
+	vm_offset_t swr = ml_io_map(VA_SWRM_PHYS, VA_SWRM_SIZE);
+	if (swr == 0) {
+		say("VA SWR master mapping failed\n");
+		return;
+	}
+	volatile uint32_t *s = (volatile uint32_t *)swr;
+	uint32_t ver = s[0x0000 / 4];
+	say("VA SWR master HW version %#x\n", ver);
+	/* The v1.6 hw_ctl gate workaround applies via the reset framework's
+	 * "swr_audio_cgcr" reset; the K90 dts binds none for this master, and the
+	 * per-master HCTL region from older SoCs does not exist at the usual
+	 * offset here (touching it panics), so this master takes no gate write. */
+	s[0x0008 / 4] = 1u; /* COMP_SW_RESET */
+	s[0x0008 / 4] = 1u;
+	bool v2 = ver >= 0x02000000u;
+	uint32_t frame = (1u << 3) | 0u | ((48u - 1u) << 16); /* 9.6MHz*2/(50*2*4kHz)-1 */
+	s[0x101c / 4] = frame;               /* MCP_FRAME_CTRL_BANK0 */
+	s[0x0500 / 4] = 1u;                  /* ENUMERATOR_CFG: auto */
+	s[0x1048 / 4] = (s[0x1048 / 4] & ~0x3e0000u) | (0x1fu << 17); /* MCP_CFG pings */
+	s[0x0314 / 4] = 3u;                  /* CMD_FIFO_CFG retries */
+	if (v2) {
+		s[0x0018 / 4] = 1u;            /* LINK_MANAGER_EE = CPU1 */
+		s[0x5060 / 4] = 1u;            /* V2_0_CLK_CTRL: CLK_START */
+	} else {
+		s[0x1044 / 4] = 1u;
+		s[0x1044 / 4] = 2u;            /* MCP_BUS_CTRL: CLK_START */
+	}
+	s[0x0004 / 4] = 2u;                  /* COMP_CFG: irq pulse */
+	if (v2) {
+		s[0x5008 / 4] = 0xffffffffu;   /* V2_0_INTERRUPT_CLEAR */
+		s[0x5004 / 4] = 0x1fdfdu;      /* V2_0_INTERRUPT_CPU_EN */
+	} else {
+		s[0x0208 / 4] = 0xffffffffu;
+		s[0x0204 / 4] = 0x1fdfdu;
+		s[0x0210 / 4] = 0x1fdfdu;
+	}
+	s[0x0004 / 4] = 3u;                  /* COMP_CFG: enable + pulse */
+	__builtin_arm_dsb(0xf);
+	bool linked = false;
+	for (unsigned i = 0; i < 100 && !linked; i++) {
+		linked = (s[0x0014 / 4] & 1u) != 0;
+		delay_for_interval(1, NSEC_PER_MSEC);
+	}
+	s[0x0314 / 4] |= 0x80000000u;        /* continue exec on cmd ignore */
+	say("VA SWR master link %s (status %#x)\n", linked ? "UP" : "DOWN", s[0x0014 / 4]);
+	/* The K90 dts declares swr-num-dev=5 on this master: if real slaves
+	 * enumerated, the mics may reach the macro as SWR_MIC channels decoded
+	 * off the bus rather than on the dedicated DMIC pads. */
+	say("VA SWR slave status %#x, dev-ids", s[0x1090 / 4]);
+	for (unsigned m = 0; m < 5u; m++) {
+		say(" %u:%#x/%#x", m, s[(0x0530 + m * 8) / 4], s[(0x0534 + m * 8) / 4]);
+	}
+	say("\n");
 }
 
 static void
@@ -469,11 +627,22 @@ mic_configure_va_macro(void)
 
 	regs[0x0000 / 4] |= 1u; /* MCLK_CONTROL_EN */
 	regs[0x0004 / 4] = 3u;  /* FS_CNT clear + enable */
-	regs[0x0004 / 4] = 1u;
+	if (mic_v41) {
+		/* LPASS codec v4.1 keeps FS_CNT_BYPASS set while the counter is
+		 * enabled; upstream does this for shikra-class parts. */
+		regs[0x0004 / 4] = 0x83u;
+		regs[0x0004 / 4] = 0x81u;
+	} else {
+		regs[0x0004 / 4] = 1u;
+	}
 	regs[0x0008 / 4] |= 1u; /* SWR_CONTROL SWR_CLK_ENABLE: sm8550 and newer
 	 * carry the decimator output out over the macro's own SoundWire master;
 	 * upstream lpass-va-macro turns this clock on in fsgen_gate_enable for
 	 * has_swr_master parts. */
+	regs[0x0008 / 4] |= 2u; /* SWR_RESET pulse, as upstream's SWR_CONTROL writes */
+	delay_for_interval(1, NSEC_PER_MSEC);
+	regs[0x0008 / 4] &= ~2u;
+	mic_swr_master_on();
 	regs[0x0080 / 4] |= 2u; /* FS_BROADCAST_EN */
 	regs[0x0094 / 4] = 0u;  /* release RESET_ALL_DMICS */
 	/* DMIC_CTL's div field is an index into {2,3,4,6,8,16}, matching the
@@ -482,20 +651,136 @@ mic_configure_va_macro(void)
 	regs[0x0088 / 4] = (5u << 1) | 1u; /* DMIC2/3 enable, /16 */
 	regs[0x008c / 4] = (5u << 1) | 1u; /* DMIC4/5 enable, /16 */
 	regs[0x0090 / 4] = (5u << 1) | 1u; /* DMIC6/7 enable, /16 */
-	regs[0x0104 / 4] = 0u;             /* DEC0 mux = VA_DMIC */
-	regs[0x0100 / 4] = (1u << 4);      /* DEC0 input = DMIC0 */
-	regs[0x0404 / 4] = (1u << 7) | (2u << 5); /* DMIC select, 150 Hz HPF */
-	regs[0x0400 / 4] = (1u << 5) | 4u; /* TX0 CLK_EN, 48 kHz, unmuted */
-	regs[0x0418 / 4] = 0u;
+	/* Upstream lpass-cdc-va-macro probes SWR_MIC_CTL0..2 with 0xCC masked by
+	 * 0xEE: the SWR-pin DMIC bridge configuration the K90 likely needs, since
+	 * its dts routes DMICs over the SoundWire gpios (is-used-swr-gpio=1). */
+	for (unsigned i = 0; i < 3u; i++) {
+		uint32_t off = 0x00d0 + i * 4u;
+		regs[off / 4] = (regs[off / 4] & ~0xeeu) | 0xccu;
+	}
+	/* VA decimator 0 stays enabled even though the proven binding is TX dec1:
+	 * removing this line turned a working stream into zero completions on
+	 * say50, so the VA block's decimator clock gates something the TX path
+	 * shares (DMIC pad receivers or the codec island's decimator domain). */
+	mic_program_dec(regs, 0, mic_dmic_sel, 0, false);
+	__builtin_arm_dsb(0xf);
+	/* Pin-level clock probe, with the mux parked on plain GPIO input: reading
+	 * GPIO_VALUE on a func1 pin can return the pad level OR function internal
+	 * state depending on the LPI generation, so both readings are taken —
+	 * func0 first (true pad level), then the same read with the dts func1
+	 * restored. A constant func0 level means nothing reaches the pad at all. */
+	{
+		vm_offset_t lpi = ml_io_map(LPI_TLMM_PHYS, LPI_TLMM_SIZE);
+		if (lpi != 0) {
+			static const struct { unsigned pin; const char *name; } probes[] = {
+				{ 6u, "dmic01clk" }, { 7u, "dmic01dat" },
+				{ 8u, "dmic23clk" }, { 9u, "dmic23dat" },
+				{ 12u, "dmic45clk" }, { 13u, "dmic45dat" },
+				{ 17u, "dmic67clk" }, { 18u, "dmic67dat" },
+				{ 0u, "swrclk" }, { 1u, "swrdata0" },
+			};
+			for (unsigned p = 0; p < sizeof(probes) / sizeof(probes[0]); p++) {
+				volatile uint32_t *cfg = (volatile uint32_t *)(lpi + 0x1000UL * probes[p].pin);
+				volatile uint32_t *io = cfg + 1;
+				uint32_t save = *cfg;
+				unsigned hi0 = 0, hi1 = 0;
+				*cfg = save & ~0x3fu;             /* gpio func, input, bias disable */
+				__builtin_arm_dsb(0xf);
+				for (unsigned s = 0; s < 2000u; s++) {
+					hi0 += *io & 1u;
+				}
+				*cfg = save;                      /* restore func1/OE/drive */
+				__builtin_arm_dsb(0xf);
+				for (unsigned s = 0; s < 2000u; s++) {
+					hi1 += *io & 1u;
+				}
+				say("pin probe %s (lpi gpio%u): %u/2000 high as gpio, %u/2000 as func1\n",
+				    probes[p].name, probes[p].pin, hi0, hi1);
+			}
+		}
+		if (tlmm_base != 0) {
+			static const struct { unsigned pin; const char *name; } en_probes[] = {
+				{ PIN_DMIC01_EN, "en-dmic01" }, { PIN_DMIC23_EN, "en-dmic23" },
+			};
+			for (unsigned p = 0; p < sizeof(en_probes) / sizeof(en_probes[0]); p++) {
+				volatile uint32_t *io = (volatile uint32_t *)(tlmm_base + 0x1000UL * en_probes[p].pin + 4UL);
+				say("pin probe %s (tlmm gpio%u): io %#x\n",
+				    en_probes[p].name, en_probes[p].pin, *io);
+			}
+		}
+	}
+}
+
+/* Bring up decimator `dec` listening to input-mux index `sel`: input mux at
+ * 0x0100 + dec*8 (CFG0[7:4] selects DMICn in MSM_DMIC mode, CFG0[3:0] selects
+ * SWR_MICn when CFG1 bit0=1), TX path at 0x0400 + dec*0x80, v4.1 ADPT block at
+ * 0x0800 + dec*0x80 (VA macro only — TX macro tops out at 0x7a8). `swr` picks
+ * the SWR_MIC source: DMICs riding the SoundWire pins, which upstream numbers
+ * SWR_MIC5..10 (three pairs). */
+static void
+mic_program_dec(volatile uint32_t *regs, uint32_t dec, uint32_t sel, uint32_t swr, bool is_tx)
+{
+	uint32_t mux = 0x0100 + dec * 8u;
+	uint32_t tx  = 0x0400 + dec * 0x80u;
+	uint32_t adpt = 0x0800 + dec * 0x80u;
+
+	regs[(mux + 4) / 4] = swr;          /* CFG1: 0 = MSM_DMIC, 1 = SWR_MIC */
+	regs[mux / 4] = swr ? sel : (sel << 4);
+	if (swr && !is_tx && sel >= 5u && sel <= 10u) {
+		/* Upstream maps SWR_MIC5/6..9/10 onto SWR_MIC_CTL0..2 and writes
+		 * the DMIC clock divider into bits[3:1]. */
+		uint32_t ctl = 0x00d0 + ((sel - 5u) / 2u) * 4u;
+		regs[ctl / 4] = (regs[ctl / 4] & ~0x0eu) | (5u << 1);
+	}
+	regs[(tx + 4) / 4] = (1u << 7) | (2u << 5); /* DMIC select, 150 Hz HPF */
+	regs[tx / 4] = (1u << 5) | 4u;     /* TX CLK_EN, 48 kHz, unmuted */
+	regs[(tx + 0x18) / 4] = 0u;
 	__builtin_arm_dsb(0xf);
 	delay_for_interval(1, NSEC_PER_MSEC);
-	regs[0x0418 / 4] = 2u;
+	regs[(tx + 0x18) / 4] = 2u;
 	delay_for_interval(1, NSEC_PER_MSEC);
-	regs[0x0418 / 4] = 0u;
-	regs[0x0418 / 4] = 1u;
+	regs[(tx + 0x18) / 4] = 0u;
+	regs[(tx + 0x18) / 4] = 1u;
 	delay_for_interval(6, NSEC_PER_MSEC);
-	regs[0x040c / 4] = 0u;             /* TX0 0 dB gain */
-	__builtin_arm_dsb(0xf);
+	regs[(tx + 0x0c) / 4] = 0u;        /* 0 dB gain */
+	if (mic_v41 && !is_tx) {
+		/* v4.1 ADPT blocks reset with the adaptive filter enabled;
+		 * upstream clears the enable field in POST_PMU. */
+		regs[adpt / 4] &= ~0xffu;
+	}
+}
+
+/* TX macro @0x6AE0000 shares the VA block's register layout; the LPI DMIC pads
+ * are shared lanes already clocked by the VA DMIC_CTL setup, so only the MCLK
+ * domain and the decimator itself need programming here. Codec-DMA binds the
+ * RXTX LPAIF for this block. */
+static void
+mic_setup_tx_macro(uint32_t dec, uint32_t dmic, uint32_t swr)
+{
+	vm_offset_t txv = ml_io_map(TX_MACRO_PHYS, TX_MACRO_SIZE);
+	if (txv == 0) {
+		say("TX macro mapping failed\n");
+		return;
+	}
+	volatile uint32_t *tregs = (volatile uint32_t *)txv;
+	static bool tx_inited;
+	if (!tx_inited) {
+		tx_inited = true;
+		/* 0xC0..0xCC are SWR_DMICn_CTL on TX — the reads just prove the map
+		 * is alive, not a core id. */
+		say("TX macro SWR_DMIC_CTL reads %#x %#x %#x %#x\n",
+		    tregs[0x00c0 / 4], tregs[0x00c4 / 4], tregs[0x00c8 / 4], tregs[0x00cc / 4]);
+		tregs[0x0000 / 4] |= 1u; /* MCLK_EN */
+		if (mic_v41) {
+			tregs[0x0004 / 4] = 0x83u;
+			tregs[0x0004 / 4] = 0x81u;
+		} else {
+			tregs[0x0004 / 4] = 3u;
+			tregs[0x0004 / 4] = 1u;
+		}
+		tregs[0x0080 / 4] |= 2u; /* FS_BROADCAST_EN */
+	}
+	mic_program_dec(tregs, dec, dmic, swr, true);
 }
 
 static bool
@@ -541,6 +826,10 @@ mic_hw_prepare(void)
 		return false;
 	}
 	mic_configure_va_macro();
+	/* Measured-good binding on the K90: the DMIC0 pad pair feeds TX macro
+	 * decimator 1 and the codec-DMA reads it over RXTX TX_CDC_DMA_TX_3,
+	 * the same port redwood validates. The sweep overrides this binding. */
+	mic_setup_tx_macro(1, mic_dmic_sel, 0);
 
 	mic_hw_prepared = true;
 	say("LPASS core, VA macro and DMIC pins configured\n");
@@ -576,9 +865,9 @@ open_capture_graphs(void)
 	mpkt_begin(&p, OUR_MIC_PORT, APM_IID, OP_SET_CFG);
 	uint32_t cmd = mpkt_cmd_begin(&p);
 	uint32_t at = mpkt_param_begin(&p, IID_MIC_SOURCE, 0x08001063); /* CODEC_DMA_INTF_CFG */
-	mpkt_put32(&p, 3); /* lpaif_type: 1 RXTX, 2 WSA, 3 VA, 4 AXI */
+	mpkt_put32(&p, mic_lpaif_type); /* lpaif_type: 1 RXTX, 2 WSA, 3 VA, 4 AXI; mic_lpaif= overrides */
 	mpkt_put32(&p, mic_intf_index); /* intf_index: TX0 by default, mic_intf= boot-arg overrides */
-	mpkt_put32(&p, 1); /* active_channels_mask = ch 0 */
+	mpkt_put32(&p, mic_ch_mask); /* active_channels_mask: slot i = decimator i */
 	mpkt_param_end(&p, at);
 	at = mpkt_param_begin(&p, IID_MIC_SOURCE, 0x08001018); /* HW_EP_FRAME_SIZE_FACTOR */
 	mpkt_put32(&p, 1);
@@ -590,11 +879,15 @@ open_capture_graphs(void)
 	mpkt_put32(&p, 1);
 	mpkt_param_end(&p, at);
 	at = mpkt_param_begin(&p, IID_MIC_SOURCE, PARAM_ID_HW_EP_POWER_MODE_CFG);
-	mpkt_put32(&p, HW_EP_POWER_MODE_KEEPCLOCKS);
+	mpkt_put32(&p, mic_pmode);
 	mpkt_param_end(&p, at);
-	at = mpkt_param_begin(&p, IID_MIC_SOURCE, PARAM_ID_HW_EP_DMA_DATA_ALIGN);
-	mpkt_put32(&p, HW_EP_DMA_DATA_ALIGN_LSB);
-	mpkt_param_end(&p, at);
+	if (!mic_noalign) {
+		/* Upstream omits DMA_DATA_ALIGN for codec-DMA; mic_noalign=1
+		 * drops it to check whether the extra param disturbs the port. */
+		at = mpkt_param_begin(&p, IID_MIC_SOURCE, PARAM_ID_HW_EP_DMA_DATA_ALIGN);
+		mpkt_put32(&p, HW_EP_DMA_DATA_ALIGN_LSB);
+		mpkt_param_end(&p, at);
+	}
 	mpkt_cmd_end(&p, cmd);
 	mpkt_finish(&p);
 	if (!annibale_audio_reach_send_cmd(p.buf, p.len, "SET_CFG MIC_SOURCE", NULL, NULL, 0)) return false;
@@ -652,6 +945,26 @@ close_capture_graphs(void)
 	mic_graphs_opened = 0;
 }
 
+static void
+mic_apply_combo(const struct mic_combo *c)
+{
+	if (c->mac != 0) {
+		mic_setup_tx_macro(c->dec, c->dmic, c->swr);
+	} else {
+		vm_offset_t va = ml_io_map(VA_MACRO_PHYS, VA_MACRO_SIZE);
+		if (va != 0) {
+			mic_program_dec((volatile uint32_t *)va, c->dec, c->dmic, c->swr, false);
+		}
+	}
+	mic_lpaif_type = c->lpaif;
+	mic_intf_index = c->intf;
+	mic_dmic_sel = c->dmic;
+	mic_ch_mask = 1u << c->dec;
+	say("mic sweep: combo %u/%u lpaif %u intf %u dec %u %s %u\n",
+	    mic_combo_idx + 1, (uint32_t)(sizeof(mic_combos) / sizeof(mic_combos[0])),
+	    c->lpaif, c->intf, c->dec, c->swr ? "swrmic" : "dmic", c->dmic);
+}
+
 static bool
 start_capture_graphs(void)
 {
@@ -659,6 +972,9 @@ start_capture_graphs(void)
 		return true;
 	}
 	if (!mic_hw_prepare()) return false;
+	if (mic_sweep && mic_combo_idx < (uint32_t)(sizeof(mic_combos) / sizeof(mic_combos[0]))) {
+		mic_apply_combo(&mic_combos[mic_combo_idx]);
+	}
 
 	if (mic_graphs_opened != 3u) {
 		if (!open_capture_graphs()) {
@@ -667,16 +983,43 @@ start_capture_graphs(void)
 		}
 	}
 
-	/* 5. Prepare & Start SG_MIC and SG_CAPTURE */
+	/* 5. Prepare & Start SG_MIC and SG_CAPTURE. Prepare both first and arm
+	 * the sink side (SG_CAPTURE) before the codec-DMA source so the stream
+	 * has a live endpoint when data starts flowing, matching the single
+	 * container START upstream relies on. */
 	if (!mic_graph_cmd_retry(OP_GRAPH_PREPARE, SG_MIC, "PREPARE SG_MIC") ||
-	    !mic_graph_cmd_retry(OP_GRAPH_START, SG_MIC, "START SG_MIC") ||
 	    !mic_graph_cmd_retry(OP_GRAPH_PREPARE, SG_CAPTURE, "PREPARE SG_CAPTURE") ||
-	    !mic_graph_cmd_retry(OP_GRAPH_START, SG_CAPTURE, "START SG_CAPTURE")) return false;
+	    !mic_graph_cmd_retry(OP_GRAPH_START, SG_CAPTURE, "START SG_CAPTURE") ||
+	    !mic_graph_cmd_retry(OP_GRAPH_START, SG_MIC, "START SG_MIC")) return false;
 
 	__atomic_store_n(&mic_async_failed, false, __ATOMIC_RELEASE);
 	mic_graphs_started = true;
 	say("AudioReach capture graphs SG_MIC (0x4007) & SG_CAPTURE (0x4003) started\n");
+	mic_dump_regs();
 	return true;
+}
+
+/* Read the decimator/DMIC/SWR state back after the DSP graph has started: if
+ * firmware rewrote the VA macro for its own capture session the reads show
+ * its expected values instead of ours, which pins the gap to driver vs DSP
+ * ownership of these registers. */
+static void
+mic_dump_regs(void)
+{
+	vm_offset_t va = ml_io_map(VA_MACRO_PHYS, VA_MACRO_SIZE);
+	if (va == 0) {
+		return;
+	}
+	volatile uint32_t *r = (volatile uint32_t *)va;
+	uint32_t dec = mic_ch_mask ? (uint32_t)__builtin_ctz(mic_ch_mask) : 0;
+	uint32_t mux = 0x0100 + dec * 8u, tx = 0x0400 + dec * 0x80u;
+	say("VA regs now: mclk %#x fs %#x swr %#x top %#x dmic %#x %#x %#x %#x reset %#x\n",
+	    r[0x000 / 4], r[0x004 / 4], r[0x008 / 4], r[0x080 / 4],
+	    r[0x084 / 4], r[0x088 / 4], r[0x08c / 4], r[0x090 / 4], r[0x094 / 4]);
+	say("VA dec%u: mux cfg0 %#x cfg1 %#x | tx ctl %#x cfg0 %#x hpf %#x gain %#x\n",
+	    dec, r[mux / 4], r[(mux + 4) / 4],
+	    r[tx / 4], r[(tx + 4) / 4], r[(tx + 0x18) / 4], r[(tx + 0x0c) / 4]);
+	say("VA swr-mic ctl: %#x %#x %#x\n", r[0x0d0 / 4], r[0x0d4 / 4], r[0x0d8 / 4]);
 }
 
 /* Stop capture subgraphs and clear stale ring/inflight state; caller holds amic_lock. */
@@ -755,6 +1098,16 @@ harvest_capture_period(uint32_t slot, volatile uint8_t *dma_va, uint32_t valid_b
 			if (level > mic_peak) {
 				mic_peak = level;
 			}
+			if (period_mono[i] < mic_win_min) {
+				mic_win_min = period_mono[i];
+			}
+			if (period_mono[i] > mic_win_max) {
+				mic_win_max = period_mono[i];
+			}
+			if (period_mono[i] > -32767 && period_mono[i] < 32767) {
+				mic_win_sig++;
+			}
+			mic_win_seen++;
 		}
 		mic_last_bytes = valid_bytes;
 	}
@@ -876,7 +1229,7 @@ __dead2
 static void
 mic_capture_thread(void *arg __unused, wait_result_t w __unused)
 {
-	uint32_t slot = 0, last_done = 0, stall_ticks = 0;
+	uint32_t slot = 0, last_done = 0, stall_ticks = 0, flat_ticks = 0;
 
 	say("capture feeder thread running\n");
 	for (;;) {
@@ -884,10 +1237,28 @@ mic_capture_thread(void *arg __unused, wait_result_t w __unused)
 		if (active) {
 			lck_mtx_lock(&amic_lock);
 			if (mic_capture_error != 0 || (!mic_graphs_started && !start_capture_graphs())) {
+				/* A combo the DSP refuses to start gets three attempts
+				 * before the sweep moves on. */
+				if (mic_sweep && mic_combo_idx + 1 < (uint32_t)(sizeof(mic_combos) / sizeof(mic_combos[0]))
+				    && ++mic_combo_fails >= 3u) {
+					say("mic sweep: combo %u refused to start, advancing\n", mic_combo_idx);
+					mic_combo_idx++;
+					mic_combo_fails = 0;
+					mic_win_min = 0x7fffffff;
+					mic_win_max = (int32_t)0x80000000;
+					mic_win_seen = 0;
+					mic_win_sig = 0;
+					flat_ticks = 0;
+					stall_ticks = 0;
+					close_capture_graphs();
+					lck_mtx_unlock(&amic_lock);
+					continue;
+				}
 				lck_mtx_unlock(&amic_lock);
 				delay_for_interval(20, NSEC_PER_MSEC);
 				continue;
 			}
+			mic_combo_fails = 0;
 			if (__atomic_load_n(&mic_async_failed, __ATOMIC_ACQUIRE)) {
 				stop_capture_graphs();
 				mic_capture_error = EIO;
@@ -940,7 +1311,37 @@ mic_capture_thread(void *arg __unused, wait_result_t w __unused)
 			}
 			slot = next_slot;
 			uint32_t inflight = (uint32_t)__builtin_popcount(mask);
-			if (!failed && inflight > 0 && done == last_done && ++stall_ticks >= 25u) {
+			/* A combo that answers reads but returns a constant sample
+			 * stream counts as failed too: the decimator is reading a
+			 * dead or floating DMIC line. All-zero is constant too —
+			 * 0 sits between the rails, so it is not caught by the
+			 * interior counter; compare min/max instead. */
+			bool stalled = inflight > 0 && done == last_done && ++stall_ticks >= 25u;
+			/* A stream that is constant, or that ever touches a rail
+			 * value, is a dead/floating input — a live DMIC gives
+			 * mid-scale samples only. Zero is inside the rails, so
+			 * the interior counter alone can't tell rail mixes like
+			 * {-32768, 0} from audio. */
+			bool flat = mic_sweep && mic_win_seen > 200u &&
+			    (mic_win_max == mic_win_min || mic_win_min <= -32768 ||
+			     mic_win_max >= 32767) && ++flat_ticks >= 40u;
+			bool empty = mic_sweep && mic_win_seen == 0 && done > 0 && ++flat_ticks >= 40u;
+			if (!failed && (stalled || flat || empty)) {
+				if (mic_sweep && mic_combo_idx + 1 < (uint32_t)(sizeof(mic_combos) / sizeof(mic_combos[0]))) {
+					say("mic sweep: combo %u %s, advancing\n", mic_combo_idx,
+					    stalled ? "stalled" : (empty ? "empty" : "flat"));
+					mic_combo_idx++;
+					mic_win_min = 0x7fffffff;
+					mic_win_max = (int32_t)0x80000000;
+					mic_win_seen = 0;
+					mic_win_sig = 0;
+					flat_ticks = 0;
+					stop_capture_graphs();
+					close_capture_graphs();
+					lck_mtx_unlock(&amic_lock);
+					stall_ticks = 0;
+					continue;
+				}
 				stop_capture_graphs();
 				mic_capture_error = EIO;
 				lck_mtx_unlock(&amic_lock);
@@ -948,11 +1349,20 @@ mic_capture_thread(void *arg __unused, wait_result_t w __unused)
 				stall_ticks = 0;
 				continue;
 			}
+			if (mic_sweep && mic_win_sig > 64u && mic_win_min > -32768 &&
+			    mic_win_max < 32767 && mic_win_max - mic_win_min > 100) {
+				mic_sweep = 0;
+				say("mic sweep: combo %u live (sample range %d..%d, %u interior), locking\n",
+				    mic_combo_idx, mic_win_min, mic_win_max, mic_win_sig);
+			}
 			lck_mtx_unlock(&amic_lock);
 			if (failed) {
 				continue;
 			}
 			if (inflight == 0 || done != last_done) {
+				if (mic_sweep && done != last_done && mic_win_seen == 0) {
+					say("mic sweep: combo %u first done %u\n", mic_combo_idx, done);
+				}
 				last_done = done;
 				stall_ticks = 0;
 			}
@@ -1201,6 +1611,34 @@ annibale_mic_init(void)
 	if (PE_parse_boot_argn("mic_intf", &mic_boot, sizeof(mic_boot))) {
 		mic_intf_index = mic_boot;
 		say("codec-DMA interface index forced to %u (mic_intf)\n", mic_intf_index);
+	}
+	if (PE_parse_boot_argn("mic_lpaif", &mic_boot, sizeof(mic_boot))) {
+		mic_lpaif_type = mic_boot;
+		say("codec-DMA LPAIF type forced to %u (mic_lpaif)\n", mic_lpaif_type);
+	}
+	if (PE_parse_boot_argn("mic_v41", &mic_boot, sizeof(mic_boot))) {
+		mic_v41 = mic_boot;
+		say("VA macro v4.1 register sequence forced to %u (mic_v41)\n", mic_v41);
+	}
+	if (PE_parse_boot_argn("mic_dmic", &mic_boot, sizeof(mic_boot))) {
+		mic_dmic_sel = mic_boot;
+		say("TX DEC1 input-mux index forced to %u (mic_dmic)\n", mic_dmic_sel);
+	}
+	if (PE_parse_boot_argn("mic_pmode", &mic_boot, sizeof(mic_boot))) {
+		mic_pmode = mic_boot;
+		say("codec-DMA power mode forced to %u (mic_pmode)\n", mic_pmode);
+	}
+	if (PE_parse_boot_argn("mic_noalign", &mic_boot, sizeof(mic_boot))) {
+		mic_noalign = mic_boot;
+		say("codec-DMA DMA_DATA_ALIGN param %s (mic_noalign)\n", mic_noalign ? "omitted" : "kept");
+	}
+	if (PE_parse_boot_argn("mic_sweep", &mic_boot, sizeof(mic_boot))) {
+		mic_sweep = mic_boot;
+		say("codec-DMA binding sweep %s (mic_sweep)\n", mic_sweep ? "enabled" : "disabled");
+	}
+	if (PE_parse_boot_argn("mic_combo", &mic_boot, sizeof(mic_boot))) {
+		mic_combo_idx = mic_boot;
+		say("codec-DMA sweep start combo %u (mic_combo)\n", mic_combo_idx);
 	}
 
 	thread_t th;
