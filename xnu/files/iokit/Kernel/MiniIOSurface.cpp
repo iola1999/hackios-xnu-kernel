@@ -115,9 +115,8 @@ static uint32_t         gSurfaceTraced;                         /* (a tunable is
  */
 static char             gSurfaceTraceOf[32];
 
-extern "C" void loader_log_line(const char *line);
-
-/* A line about a traced surface: to the loader's log too, where it outlives the kernel's own, short log. */
+/* A line about a traced surface: IOLog lands in the loader's log through
+ * console_write, where it outlives the kernel's own, short log. */
 static void
 traceLine(const char * format, ...)
 {
@@ -127,9 +126,6 @@ traceLine(const char * format, ...)
 	va_start(list, format);
 	vsnprintf(line, sizeof(line), format, list);
 	va_end(list);
-	if (gSurfaceTraceOf[0] != 0) {
-		loader_log_line(line);
-	}
 	IOLog("%s", line);
 }
 

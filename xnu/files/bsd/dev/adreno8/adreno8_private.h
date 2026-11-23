@@ -17,6 +17,10 @@ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
 extern void loader_return(void);
 extern void loader_log_putc(char c);
+extern void loader_log_line(const char *line);
+extern bool disable_serial_output;
+extern bool disable_kprintf_output;
+extern boolean_t ml_get_interrupts_enabled(void);
 extern const uint8_t *annibale_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 
 struct adreno8_block {

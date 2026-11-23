@@ -42,6 +42,9 @@
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void loader_log_putc(char c);
+extern void loader_log_line(const char *line);
+extern bool disable_serial_output;
+extern bool disable_kprintf_output;
 extern bool ml_cpu_idle_time(int cpu_id, uint64_t *idle);
 
 #define SCMI_SHMEM_PHYS         0x17b4e000UL
@@ -170,10 +173,11 @@ tell(const char *format, ...)
 	va_start(list, format);
 	vsnprintf(line, sizeof(line), format, list);
 	va_end(list);
-	for (const char *c = line; *c != 0; c++) {
-		loader_log_putc(*c);
+	if (disable_serial_output || disable_kprintf_output) {
+		loader_log_line(line);
+	} else {
+		printf("%s", line);
 	}
-	printf("%s", line);
 }
 
 /* Adds that each wait for the one before: about the core's clock in MHz. */

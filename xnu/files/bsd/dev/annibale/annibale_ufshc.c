@@ -223,6 +223,7 @@ SYSCTL_INT(_kern_annibale, OID_AUTO, ufs_native_spin, CTLFLAG_RW | CTLFLAG_LOCKE
  * end, into the loader's log directly (annibale_ufs_quiesce; printf is not for that moment).
  */
 extern void loader_log_putc(char c);
+extern void loader_log_line(const char *line);
 #define KEPT_LINES          64
 static char hc_kept[KEPT_LINES][208];
 static uint32_t hc_kept_count;
@@ -254,9 +255,7 @@ hc_say_late(const char *format, ...)
 	va_start(list, format);
 	vsnprintf(line, sizeof(line), format, list);
 	va_end(list);
-	for (const char *c = line; *c != 0; c++) {
-		loader_log_putc(*c);
-	}
+	loader_log_line(line);
 }
 
 static inline uint32_t

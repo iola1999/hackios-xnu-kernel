@@ -36,13 +36,15 @@ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, u
 extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
 extern kern_return_t thread_terminate(thread_t thread);
 extern void thread_set_thread_name(thread_t thread, const char *name);
-extern void loader_log_putc(char c);
+extern void loader_log_line(const char *line);
+extern bool disable_serial_output;
+extern bool disable_kprintf_output;
+extern boolean_t ml_get_interrupts_enabled(void);
 
 #define say annibale_wifi_say
 
 static LCK_GRP_DECLARE(lx_lock_group, "annibale-lx");
 static LCK_MTX_DECLARE(lx_lock, &lx_lock_group);
-static LCK_MTX_DECLARE(say_lock, &lx_lock_group);
 static bool leaving;
 
 int
@@ -54,18 +56,14 @@ annibale_wifi_say(const char *format, ...)
 	va_start(list, format);
 	vsnprintf(line, sizeof(line), format, list);
 	va_end(list);
-	if (leaving) {
-		for (const char *c = line; *c != 0; c++) {
-			loader_log_putc(*c);
-		}
-		return 0;
+	/* printf lands in the loader's log through console_write; write the line
+	   directly only when printf cannot run */
+	if (leaving || !ml_get_interrupts_enabled() ||
+	    disable_serial_output || disable_kprintf_output) {
+		loader_log_line(line);
+	} else {
+		printf("%s", line);
 	}
-	lck_mtx_lock(&say_lock);
-	for (const char *c = line; *c != 0; c++) {
-		loader_log_putc(*c);
-	}
-	printf("%s", line);
-	lck_mtx_unlock(&say_lock);
 	return 0;
 }
 
@@ -78,18 +76,14 @@ annibale_wifi_tell(const char *format, ...)
 	va_start(list, format);
 	vsnprintf(line, sizeof(line), format, list);
 	va_end(list);
-	if (leaving) {
-		for (const char *c = line; *c != 0; c++) {
-			loader_log_putc(*c);
-		}
-		return 0;
+	/* printf lands in the loader's log through console_write; write the line
+	   directly only when printf cannot run */
+	if (leaving || !ml_get_interrupts_enabled() ||
+	    disable_serial_output || disable_kprintf_output) {
+		loader_log_line(line);
+	} else {
+		printf("%s", line);
 	}
-	lck_mtx_lock(&say_lock);
-	for (const char *c = line; *c != 0; c++) {
-		loader_log_putc(*c);
-	}
-	printf("%s", line);
-	lck_mtx_unlock(&say_lock);
 	return 0;
 }
 

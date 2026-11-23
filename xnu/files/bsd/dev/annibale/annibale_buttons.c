@@ -74,6 +74,9 @@ extern kern_return_t thread_terminate(thread_t thread);
  * during a run is to show a press when it happens.
  */
 extern void loader_log_putc(char c);
+extern void loader_log_line(const char *line);
+extern bool disable_serial_output;
+extern bool disable_kprintf_output;
 
 static bool leaving;
 
@@ -88,10 +91,10 @@ say(const char *format, ...)
 	va_start(list, format);
 	vsnprintf(line, sizeof(line), format, list);
 	va_end(list);
-	for (const char *c = line; *c != 0; c++) {
-		loader_log_putc(*c);
-	}
-	if (!leaving && ml_get_interrupts_enabled()) {
+	if (leaving || !ml_get_interrupts_enabled() ||
+	    disable_serial_output || disable_kprintf_output) {
+		loader_log_line(line);
+	} else {
 		printf("%s", line);
 	}
 	return 0;

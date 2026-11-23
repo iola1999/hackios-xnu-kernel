@@ -189,15 +189,12 @@ static uint32_t ustacks_count;          /* boot-arg ustacks_count=N: so many tim
 static thread_call_t ustacks_call;
 
 extern void bsd_getthreadname(void *uth, char *buffer);
-extern void loader_log_line(const char *line);
 
 static void
 ustacks_say(const char *line)
 {
+	/* printf lands in the loader's log through console_write as well */
 	printf("%s", line);
-	if (ustacks_tname[0] != 0) {
-		loader_log_line(line);
-	}
 }
 
 static void

@@ -92,12 +92,16 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern const uint8_t *annibale_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 extern kern_return_t thread_terminate(thread_t thread);
 extern void loader_log_putc(char c);
+extern void loader_log_line(const char *line);
+extern bool disable_serial_output;
+extern bool disable_kprintf_output;
 extern uint64_t mhi_pcie_get_sink_pa(void);
 void mhi_pcie_msi_init(uint64_t msi_phys);
 
 static bool leaving;
 
-/* every line to the loader's log as well (and to the console when that may be written) */
+/* printf already lands in the loader's log through PE_kputc; the explicit write is
+   only for when printf cannot run (leaving, interrupts off, kprintf disabled) */
 int
 mhi_pcie_say(const char *format, ...)
 {
@@ -108,11 +112,11 @@ mhi_pcie_say(const char *format, ...)
 	va_start(list, format);
 	length = vsnprintf(line, sizeof(line), format, list);
 	va_end(list);
-	for (const char *c = line; *c != 0; c++) {
-		loader_log_putc(*c);
-	}
-	if (!leaving && ml_get_interrupts_enabled()) {
+	if (!leaving && ml_get_interrupts_enabled() &&
+	    !(disable_serial_output || disable_kprintf_output)) {
 		printf("%s", line);
+	} else {
+		loader_log_line(line);
 	}
 	return length;
 }

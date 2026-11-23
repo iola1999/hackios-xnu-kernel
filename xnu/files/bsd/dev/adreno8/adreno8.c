@@ -119,10 +119,15 @@ adreno8_say(const char *format, ...)
 	va_start(list, format);
 	vsnprintf(line, sizeof(line), format, list);
 	va_end(list);
-	for (const char *c = line; *c != 0; c++) {
-		loader_log_putc(*c);
+	/* printf lands in the loader's log through console_write; write the line
+	   directly only when printf cannot run */
+	if (!ml_get_interrupts_enabled() ||
+	    disable_serial_output || disable_kprintf_output) {
+		loader_log_line(line);
+	} else {
+		printf("%s", line);
 	}
-	return printf("%s", line);
+	return 0;
 }
 
 #define printf adreno8_say
@@ -155,8 +160,6 @@ adreno8_rd(vm_offset_t address)
 	__asm__ volatile ("ldr %w0, [%1]" : "=r" (value) : "r" (address) : "memory");
 	return value;
 }
-
-extern void loader_log_line(const char *line);
 
 void __attribute__((noinline))
 adreno8_wr(vm_offset_t address, uint32_t value)
@@ -486,9 +489,7 @@ adreno8_quiesce(void)
 	 * is verified, preserve all resources and prevent the loader from reusing memory. */
 	if (adreno8_reset_required || adreno8_memory_retained()) {
 		const char *message = "\nadreno8: GPU probe requires host cold reset before reusing kernel memory\n";
-		while (*message) {
-			loader_log_putc(*message++);
-		}
+		loader_log_line(message);
 		for (;;) {
 			__asm__ volatile ("wfe");
 		}
@@ -505,9 +506,7 @@ adreno8_quiesce(void)
 		adreno8_quiet = false;
 		if (adreno8_gmu_space.is_on) {
 			const char *message = "\nadreno8: SMMU shutdown incomplete; host reset required before reusing kernel memory\n";
-			while (*message) {
-				loader_log_putc(*message++);
-			}
+			loader_log_line(message);
 			/* The resident loader still accepts USB reboot; its memory must not be reused yet. */
 			for (;;) {
 				__asm__ volatile ("wfe");
