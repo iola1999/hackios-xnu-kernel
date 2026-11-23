@@ -84,6 +84,7 @@ bool annibale_mic_gpr_event(uint32_t src_port, uint32_t dst_port, uint32_t opcod
 #define PARAM_ID_RSC_AUDIO_HW_CLK   0x0800102cu
 #define PARAM_ID_RSC_HW_CORE        0x08001032u
 #define Q6PRM_HW_CORE_ID_LPASS      1u
+#define Q6PRM_HW_CORE_ID_DCODEC     2u
 #define Q6PRM_LPASS_CLK_ID_VA_MCLK  0x307u
 #define Q6PRM_LPASS_CLK_ID_VA_2XMCLK 0x308u /* Q6PRM_LPASS_CLK_ID_VA_CORE_2X_MCLK */
 #define Q6PRM_LPASS_CLK_SRC_INT     1u
@@ -392,6 +393,7 @@ mic_configure_dmic_pins(void)
 		{ 6u, true }, { 7u, false },
 		{ 8u, true }, { 9u, false },
 		{ 12u, true }, { 13u, false },
+		{ 17u, true }, { 18u, false }, /* dmic67 pair, present in the K90 dts */
 	};
 
 	if (tlmm_base == 0) {
@@ -488,6 +490,13 @@ mic_hw_prepare(void)
 
 	if (!mic_prm_vote_hw_core(Q6PRM_HW_CORE_ID_LPASS, "REQ LPASS CORE")) {
 		say("LPASS core resource request failed\n");
+		return false;
+	}
+	/* The codec digital island powers the decimator-to-LPAIF data path; the
+	 * VA macro registers stay writable without it, which matches reads that
+	 * take but never produce samples. Upstream votes it with the macro vote. */
+	if (!mic_prm_vote_hw_core(Q6PRM_HW_CORE_ID_DCODEC, "REQ DCODEC CORE")) {
+		say("DCODEC core resource request failed\n");
 		return false;
 	}
 	if (!mic_prm_set_clk(Q6PRM_LPASS_CLK_ID_VA_MCLK, VA_MACRO_MCLK_HZ, "REQ VA MCLK")) {
@@ -774,7 +783,7 @@ annibale_mic_gpr_event(uint32_t src_port, uint32_t dst_port, uint32_t opcode,
 
 	if (!addr_ok || (mask & (1u << slot)) == 0 || words[0] != 0 ||
 	    words[3] != map_handle || words[4] > MIC_PERIOD_BYTES ||
-	    (words[4] % sizeof(int16_t)) != 0 || words[9] != 0 || words[13] != 0) {
+	    (words[4] % sizeof(int16_t)) != 0 || words[13] != 0) {
 		static bool refused_logged;
 		if (!refused_logged) {
 			refused_logged = true;
