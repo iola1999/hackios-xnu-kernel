@@ -684,8 +684,8 @@ rw_print_threads(void)
 
 /*
  * ANNIBALE_DUMP_AIR=TEXT[,TEXT...]: the bitcode -[_MTLFunction bitcodeData] gives this driver for
- * the functions of a render pipeline whose name contains one of the TEXTs, once per name and at
- * most 16 of them, base64 in lines of 96 characters: `air dump NAME: N bytes`, then
+ * the functions of a render pipeline whose name contains one of the TEXTs, once per function object
+ * (NAME@ADDRESS, so each specialized variant) and at most 16 of them, base64 in lines of 96 characters: `air dump NAME: N bytes`, then
  * `air dump NAME K: ...`. A function the fragment stage links (RenderBox's custom_fn) is named
  * after the pipeline's fragment function, `FRAGMENT.custom_fn`. A specialized function's bitcode
  * is what _MTLLibrary made in process, which no file on disk holds; tools/k90auto/airdump.py
@@ -704,8 +704,9 @@ rw_dump_air(id function, NSString *owner)
 	if (function == nil || ![function respondsToSelector:bitcode])
 		return;
 	@synchronized ([NSData class]) {
-		NSString *name = owner != nil ? [NSString stringWithFormat:@"%@.%@", owner, [function name]]
-					      : [function name];
+		/* Specialized variants share a name; the object address tells them apart. */
+		NSString *name = owner != nil ? [NSString stringWithFormat:@"%@.%@@%p", owner, [function name], function]
+					      : [NSString stringWithFormat:@"%@@%p", [function name], function];
 		NSData *air = ((NSData *(*)(id, SEL))objc_msgSend)(function, bitcode);
 
 		BOOL named = NO;

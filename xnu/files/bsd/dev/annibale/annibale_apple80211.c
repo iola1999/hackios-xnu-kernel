@@ -403,9 +403,19 @@ get(struct apple80211req *request)
 	case 55:                                /* GUARD_INTERVAL */
 		request->req_val = 1;
 		return 0;
-	case 57:                                /* MCS */
-		request->req_val = 7;
-		return 0;
+	case 57: {                              /* MCS: an association's, none without one (PROBE A7) */
+		struct annibale_sta_state *joined = kalloc_data(sizeof(*joined), Z_WAITOK | Z_ZERO);
+		int answer = ENOMEM;
+
+		if (joined != NULL) {
+			annibale_sta_state(joined);
+			answer = joined->phase == ANNIBALE_STA_JOINED ? 0 : ENXIO;
+			kfree_data(joined, sizeof(*joined));
+		}
+		if (answer == 0)
+			request->req_val = 7;
+		return answer;
+	}
 	case 87:                                /* BTCOEX_MODE */
 		request->req_val = 0;
 		return 0;
@@ -510,6 +520,16 @@ get(struct apple80211req *request)
 	case 9:                                 /* its access point's address */
 		error = state->phase != ANNIBALE_STA_JOINED ? ENXIO : give(request, state->bss.bssid, 6);
 		break;
+	case 29: {                              /* DEAUTH: why the last association ended (PROBE A7) */
+		struct {
+			uint32_t version;
+			uint16_t reason;        /* 802.11 reason code; 8, leaving the BSS, when none is joined */
+			uint8_t  address[6];
+		} deauth = { .version = 1, .reason = state->phase == ANNIBALE_STA_JOINED ? 0 : 8 };
+
+		error = give(request, &deauth, sizeof(deauth));
+		break;
+	}
 	case 4: {                               /* its channel */
 		struct {
 			uint32_t version;

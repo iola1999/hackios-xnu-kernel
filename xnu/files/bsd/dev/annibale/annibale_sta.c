@@ -18,6 +18,7 @@
  * be joined (a wrong passphrase), the standing one is joined again.
  */
 #include <kern/kalloc.h>
+#include <pexpert/pexpert.h>
 #include <kern/locks.h>
 #include <kern/sched_prim.h>
 #include <kern/thread.h>
@@ -87,6 +88,16 @@ sta_save_standing(const struct annibale_sta_join *what)
 	(void)vnode_close(vp, FWASWRITTEN, ctx);
 }
 
+/* PROBE (A7): boot-arg wifi_rejoin=0 leaves every join to wifid, at the start and after power-on */
+static int
+sta_rejoin(void)
+{
+	static int rejoin = -1;
+	if (rejoin < 0 && !PE_parse_boot_argn("wifi_rejoin", &rejoin, sizeof(rejoin)))
+		rejoin = 1;
+	return rejoin;
+}
+
 static bool
 sta_load_standing(struct annibale_sta_join *out)
 {
@@ -130,7 +141,7 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 						lck_mtx_lock(&sta_lock);
 						if (standing.ssid_length == 0) {
 							standing = saved;
-							if (!asked_join) {
+							if (!asked_join && sta_rejoin()) {
 								asked_join_what = standing;
 								asked_join = true;
 							}
@@ -180,16 +191,16 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 				was_joined = state->phase == ANNIBALE_STA_JOINED;
 				kfree_data(state, sizeof(*state));
 			}
-			error = ops->power(power_on);
-			if (!power_on && was_joined) {
+			if (!power_on && was_joined) {          /* PROBE A7: the link goes before the radio */
 				annibale_apple80211_event(ANNIBALE_STA_LINK, 0);
 			}
+			error = ops->power(power_on);
 			annibale_apple80211_event(ANNIBALE_STA_POWER, error == 0 ? power_on : !power_on);
 			if (error == 0 && power_on && was_joined) {
 				annibale_apple80211_event(ANNIBALE_STA_LINK, 1);
 			}
 			lck_mtx_lock(&sta_lock);
-			if (error == 0 && power_on && !was_joined && standing.ssid_length != 0 && !asked_join) {
+			if (sta_rejoin() && error == 0 && power_on && !was_joined && standing.ssid_length != 0 && !asked_join) {
 				asked_join_what = standing;
 				asked_join = true;
 			}
