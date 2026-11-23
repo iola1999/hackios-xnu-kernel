@@ -18,6 +18,7 @@ index c72c690d7c74..b91083851d1b 100644
 +iokit/Kernel/MiniAppleKeyStore.cpp			optional iokitcpp
 +iokit/Kernel/MiniIONetworkStack.cpp			optional iokitcpp
 +iokit/Kernel/AnnibaleNVRAM.cpp			optional iokitcpp
++iokit/Kernel/AnnibaleSMC.cpp				optional iokitcpp
  iokit/Kernel/IOPlatformIO.cpp				optional iokitcpp
  
  iokit/Kernel/IOCPU.cpp					optional iokitcpp

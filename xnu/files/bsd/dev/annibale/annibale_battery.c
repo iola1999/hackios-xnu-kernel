@@ -25,6 +25,8 @@ extern void annibale_spmi_lock(void);
 extern void annibale_spmi_unlock(void);
 extern void annibale_ipa_init(void);
 extern void annibale_modem_init(void);
+/* iokit/Kernel/AnnibaleSMC.cpp: the AppleSMC-class stub iOS services match on */
+extern bool AnnibaleSMCStart(void);
 
 #define ARB_CORE_PHYS           0x0c400000UL
 #define ARB_CORE_SIZE           0x003000UL
@@ -932,6 +934,8 @@ annibale_battery_init(void)
 	if (reg[0] != 0x15c00000 || reg[2] != 0x15c80000 || reg[3] != 0x200000) { return; }
 	annibale_ipa_init();
 	annibale_modem_init();
+	/* batteryintelligenced aborts without an AppleSMC service to enumerate keys from */
+	if (!AnnibaleSMCStart()) { printf("battery: the AppleSMC stub failed to register\n"); }
 	if (!PE_parse_boot_argn("battery", &enabled, sizeof(enabled)) || !enabled) { return; }
 	if (kernel_thread_start(battery_thread, NULL, &thread) == KERN_SUCCESS) { thread_deallocate(thread); }
 }
