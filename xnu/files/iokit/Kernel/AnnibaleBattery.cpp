@@ -11,8 +11,16 @@
  *
  * What the values are comes from the audio DSP's battery manager (bsd/dev/annibale_adsp.c,
  * with adsp=1, unless battmgr=0), by way of bsd/dev/annibale/annibale_battery_state.c, which calls
- * AnnibaleBatteryReport() with every reading; the first one makes the service. Nothing here asks
- * the charger anything or tells it anything.
+ * AnnibaleBatteryReport() with every reading. Nothing here asks the charger anything or tells it
+ * anything.
+ *
+ * The service itself is made at boot by AnnibaleBatteryStart() (from annibale_battery_init, next
+ * to the AppleSMC stub), publishing skeleton BatteryData/ChargerData dictionaries before any real
+ * reading exists. batteryintelligenced's first XPC activity can run before the DSP's first reading
+ * arrives; when it found no power source at all, the absent properties turned into a nil member
+ * and an NSInvalidArgumentException while it built @{ smcData: ..., systemState: ... }. An early
+ * service with the empty dictionaries closes that window (its once-per-boot abort, then stable on
+ * relaunch).
  *
  * As on Apple's newer batteries, CurrentCapacity is the percentage that the fuel gauge shows (and
  * MaxCapacity 100); the charges in mAh are AppleRawCurrentCapacity, AppleRawMaxCapacity (what the
@@ -42,6 +50,7 @@ struct annibale_battery_state {
 };
 
 extern "C" void AnnibaleBatteryReport(const void * state, unsigned size);
+extern "C" bool AnnibaleBatteryStart(void);
 
 class AnnibaleBattery : public IOPMPowerSource
 {
@@ -49,11 +58,13 @@ class AnnibaleBattery : public IOPMPowerSource
 
 public:
 	void report(const struct annibale_battery_state * b);
+	void placeholders(void);
 
 private:
 	void number(const char * key, long long value);
 	void flag(const char * key, bool value);
 	void object(const char * key, OSObject * value);
+	void dicts(int32_t cycles);
 };
 
 OSDefineMetaClassAndStructors(AnnibaleBattery, IOPMPowerSource);
@@ -112,6 +123,43 @@ family_code(int usb_type)
 	}
 }
 
+/*
+ * batteryintelligenced pulls BatteryData/ChargerData out of the registry
+ * properties (IORegistryEntryCreateCFProperties on the first IOPMPowerSource
+ * match); on real batteries the gauge publishes them. Only the dictionary
+ * shape is checked — leaves it wants (AlgoChemID, Serial, VacVoltageLimit,
+ * ...) we cannot supply become NSNull on its side, but a missing dict means
+ * a nil smcKeys and an NSInvalidArgumentException abort.
+ */
+void
+AnnibaleBattery::dicts(int32_t cycles)
+{
+	OSDictionary * battData = OSDictionary::withCapacity(4);
+	OSDictionary * lifetime = OSDictionary::withCapacity(3);
+	OSDictionary * chargerData = OSDictionary::withCapacity(2);
+	if (battData != NULL && lifetime != NULL && chargerData != NULL) {
+		OSNumber * n;
+		if (cycles > 0 &&
+		    (n = OSNumber::withNumber((unsigned long long) cycles, 32)) != NULL) {
+			battData->setObject("CycleCount", n);
+			n->release();
+		}
+		battData->setObject("LifetimeData", lifetime);
+		object("BatteryData", battData);
+		object("ChargerData", chargerData);
+	}
+	OSSafeReleaseNULL(battData);
+	OSSafeReleaseNULL(lifetime);
+	OSSafeReleaseNULL(chargerData);
+}
+
+/* The empty BatteryData/ChargerData skeletons for the service made at boot, before the first reading. */
+void
+AnnibaleBattery::placeholders(void)
+{
+	dicts(0);
+}
+
 void
 AnnibaleBattery::report(const struct annibale_battery_state * b)
 {
@@ -151,32 +199,7 @@ AnnibaleBattery::report(const struct annibale_battery_state * b)
 		setCycleCount((unsigned) b->cycles);
 	}
 
-	/* batteryintelligenced pulls BatteryData/ChargerData out of the registry
-	 * properties (IORegistryEntryCreateCFProperties on the first IOPMPowerSource
-	 * match); on real batteries the gauge publishes them. Only the dictionary
-	 * shape is checked — leaves it wants (AlgoChemID, Serial, VacVoltageLimit,
-	 * ...) we cannot supply become NSNull on its side, but a missing dict means
-	 * a nil smcKeys and an NSInvalidArgumentException crash loop.
-	 */
-	{
-		OSDictionary * battData = OSDictionary::withCapacity(4);
-		OSDictionary * lifetime = OSDictionary::withCapacity(3);
-		OSDictionary * chargerData = OSDictionary::withCapacity(2);
-		if (battData != NULL && lifetime != NULL && chargerData != NULL) {
-			OSNumber * n;
-			if (b->cycles > 0 &&
-			    (n = OSNumber::withNumber((unsigned long long) b->cycles, 32)) != NULL) {
-				battData->setObject("CycleCount", n);
-				n->release();
-			}
-			battData->setObject("LifetimeData", lifetime);
-			object("BatteryData", battData);
-			object("ChargerData", chargerData);
-		}
-		OSSafeReleaseNULL(battData);
-		OSSafeReleaseNULL(lifetime);
-		OSSafeReleaseNULL(chargerData);
-	}
+	dicts(b->cycles);
 
 	if (b->external) {
 		OSDictionary * adapter = OSDictionary::withCapacity(6);
@@ -218,12 +241,46 @@ AnnibaleBattery::report(const struct annibale_battery_state * b)
 	updateStatus();
 }
 
-/* With every reading of the battery (bsd/dev/annibale/annibale_battery_state.c); the first one makes the service. One caller at a time. */
+static AnnibaleBattery *
+make_service(void)
+{
+	AnnibaleBattery * made = OSTypeAlloc(AnnibaleBattery);
+	IOService * platform = IOService::getPlatform();
+
+	if (platform == NULL || made == NULL || !made->init()) {
+		OSSafeReleaseNULL(made);
+		return NULL;
+	}
+	made->placeholders();       /* the dictionaries are there before anybody finds the service */
+	if (!made->attach(platform)) {
+		made->release();
+		return NULL;
+	}
+	made->setName("AnnibaleBattery");
+	if (!made->start(platform)) {
+		made->detach(platform);
+		made->release();
+		return NULL;
+	}
+	made->registerService();
+	return made;
+}
+
+/* At boot (annibale_battery_init), so the power source exists before daemons ask for it; readings fill in later. */
+bool
+AnnibaleBatteryStart(void)
+{
+	if (battery == NULL) {
+		battery = make_service();
+	}
+	return battery != NULL;
+}
+
+/* With every reading of the battery (bsd/dev/annibale/annibale_battery_state.c). One caller at a time. */
 void
 AnnibaleBatteryReport(const void * state, unsigned size)
 {
 	const struct annibale_battery_state * b = (const struct annibale_battery_state *) state;
-	IOService * platform;
 
 	if (size != sizeof(struct annibale_battery_state) || b->size != sizeof(struct annibale_battery_state)) {
 		static bool said;
@@ -235,31 +292,16 @@ AnnibaleBatteryReport(const void * state, unsigned size)
 		}
 		return;
 	}
-	if (battery == NULL) {
-		AnnibaleBattery * made = OSTypeAlloc(AnnibaleBattery);
-
-		if ((platform = IOService::getPlatform()) == NULL || made == NULL || !made->init()) {
-			OSSafeReleaseNULL(made);
-			return;
-		}
-		made->report(b);        /* (the properties are there before anybody finds the service) */
-		if (!made->attach(platform)) {
-			made->release();
-			return;
-		}
-		made->setName("AnnibaleBattery");
-		if (!made->start(platform)) {
-			made->detach(platform);
-			made->release();
-			return;
-		}
-		made->registerService();
-		battery = made;
-		IOLog("AnnibaleBattery: the battery's power source is up: %d%%, %s\n", (b->percent_hundredths + 50) / 100,
-		    b->external ? (b->status == 1 ? "charging" : "on a charger, not charging") : "not on a charger");
+	if (battery == NULL && !AnnibaleBatteryStart()) {
 		return;
 	}
 	battery->report(b);
+	static bool announced;
+	if (!announced) {
+		announced = true;
+		IOLog("AnnibaleBattery: the battery's power source is up: %d%%, %s\n", (b->percent_hundredths + 50) / 100,
+		    b->external ? (b->status == 1 ? "charging" : "on a charger, not charging") : "not on a charger");
+	}
 	/* each change of charger or charging state, to tell a charger that drops out from one that stops charging */
 	static int32_t external = -1, status = -1;
 	if (b->external != external || b->status != status) {
