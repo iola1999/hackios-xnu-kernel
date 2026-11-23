@@ -84,9 +84,15 @@ bool annibale_mic_gpr_event(uint32_t src_port, uint32_t dst_port, uint32_t opcod
 #define PARAM_ID_RSC_HW_CORE        0x08001032u
 #define Q6PRM_HW_CORE_ID_LPASS      1u
 #define Q6PRM_LPASS_CLK_ID_VA_MCLK  0x307u
+#define Q6PRM_LPASS_CLK_ID_VA_2XMCLK 0x308u /* Q6PRM_LPASS_CLK_ID_VA_CORE_2X_MCLK */
 #define Q6PRM_LPASS_CLK_SRC_INT     1u
 #define Q6PRM_LPASS_CLK_ROOT_DEF    0u
 #define VA_MACRO_MCLK_HZ            19200000u
+
+#define PARAM_ID_HW_EP_POWER_MODE_CFG 0x08001176u
+#define PARAM_ID_HW_EP_DMA_DATA_ALIGN 0x08001233u
+#define HW_EP_POWER_MODE_KEEPCLOCKS   2u   /* XO shutdown not allowed while capturing */
+#define HW_EP_DMA_DATA_ALIGN_LSB      1u
 
 #define MOD_RD_SHMEM            0x07001001u
 #define MOD_PCM_CNV             0x07001003u
@@ -438,9 +444,11 @@ mic_configure_va_macro(void)
 	regs[0x0004 / 4] = 1u;
 	regs[0x0080 / 4] |= 2u; /* FS_BROADCAST_EN */
 	regs[0x0094 / 4] = 0u;  /* release RESET_ALL_DMICS */
-	regs[0x0084 / 4] = (5u << 1) | 1u; /* DMIC0/1 enable, DIV16 */
-	regs[0x0088 / 4] = (5u << 1) | 1u; /* DMIC2/3 enable, DIV16 */
-	regs[0x008c / 4] = (5u << 1) | 1u; /* DMIC4/5 enable, DIV16 */
+	/* va-dmic-clk-div-factor 16: DMIC_CTL's div field is a power-of-2
+	 * selector (3 = /16), not the factor itself. */
+	regs[0x0084 / 4] = (3u << 1) | 1u; /* DMIC0/1 enable, /16 = 1.2 MHz */
+	regs[0x0088 / 4] = (3u << 1) | 1u; /* DMIC2/3 enable, /16 */
+	regs[0x008c / 4] = (3u << 1) | 1u; /* DMIC4/5 enable, /16 */
 	regs[0x0104 / 4] = 0u;             /* DEC0 mux = VA_DMIC */
 	regs[0x0100 / 4] = (1u << 4);      /* DEC0 input = DMIC0 */
 	regs[0x0404 / 4] = (1u << 7) | (2u << 5); /* DMIC select, 150 Hz HPF */
@@ -473,6 +481,12 @@ mic_hw_prepare(void)
 	}
 	if (!mic_prm_set_clk(Q6PRM_LPASS_CLK_ID_VA_MCLK, VA_MACRO_MCLK_HZ, "REQ VA MCLK")) {
 		say("LPASS VA MCLK request failed\n");
+		return false;
+	}
+	/* The decimator-to-LPAIF path in the VA macro runs on the 2X core clock;
+	 * without this request the TX DMA interface has no clock and returns zeros. */
+	if (!mic_prm_set_clk(Q6PRM_LPASS_CLK_ID_VA_2XMCLK, VA_MACRO_MCLK_HZ, "REQ VA 2X MCLK")) {
+		say("LPASS VA 2X MCLK request failed\n");
 		return false;
 	}
 
@@ -525,6 +539,12 @@ open_capture_graphs(void)
 	mpkt_put16(&p, 16);
 	mpkt_put16(&p, 1);
 	mpkt_put32(&p, 1);
+	mpkt_param_end(&p, at);
+	at = mpkt_param_begin(&p, IID_MIC_SOURCE, PARAM_ID_HW_EP_POWER_MODE_CFG);
+	mpkt_put32(&p, HW_EP_POWER_MODE_KEEPCLOCKS);
+	mpkt_param_end(&p, at);
+	at = mpkt_param_begin(&p, IID_MIC_SOURCE, PARAM_ID_HW_EP_DMA_DATA_ALIGN);
+	mpkt_put32(&p, HW_EP_DMA_DATA_ALIGN_LSB);
 	mpkt_param_end(&p, at);
 	mpkt_cmd_end(&p, cmd);
 	mpkt_finish(&p);
