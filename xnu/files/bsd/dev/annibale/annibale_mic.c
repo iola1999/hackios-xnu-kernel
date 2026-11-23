@@ -87,6 +87,7 @@ bool annibale_mic_gpr_event(uint32_t src_port, uint32_t dst_port, uint32_t opcod
 #define Q6PRM_HW_CORE_ID_DCODEC     2u
 #define Q6PRM_LPASS_CLK_ID_VA_MCLK  0x307u
 #define Q6PRM_LPASS_CLK_ID_VA_2XMCLK 0x308u /* Q6PRM_LPASS_CLK_ID_VA_CORE_2X_MCLK */
+#define Q6PRM_LPASS_CLK_ID_TX_MCLK  0x30cu /* Q6PRM_LPASS_CLK_ID_TX_CORE_MCLK */
 #define Q6PRM_LPASS_CLK_SRC_INT     1u
 #define Q6PRM_LPASS_CLK_ROOT_DEF    0u
 #define VA_MACRO_MCLK_HZ            19200000u
@@ -507,6 +508,13 @@ mic_hw_prepare(void)
 	 * without this request the TX DMA interface has no clock and returns zeros. */
 	if (!mic_prm_set_clk(Q6PRM_LPASS_CLK_ID_VA_2XMCLK, VA_MACRO_MCLK_HZ, "REQ VA 2X MCLK")) {
 		say("LPASS VA 2X MCLK request failed\n");
+		return false;
+	}
+	/* The codec-DMA TX interface itself runs on the TX core domain, which is a
+	 * different island from the VA macro's; upstream binds the va-macro mclk to
+	 * it. PRM requests are reference counted, so this stacks on the VA votes. */
+	if (!mic_prm_set_clk(Q6PRM_LPASS_CLK_ID_TX_MCLK, VA_MACRO_MCLK_HZ, "REQ TX MCLK")) {
+		say("LPASS TX MCLK request failed\n");
 		return false;
 	}
 
