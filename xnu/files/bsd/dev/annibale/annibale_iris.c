@@ -82,10 +82,14 @@ iris_ioctl_get_info(struct iris_device_info *info)
 	if (iris_hw_probe_firmware()) {
 		out.flags |= IRIS_INFO_FW_PRESENT;
 		out.fw_size = g_iris.fw_size;
-	}
-	if (iris_hw_ensure_ready()) {
-		out.flags |= IRIS_INFO_HW_READY;
 		out.codecs_mask = IRIS_CODEC_MASK_H264 | IRIS_CODEC_MASK_HEVC;
+	}
+	/* Probing stays free of side effects: mediaserverd issues GET_INFO when the
+	 * inject dylib loads, and powering the VPU here kept PAS 9 and its DMA up for
+	 * the whole run even when nothing ever decoded a frame. The hardware comes
+	 * up on the first OPEN_SESSION instead. */
+	if (g_iris.hw_ready) {
+		out.flags |= IRIS_INFO_HW_READY;
 	}
 	*info = out;
 	return 0;
