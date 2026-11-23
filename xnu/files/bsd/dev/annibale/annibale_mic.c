@@ -5,9 +5,10 @@
  *   - Q6PRM LPASS core vote (PARAM_ID_RSC_HW_CORE=1) & VA/TX MCLK (19.2 MHz)
  *   - DMIC power/enable TLMM GPIOs 182/183 & LPI TLMM pins 6/7, 8/9, 12/13 (func 1)
  *   - LPASS VA Macro (0x07660000) MCLK, FS broadcast, DMIC0 clock & DEC0 path
- *   - AudioReach capture subgraphs:
+ *   - AudioReach capture subgraphs (upstream audioreach-topology capture chain):
  *       SG_MIC (0x4007):     MOD_CODEC_DMA_SOURCE (0x07001024, IID 0x6071) on LPASS VA0
- *       SG_CAPTURE (0x4003): MOD_PCM_CNV (0x07001003, IID 0x6023) ->
+ *       SG_CAPTURE (0x4003): MOD_MFC (0x07001015, IID 0x6025) ->
+ *                            MOD_PCM_CNV (0x07001003, IID 0x6023) ->
  *                            MOD_PCM_ENC (0x07001004, IID 0x6022) ->
  *                            MOD_RD_SHMEM (0x07001001, IID 0x6021)
  *   - Shared DMA capture window at reach_buffer + 0x8000 (4 slots of 960 frames @ 48 kHz)
@@ -97,6 +98,8 @@ bool annibale_mic_gpr_event(uint32_t src_port, uint32_t dst_port, uint32_t opcod
 #define MOD_RD_SHMEM            0x07001001u
 #define MOD_PCM_CNV             0x07001003u
 #define MOD_PCM_ENC             0x07001004u
+#define MOD_MFC                 0x07001015u
+#define MOD_LOG                 0x0700101Au
 #define MOD_CODEC_DMA_SOURCE    0x07001024u
 
 #define SG_CAPTURE              0x4003u
@@ -105,7 +108,10 @@ bool annibale_mic_gpr_event(uint32_t src_port, uint32_t dst_port, uint32_t opcod
 #define IID_CAP_SHMEM           0x6021u
 #define IID_CAP_ENC             0x6022u
 #define IID_CAP_CNV             0x6023u
+#define IID_CAP_LOG             0x6024u
+#define IID_CAP_MFC             0x6025u
 #define IID_MIC_SOURCE          0x6071u
+#define IID_MIC_LOG             0x6072u
 
 #define MIC_RATE                48000u
 #define MIC_PERIOD_FRAMES       960u            /* 20 ms @ 48 kHz */
@@ -262,23 +268,23 @@ mpkt_graph_open(struct mic_pkt *p, uint32_t sg, uint32_t dir, const struct mic_m
 	mpkt_begin(p, OUR_MIC_PORT, APM_IID, OP_GRAPH_OPEN);
 	uint32_t cmd = mpkt_cmd_begin(p);
 
-	uint32_t at = mpkt_param_begin(p, APM_IID, 0x08001001);
+	uint32_t at = mpkt_param_begin(p, APM_IID, 0x08001001); /* SUB_GRAPH_CONFIG */
 	mpkt_put32(p, 1);
 	mpkt_put32(p, sg);
 	mpkt_put32(p, 3);
-	mpkt_put32(p, 0x0800100e); mpkt_put32(p, 4); mpkt_put32(p, 2);
+	mpkt_put32(p, 0x0800100e); mpkt_put32(p, 4); mpkt_put32(p, 2);  /* PERF_MODE low-latency */
 	mpkt_put32(p, 0x0800100f); mpkt_put32(p, 4); mpkt_put32(p, dir);
-	mpkt_put32(p, 0x08001010); mpkt_put32(p, 4); mpkt_put32(p, 1);
+	mpkt_put32(p, 0x08001010); mpkt_put32(p, 4); mpkt_put32(p, 2); /* SCENARIO_ID record */
 	mpkt_param_end(p, at);
 
-	at = mpkt_param_begin(p, APM_IID, 0x08001000);
+	at = mpkt_param_begin(p, APM_IID, 0x08001000); /* CONTAINER_CONFIG */
 	mpkt_put32(p, 1);
 	mpkt_put32(p, sg);
 	mpkt_put32(p, 4);
-	mpkt_put32(p, 0x08001011); mpkt_put32(p, 8); mpkt_put32(p, 1); mpkt_put32(p, 0x0b001001);
-	mpkt_put32(p, 0x08001012); mpkt_put32(p, 4); mpkt_put32(p, 1);
+	mpkt_put32(p, 0x08001011); mpkt_put32(p, 8); mpkt_put32(p, 1); mpkt_put32(p, 0x0b001001); /* GC */
+	mpkt_put32(p, 0x08001012); mpkt_put32(p, 4); mpkt_put32(p, 4); /* GRAPH_POS global-dev */
 	mpkt_put32(p, 0x08001013); mpkt_put32(p, 4); mpkt_put32(p, 8192);
-	mpkt_put32(p, 0x08001014); mpkt_put32(p, 4); mpkt_put32(p, 2);
+	mpkt_put32(p, 0x08001014); mpkt_put32(p, 4); mpkt_put32(p, 2); /* PROC_DOMAIN ADSP */
 	mpkt_param_end(p, at);
 
 	at = mpkt_param_begin(p, APM_IID, 0x08001002);
@@ -442,13 +448,18 @@ mic_configure_va_macro(void)
 	regs[0x0000 / 4] |= 1u; /* MCLK_CONTROL_EN */
 	regs[0x0004 / 4] = 3u;  /* FS_CNT clear + enable */
 	regs[0x0004 / 4] = 1u;
+	regs[0x0008 / 4] |= 1u; /* SWR_CONTROL SWR_CLK_ENABLE: sm8550 and newer
+	 * carry the decimator output out over the macro's own SoundWire master;
+	 * upstream lpass-va-macro turns this clock on in fsgen_gate_enable for
+	 * has_swr_master parts. */
 	regs[0x0080 / 4] |= 2u; /* FS_BROADCAST_EN */
 	regs[0x0094 / 4] = 0u;  /* release RESET_ALL_DMICS */
-	/* va-dmic-clk-div-factor 16: DMIC_CTL's div field is a power-of-2
-	 * selector (3 = /16), not the factor itself. */
-	regs[0x0084 / 4] = (3u << 1) | 1u; /* DMIC0/1 enable, /16 = 1.2 MHz */
-	regs[0x0088 / 4] = (3u << 1) | 1u; /* DMIC2/3 enable, /16 */
-	regs[0x008c / 4] = (3u << 1) | 1u; /* DMIC4/5 enable, /16 */
+	/* DMIC_CTL's div field is an index into {2,3,4,6,8,16}, matching the
+	 * upstream VA_MACRO_CLK_DIV_* enum: 5 is the dts /16 selection. */
+	regs[0x0084 / 4] = (5u << 1) | 1u; /* DMIC0/1 enable, /16 = 1.2 MHz */
+	regs[0x0088 / 4] = (5u << 1) | 1u; /* DMIC2/3 enable, /16 */
+	regs[0x008c / 4] = (5u << 1) | 1u; /* DMIC4/5 enable, /16 */
+	regs[0x0090 / 4] = (5u << 1) | 1u; /* DMIC6/7 enable, /16 */
 	regs[0x0104 / 4] = 0u;             /* DEC0 mux = VA_DMIC */
 	regs[0x0100 / 4] = (1u << 4);      /* DEC0 input = DMIC0 */
 	regs[0x0404 / 4] = (1u << 7) | (2u << 5); /* DMIC select, 150 Hz HPF */
@@ -509,10 +520,12 @@ open_capture_graphs(void)
 	static const struct mic_mod cap_mods[] = {
 		{ MOD_RD_SHMEM, IID_CAP_SHMEM, 1, 0 },
 		{ MOD_PCM_ENC,  IID_CAP_ENC,   1, 1 },
-		{ MOD_PCM_CNV,  IID_CAP_CNV,   1, 1 }
+		{ MOD_PCM_CNV,  IID_CAP_CNV,   1, 1 },
+		{ MOD_MFC,      IID_CAP_MFC,   1, 1 }
 	};
 	static const struct mic_link cap_links[] = {
-		{ IID_MIC_SOURCE, IID_CAP_CNV },
+		{ IID_MIC_SOURCE, IID_CAP_MFC },
+		{ IID_CAP_MFC,    IID_CAP_CNV },
 		{ IID_CAP_CNV,    IID_CAP_ENC },
 		{ IID_CAP_ENC,    IID_CAP_SHMEM }
 	};
@@ -551,13 +564,28 @@ open_capture_graphs(void)
 	if (!annibale_audio_reach_send_cmd(p.buf, p.len, "SET_CFG MIC_SOURCE", NULL, NULL, 0)) return false;
 
 	/* 3. Open SG_CAPTURE (0x4003) */
-	mpkt_graph_open(&p, SG_CAPTURE, 1, cap_mods, 3, cap_links, 3);
+	mpkt_graph_open(&p, SG_CAPTURE, 1, cap_mods, 4, cap_links, 4);
 	if (!annibale_audio_reach_send_cmd(p.buf, p.len, "OPEN SG_CAPTURE (0x4003)", NULL, NULL, 0)) return false;
 	mic_graphs_opened |= 2u;
 
+	/* 3a. MFC output format, as audioreach_set_media_format: 48 kHz 16-bit mono fixed-point */
+	mpkt_begin(&p, OUR_MIC_PORT, APM_IID, OP_SET_CFG);
+	cmd = mpkt_cmd_begin(&p);
+	at = mpkt_param_begin(&p, IID_CAP_MFC, 0x08001024); /* MFC_OUTPUT_MEDIA_FORMAT */
+	mpkt_put32(&p, MIC_RATE);
+	mpkt_put16(&p, 16);
+	mpkt_put16(&p, 1);
+	mpkt_put16(&p, 1); /* channel_mapping[0] = PCM_CHANNEL_FL */
+	mpkt_put16(&p, 0);
+	mpkt_param_end(&p, at);
+	mpkt_cmd_end(&p, cmd);
+	mpkt_finish(&p);
+	if (!annibale_audio_reach_send_cmd(p.buf, p.len, "SET_CFG CAP_MFC", NULL, NULL, 0)) return false;
+
 	/*
-	 * 4. PCM_OUTPUT_FORMAT_CFG for the converter and the encoder, the layout the playback graph
-	 * sends its PCM modules: 16-bit Q15 little-endian interleaved mono. The payload size excludes padding.
+	 * 4. PCM_OUTPUT_FORMAT_CFG for the shmem endpoint, the converter and the encoder, the
+	 * layout the playback graph sends its PCM modules: 16-bit Q15 LE interleaved mono.
+	 * The payload size excludes padding.
 	 */
 	mpkt_begin(&p, OUR_MIC_PORT, APM_IID, OP_SET_CFG);
 	cmd = mpkt_cmd_begin(&p);
