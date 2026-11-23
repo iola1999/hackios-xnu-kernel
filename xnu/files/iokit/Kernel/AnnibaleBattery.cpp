@@ -151,6 +151,33 @@ AnnibaleBattery::report(const struct annibale_battery_state * b)
 		setCycleCount((unsigned) b->cycles);
 	}
 
+	/* batteryintelligenced pulls BatteryData/ChargerData out of the registry
+	 * properties (IORegistryEntryCreateCFProperties on the first IOPMPowerSource
+	 * match); on real batteries the gauge publishes them. Only the dictionary
+	 * shape is checked — leaves it wants (AlgoChemID, Serial, VacVoltageLimit,
+	 * ...) we cannot supply become NSNull on its side, but a missing dict means
+	 * a nil smcKeys and an NSInvalidArgumentException crash loop.
+	 */
+	{
+		OSDictionary * battData = OSDictionary::withCapacity(4);
+		OSDictionary * lifetime = OSDictionary::withCapacity(3);
+		OSDictionary * chargerData = OSDictionary::withCapacity(2);
+		if (battData != NULL && lifetime != NULL && chargerData != NULL) {
+			OSNumber * n;
+			if (b->cycles > 0 &&
+			    (n = OSNumber::withNumber((unsigned long long) b->cycles, 32)) != NULL) {
+				battData->setObject("CycleCount", n);
+				n->release();
+			}
+			battData->setObject("LifetimeData", lifetime);
+			object("BatteryData", battData);
+			object("ChargerData", chargerData);
+		}
+		OSSafeReleaseNULL(battData);
+		OSSafeReleaseNULL(lifetime);
+		OSSafeReleaseNULL(chargerData);
+	}
+
 	if (b->external) {
 		OSDictionary * adapter = OSDictionary::withCapacity(6);
 		long long mv = b->usb_voltage_uv / 1000, ma = b->usb_current_ua / 1000;
