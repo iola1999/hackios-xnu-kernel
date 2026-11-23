@@ -55,6 +55,7 @@ static bool asked_power, asked_power_on, asked_join, asked_leave;
 static struct annibale_sta_scan asked_scans[ASKED_SCANS_MOST];
 static unsigned asked_scans_head, asked_scans_count;
 static struct annibale_sta_join asked_join_what;
+static bool power_report_pending;                /* the "radio on" event, held until the join it asked for is done */
 static struct annibale_sta_join standing;        /* the network joined whenever the radio comes on (ssid_length 0: none) */
 static struct annibale_sta_join fallback;        /* ... as it was before a join that has not come through yet */
 
@@ -199,16 +200,24 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 				annibale_apple80211_event(ANNIBALE_STA_LINK, 0);
 			}
 			error = ops->power(power_on);
-			annibale_apple80211_event(ANNIBALE_STA_POWER, error == 0 ? power_on : !power_on);
+			lck_mtx_lock(&sta_lock);
+			bool defer = sta_rejoin() && error == 0 && power_on && !was_joined &&
+			    standing.ssid_length != 0 && !asked_join;
+			if (defer) {
+				/* wifid enumerates the device the moment "power on" arrives: hold it until the
+				 * standing join it triggers is done, so the enumeration finds the network (the
+				 * same way a wifid that starts after the join marks itself associated) */
+				asked_join_what = standing;
+				asked_join = true;
+				power_report_pending = true;
+			}
+			lck_mtx_unlock(&sta_lock);
+			if (!defer) {
+				annibale_apple80211_event(ANNIBALE_STA_POWER, error == 0 ? power_on : !power_on);
+			}
 			if (error == 0 && power_on && was_joined) {
 				annibale_apple80211_event(ANNIBALE_STA_LINK, 1);
 			}
-			lck_mtx_lock(&sta_lock);
-			if (sta_rejoin() && error == 0 && power_on && !was_joined && standing.ssid_length != 0 && !asked_join) {
-				asked_join_what = standing;
-				asked_join = true;
-			}
-			lck_mtx_unlock(&sta_lock);
 		} else if (leave) {
 			ops->leave();
 			annibale_apple80211_event(ANNIBALE_STA_LINK, 0);
@@ -227,6 +236,13 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 				sta_save_standing(&join);
 			}
 			bzero(&join, sizeof(join));
+			lck_mtx_lock(&sta_lock);
+			bool report_power = power_report_pending && sta_on;
+			power_report_pending = false;
+			lck_mtx_unlock(&sta_lock);
+			if (report_power) {
+				annibale_apple80211_event(ANNIBALE_STA_POWER, 1);
+			}
 			annibale_apple80211_event(ANNIBALE_STA_JOIN_DONE, error);
 			if (error == 0) {
 				annibale_apple80211_event(ANNIBALE_STA_LINK, 1);
@@ -356,6 +372,7 @@ annibale_sta_ask_power(bool on)
 	if (!on) {
 		asked_join = asked_leave = false;
 		asked_scans_count = 0;
+		power_report_pending = false;              /* the join never runs; "power off" is said on its own */
 	}
 	lck_mtx_unlock(&sta_lock);
 	thread_wakeup((event_t)&sta_ops);
@@ -428,7 +445,12 @@ annibale_sta_ask_leave(void)
 	asked_join = false;
 	bzero(&asked_join_what, sizeof(asked_join_what));
 	bzero(&fallback, sizeof(fallback));
+	bool flush_power = power_report_pending;
+	power_report_pending = false;
 	lck_mtx_unlock(&sta_lock);
+	if (flush_power) {
+		annibale_apple80211_event(ANNIBALE_STA_POWER, 1);    /* the radio stays on; "power on" can no longer wait for a join */
+	}
 	thread_wakeup((event_t)&sta_ops);
 	return 0;
 }

@@ -189,6 +189,21 @@ struct apple80211_assoc_26 {
 #define CIPHER_PMK              6
 #define CIPHER_PASSPHRASE       10
 
+/* the SSID and BSSID events' data (IO80211's WiFiDeviceClient::getLinkStatus reads both, empty means "not on a net") */
+struct apple80211_ssid_changed {
+	uint32_t version, ssid_length;
+	uint8_t ssid[32];
+};
+struct apple80211_bssid_changed {
+	uint32_t version;
+	uint8_t bssid[6], unused[10];
+};
+
+/* the power event's data (IO80211's apple80211_power_data: the radio's new state) */
+struct apple80211_power_changed {
+	uint32_t version, state;
+};
+
 /* the link event's data (at least 32 bytes, or the framework drops the event) */
 struct apple80211_link_changed {
 	uint8_t down, unused_0[3];
@@ -812,6 +827,9 @@ set(const struct apple80211req *request, char *said, size_t said_size)
 			annibale_sta_state(state);
 			if (state->phase == ANNIBALE_STA_JOINED) {
 				int32_t rssi = state->bss.rssi != 0 ? state->bss.rssi : -55;
+				struct apple80211_ssid_changed ssid = { .version = 1,
+					.ssid_length = MIN(state->bss.ssid_length, sizeof(ssid.ssid)) };
+				struct apple80211_bssid_changed bssid = { .version = 1 };
 				struct apple80211_link_changed link = {
 					.down = 0,
 					.rssi = rssi,
@@ -820,8 +838,10 @@ set(const struct apple80211req *request, char *said, size_t said_size)
 				};
 				struct apple80211_lqm_changed lqm = { .rssi_known = 1, .rssi = rssi };
 
-				post(EVENT_SSID_CHANGED, NULL, 0);
-				post(EVENT_BSSID_CHANGED, NULL, 0);
+				memcpy(ssid.ssid, state->bss.ssid, ssid.ssid_length);
+				memcpy(bssid.bssid, state->bss.bssid, 6);
+				post(EVENT_SSID_CHANGED, &ssid, sizeof(ssid));
+				post(EVENT_BSSID_CHANGED, &bssid, sizeof(bssid));
 				post(EVENT_LINK_CHANGED, &link, sizeof(link));
 				post(EVENT_LQM_CHANGED, &lqm, sizeof(lqm));
 			}
@@ -904,9 +924,12 @@ annibale_apple80211_event(enum annibale_sta_event event, int status)
 		    "a scan is over" : event == ANNIBALE_STA_JOIN_DONE ? "a join is over" : "the link", status);
 	}
 	switch (event) {
-	case ANNIBALE_STA_POWER:
-		post(EVENT_POWER_CHANGED, NULL, 0);
+	case ANNIBALE_STA_POWER: {
+		struct apple80211_power_changed power = { .version = 1, .state = status == 1 ? 1 : 0 };
+
+		post(EVENT_POWER_CHANGED, &power, sizeof(power));
 		break;
+	}
 	case ANNIBALE_STA_SCAN_DONE:
 		lck_mtx_lock(&apple80211_lock);
 		bzero(result_readers, sizeof(result_readers));
@@ -932,15 +955,23 @@ annibale_apple80211_event(enum annibale_sta_event event, int status)
 			                                .noise = status == 1 ? (uint16_t)-95 : 0 };
 		struct annibale_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
 
+		struct apple80211_ssid_changed ssid = { .version = 1 };
+		struct apple80211_bssid_changed bssid = { .version = 1 };
+
 		if (state != NULL) {
 			annibale_sta_state(state);
 			link.rssi = status == 1 ? (state->bss.rssi != 0 ? state->bss.rssi : -55) : 0;
+			if (status == 1) {
+				ssid.ssid_length = MIN(state->bss.ssid_length, sizeof(ssid.ssid));
+				memcpy(ssid.ssid, state->bss.ssid, ssid.ssid_length);
+				memcpy(bssid.bssid, state->bss.bssid, 6);
+			}
 			kfree_data(state, sizeof(*state));
 		} else if (status == 1) {
 			link.rssi = -55;
 		}
-		post(EVENT_SSID_CHANGED, NULL, 0);
-		post(EVENT_BSSID_CHANGED, NULL, 0);
+		post(EVENT_SSID_CHANGED, &ssid, sizeof(ssid));
+		post(EVENT_BSSID_CHANGED, &bssid, sizeof(bssid));
 		post(EVENT_LINK_CHANGED, &link, sizeof(link));
 		if (status == 1) {
 			struct apple80211_lqm_changed lqm = { .rssi_known = 1, .rssi = link.rssi };
