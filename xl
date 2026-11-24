@@ -135,10 +135,14 @@ run() { # run <oem command> <label>
 		# A run about Wi-Fi is given the radio's own address, which is this phone's and so is kept in a
 		# file that is not in the repository: fw-wifi/mac, one line, six bytes in hexadecimal with colons.
 		local args=${XL_CMDLINE--v}
+		local mac_file=${K90_WIFI_MAC_FILE:-fw-wifi/mac}
+		local mac_args=()
 		case " $args " in
-		*" wifi="*|*" wifi_step="*) [ -s fw-wifi/mac ] && args="$args wifi_mac=$(tr -d ' \n\r' < fw-wifi/mac)" ;;
+		*" wifi_mac="*) ;;
+		*" wifi="*|*" wifi_step="*|*" wifi_station=1 "*)
+			[ ! -f "$mac_file" ] || mac_args=(--wifi-mac-file "$mac_file") ;;
 		esac
-		xnuloader/mkpayload.py -o run-payload.bin kernel=$K ${rd:+ramdisk=$rd} --cmdline "loader_return_after=${XL_SECS:-8} epoch=$(date +%s) sb_delay=${XL_SB_DELAY:-8} $args" >/dev/null || return 1
+		xnuloader/mkpayload.py -o run-payload.bin kernel=$K ${rd:+ramdisk=$rd} "${mac_args[@]}" --cmdline "loader_return_after=${XL_SECS:-8} epoch=$(date +%s) sb_delay=${XL_SB_DELAY:-8} $args" >/dev/null || return 1
 		FB_TIMEOUT=30 fb stage run-payload.bin | grep -q OKAY || { echo "xl: upload failed"; return 1; }
 	fi
 	local live=; live_loader && live=1

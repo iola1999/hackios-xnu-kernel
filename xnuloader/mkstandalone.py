@@ -23,7 +23,7 @@ DEFAULT_CMDLINE = (
     "touch_lat=0 gpu_coherent=1 fb_flip=2 fb_beat=0 fb_hz=120 fb_ca_hz=120 dl_max=1 "
     "touch_poll_us=4000 pcie=10 pcie_power=1 pcie_sleep_clock=board pcie_bdf=bd_p11.elf "
     "pcie_smps_hpm=1 pcie_bt_en=1 pcie_aop_pdc=1 pcie_rddm=1 wifi_mlo=1 "
-    "wifi_mac=02:4b:39:30:00:01 wifi_station=1 ufs=2 ufs_native=1 ufs_write=1 "
+    "wifi_station=1 ufs=2 ufs_native=1 ufs_write=1 "
     "bt=4 cam=5 torch=1 fbwidth=1206 fbheight=2622 fbpitch=460"
 )
 
@@ -95,6 +95,7 @@ def build_standalone_payload(
     memsize: str = DEFAULT_MEMSIZE,
     cmdline: str = DEFAULT_CMDLINE,
     lz4: bool = True,
+    wifi_mac_file: Path | None = None,
 ) -> tuple[Path, Path | None]:
     here = Path(__file__).resolve().parent
     mkpayload_py = here / "mkpayload.py"
@@ -159,6 +160,8 @@ def build_standalone_payload(
         cmdline,
     ])
 
+    if wifi_mac_file is not None:
+        cmd.extend(["--wifi-mac-file", str(wifi_mac_file)])
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode != 0:
         raise RuntimeError(f"mkpayload.py failed:\n{res.stderr}\n{res.stdout}")
@@ -190,6 +193,7 @@ def main() -> int:
                         help="identity (v57 for iOS 26)")
     parser.add_argument("--memsize", default=DEFAULT_MEMSIZE,
                         help="memsize in hex")
+    parser.add_argument("--wifi-mac-file", type=Path, help="factory Wi-Fi address imported from this phone")
     parser.add_argument("--cmdline", default=DEFAULT_CMDLINE,
                         help="boot arguments cmdline")
     parser.add_argument("--no-lz4", action="store_true",
@@ -235,6 +239,7 @@ def main() -> int:
         identity=args.identity,
         memsize=args.memsize,
         cmdline=args.cmdline,
+        wifi_mac_file=args.wifi_mac_file,
         lz4=not args.no_lz4,
     )
 

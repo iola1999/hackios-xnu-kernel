@@ -52,6 +52,7 @@ __pycache__/
 !/xnuloader/ui_font_private.h
 !/xnuloader/mkidentity.py
 !/xnuloader/mkpayload.py
+!/xnuloader/wifi_mac.py
 !/xnuloader/mkstandalone.py
 !/xnuloader/test_boot_safety.py
 

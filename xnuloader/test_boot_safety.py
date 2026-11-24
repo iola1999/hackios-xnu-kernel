@@ -261,6 +261,31 @@ int main(void) {
 
 
 class TestStandalonePackager(unittest.TestCase):
+    def test_imported_factory_address(self):
+        import struct
+        pack = self.packager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("kernel", "root", "boot"):
+                (root / name).write_bytes(b"test image")
+            # Synthetic identifiers from the documentation address block.
+            addresses = ["00:00:5e:00:53:01", "00:00:5e:00:53:02"]
+            for n, address in enumerate(addresses):
+                source, out = root / "mac", root / f"payload-{n}"
+                source.write_text(address.upper() + "\n")
+                pack.build_standalone_payload(root/"kernel", root/"root", out, boot_image=root/"boot",
+                                              wifi_mac_file=source, lz4=False)
+                data = out.read_bytes()
+                pos = 8
+                while data[pos:pos+7] != b"cmdline":
+                    length = struct.unpack_from("<I", data, pos+16)[0]
+                    pos += 24 + ((length+15)//16)*16
+                length = struct.unpack_from("<I", data, pos+16)[0]
+                tokens = data[pos+24:pos+24+length-1].decode().split()
+                self.assertEqual([t for t in tokens if t.startswith("wifi_mac=")], ["wifi_mac=" + address])
+                self.assertEqual(out.stat().st_mode & 0o777, 0o600)
+            self.assertNotEqual((root/"payload-0").read_bytes(), (root/"payload-1").read_bytes())
+
     def packager(self):
         spec = importlib.util.spec_from_file_location('standalone_under_test', HERE / 'mkstandalone.py')
         module = importlib.util.module_from_spec(spec)

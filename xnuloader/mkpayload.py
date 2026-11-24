@@ -20,7 +20,9 @@ struct.pack truncates char name[16] silently and the loader binds names with
 strcmp semantics: a stored NUL aliases the prefix and the last duplicate
 entry wins. --require-cmd demands an exact boot-arg token, --forbid-cmd
 rejects an exact boot-arg key (bare or with =value), --exact-cmd demands the approved token set;
-no boot-arg string may contain NUL.
+no boot-arg string may contain NUL. With --wifi-mac-file, the checked
+token is wifi_mac=@factory; assembly replaces it with the validated address
+from that file. --exact-cmd includes the symbolic token in this case.
 --forbid-entry NAME (repeatable) refuses any payload entry, item- or
 flag-derived; an approved experiment command uses it to forbid rdfile/rdres or
 any other out-of-scope entry explicitly. Validation failures exit before
@@ -33,13 +35,15 @@ with the cmdline/physbase/rdres/rdfile/usb/checkpoint flags, or NUL bytes in
 boot-arg strings are rejected now; ordinary
 kernel=/ramdisk= items plus flags build unchanged.
 """
-import argparse, hashlib, struct, sys
+import argparse, hashlib, os, struct, sys
+from pathlib import Path
 
 FLAG_OWNED = ('cmdline', 'physbase', 'rdres', 'rdfile', 'usb', 'checkpoint', 'memsize', 'identity')
 
 ap = argparse.ArgumentParser()
 ap.add_argument('-o', '--output', required=True)
 ap.add_argument('--cmdline', default='')
+ap.add_argument('--wifi-mac-file', type=Path, help='local factory address for the wifi_mac boot argument')
 ap.add_argument('--physbase', default='', help='hex: force XNU physical base (testing)')
 ap.add_argument('--memsize', default='', help="hex: the largest memory window, for a kernel whose bootstrap page tables cover it (default 6 GB)")
 ap.add_argument('--identity', default='', choices=('', 'd22', 'v57'),
@@ -60,6 +64,8 @@ ap.add_argument('--forbid-entry', action='append', default=[], metavar='NAME',
                 help='refuse to build if the payload would carry an entry with this name (item or flag)')
 ap.add_argument('items', nargs='*')
 args = ap.parse_args()
+if args.wifi_mac_file is not None:
+    os.umask(0o077)
 
 inputs = {}
 for item in args.items:
@@ -101,6 +107,17 @@ for req in args.require:
 for where, text in (('cmdline', args.cmdline), ('exact-cmd', args.exact_cmd)):
     if '\0' in text:
         sys.exit(f'{where}: contains a NUL byte; the loader and kernel stop parsing at it')
+# Validate the imported argument by name without exposing the device's address in argv or errors.
+factory_mac = None
+if args.wifi_mac_file is not None:
+    from wifi_mac import read_factory_mac
+    try:
+        factory_mac = read_factory_mac(args.wifi_mac_file)
+    except ValueError as error:
+        sys.exit(str(error))
+    if any(token.split('=', 1)[0] == 'wifi_mac' for token in args.cmdline.split()):
+        sys.exit('wifi_mac already present in cmdline with --wifi-mac-file')
+    args.cmdline = (args.cmdline + ' wifi_mac=@factory').strip()
 tokens = args.cmdline.split()
 for want in args.require_cmd:
     if want not in tokens:
@@ -141,7 +158,10 @@ def add(name, data):
 for name in inputs:
     add(name, blobs[name])
 if args.cmdline:
-    add('cmdline', args.cmdline.encode() + b'\0')
+    cmdline = args.cmdline
+    if factory_mac is not None:
+        cmdline = cmdline.removesuffix('wifi_mac=@factory') + 'wifi_mac=' + factory_mac
+    add('cmdline', cmdline.encode() + b'\0')
 if args.physbase:
     add('physbase', args.physbase.lower().replace('0x', '').encode() + b'\0')
 if args.memsize:
@@ -160,5 +180,8 @@ body += b'\0' * 24
 payload = struct.pack('<II', 0x50554E58, len(body)) + body
 if len(payload) > 0x03700000:
     sys.exit(f'payload: {len(payload)} bytes exceed the loader container limit 57671680')
-open(args.output, 'wb').write(payload)
+with open(args.output, 'wb') as out:
+    if factory_mac is not None:
+        os.fchmod(out.fileno(), 0o600)
+    out.write(payload)
 print(f'{args.output}: {len(payload)} bytes, sha256 {hashlib.sha256(payload).hexdigest()}')
