@@ -190,7 +190,19 @@ IOMobileFramebuffer::hashRows(RowJob * job, unsigned share, unsigned shares)
 		const uint64_t * w = (const uint64_t *) (job->pixels + (size_t) (job->sy + r) * job->stride + (size_t) job->sx * 4);
 		int32_t i = 0;
 		uint64_t h0;
-#if defined(__aarch64__) || defined(__x86_64__)
+#if defined(__aarch64__)
+		/* NEON has no 64-bit integer vector multiply. Keep the four hash streams in integer registers. */
+		const uint64_t prime = 0x100000001b3ULL;
+		uint64_t lane0 = 0xcbf29ce484222325ULL, lane1 = 1, lane2 = 2, lane3 = 3;
+
+		for (; i + 8 <= words; i += 8) {
+			lane0 = (lane0 ^ w[i]) * prime ^ w[i + 2];
+			lane1 = (lane1 ^ w[i + 1]) * prime ^ w[i + 3];
+			lane2 = (lane2 ^ w[i + 4]) * prime ^ w[i + 6];
+			lane3 = (lane3 ^ w[i + 5]) * prime ^ w[i + 7];
+		}
+		h0 = lane0 ^ (lane1 * 3) ^ (lane2 * 5) ^ (lane3 * 7);
+#elif defined(__x86_64__)
 		fb_u64x2 v0 = { 0xcbf29ce484222325ULL, 1ULL };
 		fb_u64x2 v1 = { 2ULL, 3ULL };
 		fb_u64x2 prime = { 0x100000001b3ULL, 0x100000001b3ULL };

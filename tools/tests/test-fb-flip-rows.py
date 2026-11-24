@@ -154,6 +154,25 @@ static void fill_band(MiniIOSurface *s, uint32_t y0, uint32_t y1, uint32_t color
 }
 
 int main(void) {
+#if defined(__aarch64__) || defined(__x86_64__)
+    {
+        /* Two rounds of the four hash streams, then both the 64- and 32-bit tails. */
+        alignas(8) uint32_t pixels[36];
+        for (unsigned i = 0; i < 36; i++) pixels[i] = 0x12340000u + 17u * i;
+        uint64_t value = 0;
+        uint32_t changed = 0;
+        IOMobileFramebuffer test;
+        test.fRowHash = &value;
+        test.fRowChanged = &changed;
+        struct RowJob job = {};
+        job.pixels = (const uint8_t *)pixels;
+        job.stride = sizeof(pixels);
+        job.sw = 35;
+        job.sh = 1;
+        test.hashRows(&job, 0, 1);
+        assert(value == 0x944451ce5f83876bull);
+    }
+#endif
     const uint32_t sw = 76, sh = 162, pw = 72, ph = 160;
     IOMobileFramebuffer fb, ref;
     fb.fWidth = ref.fWidth = sw;
