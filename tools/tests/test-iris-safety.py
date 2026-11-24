@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Compile and test SM8750 Iris VPU (/dev/annibale-iris) and VideoToolbox plugin safety."""
 from pathlib import Path
+import sys
 import re
 import subprocess
 import tempfile
@@ -454,7 +455,8 @@ static OSStatus VTDecoderSessionEmitDecodedFrame(VTDecoderSessionRef s, VTDecode
 static bool sim_dev_exists;
 static uint32_t sim_info_flags;
 static int sim_delay_mode;
-static bool sim_fail_decode, sim_fail_poll, sim_fail_flush, sim_fail_drain;
+static bool sim_fail_decode, sim_fail_poll, sim_fail_flush, sim_fail_drain, sim_unsupported_format;
+static unsigned sim_opened_sessions;
 static uint32_t sim_output_flags, sim_poll_flags, sim_drain_flags;
 static uint64_t sim_output_tag;
 static unsigned sim_decode_calls, sim_flush_calls;
@@ -483,6 +485,7 @@ static int iris_sys_ioctl(int fd, unsigned long cmd, void *arg) {
 	}
 	if (cmd == IRIS_IOC_OPEN_SESSION) {
 		struct iris_session_params *sp = arg;
+		sim_opened_sessions++;
 		sp->session_id = 1;
 		return 0;
 	}
@@ -490,6 +493,7 @@ static int iris_sys_ioctl(int fd, unsigned long cmd, void *arg) {
 		sim_decode_calls++;
 		struct iris_decode_frame *req = arg;
 		if (sim_fail_decode) { errno = EIO; return -1; }
+		if (sim_unsupported_format) { errno = EOPNOTSUPP; return -1; }
 		if ((req->flags & IRIS_FRAME_POLL) != 0) {
 			if (sim_fail_poll) return -1;
 			req->flags = sim_poll_flags;
@@ -654,6 +658,75 @@ static void test_corrupt_outputs(CFTypeRef obj) {
 	assert(iris_vt_finish_delayed_frames(obj) == noErr && emit_calls == 11);
 }
 
+static void test_hevc_format(VTDecoderSessionRef session) {
+	/* Parameter sets and the first access unit of generated 160 x 96 black
+	 * HEVC Main and Main 10 clips, encoded with no user-data SEI. */
+	static const uint8_t main_config[] =
+	    "\x01\x01\x60\x00\x00\x00\x90\x00\x00\x00\x00\x00\x1e\xf0\x00\xfc"
+	    "\xfd\xf8\xf8\x00\x00\x0f\x03\xa0\x00\x01\x00\x18\x40\x01\x0c\x01"
+	    "\xff\xff\x01\x60\x00\x00\x03\x00\x90\x00\x00\x03\x00\x00\x03\x00"
+	    "\x1e\x95\x98\x09\xa1\x00\x01\x00\x29\x42\x01\x01\x01\x60\x00\x00"
+	    "\x03\x00\x90\x00\x00\x03\x00\x00\x03\x00\x1e\xa0\x14\x20\x61\x65"
+	    "\x95\x9a\x49\x32\xbc\x05\xa0\x20\x00\x00\x03\x00\x20\x00\x00\x03"
+	    "\x00\x21\xa2\x00\x01\x00\x07\x44\x01\xc1\x72\xb4\x62\x40";
+	static const uint8_t ten_config[] =
+	    "\x01\x02\x20\x00\x00\x00\x90\x00\x00\x00\x00\x00\x1e\xf0\x00\xfc"
+	    "\xfd\xfa\xfa\x00\x00\x0f\x03\xa0\x00\x01\x00\x18\x40\x01\x0c\x01"
+	    "\xff\xff\x02\x20\x00\x00\x03\x00\x90\x00\x00\x03\x00\x00\x03\x00"
+	    "\x1e\x95\x98\x09\xa1\x00\x01\x00\x2a\x42\x01\x01\x02\x20\x00\x00"
+	    "\x03\x00\x90\x00\x00\x03\x00\x00\x03\x00\x1e\xa0\x14\x20\x61\x36"
+	    "\x59\x59\xa4\x93\x2b\xc0\x5a\x02\x00\x00\x03\x00\x02\x00\x00\x03"
+	    "\x00\x02\x10\xa2\x00\x01\x00\x07\x44\x01\xc1\x72\xb4\x62\x40";
+	static const uint8_t main_frame[] =
+	    "\x00\x00\x00\x1a\x28\x01\xaf\x13\x44\xe8\xe6\x68\xe3\xff\xfd\x17"
+	    "\xcf\xc7\xf6\x40\x2d\x58\x98\xf3\x48\xa6\x3b\x29\x40\xe0";
+	static const uint8_t in_band_frame[] =
+	    "\x00\x00\x00\x18\x40\x01\x0c\x01\xff\xff\x02\x20\x00\x00\x03\x00"
+	    "\x90\x00\x00\x03\x00\x00\x03\x00\x1e\x95\x98\x09\x00\x00\x00\x2a"
+	    "\x42\x01\x01\x02\x20\x00\x00\x03\x00\x90\x00\x00\x03\x00\x00\x03"
+	    "\x00\x1e\xa0\x14\x20\x61\x36\x59\x59\xa4\x93\x2b\xc0\x5a\x02\x00"
+	    "\x00\x03\x00\x02\x00\x00\x03\x00\x02\x10\x00\x00\x00\x07\x44\x01"
+	    "\xc1\x72\xb4\x62\x40\x00\x00\x00\x1a\x28\x01\xaf\x13\x44\xe8\xe6"
+	    "\x68\xe3\xff\xfd\x17\xcf\xc7\xf6\x40\x2d\x58\x98\xf3\x48\xa6\x3b"
+	    "\x29\x40\xe0";
+	for (unsigned i = 0; i < 2; i++) {
+		CMVideoCodecType codec = i ? (CMVideoCodecType)'hev1' : kCMVideoCodecType_HEVC;
+		CFTypeRef decoder = NULL;
+		assert(vt_create_cb(codec, NULL, &decoder) == noErr);
+		const struct iris_cm_vtable *vt = last_created_vtable;
+		struct fake_fmt eight = { .sub = codec, .w = 160, .h = 96, .cfg = { main_config, sizeof(main_config) - 1 } };
+		struct fake_fmt ten = { .sub = codec, .w = 160, .h = 96, .cfg = { ten_config, sizeof(ten_config) - 1 } };
+		unsigned opened = sim_opened_sessions;
+		assert(vt->derived_class->start_session(decoder, session, &ten) == kVTVideoDecoderUnsupportedDataFormatErr);
+		assert(sim_opened_sessions == opened);
+		assert(vt->derived_class->start_session(decoder, session, &eight) == noErr);
+		assert(vt->derived_class->can_accept_format(decoder, &eight));
+		assert(!vt->derived_class->can_accept_format(decoder, &ten));
+		assert(vt->derived_class->reset_format(decoder, session, &ten) == kVTVideoDecoderUnsupportedDataFormatErr);
+		assert(sim_opened_sessions == opened + 1);
+		int outputs = emit_calls;
+		struct fake_sample frame = { main_frame, sizeof(main_frame) - 1, false };
+		assert(vt->derived_class->decode_frame(decoder, (VTDecodeFrameRef)(uintptr_t)1, &frame, 0, NULL) == noErr);
+		assert(emit_calls == outputs + 1 && emitted_images[outputs]);
+		if (codec == (CMVideoCodecType)'hev1') {
+			/* The elementary sample carries its VPS, SPS and PPS before the IDR. */
+			struct fake_fmt in_band = { .sub = codec, .w = 160, .h = 96 };
+			assert(vt->derived_class->start_session(decoder, session, &in_band) == noErr);
+			frame = (struct fake_sample){ in_band_frame, sizeof(in_band_frame) - 1, false };
+		}
+		sim_unsupported_format = true;
+		assert(vt->derived_class->decode_frame(decoder, (VTDecodeFrameRef)(uintptr_t)2, &frame, 0, NULL) == kVTVideoDecoderUnsupportedDataFormatErr);
+		sim_unsupported_format = false;
+		assert(emit_calls == outputs + 2 && emitted_statuses[outputs + 1] == kVTVideoDecoderUnsupportedDataFormatErr);
+		assert(!emitted_images[outputs + 1] && emitted_flags[outputs + 1] == kVTDecodeInfo_FrameDropped);
+		assert(vt->base_class->invalidate(decoder) == noErr);
+		vt->base_class->finalize(decoder);
+		CFRelease(decoder);
+	}
+	assert(cf_live_objects == 0);
+	puts("PASS: hvc1 and hev1 agree on 8-bit playback, Main 10 negotiation, reset and in-band format rejection");
+}
+
 int main(int argc, char **argv) {
 	uintptr_t session_words[4] = { 0x101, 0x202, 0x303, 0 };
 	const uintptr_t original_words[4] = { 0x101, 0x202, 0x303, 0 };
@@ -678,6 +751,11 @@ int main(int argc, char **argv) {
 	sim_info_flags = IRIS_INFO_DEV_PRESENT | IRIS_INFO_FW_PRESENT | IRIS_INFO_HW_READY;
 	register_iris_videotoolbox_decoders();
 	assert(vt_register_calls == 3 && vt_create_cb != NULL);
+	if (argc == 2 && strcmp(argv[1], "hevc-format") == 0) {
+		test_hevc_format(sess);
+		return 0;
+	}
+
 
 	/* 3. Create instance, check vtable versions & UsingHardwareAcceleratedVideoDecoder */
 	CFTypeRef dec_obj = NULL;
@@ -844,6 +922,14 @@ def run_vt(directory: Path, vt_code=None, args=(), label='vt_test') -> subproces
     return subprocess.run([str(binary), *args], capture_output=True, text=True)
 
 
+if __name__ == '__main__' and sys.argv[1:] == ['--hevc-format']:
+    with tempfile.TemporaryDirectory(prefix='iris-hevc-format-') as tmp:
+        result = run_vt(Path(tmp), args=('hevc-format',))
+        if result.returncode:
+            raise SystemExit(result.stderr)
+        print(result.stdout.strip())
+    raise SystemExit(0)
+
 with tempfile.TemporaryDirectory(prefix='iris-safety-') as tmp:
     directory = Path(tmp)
     kernel_text = KERNEL_SRC.read_text()
@@ -869,6 +955,10 @@ with tempfile.TemporaryDirectory(prefix='iris-safety-') as tmp:
         mres = run_kernel(kernel_text.replace(old, new, 1), directory, label)
         assert mres.returncode != 0, label
     print(f'PASS: {len(mutations)} compiled kernel regressions are rejected')
+
+    hevc = run_vt(directory, args=('hevc-format',), label='vt_hevc_format')
+    assert hevc.returncode == 0, hevc.stderr
+    print(hevc.stdout.strip())
 
     vt_res = run_vt(directory)
     assert vt_res.returncode == 0, vt_res.stderr
