@@ -36,7 +36,13 @@ static void key_free(void *bytes)
     if (bytes != NULL) buffer_frees++;
     free(bytes);
 }
-static BOOL rw_stitch_dump_begin(const char *label) { (void)label; return NO; }
+static atomic_uint fallback_dumps;
+static BOOL rw_stitch_dump_begin(const char *label)
+{
+    (void)label;
+    atomic_fetch_add(&fallback_dumps, 1);
+    return NO;
+}
 static void rw_stitch_dump(const char *label, id object, unsigned depth)
 { (void)label; (void)object; (void)depth; }
 static void fixture_print(const char *format, ...) { (void)format; }
@@ -489,8 +495,10 @@ int main(int argc, char **argv)
             [result release]; call_counts(useDescriptor); base.missingHash = NO;
             library.base = nil;
             error = sentinel;
+            unsigned beforeMissing = atomic_load(&fallback_dumps);
             reset_calls(); result = invoke(library, useDescriptor, @"kernel", nil, &error);
             check(result == nil && error == library.failure, "missing base lost native failure");
+            check(atomic_load(&fallback_dumps) == beforeMissing, "missing function reported as a proxy");
             call_counts(useDescriptor);
             library.base = base; library.nativeFunction = native;
         }

@@ -540,16 +540,16 @@ rw_specialize_by_proxy(id function, NSString *name, NSString *specialized, id va
 {
 	id proxy;
 
-	if (cached_bitcode == nil && rw_stitch_dump_begin("a specialization _MTLLibrary refused")) {
-		rw_stitch_dump("descriptor", descriptor, 0);
-		rw_print("stitch: _MTLLibrary said %s; the proxy runs the function with every "
-			 "constant zero\n", why != nil ? [[why description] UTF8String] : "nothing");
-	}
 	if (function == nil) {
 		return nil;
 	}
 	if ([specialized length] == 0 && values == nil && cached_bitcode == nil) {
 		return [function retain];
+	}
+	if (cached_bitcode == nil && rw_stitch_dump_begin("a specialization _MTLLibrary refused")) {
+		rw_stitch_dump("descriptor", descriptor, 0);
+		rw_print("stitch: using the base function and requested constants; _MTLLibrary said %s\n",
+		    why != nil ? [[why description] UTF8String] : "nothing");
 	}
 	proxy = [[AnnibaleMetalSpecializedFunction alloc]
 	    initWithFunction:function name:[specialized length] != 0 ? specialized : name
@@ -618,7 +618,7 @@ rw_library_specialize(id library, SEL _cmd, id descriptor, NSString *name, NSStr
 					if (bc != nil && [bc length] > 0)
 						rw_air_cache_store(cache_key, bc);
 				}
-			} else {
+			} else if (base != nil) {
 				NSString *legacy_key = rw_air_cache_legacy_key(library, name, specialized, values);
 				NSData *cached = rw_air_cache_lookup(legacy_key);
 				function = rw_specialize_by_proxy(base, name, specialized, values,
