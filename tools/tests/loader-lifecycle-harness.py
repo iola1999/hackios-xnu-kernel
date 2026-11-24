@@ -111,6 +111,7 @@ static void flush_log(void) { write_logs(NULL, 0); }
 static volatile uint64_t other_cpu_done, other_cpu_stage;
 enum { CTX_LOG_PA = 0, CTX_KSP = 10 };
 static uint64_t loader_ctx[16];
+static uint64_t kernel_return_intent;
 static uint64_t seconds_since(uint64_t then) { return (clk_now - then) / clk_freq; }
 static int wdt_armed = 1, pets, charger_polls, block_polls, hung_snaps, charger_enabled;
 static void wdt_pet(void) { pets++; seq('W'); }
