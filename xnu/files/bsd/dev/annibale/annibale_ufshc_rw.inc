@@ -556,6 +556,12 @@ ufs_build_sg(buf_t bp, struct ufshc_sg *sg, uint32_t max_segs, uint32_t *out_seg
 		}
 	}
 
+	/* UFSHCI requires DWORD-aligned PRD addresses and lengths. ufs_strategy can use the slot buffer. */
+	for (uint32_t i = 0; i < nsegs; i++) {
+		if ((sg[i].pa | sg[i].len) & 3u) {
+			return EINVAL;
+		}
+	}
 	*out_segs = nsegs;
 	return 0;
 }

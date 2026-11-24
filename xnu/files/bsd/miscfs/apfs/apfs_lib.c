@@ -3043,9 +3043,6 @@ apfs_inflate_fast(struct libdeflate_decompressor *d, const uint8_t *src, size_t 
 	return apfs_inflate_counted(NULL, src, src_len, dst, dst_len, out);
 }
 
-static size_t apfs_last_in;
-static int apfs_last_zerr;
-
 static int
 apfs_inflate_counted(struct apfs_nx *nx, const uint8_t *src, size_t src_len, uint8_t *dst,
     size_t dst_len, size_t *out)
@@ -3081,8 +3078,6 @@ apfs_inflate_counted(struct apfs_nx *nx, const uint8_t *src, size_t src_len, uin
 	}
 	zerr = inflate(&zs, Z_FINISH);
 	*out = (size_t)zs.total_out;
-	apfs_last_in = (size_t)zs.total_in;
-	apfs_last_zerr = zerr;
 	inflateEnd(&zs);
 	if (nx != NULL) {
 		nx->inflate_ticks += apfs_ticks() - t0;
@@ -3857,27 +3852,9 @@ read_cfile_rsrc(struct apfs_vol *vol, const struct apfs_inode *ino,
 				vol->nx->inflate_out += got_len;
 			}
 			if (error) {
-				uint64_t _h = 1469598103934665603ULL;
-				for (size_t _k = 0; _k < plen; _k++) {
-					_h ^= src[_k];
-					_h *= 1099511628211ULL;
-				}
-				printf("apfs: piece %llu read/decode failed (%d): type %u plen %u "
-				    "want %zu got %zu zin %zu zerr %d src %02x %02x %02x %02x poff %llu fnv %llx\n",
+				printf("apfs: piece %llu read/decode failed (%d): type %u plen %u want %zu got %zu poff %llu\n",
 				    (unsigned long long)i, error, cf->type, plen, want, got_len,
-				    apfs_last_in, apfs_last_zerr,
-				    src[0], src[1], src[2], src[3], (unsigned long long)poff,
-				    (unsigned long long)_h);
-				if (plen > 424) {
-					printf("apfs: piece %llu src[400:424]: %02x %02x %02x %02x %02x %02x "
-					    "%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x "
-					    "%02x %02x %02x %02x %02x %02x %02x %02x\n",
-					    (unsigned long long)i,
-					    src[400], src[401], src[402], src[403], src[404], src[405],
-					    src[406], src[407], src[408], src[409], src[410], src[411],
-					    src[412], src[413], src[414], src[415], src[416], src[417],
-					    src[418], src[419], src[420], src[421], src[422], src[423]);
-				}
+				    (unsigned long long)poff);
 				goto out;
 			}
 			if (raw_type) {
