@@ -118,7 +118,7 @@ rw_one_sample(void)
 
 /* Global sync retains the vertex/fragment modules passed to the compiler for failure dumps.
  * Linked graph nodes are separate inputs and are not retained here. Matched sync retains only
- * matching handles and names; it neither copies modules nor enables failure AIR dumps. */
+ * matching handles and names. Vertex replay also retains the selected vertex modules. */
 #define RW_KEPT_PIPELINES 256
 static struct rw_kept_pipeline {
 	const void *render;
@@ -144,8 +144,14 @@ rw_keep_air(const void *render, NSData *vertex, const char *vertex_name, NSData 
 		i++;
 	if (matched && !(vertex_name && strstr(vertex_name, rw_matched_text)) &&
 	    !(fragment_name && strstr(fragment_name, rw_matched_text))) {
-		if (i < rw_kept_count)
-			rw_kept[i] = rw_kept[--rw_kept_count];
+		if (i < rw_kept_count) {
+			[rw_kept[i].vertex release];
+			[rw_kept[i].fragment release];
+			unsigned last = --rw_kept_count;
+			if (i != last)
+				rw_kept[i] = rw_kept[last];
+			memset(&rw_kept[last], 0, sizeof(rw_kept[last]));
+		}
 		goto done;
 	}
 	if (i >= RW_KEPT_PIPELINES) {
@@ -155,7 +161,7 @@ rw_keep_air(const void *render, NSData *vertex, const char *vertex_name, NSData 
 	[rw_kept[i].vertex release];
 	[rw_kept[i].fragment release];
 	rw_kept[i].render = render;
-	rw_kept[i].vertex = matched ? nil : [vertex copy];
+	rw_kept[i].vertex = !matched || getenv("ANNIBALE_REPLAY_VERTEX") != NULL ? [vertex copy] : nil;
 	rw_kept[i].fragment = matched ? nil : [fragment copy];
 	snprintf(rw_kept[i].vertex_name, sizeof(rw_kept[0].vertex_name), "%s",
 		 vertex_name ? vertex_name : "(none)");
@@ -386,6 +392,58 @@ rw_take_matched_draw(AnnibaleMetalWork *work, unsigned commit, unsigned index)
 	rw_print("sync matched: commit %u work %u pipeline %p, %u attempts left; waits for preceding work\n",
 	    commit, index, ((void *(*)(id, SEL))objc_msgSend)(work->render, sel_registerName("render")), rw_matched_left);
 	return true;
+}
+
+/* Called after the preceding GPU work has finished. Preserve bytes from the bound
+ * offset to the end: a sprite index can select records far beyond the first page. */
+static void
+rw_capture_vertex(AnnibaleMetalWork *work, const void *render, unsigned commit, unsigned index)
+{
+	@autoreleasepool {
+		NSMutableDictionary *buffers = [NSMutableDictionary dictionary];
+		NSData *vertex = nil;
+		NSString *entry = nil;
+		pthread_mutex_lock(&rw_kept_lock);
+		for (unsigned i = 0; i < rw_kept_count; i++) {
+			if (rw_kept[i].render == render) {
+				vertex = [[rw_kept[i].vertex retain] autorelease];
+				entry = [NSString stringWithUTF8String:rw_kept[i].vertex_name];
+				break;
+			}
+		}
+		pthread_mutex_unlock(&rw_kept_lock);
+		if (!vertex || !entry) {
+			rw_print("vertex capture: missing module for commit %u work %u\n", commit, index);
+			return;
+		}
+		for (unsigned i = 0; i < work->vertexBufferCount; i++) {
+			id<MTLBuffer> buffer = work->vertexBuffers[i];
+			if (!buffer)
+				continue;
+			const uint8_t *bytes = [buffer contents];
+			size_t offset = work->vertexBufferOffsets[i], size = [buffer length];
+			if (!bytes || offset > size) {
+				rw_print("vertex capture: unreadable buffer %u of commit %u work %u\n", i, commit, index);
+				return;
+			}
+			buffers[[@(i) stringValue]] = [NSData dataWithBytesNoCopy:(void *)(bytes + offset)
+			    length:size - offset freeWhenDone:NO];
+		}
+		NSDictionary *capture = @{@"entry":entry, @"vertex":vertex, @"buffers":buffers,
+		    @"primitive":@(work->primitive), @"indexed":@(work->indexBuffer != nil),
+		    @"start":@(work->vertexStart), @"count":@(work->vertexCount),
+		    @"baseInstance":@(work->baseInstance), @"instances":@(work->instanceCount)};
+		NSString *name = [NSString stringWithFormat:@"rv-%d-%u-%u.plist", getpid(), commit, index];
+		NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:name];
+		NSError *error = nil;
+		NSData *plist = [NSPropertyListSerialization dataWithPropertyList:capture
+		    format:NSPropertyListBinaryFormat_v1_0 options:0 error:&error];
+		if (plist && [plist writeToFile:path options:NSDataWritingAtomic error:&error])
+			rw_print("vertex capture: %lu bytes at %s\n", (unsigned long)[plist length],
+			    [path fileSystemRepresentation]);
+		else
+			rw_print("vertex capture: write failed: %s\n", [[error description] UTF8String]);
+	}
 }
 
 /* No other draw can spend the thumbnail budget while rw_commit_lock is held. */

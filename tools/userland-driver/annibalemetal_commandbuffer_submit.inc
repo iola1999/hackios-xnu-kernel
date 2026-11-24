@@ -214,7 +214,20 @@ static void rw_surface_commit_mark(id texture, unsigned commit);   /* annibaleme
 			continue;
 		}
 		if (work->render != nil) {
-			bool sync = rw_sync_draws() || rw_take_matched_draw(work, commit_count, work_index);
+			bool matched = rw_take_matched_draw(work, commit_count, work_index);
+			bool sync = matched || rw_sync_draws();
+
+			if (matched && getenv("ANNIBALE_REPLAY_VERTEX") != NULL) {
+				/* rw_take_matched_draw requires both synchronization methods. */
+				struct rwa_device *device = [[_queue device] mesaDevice];
+				char reason[256] = {0};
+				if (mesa.flush(device, reason, sizeof(reason)) != 0)
+					rw_print("vertex capture: flush failed: %s\n", reason);
+				else if (mesa.finish(device, reason, sizeof(reason)) != 0)
+					rw_print("vertex capture: preceding work did not finish: %s\n", reason);
+				else
+					rw_capture_vertex(work, [work->render render], commit_count, work_index);
+			}
 			bool sample = !rw_matched_sync() ||
 			    (sync && rw_thumb_group_fits(work, commit_count, work_index));
 			if (sample)
