@@ -296,7 +296,7 @@ AnnibaleGPUUserClient::keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint6
 }
 
 IOReturn
-AnnibaleGPUUserClient::gemNew(struct msm_gem_new * request)
+AnnibaleGPUUserClient::gemNew(struct msm_gem_new * request, uint64_t * iova)
 {
 	uint64_t size = round_page_64(request->size), began = mach_absolute_time();
 	struct gpu_buffer * b;
@@ -350,6 +350,7 @@ AnnibaleGPUUserClient::gemNew(struct msm_gem_new * request)
 			fBufferCount++;
 			fBufferBytes += found->size;
 			request->handle = h + 1;
+			if (iova) *iova = b->address;
 			found->memory = NULL;
 			fKeptBytes -= found->size;
 			gGPUStat.given_again++;
@@ -380,6 +381,7 @@ AnnibaleGPUUserClient::gemNew(struct msm_gem_new * request)
 	if (b != NULL) {
 		b->memory = memory;
 		b->kernel = (uint8_t *) memory->getBytesNoCopy();
+		if (iova) *iova = b->address;
 		gGPUStat.made++;
 		gGPUStat.making += mach_absolute_time() - began;
 		gGPUStat.allocating += allocated - began;

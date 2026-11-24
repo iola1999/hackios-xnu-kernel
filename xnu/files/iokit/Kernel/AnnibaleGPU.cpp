@@ -117,6 +117,11 @@ struct msm_gem_new {
 	uint64_t size;
 	uint32_t flags, handle;
 };
+struct annibale_gem_new {
+	struct msm_gem_new request;
+	uint64_t iova;
+};
+static_assert(sizeof(struct annibale_gem_new) == 24, "GEM_NEW with an address");
 struct msm_gem_info {
 	uint32_t handle, info;
 	uint64_t value;
@@ -649,7 +654,7 @@ class AnnibaleGPUUserClient : public IOUserClient
 	bool keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags);
 	bool dropKept(struct gpu_kept * k);
 	void reap(void);
-	IOReturn gemNew(struct msm_gem_new * request);
+	IOReturn gemNew(struct msm_gem_new * request, uint64_t * iova);
 	IOReturn surfaceBuffer(struct annibale_surface * request);
 	IOReturn memoryBuffer(struct annibale_memory * request);
 	IOReturn gemInfo(struct msm_gem_info * request);
@@ -861,7 +866,7 @@ AnnibaleGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 {
 	union {
 		struct msm_param param;
-		struct msm_gem_new gemNew;
+		struct annibale_gem_new gemNew;
 		struct msm_gem_info gemInfo;
 		struct msm_gem_cpu_prep cpuPrep;
 		struct msm_gem_submit submit;
@@ -916,7 +921,7 @@ AnnibaleGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 	case kMsmSubmitQueueClose:
 		break;
 	case kMsmGemNew:
-		ret = gemNew(&r.gemNew);
+		ret = gemNew(&r.gemNew.request, size == sizeof(r.gemNew) ? &r.gemNew.iova : NULL);
 		break;
 	case kMsmGemInfo:
 		ret = gemInfo(&r.gemInfo);
