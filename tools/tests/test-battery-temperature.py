@@ -76,6 +76,7 @@ static OSObject false_object, true_object;
 class AnnibaleBattery {
 public:
     void number(const char *, long long);
+    void dicts(int32_t);
     void report(const annibale_battery_state *);
     void flag(const char *, bool) {}
     void object(const char *, OSObject *) {}
@@ -88,6 +89,8 @@ public:
 };
 ''' + "\nvoid\n" + function(iokit, "AnnibaleBattery::number")
     code += "\nstatic unsigned\n" + function(iokit, "family_code")
+    if "AnnibaleBattery::dicts(" in iokit:
+        code += "\nvoid\n" + function(iokit, "AnnibaleBattery::dicts")
     code += "\nvoid\n" + function(iokit, "AnnibaleBattery::report")
     code += r'''
 static annibale_battery_state published;
