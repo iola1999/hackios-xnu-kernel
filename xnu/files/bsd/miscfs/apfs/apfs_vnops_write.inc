@@ -323,6 +323,16 @@ apfs_has_decmpfs(struct apfs_mount *am, struct apfs_node *an)
 	return magic == APFS_DECMPFS_MAGIC;
 }
 
+static int
+apfs_sync_pages(vnode_t vp, bool wait)
+{
+	if (!vnode_isreg(vp)) {
+		return 0;
+	}
+	off_t size = ubc_getsize(vp);
+	return size > 0 ? ubc_msync(vp, 0, size, NULL, UBC_PUSHDIRTY | (wait ? UBC_SYNC : 0)) : 0;
+}
+
 /* fsync(2): the file's pages on the device, and a commit if anything of it is not committed. */
 static int
 apfs_vnop_fsync(struct vnop_fsync_args *ap)
@@ -335,8 +345,9 @@ apfs_vnop_fsync(struct vnop_fsync_args *ap)
 	if (apfs_wtx_of(am) == NULL) {
 		return 0;
 	}
-	if (vnode_isreg(vp) && ubc_getsize(vp) > 0) {
-		(void)ubc_msync(vp, 0, ubc_getsize(vp), NULL, UBC_PUSHDIRTY | (wait ? UBC_SYNC : 0));
+	int error = apfs_sync_pages(vp, wait);
+	if (error != 0) {
+		return error;
 	}
 	return wait && an->an_wseq > apfs_wcommits(am) ? apfs_wcommit(am, false, an->an_wseq, APFS_WHY_FSYNC) : 0;
 }
@@ -381,8 +392,9 @@ apfs_vnop_ioctl(struct vnop_ioctl_args *ap)
 		if (w == NULL) {
 			return 0;
 		}
-		if (vnode_isreg(vp) && ubc_getsize(vp) > 0) {
-			(void)ubc_msync(vp, 0, ubc_getsize(vp), NULL, UBC_PUSHDIRTY | UBC_SYNC);
+		int error = apfs_sync_pages(vp, true);
+		if (error != 0) {
+			return error;
 		}
 		return apfs_wflush(am);
 	case FSIOC_CAS_BSDFLAGS: {
