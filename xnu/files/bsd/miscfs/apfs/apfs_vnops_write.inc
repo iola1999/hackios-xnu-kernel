@@ -133,18 +133,22 @@ apfs_vnop_write(struct vnop_write_args *ap)
 	off_t old, end, size;
 
 	if (w == NULL) {
+		printf("apfs: write ino %llu refused: no write transaction (EROFS)\n", an->an_id);
 		return EROFS;
 	}
 	if (!vnode_isreg(vp)) {
+		printf("apfs: write ino %llu refused: not a regular file\n", an->an_id);
 		return vnode_isdir(vp) ? EISDIR : EPERM;
 	}
 	if (uio_offset(uio) < 0) {
+		printf("apfs: write ino %llu refused: negative offset\n", an->an_id);
 		return EINVAL;
 	}
 	if (resid == 0) {
 		return 0;
 	}
 	if (an->an_ino.bsd_flags & UF_COMPRESSED) {
+		printf("apfs: write ino %llu refused: UF_COMPRESSED (EPERM)\n", an->an_id);
 		return EPERM;                   /* decmpfs contents are never rewritten here */
 	}
 	lck_rw_lock_exclusive(&an->an_rwlock);
@@ -185,6 +189,11 @@ apfs_vnop_write(struct vnop_write_args *ap)
 	}
 out:
 	lck_rw_unlock_exclusive(&an->an_rwlock);
+	if (error) {
+		printf("apfs: write ino %llu resid %lld ioflag 0x%x failed: %d (free %llu)\n",
+		    an->an_id, (long long)resid, ioflag, error,
+		    (unsigned long long)apfs_wtx_free_blocks(w));
+	}
 	return error;
 }
 
@@ -635,6 +644,8 @@ static int
 apfs_vnop_open(struct vnop_open_args *ap)
 {
 	if ((ap->a_mode & (FWRITE | O_TRUNC)) && apfs_wtx_of(APFS_VP_MOUNT(ap->a_vp)) == NULL) {
+		printf("apfs: open ino %llu for write refused: no write transaction (EROFS)\n",
+		    APFS_VP(ap->a_vp)->an_id);
 		return EROFS;
 	}
 	return 0;
