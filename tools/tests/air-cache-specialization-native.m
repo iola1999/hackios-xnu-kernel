@@ -60,6 +60,8 @@ static BOOL different(NSString *left, NSString *right)
 }
 
 @interface CacheFunction : NSObject { uint8_t _hash[32]; atomic_uint _reads; }
+@property MTLFunctionType functionType;
+@property(copy) NSDictionary *functionConstantsDictionary;
 @property BOOL missingHash;
 @property BOOL throwBitcode;
 @property(retain) NSData *bytes;
@@ -87,7 +89,7 @@ static BOOL different(NSString *left, NSString *right)
 }
 - (unsigned)reads { return atomic_load(&_reads); }
 - (void)dealloc
-{ [_bytes release]; atomic_fetch_sub(&live_functions, 1); [super dealloc]; }
+{ [_functionConstantsDictionary release]; [_bytes release]; atomic_fetch_sub(&live_functions, 1); [super dealloc]; }
 @end
 
 @interface SerializedValues : NSObject <NSCopying>
@@ -466,6 +468,21 @@ int main(int argc, char **argv)
             [result release]; call_counts(useDescriptor);
             check([base retainCount] == heldBase, "uncached proxy leaked base");
 
+            if (!useDescriptor) {
+                base.functionType = MTLFunctionTypeVisible;
+                base.functionConstantsDictionary = @{};
+                reset_calls(); result = invoke(library, NO, @"kernel", values, &error);
+                check(result == base && [base retainCount] == heldBase + 1,
+                      "constant-free visible function did not return its retained base");
+                call_counts_hit();
+                [result release];
+                base.functionConstantsDictionary = @{@"gain": @1};
+                reset_calls(); result = invoke(library, NO, @"kernel", values, &error);
+                call_counts(NO);
+                [result release];
+                base.functionType = MTLFunctionTypeKernel;
+                base.functionConstantsDictionary = nil;
+            }
             base.missingHash = YES;
             reset_calls(); result = invoke(library, useDescriptor, @"kernel", nil, &error);
             check(result == base && [base retainCount] == heldBase + 1, "direct fallback ownership changed");

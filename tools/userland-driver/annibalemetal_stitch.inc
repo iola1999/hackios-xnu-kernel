@@ -580,6 +580,13 @@ rw_library_specialize(id library, SEL _cmd, id descriptor, NSString *name, NSStr
 			base = name != nil
 			    ? rw_library_function_with_name(library, @selector(newFunctionWithName:), name)
 			    : nil;
+			/* A visible function with no declared constants already has its final
+			 * body. A descriptor may request a new name or compiler options. */
+			if (descriptor == nil && [base functionType] == MTLFunctionTypeVisible) {
+				NSDictionary *declared = [base functionConstantsDictionary];
+				if (declared != nil && declared.count == 0)
+					return [base retain];
+			}
 			cache_key = rw_air_cache_key(base, name, specialized, values, descriptor);
 			NSData *cached = cache_key != nil ? rw_air_cache_lookup(cache_key) : nil;
 			if (cached != nil) {
