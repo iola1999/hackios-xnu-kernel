@@ -336,6 +336,7 @@ public:
 	MiniIOSurface * defaultSurface(void);
 	void present(const uint8_t * swap);
 	void show(const uint8_t * swap, MiniIOSurface ** surfaces);
+	void finishSwapLocked();
 	void presenter(void);
 	static void presenterMain(void * self, wait_result_t result);
 	void settle(const uint8_t * swap, MiniIOSurface ** surfaces);
@@ -762,6 +763,14 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 	IOLockUnlock(fSwapLock);
 }
 
+void
+IOMobileFramebuffer::finishSwapLocked()
+{
+	fSwapFirst = (fSwapFirst + 1) % SWAP_QUEUE;
+	fSwapsWaiting--;
+	IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
+}
+
 /* A swap's surfaces onto the panel, once the GPU is done with them. */
 void
 IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
@@ -799,9 +808,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			    "the GPU has stopped; the panel keeps its last frame\n", swapWord(swap, SWAP_ID));
 		}
 		IOLockLock(fSwapLock);
-		fSwapFirst = (fSwapFirst + 1) % SWAP_QUEUE;
-		fSwapsWaiting--;
-		IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
+		finishSwapLocked();
 		IOLockUnlock(fSwapLock);
 		return;
 	}
@@ -833,6 +840,20 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	}
 	copy_began = began;
 	IOLockLock(fLock);
+	uint8_t * target;
+	while ((target = flip_target(fBase)) == NULL) {
+		IOLockUnlock(fLock);
+		IOLockLock(fSwapLock);
+		if (fSwapsWaiting > 1) {
+			fStatLost++;
+			finishSwapLocked();
+			IOLockUnlock(fSwapLock);
+			return;
+		}
+		IOLockUnlock(fSwapLock);
+		IOLockLock(fLock);
+	}
+	fBase = target;
 	report = fSwapsShown < 8;
 	fSingleLayer = swapWord(swap, SWAP_SURFACE(0)) != 0;
 	for (unsigned layer = 1; layer < SWAP_LAYERS; layer++) {
@@ -846,7 +867,6 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		    swapWord(swap, SWAP_ID), fSwapsShown, swapWord(swap, SWAP_SURFACE(0)), swapWord(swap, SWAP_SURFACE(1)),
 		    swapWord(swap, SWAP_SURFACE(2)), swapWord(swap, SWAP_SURFACE(3)), set, swapWord(swap, SWAP_LAYERS_CLEARED));
 	}
-	fBase = flip_target(fBase);
 	fLastBy0 = fLastBy1 = -1;
 	fLastBufSeqBefore = fLastBufSeqAfter = fBufferSeq[flip.ready ? (flip.shown ^ 1) : 0];
 	fLastAllDirty = false;
@@ -942,9 +962,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	}
 	/* its pixels copied (and recorded): the swap after it may be handed over */
 	IOLockLock(fSwapLock);
-	fSwapFirst = (fSwapFirst + 1) % SWAP_QUEUE;
-	fSwapsWaiting--;
-	IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
+	finishSwapLocked();
 	IOLockUnlock(fSwapLock);
 	fSwapsShown++;
 	annibale_frames_shown = fSwapsShown;      /* (kern.annibale.frames: what a control run watches) */

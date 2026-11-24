@@ -172,9 +172,14 @@ IOMobileFramebuffer::settle(const uint8_t * swap, MiniIOSurface ** surfaces)
 		return;
 	}
 	IOLockLock(fLock);
+	uint8_t * target = flip_target(fBase);
+	if (target == NULL) {
+		IOLockUnlock(fLock);
+		return;
+	}
+	fBase = target;
 	fSettling = true;
 	fRowHashRows = 0;
-	fBase = flip_target(fBase);
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 		MiniIOSurface * s = surfaces[layer];
 		int32_t src[4], dst[4];

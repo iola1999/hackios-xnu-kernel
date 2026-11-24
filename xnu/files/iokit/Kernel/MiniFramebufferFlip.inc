@@ -360,6 +360,7 @@ flip_target(uint8_t * base)
 	}
 	if (flip.pending && !flip_taken(40000, true)) {
 		flip.late++;
+		return NULL;
 	}
 	flip.pending = false;
 	return flip.va[flip.shown ^ 1];
@@ -419,14 +420,22 @@ extern "C" void
 MiniIOMobileFramebufferQuiesce(void)
 {
 	dim_quiesce();
-	if (!flip.ready || flip.shown == 0) {
+	if (!flip.ready) {
 		loader_set_scanout_pa(0);
 		return;
 	}
-	flip_taken(40000, false);
-	memcpy(flip.va[0], flip.va[1], flip.bytes);
-	flip_point(0);
-	flip_taken(40000, false);
+	bool accepted = !flip.pending || flip_taken(40000, false);
+	if (flip.shown == 1 && accepted) {
+		memcpy(flip.va[0], flip.va[1], flip.bytes);
+	}
+	if (flip.shown == 1 || !accepted) {
+		/* Request A even if the previous flush timed out. Both buffers are
+		 * reserved across handoff, and A may still be scanned in that case. */
+		flip_point(0);
+		if (!flip_taken(40000, false)) {
+			IOLog("MiniIOMobileFramebuffer: boot framebuffer flush still pending at handoff\n");
+		}
+	}
 	loader_set_scanout_pa(0);
 	flip.ready = false;
 }

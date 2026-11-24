@@ -11,7 +11,7 @@ FLIP = ROOT / "xnu/files/iokit/Kernel/MiniFramebufferFlip.inc"
 
 def function(source, name):
     marker = source.index(f"\n{name}(")
-    start = source.rfind("\nstatic ", 0, marker) + 1
+    start = source.rfind("\n", 0, marker) + 1
     brace = source.index("{", marker)
     depth = 0
     for at in range(brace, len(source)):
@@ -31,6 +31,8 @@ routines = "\n\n".join([
     function(flip, "flip_note_taken"),
     function(flip, "flip_taken"),
     function(flip, "flip_latch"),
+    function(flip, "flip_target"),
+    function(flip, "MiniIOMobileFramebufferQuiesce").replace('extern "C"', "static"),
 ])
 
 test = r'''
@@ -38,6 +40,8 @@ test = r'''
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
+#define IOLog(...) ((void)0)
 
 #define FLIP_CTL(n) (0x15000u + 0x1000u * (n))
 #define FLIP_CTL_FLUSH 0x018u
@@ -47,7 +51,10 @@ test = r'''
 static struct {
     uint32_t ctl, flush, intf, pending_swap, taken_frame;
     uint64_t taken;
-    bool taken_valid;
+    bool taken_valid, ready, pending;
+    uint64_t late;
+    unsigned shown, bytes;
+    uint8_t *va[2];
 } flip;
 static uint64_t now_ticks;
 static uint32_t hardware_flush, hardware_frame;
@@ -67,6 +74,9 @@ static uint32_t flip_rd(uint32_t off)
     return hardware_flush;
 }
 
+static void dim_quiesce(void) {}
+static void loader_set_scanout_pa(uint64_t pa) { (void)pa; }
+static void flip_point(int which) { flip.shown = which; }
 ''' + routines + r'''
 
 static void reset(void)
@@ -83,6 +93,36 @@ int main(void)
     /* 19.2 MHz: 19200 ticks are 1 ms. The production helper must convert absolute time, then divide ns by 1000. */
     assert(micros(19200) == 1000);
     assert(micros(19) == 0 && micros(20) == 1);
+
+    uint8_t front, back;
+    reset();
+    flip.ready = true;
+    flip.pending = true;
+    flip.shown = 1;
+    flip.va[0] = &front;
+    flip.va[1] = &back;
+    flip.pending_swap = 17;
+    assert(flip_target(&back) == NULL);
+    assert(flip.pending && flip.late == 1 && flip.pending_swap == 17);
+    clear_after = 2;
+    assert(flip_target(&back) == &front);
+    assert(!flip.pending && flip.taken_valid && flip.pending_swap == 17);
+
+    /* A confirmed B may be copied to A. A still-pending B leaves A intact. */
+    for (unsigned accepted = 0; accepted <= 1; accepted++) {
+        reset();
+        front = 11;
+        back = 22;
+        flip.ready = flip.pending = true;
+        flip.shown = 1;
+        flip.bytes = 1;
+        flip.va[0] = &front;
+        flip.va[1] = &back;
+        if (accepted) clear_after = 1;
+        MiniIOMobileFramebufferQuiesce();
+        assert(front == (accepted ? 22 : 11));
+        assert(flip.shown == 0 && !flip.ready);
+    }
 
     reset();
     flip.pending_swap = 77;
