@@ -117,8 +117,33 @@ static int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo,
     *answer = named("auth_firmware_fail") ? 7 : 0;
     return named("auth_transport_fail") ? -1 : 0;
 }
+static unsigned noc_acks, bridge_step, domains_off;
+static uint32_t last_request;
+
 static uint32_t mmio_r32(vm_offset_t base, uint32_t off)
 {
+    if (base == 2) {
+        if (off == VIDCC_MVS0_GDSCR + 4 || off == VIDCC_MVS0C_GDSCR + 4) {
+            unsigned bit = off == VIDCC_MVS0_GDSCR + 4 ? 1 : 2;
+            if (domains_off & bit)
+                return named("domain_timeout") ? 0 : (1u << 15);
+            return 1u << 16;
+        }
+        return 0;
+    }
+    if (base == 3) {
+        assert(stage == 2 && shutdown_calls == 1);
+        if (off == 0xb0080) return 2;
+        if (off == 0xb0088 && named("clock_invalid")) return UINT32_MAX;
+        if (off >= 0x70 && off <= 0x7c)
+            return named("pipe_busy") && off == 0x7c ? 0 : (1u << 22);
+        if (off == 0xe0004 || off == 0xb0060 || off == 0xe0030) {
+            assert(last_request == off - 4);
+            if (named("noc_timeout") && off == 0xe0030) return 2;
+            return 1;
+        }
+        return 0;
+    }
     assert(base == 1 && off < 0x100000u && (off & 3u) == 0);
     if (off == (128u + 81u) * 4096u + 0x7f4u) {
         tlb_reads++;
@@ -129,6 +154,29 @@ static uint32_t mmio_r32(vm_offset_t base, uint32_t off)
 }
 static void mmio_w32(vm_offset_t base, uint32_t off, uint32_t value)
 {
+    if (base == 2) {
+        assert((value & 1) && stopped && stage == 2);
+        if (off == VIDCC_MVS0_GDSCR) {
+            assert(noc_acks == 1 && bridge_step == 3);
+            domains_off |= 1;
+        } else {
+            assert(off == VIDCC_MVS0C_GDSCR && noc_acks == 3 && domains_off == 1);
+            domains_off |= 2;
+        }
+        return;
+    }
+    if (base == 3) {
+        assert(stopped && stage == 2);
+        assert(!(off == 0xb0088 && named("clock_invalid")));
+        if (off == 0xa0160) {
+            const unsigned order[] = {3, 2, 0};
+            assert(bridge_step < 3 && value == order[bridge_step++]);
+        } else if (off == 0xe0000 || off == 0xb005c || off == 0xe002c) {
+            last_request = off;
+            if (value == 0 && !(off == 0xe002c && named("noc_timeout"))) noc_acks++;
+        }
+        return;
+    }
     assert(stopped == 1 && base == 1 && off < 0x100000u && (off & 3u) == 0);
     if (shutdown_calls) assert(stage == 2);
     mmio_writes++;
@@ -139,7 +187,13 @@ static void mmio_w32(vm_offset_t base, uint32_t off, uint32_t value)
         (named("sctlr_rejected") && off == 209u * 4096u)) return;
     registers[off / 4u] = value;
 }
-void iris_sleep_us(uint32_t us) { assert(us == 2); sleeps++; }
+void iris_sleep_us(uint32_t us)
+{
+    if (us == 2) sleeps++;
+    else assert(us == 10 || us == 200 || us == 2000);
+}
+
+#include "annibale_iris_poweroff.inc"
 
 __HW_FUNCTIONS__
 
@@ -197,6 +251,11 @@ int main(int argc, char **argv)
     registers[0x830u / 4u] = 0x80001947u;
     registers[0xc2cu / 4u] = registers[0xc30u / 4u] = 0x351u;
     registers[209u * 4096u / 4u] = 0x27u;
+    bool expect_power_off = named("power_off");
+    if (expect_power_off || named("clock_invalid") || named("pipe_busy") || named("noc_timeout") || named("domain_timeout")) {
+        g_iris.vidcc = 2;
+        g_iris.mmio = 3;
+    }
     bool expected = true;
     if (named("never_started") || named("camera_unquiesced")) {
         g_iris.pas_shutdown_required = g_iris.pas_authed = false;
@@ -245,13 +304,14 @@ int main(int argc, char **argv)
         assert(g_iris.pas_shutdown_required == want_shutdown);
         assert(g_iris.dma_shutdown_unconfirmed == want_shutdown);
     }
-    bool want_dma_retained = g_iris.dma_shutdown_unconfirmed || want_shutdown;
+    bool want_dma_retained = (g_iris.dma_shutdown_unconfirmed || want_shutdown) && !expect_power_off;
     bool want_cam_retained = named("camera_unquiesced");
     bool want_normal_return = expected && !want_dma_retained && !want_cam_retained;
     bool original_required = g_iris.pas_shutdown_required;
     memcpy(initial, registers, sizeof(registers));
     loader_return();
     assert(stopped == 1 && save_calls == 1 && display_calls == 1);
+    if (expect_power_off) assert(domains_off == 3 && noc_acks == 3);
     assert(return_reason == (want_normal_return ? 0u : 3u));
     assert(return_code == (want_normal_return ? 0u : (want_cam_retained ? 10u : 9u)));
     assert(shutdown_calls == (want_shutdown ? 1u : 0u));
@@ -306,7 +366,7 @@ CASES = ['never_started', 'smmu_only', 'pending_auth', 'authed_only', 'success',
          'wrong_route', 'bad_mapping', 'bad_geometry', 'sctlr_invalid',
          'sctlr_rejected', 'tlb_timeout', 'tlb_delayed', 'auth_success',
          'auth_init_fail', 'auth_mem_fail', 'auth_transport_fail', 'auth_firmware_fail',
-         'camera_unquiesced']
+         'camera_unquiesced', 'power_off', 'pipe_busy', 'noc_timeout', 'domain_timeout', 'clock_invalid']
 
 
 def function(source, name):
@@ -385,9 +445,9 @@ def verify(args, directory):
         name = 'auth_request_unrecorded'
         results['variants'][name] = run(args.source_root, modified, returning, directory / name)
         if all(c['passed'] for c in results['variants'][name]): failures.append(name + '_accepted')
-        old = 'loader_jump((iris_quiesced && cam_quiesced) ? 0 : 3,\n\t    !iris_quiesced ? 9 : (cam_quiesced ? 0 : 10));'
+        old = 'loader_jump((iris_quiesced && cam_quiesced && modem_quiesced) ? 0 : 3,\n\t    !iris_quiesced ? 9 : (!cam_quiesced ? 10 : (modem_quiesced ? 0 : 4)));'
         if returning.count(old) != 1: raise AssertionError('Loader reason boundary changed')
-        modified = returning.replace(old, '(void)iris_quiesced; (void)cam_quiesced; loader_jump(0, 0);')
+        modified = returning.replace(old, '(void)iris_quiesced; (void)cam_quiesced; (void)modem_quiesced; loader_jump(0, 0);')
         name = 'discard_resource_failure'
         results['variants'][name] = run(args.source_root, hardware, modified, directory / name)
         if all(c['passed'] for c in results['variants'][name]): failures.append(name + '_accepted')

@@ -974,6 +974,8 @@ iris_smmu_return_quiesce(void)
 	return false;
 }
 
+#include "annibale_iris_poweroff.inc"
+
 bool annibale_iris_return_quiesce(void);
 
 bool
@@ -988,8 +990,12 @@ annibale_iris_return_quiesce(void)
 		}
 		g_iris.pas_shutdown_required = false;
 		g_iris.pas_authed = false;
-		g_iris.hw_ready = false;
 		iris_say("PAS 9 shutdown succeeded\n");
+		if (iris_return_power_off()) {
+			g_iris.dma_shutdown_unconfirmed = false;
+			iris_say("return confirmed four idle pipes, NoC acknowledgements and both power domains off\n");
+		}
+		g_iris.hw_ready = false;
 	}
 	if (!iris_smmu_return_quiesce()) {
 		iris_say("return retains resources: SMMU shutdown unconfirmed\n");
