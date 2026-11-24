@@ -468,7 +468,7 @@ cam_native_apply_exposure_regs(bool force)
  * goes off.
  */
 #define OVX8000_LENS_STEP       64u
-#define OVX8000_LENS_STEP_US    3000u
+#define OVX8000_LENS_STEP_US    10800u  /* GT9764V AAC3: 9.8 ms with 0x06=0x40, 0x07=7, plus 1 ms settling margin. */
 
 static bool cam_native_lens_ready;
 
