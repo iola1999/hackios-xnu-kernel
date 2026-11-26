@@ -1,6 +1,70 @@
 /* Commit execution retains the existing work order and completion path. */
 static void rw_surface_commit_mark(id texture, unsigned commit);   /* annibalemetal_completion.inc */
 
+/*
+ * GPU YIELDING, the submission half (the grid cutting is the encoder's half,
+ * annibalemetal_compute_argencoder.inc; rw_gpu_yield in annibalemetal_diag.inc says what
+ * the pair is for, with the measurements). The kernel's context queue is first-in
+ * first-out and a submission in execution cannot be interrupted, so a piece only bounds
+ * the compositor's wait if the queue in front of it is short. This is the shortness: a
+ * commit that paces waits for the piece it last handed over before it hands over the next
+ * one, so at most one piece of this process is ever in the queue or in execution, and a
+ * compositor submission landing meanwhile starts behind that one piece rather than behind
+ * the whole commit. The fence carries across commits, because the camera's chain is one
+ * dispatch a commit as often as it is several: the first piece of the next commit waits
+ * for the last piece of this one exactly as the pieces inside it do.
+ *
+ * The wait holds rw_commit_lock, so a second commit of this process lines up behind the
+ * whole paced commit rather than behind one piece of it. That is the price the shape
+ * already paid before yielding (the one flush of a commit serialised the same way) plus
+ * the piece round trips, and it is only paid by a process whose commit is both large and
+ * compute-only -- the compositor's own commits carry draws and never pace. The fence
+ * itself completes off the kernel's interrupt path, so nothing the lock holds back can be
+ * part of what the wait is for.
+ *
+ * One fence reference is held here between commits. It is released when the next paced
+ * flush replaces or consumes it, and the last one of a process simply stays: one fence.
+ */
+static struct rwa_fence *rw_yield_fence;
+static struct rwa_device *rw_yield_fence_device;
+
+/* Waits out the piece handed over last, if the wait is for this device at all, and
+ * answers how long it took. A fence that does not signal is the GPU stuck, which the
+ * completion path reports for its own waits; here the piece boundary is simply lost and
+ * the commit goes on, no worse than before yielding. */
+static uint64_t
+rw_yield_wait(struct rwa_device *device)
+{
+	uint64_t began;
+
+	if (rw_yield_fence == NULL || rw_yield_fence_device != device) {
+		return 0;
+	}
+	began = rw_now_us();
+	if (mesa.fence_wait(device, rw_yield_fence) != 0) {
+		rw_print("yield: a piece's fence did not signal in time; the pieces of "
+		         "this commit go on without the boundary\n");
+	}
+	mesa.fence_release(device, rw_yield_fence);
+	rw_yield_fence = NULL;
+	rw_yield_fence_device = NULL;
+	return rw_now_us() - began;
+}
+
+/* Adopts the fence of the flush just made as the piece the next flush waits for. The
+ * reference is the take's own, independent of the one the completion thread holds. */
+static void
+rw_yield_adopt(struct rwa_device *device)
+{
+	struct rwa_fence *fence = mesa.fence_take(device);
+
+	if (rw_yield_fence != NULL) {
+		mesa.fence_release(rw_yield_fence_device, rw_yield_fence);
+	}
+	rw_yield_fence = fence;
+	rw_yield_fence_device = fence != NULL ? device : NULL;
+}
+
 - (void)commit
 {
 	char why[512] = { 0 };
@@ -164,6 +228,36 @@ static void rw_surface_commit_mark(id texture, unsigned commit);   /* annibaleme
 
 	unsigned work_index = 0;
 	NSMutableArray *rgb2pOpen = nil;
+
+	/* Whether this commit paces (the rw_yield_* notes above): it does when it carries no
+	 * draw at all and its compute dispatches total at least the size one piece is cut at.
+	 * A draw in the mix is the compositor's shape of commit, which is exactly the work
+	 * the yield makes room for; pacing it would be the yield backwards. The total is over
+	 * the pieces of cut dispatches as they are recorded, which sums back to the grid
+	 * they were cut from. */
+	struct rwa_device *yield_device = [[_queue device] mesaDevice];
+	BOOL pacing = rw_gpu_yield() && mesa.flush != NULL && mesa.fence_take != NULL &&
+	    mesa.fence_wait != NULL && mesa.fence_release != NULL;
+	uint64_t commit_threads = 0, yield_waited_us = 0;
+	unsigned yield_flushes = 0;
+
+	if (pacing) {
+		for (AnnibaleMetalWork *scan in _work) {
+			if (scan->render != nil) {
+				pacing = NO;
+				break;
+			}
+			if (scan->copyKind == RW_COPY_NONE && scan->pipeline != nil) {
+				uint64_t t = 1;
+
+				for (unsigned i = 0; i < 3; i++) {
+					t *= (uint64_t)scan->groups[i] * scan->size[i];
+				}
+				commit_threads += t;
+			}
+		}
+		pacing = pacing && commit_threads >= RW_YIELD_THREADS;
+	}
 
 	rw_thumb_commit(_work, commit_count);
 	rw_audit_commit_begin(_work, commit_count);
@@ -349,6 +443,19 @@ static void rw_surface_commit_mark(id texture, unsigned commit);   /* annibaleme
 			[self failWith:why];
 			goto done;
 		}
+		/* One dispatch is one piece: hand it over before encoding the next, and wait for
+		 * the piece before it first (rw_yield_wait). The encode of the next dispatch
+		 * happens ahead of that wait, so what the GPU idles between pieces is the wake
+		 * and the flush rather than the encoding. An open RGB2P pass is not a boundary
+		 * the batch may break at, so the piece goes on until it closes. */
+		if (pacing && [rgb2pOpen count] == 0) {
+			char piece_why[256] = { 0 };
+
+			yield_waited_us += rw_yield_wait(yield_device);
+			mesa.flush(yield_device, piece_why, sizeof(piece_why));
+			rw_yield_adopt(yield_device);
+			yield_flushes++;
+		}
 	}
 	if (rw_sync_draws() && rw_thumbs_wanted(commit_count) && !rw_thumb_draws) {
 		NSMutableSet *seen = [NSMutableSet set];
@@ -416,10 +523,19 @@ done:
 		 * enough to be a missed frame says its own length when it returns. */
 		commit_phase = 1;
 		commit_progress_us = rw_now_us();
+		if (pacing) {
+			yield_waited_us += rw_yield_wait(yield_device);
+		}
 		mesa.flush([[_queue device] mesaDevice], flushed, sizeof(flushed));
 		/* Retain this submission before another commit or finish changes pending. */
 		if (mesa.fence_take != NULL) {
 			submission_fence = mesa.fence_take([[_queue device] mesaDevice]);
+		}
+		/* The carry for the next commit's first piece: this commit's last piece, which a
+		 * non-pacing commit in between leaves untouched. A second take of the same
+		 * fence, owned apart from the completion thread's. */
+		if (pacing) {
+			rw_yield_adopt(yield_device);
 		}
 		/* A texture over a buffer the library could not lay over the buffer's memory is a copy
 		 * (rwa_texture_from_buffer); what this command buffer wrote into one goes back into the
@@ -496,9 +612,16 @@ done:
 		uint64_t us = rw_ticks_us(mach_absolute_time() - started);
 
 		if (us > RW_COMMIT_SLOW_US) {
-			rw_print("commit %u took %llu ms over %lu recorded works\n", commit_count,
+			rw_print("commit %u took %llu ms over %lu recorded works%s\n", commit_count,
 			         (unsigned long long)(us / 1000),
-			         (unsigned long)[_work count]);
+			         (unsigned long)[_work count],
+			         pacing ? " (paced)" : "");
+		}
+		if (pacing) {
+			rw_print("yield: commit %u: %u piece flushes over %llu threads, "
+			         "%llu ms of piece waits in it\n", commit_count, yield_flushes,
+			         (unsigned long long)commit_threads,
+			         (unsigned long long)(yield_waited_us / 1000));
 		}
 	}
 }

@@ -128,17 +128,15 @@
 	}
 }
 
-- (void)dispatchThreadgroups:(MTLSize)groups threadsPerThreadgroup:(MTLSize)size
+/* Records one dispatch of `groups` threadgroups of `size` threads. `counts` is the 12-word
+ * grid-split description of -dispatchThreads's partial threadgroups (first group, nominal
+ * size, grid threads, grid groups -- struct rwa_grid_split in tools/mesa/air/air_metal.h),
+ * or NULL for a grid that starts at group zero with nothing to report. */
+- (void)recordDispatchGroups:(MTLSize)groups threadsPerThreadgroup:(MTLSize)size
+		 splitCounts:(const unsigned *)counts
 {
-	if (_ended) return;
 	AnnibaleMetalWork *work = [[AnnibaleMetalWork alloc] init];
 
-	if (_pipeline == nil || _complained) {
-		rw_print("this dispatch has %s and is dropped\n",
-		         _pipeline == nil ? "no pipeline state" : "a binding this driver refused");
-		[work release];
-		return;
-	}
 	work->pipeline = _pipeline;
 	work->count = _highest;
 	work->textureCount = _highestTexture;
@@ -211,15 +209,120 @@
 	work->threadgroupBytes = _threadgroupBytes;
 	work->imageblockSize[0] = _imageblockSize[0];
 	work->imageblockSize[1] = _imageblockSize[1];
-	if (_split != NULL) {
+	if (counts != NULL) {
 		work->split = YES;
-		memcpy(work->splitBaseGroup, _split, sizeof(work->splitBaseGroup));
-		memcpy(work->splitNominal, _split + 3, sizeof(work->splitNominal));
-		memcpy(work->splitGridThreads, _split + 6, sizeof(work->splitGridThreads));
-		memcpy(work->splitGridGroups, _split + 9, sizeof(work->splitGridGroups));
+		memcpy(work->splitBaseGroup, counts, sizeof(work->splitBaseGroup));
+		memcpy(work->splitNominal, counts + 3, sizeof(work->splitNominal));
+		memcpy(work->splitGridThreads, counts + 6, sizeof(work->splitGridThreads));
+		memcpy(work->splitGridGroups, counts + 9, sizeof(work->splitGridGroups));
 	}
 	[_commandBuffer recordWork:work];
 	[work release];
+}
+
+/*
+ * One -dispatchThreadgroups:, as one or more recorded dispatches. A small grid is one
+ * work, exactly as recorded before yielding existed. A large one is cut along its widest
+ * dimension into pieces small enough that the GPU never holds one piece longer than a
+ * frame's share of it (rw_gpu_yield in annibalemetal_diag.inc says why, with the
+ * measurements): the compositor's submission, whenever it lands, waits behind at most the
+ * piece in execution rather than behind the whole grid. Every piece is recorded with the
+ * grid-split description of where its threadgroups sit in the whole grid, so the kernel
+ * running them computes exactly what the unsplit grid would (air_to_nir.c offsets the
+ * position system values by the piece's first group and reports the whole grid's size,
+ * the same translation the partial-threadgroup parts of -dispatchThreads: already run on
+ * device). The order is the order they are recorded in, which is the only order this
+ * driver's one submission timeline ever had.
+ *
+ * The pieces of one dispatch share the encoder's bindings as they are at this call, which
+ * is what the single record did; the encoder is free to rebind afterwards because every
+ * work has its own copy of the table.
+ *
+ * Not every kernel can be cut: the grid offset is compiled into the shader at dispatch
+ * time, which the compiler library can only do while it keeps the kernel's bitcode, and
+ * it keeps that copy for the kernels that read their threadgroup or use an imageblock
+ * (air_metal_compute.inc). A kernel outside those goes in whole -- still one piece among
+ * the pieces of the commit, so the yield loses only its worst-case bound, not its effect.
+ * The camera's measured chain (kernelRec709Downsample*, pyramid_downsample,
+ * VarianceSharpening_kernel_5x5) is of the kind that can: those are the kernels the
+ * partial-threadgroup split and the imageblock path already serve.
+ */
+- (void)dispatchThreadgroups:(MTLSize)groups threadsPerThreadgroup:(MTLSize)size
+{
+	if (_ended) return;
+	if (_pipeline == nil || _complained) {
+		rw_print("this dispatch has %s and is dropped\n",
+		         _pipeline == nil ? "no pipeline state" : "a binding this driver refused");
+		return;
+	}
+	NSUInteger gn[3] = { groups.width, groups.height, groups.depth };
+	NSUInteger gs[3] = { size.width, size.height, size.depth };
+	uint64_t threads = 1;
+
+	for (unsigned i = 0; i < 3; i++) {
+		threads *= (uint64_t)gn[i] * gs[i];
+	}
+	BOOL sliceable = rw_gpu_yield() && mesa.dispatch_split != NULL &&
+	    (![_pipeline groupFree] || _imageblockSize[0] != 0 || _imageblockSize[1] != 0);
+	unsigned pieces = 0, dim = 0;
+
+	if (sliceable && threads >= RW_YIELD_THREADS) {
+		uint64_t want = (threads + RW_YIELD_THREADS - 1) / RW_YIELD_THREADS;
+
+		pieces = want > RW_YIELD_MAX_PIECES ? RW_YIELD_MAX_PIECES : (unsigned)want;
+		for (unsigned i = 1; i < 3; i++) {
+			if (gn[i] > gn[dim]) {
+				dim = i;
+			}
+		}
+		if ((uint64_t)pieces > gn[dim]) {
+			pieces = (unsigned)gn[dim];
+		}
+		if (pieces < 2) {
+			pieces = 0;
+		}
+	}
+	if (pieces == 0) {
+		[self recordDispatchGroups:groups threadsPerThreadgroup:size splitCounts:_split];
+		return;
+	}
+	static unsigned said_slice;
+
+	if (__atomic_fetch_add(&said_slice, 1, __ATOMIC_RELAXED) < 8) {
+		const char *name = "?";
+
+		if ([_pipeline respondsToSelector:sel_registerName("annibaleKernelName")]) {
+			NSString *kn = ((id (*)(id, SEL))objc_msgSend)(
+			    _pipeline, sel_registerName("annibaleKernelName"));
+			if ([kn isKindOfClass:[NSString class]] && [kn length] != 0)
+				name = [kn UTF8String];
+		}
+		rw_print("yield: %s, %lux%lux%lu groups of %lux%lux%lu, in %u pieces along %c\n",
+		         name, (unsigned long)gn[0], (unsigned long)gn[1], (unsigned long)gn[2],
+		         (unsigned long)gs[0], (unsigned long)gs[1], (unsigned long)gs[2],
+		         pieces, "xyz"[dim]);
+	}
+	for (unsigned p = 0, doneGroups = 0; p < pieces; p++) {
+		unsigned count = (unsigned)(gn[dim] / pieces) + (p < gn[dim] % pieces ? 1 : 0);
+		unsigned sp[12] = { 0 };
+		MTLSize piece = groups;
+
+		if (_split != NULL) {
+			memcpy(sp, _split, sizeof(sp));
+		} else {
+			for (unsigned i = 0; i < 3; i++) {
+				sp[3 + i] = (unsigned)gs[i];
+				sp[6 + i] = (unsigned)(gn[i] * gs[i]);
+				sp[9 + i] = (unsigned)gn[i];
+			}
+		}
+		sp[dim] += doneGroups;
+		if (dim == 0) piece.width = count;
+		if (dim == 1) piece.height = count;
+		if (dim == 2) piece.depth = count;
+		[self recordDispatchGroups:piece threadsPerThreadgroup:size splitCounts:sp];
+		doneGroups += count;
+	}
 }
 
 /* Metal counts threads here and threadgroups above, and runs the last threadgroups of a

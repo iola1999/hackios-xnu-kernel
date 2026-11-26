@@ -198,6 +198,14 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		}
 		out[0] = OSIncrementAtomic(&fOwner->fSwapID) + 1;
 		args->scalarOutputCount = 1;
+		if (gTouchLat) {
+			char who[24] = "?";
+
+			proc_selfname(who, sizeof(who));
+			annibale_tl("tl: b %u %d %llu %s at %llu\n", (unsigned) out[0],
+			    proc_pid(current_proc()), (unsigned long long) thread_tid(current_thread()), who,
+			    micros(mach_absolute_time()));
+		}
 		return kIOReturnSuccess;
 
 	case kFBMethodSwapEnd: {

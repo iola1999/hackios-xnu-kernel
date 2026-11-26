@@ -79,6 +79,10 @@ static struct {
 	uint64_t        taken;                    /* mach_absolute_time when CTL_FLUSH was observed clear */
 	uint32_t        taken_frame;              /* INTF_FRAME_COUNT at that same observation */
 	bool            taken_valid;
+	uint64_t        watch_began;              /* when the watchdog first saw this pending un-taken */
+	uint64_t        watch_kicked;             /* when the flip was first pointed again for it */
+	uint64_t        watch_last;               /* when it was last pointed again */
+	bool            watch_dumped, watch_ceased;
 } flip;
 
 static inline uint32_t
@@ -151,11 +155,35 @@ flip_clocks(void)
 	return true;
 }
 
+/*
+ * INTF_FRAME_COUNT counts the timing engine's frames (video mode), INTF_TEAR_INT_COUNT_VAL the read
+ * pointer's (command mode). Only INTF1 and INTF2, the DSI ones, as the Xiaomi 15's look did. Read
+ * twice 200 ms apart; called at boot by flip_look and, once per stall, by the pending watchdog.
+ */
+static void
+flip_look_intfs(void)
+{
+	uint32_t frames[3], reads[3];
+
+	for (unsigned n = 1; n <= 2; n++) {
+		frames[n] = flip_rd(FLIP_INTF(n) + 0xac);
+		reads[n] = flip_rd(FLIP_INTF(n) + 0x298);
+	}
+	IOSleep(200);
+	for (unsigned n = 1; n <= 2; n++) {
+		uint32_t i = FLIP_INTF(n), r = flip_rd(i + 0x298);
+
+		IOLog("MiniIOMobileFramebuffer: flip: intf%u: status %08x engine %08x config %08x tear check %08x autorefresh "
+		    "%08x write line %u; frames %u -> %u, read pointer frame %u line %u -> frame %u line %u in 200 ms\n", n,
+		    flip_rd(i + 0x26c), flip_rd(i + 0x0), flip_rd(i + 0x4), flip_rd(i + 0x284), flip_rd(i + 0x2b4),
+		    flip_rd(i + 0x2b0), frames[n], flip_rd(i + 0xac), reads[n] >> 16, reads[n] & 0xffff, r >> 16, r & 0xffff);
+	}
+}
+
 /* What the loader left running, and how far the interfaces count in 200 ms (a refresh rate). */
 static void
 flip_look(uint64_t fb)
 {
-	uint32_t frames[3], reads[3];
 
 	IOLog("MiniIOMobileFramebuffer: flip: MDSS %08x, DPU %08x; the boot framebuffer at %#llx\n", flip_rd(0),
 	    flip_rd(FLIP_MDP), fb);
@@ -189,23 +217,7 @@ flip_look(uint64_t fb)
 			IOLog("MiniIOMobileFramebuffer: flip: lm%u: op %08x out %08x\n", n, flip_rd(m), flip_rd(m + 4));
 		}
 	}
-	/*
-	 * INTF_FRAME_COUNT counts the timing engine's frames (video mode), INTF_TEAR_INT_COUNT_VAL the read
-	 * pointer's (command mode). Only INTF1 and INTF2, the DSI ones, as the Xiaomi 15's look did.
-	 */
-	for (unsigned n = 1; n <= 2; n++) {
-		frames[n] = flip_rd(FLIP_INTF(n) + 0xac);
-		reads[n] = flip_rd(FLIP_INTF(n) + 0x298);
-	}
-	IOSleep(200);
-	for (unsigned n = 1; n <= 2; n++) {
-		uint32_t i = FLIP_INTF(n), r = flip_rd(i + 0x298);
-
-		IOLog("MiniIOMobileFramebuffer: flip: intf%u: status %08x engine %08x config %08x tear check %08x autorefresh "
-		    "%08x write line %u; frames %u -> %u, read pointer frame %u line %u -> frame %u line %u in 200 ms\n", n,
-		    flip_rd(i + 0x26c), flip_rd(i + 0x0), flip_rd(i + 0x4), flip_rd(i + 0x284), flip_rd(i + 0x2b4),
-		    flip_rd(i + 0x2b0), frames[n], flip_rd(i + 0xac), reads[n] >> 16, reads[n] & 0xffff, r >> 16, r & 0xffff);
-	}
+	flip_look_intfs();
 }
 
 static void
@@ -254,6 +266,24 @@ flip_latch(uint32_t *swap, uint64_t *at, uint32_t *frame)
 	return true;
 }
 
+/*
+ * The pending flip's keeper while no swap is queued (IOMobileFramebuffer::flipWatchdog). The
+ * presenter's empty-queue sleep has no deadline, so a CTL that never clears CTL_FLUSH leaves the
+ * panel on its last frame while everything that gates on the flip's being taken starves behind
+ * it (kernel-12377-s21-tlb-round3: gaps of 10-12 s in the latch stream ended only when a swap
+ * finally arrived). With a flip pending the presenter sleeps at most FLIP_WATCH_MS, then reads
+ * the flush bit once; one pending for FLIP_WATCH_DUMP_MS gets the interfaces' state dumped once
+ * and the same flip pointed again every FLIP_WATCH_KICK_MS, until FLIP_WATCH_CEASE_MS of that --
+ * after which the hardware is left alone and the next swap's own poll sees it. flip.pending is
+ * only ever written on the presenter's thread (flip_present, flip_target), so the sleep's
+ * condition may be read without fLock; the watchdog itself takes fLock around the registers, as
+ * show() does.
+ */
+#define FLIP_WATCH_MS           25          /* ~3 refreshes at 120 Hz */
+#define FLIP_WATCH_DUMP_MS      2000        /* a pending this old is a stall, not a late frame */
+#define FLIP_WATCH_KICK_MS      1000        /* a stuck flip is pointed again this often */
+#define FLIP_WATCH_CEASE_MS     8000        /* after this much pointing again, stop writing the ctl */
+
 /* The pipes onto buffer WHICH, taken at the next refresh. */
 static void
 flip_point(int which)
@@ -274,6 +304,27 @@ flip_point(int which)
 
 #include "MiniFramebufferDim.inc"
 #include "MiniFramebufferDCS.inc"
+
+/*
+ * A stuck flip pointed again, in two writes: the flip itself first (a SRC write that never
+ * landed is still possible), then -- when the dim mixers sit on the same ctl -- the brightness
+ * exactly as it stands. flip_point's flush word is what is already pending, so a ctl that left
+ * it set without servicing it may see nothing new in a rewrite; a backlight write's word is
+ * new: CTL_FLUSH gets the layer mixers' bits, disjoint from the pipes', and the ctl's
+ * servicing that flush clears the pipes' with it -- which is what let each backlight write
+ * end a stall in kernel-12377-s21-tlb-round4 (the 564.58 s sample). The alpha read back from
+ * the stage keeps the picture unchanged.
+ */
+static void
+flip_kick(void)
+{
+	int alpha;
+
+	flip_point(flip.shown);
+	if (dim.ready && dim.ctl == flip.ctl && (alpha = MiniIOMobileFramebufferDimShown()) >= 0) {
+		dim_write(alpha);
+	}
+}
 
 static void
 flip_start(uint64_t fb, uint8_t * fbBase, uint32_t bytes, uint32_t rows)

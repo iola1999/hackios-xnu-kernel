@@ -485,6 +485,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	int camera_requested = 0;
 	/* (the loader stays for run after run: what the last run's arguments said must not hold for this one) */
 	gamut_p3 = 0;
+	front_cam_rotation_isp = 180;   /* K90's measured mounting angle; frontcamrot= overrides */
 	for (const char *c = pi.cmdline; *c; c++) {
 		if (starts_with(c, "bootcpu=") && (c == pi.cmdline || c[-1] == ' ') && c[8] >= '0' && c[8] <= '7') {
 			kernel_mpidr = PLAT->core_mpidr[c[8] - '0'];
@@ -495,6 +496,21 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		torch_requested |= starts_with(c, "torch=") && (c == pi.cmdline || c[-1] == ' ') && c[6] >= '1' && c[6] <= '9';
 		camera_requested |= starts_with(c, "cam=5") && (c == pi.cmdline || c[-1] == ' ') && (c[5] == 0 || c[5] == ' ');
 		gamut_p3 |= starts_with(c, "gamut=p3") && (c == pi.cmdline || c[-1] == ' ');
+		if (starts_with(c, "frontcamrot=") && (c == pi.cmdline || c[-1] == ' ')) {
+			const char *p = c + sizeof("frontcamrot=") - 1;
+			int value = 0, digits = 0;
+
+			while (*p >= '0' && *p <= '9') {
+				value = value * 10 + *p++ - '0';
+				digits++;
+			}
+			if (digits && (*p == 0 || *p == ' ') &&
+			    (value == 0 || value == 90 || value == 180 || value == 270)) {
+				front_cam_rotation_isp = value;
+			} else {
+				print("frontcamrot: only 0, 90, 180 or 270 is a mounting angle here\n");
+			}
+		}
 		low_dma_requested |= starts_with(c, "pcie=") && (c == pi.cmdline || c[-1] == ' ') &&
 		    ((c[5] >= '7' && c[5] <= '9' && (c[6] == 0 || c[6] == ' ')) ||
 		    (c[5] == '1' && c[6] == '0' && (c[7] == 0 || c[7] == ' ')));
@@ -706,6 +722,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		}
 	}
 	print("identity %s\n", id->name);
+	if (front_cam_rotation_isp >= 0) {
+		print("front-cam-rotation-isp %d (K90 mounting angle)\n", front_cam_rotation_isp);
+	}
 	struct dt_writer w = { .base = (uint8_t *)dt_pa, .cur = (uint8_t *)dt_pa, .depth = 0 };
 	uint64_t cntfrq = READ_SYSREG(CNTFRQ_EL0);
 	uint64_t ranges[3] = { 0, plat->io_base, plat->io_size };

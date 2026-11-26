@@ -313,7 +313,7 @@ AnnibaleGPUUserClient::gemNew(struct msm_gem_new * request, uint64_t * iova)
 	 * backboardd made 218 buffers of 8 MB or more. The program sees the size it asked for; the rest
 	 * is mapped and unused.
 	 */
-	IOLockLock(gGPULock);
+	gpuLockIoctl(kMsmGemNew);
 	if (gGPUReported || !annibale_gpu_ready()) {
 		IOLockUnlock(gGPULock);
 		return kIOReturnNotReady;
@@ -375,7 +375,7 @@ AnnibaleGPUUserClient::gemNew(struct msm_gem_new * request, uint64_t * iova)
 	}
 	uint64_t allocated = mach_absolute_time();
 
-	IOLockLock(gGPULock);
+	gpuLockIoctl(kMsmGemNew);
 	gGPUStat.locking += mach_absolute_time() - allocated;
 	b = newBuffer(memory, 0, size, request->flags, &request->handle);
 	if (b != NULL) {
@@ -419,7 +419,9 @@ AnnibaleGPUUserClient::surfaceBuffer(struct annibale_surface * request)
 		return kIOReturnUnsupported;
 	}
 	size = round_page_64(s->info.allocSize);
-	memory = IOSubMemoryDescriptor::withSubRange(s->memory, PAGE_SIZE, size, kIODirectionInOut);
+	IOMemoryDescriptor * pixelsMemory = s->backing != NULL ? s->backing : s->memory;
+	uint64_t pixelsOffset = s->backing != NULL ? s->backingOffset : PAGE_SIZE;
+	memory = IOSubMemoryDescriptor::withSubRange(pixelsMemory, pixelsOffset, size, kIODirectionInOut);
 	if (memory == NULL || size == 0 || size > GPU_BUFFER_MAX) {
 		OSSafeReleaseNULL(memory);
 		MiniIOSurfaceDrop(s);
@@ -439,7 +441,9 @@ AnnibaleGPUUserClient::surfaceBuffer(struct annibale_surface * request)
 		return kIOReturnSuccess;
 	}
 
-	IOLockLock(gGPULock);
+	gpuLockIoctl(kAnnibaleSurface);
+	uint64_t inLock = mach_absolute_time();
+
 	if (gGPUReported || !annibale_gpu_ready()) {
 		IOLockUnlock(gGPULock);
 		memory->release();
@@ -456,13 +460,23 @@ AnnibaleGPUUserClient::surfaceBuffer(struct annibale_surface * request)
 	if (b != NULL) {
 		memory->release();
 		MiniIOSurfaceDrop(s);
-	} else if ((b = newBuffer(s->memory, PAGE_SIZE, size, 0, &request->handle)) != NULL) {
+	} else if ((b = newBuffer(pixelsMemory, pixelsOffset, size, 0, &request->handle)) != NULL) {
 		b->memory = memory;
-		b->kernel = s->kbase + PAGE_SIZE;
+		b->kernel = s->kpixels;
 		b->surface = s;
 		gGPUStat.surfaces++;
 	}
 	gGPUStat.taking += mach_absolute_time() - began;
+	if (gWaitLines) {
+		uint64_t cost, at;
+
+		absolutetime_to_nanoseconds(mach_absolute_time() - inLock, &cost);
+		if (cost >= (uint64_t) GPU_IMPORT_NOTICE_US * NSEC_PER_USEC) {
+			absolutetime_to_nanoseconds(mach_absolute_time(), &at);
+			annibale_tl("tl: S %d %llu surface %u %llu %llu at %llu\n", proc_pid(current_proc()),
+			    (unsigned long long)thread_tid(current_thread()), request->surface, size >> 10, cost / 1000, at / 1000);
+		}
+	}
 	IOLockUnlock(gGPULock);
 	if (b == NULL) {
 		memory->release();
@@ -516,7 +530,7 @@ AnnibaleGPUUserClient::memoryBuffer(struct annibale_memory * request)
 		memory->release();
 		return ret;
 	}
-	IOLockLock(gGPULock);
+	gpuLockIoctl(kAnnibaleMemory);
 	if (!gGPUReported && annibale_gpu_ready() && (b = newBuffer(memory, 0, request->size, flags, &request->handle)) != NULL) {
 		b->memory = memory;
 		b->kernel = NULL;

@@ -830,6 +830,10 @@ dt_prop_padded(struct dt_writer *w, const char *name, const char *value, uint32_
  * what the framebuffer is: sRGB.
  */
 static int gamut_p3;    /* boot-arg gamut=p3 (a test): the iPhone's own "P3" left in place */
+/* K90's front camera mounting angle, measured with the text-target matrix (batch 5):
+   upright at 180, sideways at the donor iPhone's 270. boot-arg frontcamrot=0/90/180/270
+   overrides; -1 would hand the donor's value through. */
+static int front_cam_rotation_isp = 180;
 
 struct identity_table { const struct identity_prop *props; uint32_t count; const unsigned char *data; };
 #define IDENTITY_TABLE(t) { t, sizeof(t) / sizeof(t[0]), t##_data }
@@ -857,6 +861,10 @@ dt_identity(struct dt_writer *w, const struct identity_table *t)
 	for (uint32_t i = 0; i < t->count; i++) {
 		if (str_eq(t->props[i].name, "artwork-display-gamut") && !gamut_p3) {
 			dt_prop(w, t->props[i].name, "sRGB", 5);
+			continue;
+		}
+		if (str_eq(t->props[i].name, "front-cam-rotation-isp") && front_cam_rotation_isp >= 0) {
+			dt_prop_u32(w, t->props[i].name, (uint32_t)front_cam_rotation_isp);
 			continue;
 		}
 		dt_prop(w, t->props[i].name, t->data + t->props[i].offset, t->props[i].length);

@@ -205,13 +205,14 @@ struct IOMemoryMap {
 };
 struct Memory {
     bool fail;
-    IOMemoryMap *createMappingInTask(int, int, int) { return fail ? NULL : new IOMemoryMap; }
+    IOMemoryMap *createMappingInTask(int, int, int, uint64_t = 0, uint64_t = 0) { return fail ? NULL : new IOMemoryMap; }
 };
 struct MiniIOSurface {
     minisurf_abi sharedABI;
     unsigned sid, holders, useCount[2];
     minisurf_result info;
-    Memory *memory, *client;
+    Memory *memory, *backing, *client;
+    uint64_t backingOffset, backingLength;
     int clientTask;
     struct Shared { uint64_t useCount; } state;
     Shared *shared() { return &state; }
@@ -412,6 +413,7 @@ struct Memory {
     void *getBytesNoCopy() { return buffer; }
     IOReturn prepare() { return kIOReturnSuccess; }
     IOMemoryMap *createMappingInTask(task_t, int, int) { return new IOMemoryMap; }
+    void retain() {}
     void release() { delete this; }
 };
 
@@ -439,11 +441,14 @@ struct MiniIOSurface : public OSObject {
     struct minisurf_result info;
     struct minisurf_plane planes[MINISURF_MAX_PLANES];
     Memory *memory;
+    Memory *backing;
     Memory *client;
     IOMemoryMap *clientMap;
     OSDictionary *values;
     uint8_t *kbase;
     uint8_t *kpixels;
+    uint64_t backingOffset;
+    uint64_t backingLength;
     task_t clientTask;
     uint64_t clientAddress;
     uint32_t sid;
@@ -453,10 +458,11 @@ struct MiniIOSurface : public OSObject {
     bool init() {
         memset(&info, 0, sizeof(info));
         memset(planes, 0, sizeof(planes));
-        memory = client = NULL;
+        memory = backing = client = NULL;
         clientMap = NULL;
         values = NULL;
         kbase = kpixels = NULL;
+        backingOffset = backingLength = 0;
         clientTask = 0;
         clientAddress = 0;
         sid = holders = 0;
@@ -465,6 +471,7 @@ struct MiniIOSurface : public OSObject {
     }
     virtual ~MiniIOSurface() {
         if (memory) memory->release();
+        if (backing) backing->release();
         if (client) client->release();
         if (clientMap) clientMap->release();
         if (values) values->release();

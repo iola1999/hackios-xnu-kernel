@@ -1092,6 +1092,7 @@ struct gem_close { uint32_t handle, pad; };
 
 #include "annibalemetal_stitch.inc"
 #include "annibalemetal_pipecache.inc"
+#include "annibalemetal_prewarm.inc"   /* pipeline harvest and the boot-time replay of it */
 #include "annibalemetal_reflection.inc"
 
 

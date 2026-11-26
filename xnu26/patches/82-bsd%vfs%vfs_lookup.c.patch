@@ -1,0 +1,19 @@
+diff --git a/bsd/vfs/vfs_lookup.c b/bsd/vfs/vfs_lookup.c
+index b897c9c..2d8e6ff 100644
+--- a/bsd/vfs/vfs_lookup.c
++++ b/bsd/vfs/vfs_lookup.c
+@@ -2008,6 +2008,14 @@ restart:
+ 		ndp->ni_vp = dp = tdp;
+ 		if (dp->v_type != VDIR) {
+ #if DEVELOPMENT || DEBUG
++			/*
++			 * bindfs mounts a single file whose root vnode is legitimately not
++			 * a directory; the release build's break is the right answer for
++			 * it (the weights' per-file binds, batch 5).
++			 */
++			if (dp->v_type == VREG) {
++				break;
++			}
+ 			panic("%s : Root of filesystem not a directory",
+ 			    __FUNCTION__);
+ #else

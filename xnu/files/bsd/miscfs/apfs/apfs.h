@@ -47,8 +47,8 @@ struct apfs_graft;
 #define APFS_ROUND_SHARED  (128 * 1024)
 #define APFS_IOBUF_KEEP    8
 
-#define APFS_SYNTH_MAX     64
-#define APFS_SYNTH_NAMELEN 96
+#define APFS_SYNTH_MAX     128      /* (64 leaves 10 past the boot-time system entries; the analysis model binds alone need 24) */
+#define APFS_SYNTH_NAMELEN 256       /* (96 cannot hold the longest weight filename the analysis models' binds need) */
 /*
  * Object ids from here up are synthetic: the last few of the 60 bits an id has.  (Not
  * 0x0FFFFFFF00000000: the iOS root volume numbers its own objects from there.)

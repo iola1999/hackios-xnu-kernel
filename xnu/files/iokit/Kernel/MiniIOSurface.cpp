@@ -5,8 +5,8 @@
  * followed by the pixels. Every client that knows a surface has the whole of it mapped once.
  * Surfaces travel between processes as Mach send rights (IOSurfaceSendRight) or by number.
  *
- * What is not here: child surfaces, wrapping of client memory, purgeability, compression,
- * notifications. Calls that are not implemented are logged once and refused.
+ * What is not here: child surfaces of wrapped memory or of another child, purgeability,
+ * compression, notifications. Calls that are not implemented are logged once and refused.
  */
 
 #include <IOKit/IOLib.h>
@@ -310,6 +310,7 @@ MiniIOSurface::free(void)
 		surfaceMemoryBack(memory);
 		memory = NULL;
 	}
+	OSSafeReleaseNULL(backing);
 	OSObject::free();
 	OSAddAtomic64((SInt64) (mach_absolute_time() - began), (SInt64 *) &gSurfaceFreeing);
 	OSIncrementAtomic(&gSurfacesFreed);
@@ -458,7 +459,7 @@ describeComponents(struct minisurf_plane * plane, uint32_t format)
  * Returned with one holder, and entered in the table.
  */
 static MiniIOSurface *
-surfaceCreate(OSDictionary * props, IOReturn * error)
+surfaceCreate(OSDictionary * props, IOReturn * error, MiniIOSurface * parent = NULL)
 {
 	MiniIOSurface * s;
 	struct minisurf_result * info;
@@ -470,6 +471,11 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 	uint64_t needed;
 
 	*error = kIOReturnBadArgument;
+	if (parent != NULL && (parent->info.parentID != 0 || parent->client != NULL)) {
+		/* Child surfaces are made from a root surface with owned backing. */
+		*error = kIOReturnUnsupported;
+		return NULL;
+	}
 	width = dictNumber(props, "IOSurfaceWidth", 0);
 	height = dictNumber(props, "IOSurfaceHeight", 0);
 	format = dictNumber(props, "IOSurfacePixelFormat", 0);
@@ -497,7 +503,13 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 	eh = dictNumber(props, "IOSurfaceElementHeight", 1);
 	bpe = dictNumber(props, "IOSurfaceBytesPerElement", 0);
 	offset = dictNumber(props, "IOSurfaceOffset", 0);
-	if (width > MINISURF_MAX_DIMENSION || height > MINISURF_MAX_DIMENSION || ew == 0 || eh == 0 || ew > 255 || eh > 255) {
+	/*
+	 * No small cap on width or height: Vision's neural network passes flat tensors as one-row
+	 * surfaces millions of pixels wide ('L008', mediaanalysisd), which iOS accepts -- a surface
+	 * is a memory layout, and its volume is what MINISURF_MAX_ALLOC bounds. Consumers that draw
+	 * or texture from a surface validate their own geometry.
+	 */
+	if (ew == 0 || eh == 0 || ew > 255 || eh > 255) {
 		return NULL;
 	}
 	if (props->getObject("IOSurfaceAddressRanges") != NULL) {
@@ -548,11 +560,23 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 			p->elementHeight = (uint8_t) peh;
 			p->bytesPerRow = dictNumber(pd, "IOSurfacePlaneBytesPerRow", 0);
 			if (p->bytesPerRow == 0) {
-				p->bytesPerRow = alignUp((uint64_t) ((p->width + pew - 1) / pew) * p->bytesPerElement, MINISURF_ROW_ALIGN);
+				uint64_t row = alignUp(((uint64_t) p->width + pew - 1) / pew * p->bytesPerElement, MINISURF_ROW_ALIGN);
+
+				if (row > MINISURF_MAX_ALLOC) {
+					s->release();
+					return NULL;
+				}
+				p->bytesPerRow = (uint32_t) row;
 			}
 			p->size = dictNumber(pd, "IOSurfacePlaneSize", 0);
 			if (p->size == 0) {
-				p->size = p->bytesPerRow * ((p->height + peh - 1) / peh);
+				uint64_t size = (uint64_t) p->bytesPerRow * (((uint64_t) p->height + peh - 1) / peh);
+
+				if (size > MINISURF_MAX_ALLOC) {
+					s->release();
+					return NULL;
+				}
+				p->size = (uint32_t) size;
 			}
 			p->offset = dictNumber(pd, "IOSurfacePlaneOffset", dictNumber(pd, "IOSurfacePlaneBase", (uint32_t) needed));
 			p->extendedPixels[0] = dictNumber(pd, "IOSurfacePlaneExtendedPixelsOnLeft", 0);
@@ -571,15 +595,30 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 		y->height = height;
 		y->bytesPerElement = wide ? 2 : 1;
 		y->elementWidth = y->elementHeight = 1;
-		y->bytesPerRow = alignUp((uint64_t) width * y->bytesPerElement, MINISURF_ROW_ALIGN);
-		y->size = y->bytesPerRow * height;
-		y->offset = 0;
+		uint64_t yrow = alignUp((uint64_t) width * y->bytesPerElement, MINISURF_ROW_ALIGN);
+
 		c->width = (width + hsub - 1) / hsub;
 		c->height = (height + vsub - 1) / vsub;
 		c->bytesPerElement = wide ? 4 : 2;
 		c->elementWidth = c->elementHeight = 1;
-		c->bytesPerRow = alignUp((uint64_t) c->width * c->bytesPerElement, MINISURF_ROW_ALIGN);
-		c->size = c->bytesPerRow * c->height;
+		uint64_t crow = alignUp((uint64_t) c->width * c->bytesPerElement, MINISURF_ROW_ALIGN);
+
+		/* (row bytes first: below the allocation cap they cannot push the size arithmetic out of 64 bits) */
+		if (yrow > MINISURF_MAX_ALLOC || crow > MINISURF_MAX_ALLOC) {
+			s->release();
+			return NULL;
+		}
+		uint64_t ysize = yrow * height, csize = crow * c->height;
+
+		if (ysize > MINISURF_MAX_ALLOC || csize > MINISURF_MAX_ALLOC) {
+			s->release();
+			return NULL;
+		}
+		y->bytesPerRow = (uint32_t) yrow;
+		y->size = (uint32_t) ysize;
+		y->offset = 0;
+		c->bytesPerRow = (uint32_t) crow;
+		c->size = (uint32_t) csize;
 		c->offset = y->size;
 		needed = (uint64_t) c->offset + c->size;
 	}
@@ -589,11 +628,20 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 	}
 	bpr = dictNumber(props, "IOSurfaceBytesPerRow", 0);
 	if (bpr == 0) {
-		bpr = planeCount ? s->planes[0].bytesPerRow
-		    : alignUp((uint64_t) ((width + ew - 1) / ew) * bpe, MINISURF_ROW_ALIGN);
+		if (planeCount) {
+			bpr = s->planes[0].bytesPerRow;
+		} else {
+			uint64_t row = alignUp(((uint64_t) width + ew - 1) / ew * bpe, MINISURF_ROW_ALIGN);
+
+			if (row > MINISURF_MAX_ALLOC) {
+				s->release();
+				return NULL;
+			}
+			bpr = (uint32_t) row;
+		}
 	}
 	if (planeCount == 0) {
-		needed = (uint64_t) bpr * ((height + eh - 1) / eh);
+		needed = (uint64_t) bpr * (((uint64_t) height + eh - 1) / eh);
 		/* the one implicit plane, for the per-plane getters */
 		s->planes[0].width = width;
 		s->planes[0].height = height;
@@ -607,35 +655,59 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 	bool geometry = needed != 0;
 	needed += offset;
 	alloc = dictNumber(props, "IOSurfaceAllocSize", 0);
-	if (alloc < needed) {
-		if (alloc != 0) {
-			IOLog("MiniIOSurface: alloc size %u too small for %ux%u '%.4s', using %llu\n", alloc, width, height,
-			    (const char *) &format, needed);
+	if (parent != NULL) {
+		/*
+		 * In a child the offsets are in the parent's backing coordinate space. Width, height
+		 * and plane layout bound the view when present; IOSurfaceAllocSize is the length of a
+		 * dimensionless view (unlike a root surface, where it already includes the offset).
+		 */
+		uint64_t end = needed;
+
+		if (!geometry) {
+			if (alloc == 0) {
+				s->release();
+				return NULL;
+			}
+			end = (uint64_t) offset + alloc;
 		}
-		if (needed > MINISURF_MAX_ALLOC) {
+		if (end == 0 || end > parent->info.allocSize) {
 			s->release();
 			return NULL;
 		}
-		alloc = (uint32_t) needed;
-	}
-	if (alloc == 0 || alloc > MINISURF_MAX_ALLOC) {
-		s->release();
-		return NULL;
-	}
-	if (wrapped != NULL) {
-		/* (the memory is as big as its owner says, and not a byte of ours is added to it) */
-		alloc = dictNumber(props, "IOSurfaceAllocSize", (uint32_t) needed);
-	} else if (!geometry) {
-		/* Only a size was asked for, as AudioToolboxCore's shared buffers are: all of it, in whole
-		 * pages. Its unilaterally_billed_shared_memory throws "bad IOSurface" when IOSurfaceGetAllocSize
-		 * is below the request, and audiomxd ends on that. */
-		alloc = alignUp(alloc, (uint32_t) PAGE_SIZE);
-	} else if (alloc > alignUp(needed, (uint32_t) PAGE_SIZE)) {
-		alloc = alignUp(needed, (uint32_t) PAGE_SIZE);
+	} else {
+		if (alloc < needed) {
+			if (alloc != 0) {
+				IOLog("MiniIOSurface: alloc size %u too small for %ux%u '%.4s', using %llu\n", alloc, width, height,
+				    (const char *) &format, needed);
+			}
+			if (needed > MINISURF_MAX_ALLOC) {
+				s->release();
+				return NULL;
+			}
+			alloc = (uint32_t) needed;
+		}
+		if (alloc == 0 || alloc > MINISURF_MAX_ALLOC) {
+			s->release();
+			return NULL;
+		}
+		if (wrapped != NULL) {
+			/* (the memory is as big as its owner says, and not a byte of ours is added to it) */
+			alloc = dictNumber(props, "IOSurfaceAllocSize", (uint32_t) needed);
+		} else if (!geometry) {
+			/* Only a size was asked for, as AudioToolboxCore's shared buffers are: all of it, in whole
+			 * pages. Its unilaterally_billed_shared_memory throws "bad IOSurface" when IOSurfaceGetAllocSize
+			 * is below the request, and audiomxd ends on that. */
+			alloc = alignUp(alloc, (uint32_t) PAGE_SIZE);
+		} else if (alloc > alignUp(needed, (uint32_t) PAGE_SIZE)) {
+			alloc = alignUp(needed, (uint32_t) PAGE_SIZE);
+		}
+		s->backingOffset = wrapped ? 0 : PAGE_SIZE;
+		s->backingLength = wrapped ? alloc : alignUp(alloc, (uint32_t) PAGE_SIZE);
 	}
 
 	/* IOSurfaceGetAllocSize reports the buffer size; its owned backing remains page-aligned. */
-	s->memory = surfaceMemory((vm_size_t) PAGE_SIZE + (wrapped ? 0 : alignUp(alloc, (uint32_t) PAGE_SIZE)));
+	s->memory = surfaceMemory(parent != NULL ? PAGE_SIZE :
+	    (vm_size_t) PAGE_SIZE + (wrapped ? 0 : alignUp(alloc, (uint32_t) PAGE_SIZE)));
 	if (s->memory == NULL) {
 		IOLog("MiniIOSurface: no memory for %u bytes (%u surfaces, %llu MB in use)\n", alloc, gSurfaceCount,
 		    gSurfaceBytes >> 20);
@@ -674,8 +746,16 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 		}
 		s->kpixels = (uint8_t *) s->clientMap->getVirtualAddress();
 	}
+	if (parent != NULL) {
+		s->backing = parent->memory;
+		s->backing->retain();
+		s->backingOffset = parent->backingOffset;
+		s->backingLength = parent->backingLength;
+		s->kpixels = parent->kpixels;
+	}
 
-	info->allocSize = alloc;
+	info->allocSize = parent != NULL ? parent->info.allocSize : alloc;
+	info->parentID = parent != NULL ? parent->sid : 0;
 	info->width = width;
 	info->height = height;
 	info->bytesPerRow = bpr;
@@ -715,7 +795,7 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 	info->traceID = sid;
 	gSurfaceTable[sid] = s;                 /* the table owns the object until the last holder goes */
 	gSurfaceCount++;
-	gSurfaceBytes += alloc;
+	gSurfaceBytes += s->backing == NULL ? alloc : 0;
 
 	struct minisurf_shared * sh = s->shared();
 	sh->registryID = 0x100000000ULL + sid;
@@ -746,7 +826,7 @@ surfaceUnhold(MiniIOSurface * s)
 	}
 	gSurfaceTable[s->sid] = NULL;
 	gSurfaceCount--;
-	gSurfaceBytes -= s->info.allocSize;
+	gSurfaceBytes -= s->backing == NULL ? s->info.allocSize : 0;
 	s->release();
 }
 
@@ -801,7 +881,7 @@ MiniIOSurfaceCreateSimple(uint32_t width, uint32_t height, uint32_t pixelFormat)
 	n = OSNumber::withNumber(width, 32); props->setObject("IOSurfaceWidth", n); n->release();
 	n = OSNumber::withNumber(height, 32); props->setObject("IOSurfaceHeight", n); n->release();
 	n = OSNumber::withNumber(pixelFormat, 32); props->setObject("IOSurfacePixelFormat", n); n->release();
-	s = surfaceCreate(props, &error);
+	s = surfaceCreate(props, &error, NULL);
 	props->release();
 	return s;
 }
@@ -1081,7 +1161,14 @@ IOSurfaceRootUserClient::addRef(MiniIOSurface * surface, IOReturn * error)
 		IOLog("MiniIOSurface: cannot map surface %u (%u bytes) into the client\n", surface->sid, surface->info.allocSize);
 		return NULL;
 	}
-	if (surface->client != NULL && surface->clientTask != fTask) {
+	if (surface->backing != NULL) {
+		pixelMap = surface->backing->createMappingInTask(fTask, 0, kIOMapAnywhere,
+		    surface->backingOffset, surface->backingLength);
+		if (pixelMap == NULL) {
+			map->release();
+			return NULL;
+		}
+	} else if (surface->client != NULL && surface->clientTask != fTask) {
 		pixelMap = surface->client->createMappingInTask(fTask, 0, kIOMapAnywhere);
 		if (pixelMap == NULL) {
 			map->release();

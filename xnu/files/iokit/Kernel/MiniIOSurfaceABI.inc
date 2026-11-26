@@ -8,8 +8,8 @@ IOSurfaceRootUserClient::returnSurface(struct minisurf_client_ref * ref, bool kn
 
 	result.shared = address;
 	result.aux = address + MINISURF_AUX_OFFSET;
-	result.base = known ? ~0ULL : s->client == NULL ? address + PAGE_SIZE :
-	    ref->pixelMap != NULL ? ref->pixelMap->getAddress() : s->clientAddress;
+	result.base = known ? ~0ULL : ref->pixelMap != NULL ? ref->pixelMap->getAddress() :
+	    s->client == NULL ? address + PAGE_SIZE : s->clientAddress;
 	uint32_t size = minisurfWriteResult(args->structureOutput, args->structureOutputSize, fABI, &result, s->planes);
 	if (size == 0) {
 		return kIOReturnBadArgument;

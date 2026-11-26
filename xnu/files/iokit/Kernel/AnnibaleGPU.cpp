@@ -450,6 +450,119 @@ slowWait(const char * kind, uint64_t began)
 	}
 }
 
+/*
+ * The rest of a wait's story, under the same touch_lat=1 switch: "tl: f" exists only when the
+ * ioctl returned, so a wait the thread never comes back from -- or one that keeps failing --
+ * leaves nothing. "tl: F PID TID KIND FENCE PATIENCE_MS at US" is written before the wait
+ * begins, and "tl: X PID TID KIND FENCE retired R last L at US" when it fails, with R the
+ * newest timestamp the GPU retired and L the newest it was ever given (annibale_gpu_retired/
+ * annibale_gpu_last, which count in the same timestamps as the fence). R at or past FENCE with
+ * the wait failed is a completion the wait could not see; FENCE beyond L is userspace waiting
+ * for work that was never submitted. annibale_tl writes a memory ring, so these are safe with
+ * the GPU lock held; the entry line must precede the wait itself or it is worthless.
+ */
+static void
+fenceWaitEntry(const char * kind, uint32_t fence, uint64_t patience)
+{
+	uint64_t at;
+
+	if (!gWaitLines) {
+		return;
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time(), &at);
+	annibale_tl("tl: F %d %llu %s %u %llu at %llu\n", proc_pid(current_proc()),
+	    (unsigned long long)thread_tid(current_thread()), kind, fence,
+	    (unsigned long long)patience, at / 1000);
+}
+
+static void
+fenceWaitFailed(const char * kind, uint32_t fence)
+{
+	uint64_t at;
+
+	if (!gWaitLines) {
+		return;
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time(), &at);
+	annibale_tl("tl: X %d %llu %s %u retired %u last %u at %llu\n", proc_pid(current_proc()),
+	    (unsigned long long)thread_tid(current_thread()), kind, fence,
+	    annibale_gpu_retired(), annibale_gpu_last(), at / 1000);
+}
+
+/*
+ * The same switch over the rest of what a WriteRead ioctl can be kept by (kernel-submit-blocking
+ * report, batch 5; the WriteRead paths have no per-event lines of their own at all):
+ *
+ * "tl: D PID TID target F inflight N depth M at US" -- submit() is about to wait for room in the
+ * queue: F is the fence whose retirement makes room, fixed here rather than advancing with later
+ * submissions (submit() says why), N the submissions outstanding at this moment. "tl: d PID TID
+ * target F US at US" -- the wait is over and took US microseconds.
+ *
+ * "tl: L PID TID sel SEL US at US" -- acquiring the GPU lock for request SEL took at least
+ * GPU_LOCK_NOTICE_US: the queueing a long-held lock makes every other request stand in.
+ *
+ * "tl: S PID TID surface ID KB US at US" -- an IOSurface's import as a buffer took at least
+ * GPU_IMPORT_NOTICE_US with the lock held. KB is the surface's size in kilobytes: the cost is in
+ * the pages.
+ *
+ * "tl: I PID TID US at US" -- printing the five-second statistics in submit() itself took US
+ * microseconds, lock held throughout: the block is the leading suspect for the flips-window
+ * stalls, so its cost is measured where nothing else can see it. This one has no threshold --
+ * the distribution is the answer.
+ */
+#define GPU_LOCK_NOTICE_US      2000
+#define GPU_IMPORT_NOTICE_US    2000
+
+static void
+depthWaitEntry(uint32_t target, uint32_t depth)
+{
+	uint64_t at;
+
+	if (!gWaitLines) {
+		return;
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time(), &at);
+	annibale_tl("tl: D %d %llu target %u inflight %u depth %u at %llu\n", proc_pid(current_proc()),
+	    (unsigned long long)thread_tid(current_thread()), target,
+	    annibale_gpu_last() - annibale_gpu_retired(), depth, at / 1000);
+}
+
+static void
+depthWaitExit(uint32_t target, uint64_t began)
+{
+	uint64_t now = mach_absolute_time(), ns, at;
+
+	if (!gWaitLines) {
+		return;
+	}
+	absolutetime_to_nanoseconds(now - began, &ns);
+	absolutetime_to_nanoseconds(now, &at);
+	annibale_tl("tl: d %d %llu target %u %llu at %llu\n", proc_pid(current_proc()),
+	    (unsigned long long)thread_tid(current_thread()), target, ns / 1000, at / 1000);
+}
+
+/* IOLockLock(gGPULock) for a program's request, with the queueing for it measured. */
+static void
+gpuLockIoctl(uint32_t selector)
+{
+	uint64_t began = 0;
+
+	if (gWaitLines) {
+		began = mach_absolute_time();
+	}
+	IOLockLock(gGPULock);
+	if (gWaitLines) {
+		uint64_t now = mach_absolute_time(), ns, at;
+
+		absolutetime_to_nanoseconds(now - began, &ns);
+		if (ns >= (uint64_t) GPU_LOCK_NOTICE_US * NSEC_PER_USEC) {
+			absolutetime_to_nanoseconds(now, &at);
+			annibale_tl("tl: L %d %llu sel %#x %llu at %llu\n", proc_pid(current_proc()),
+			    (unsigned long long)thread_tid(current_thread()), selector, ns / 1000, at / 1000);
+		}
+	}
+}
+
 /* How long from now a time of msm's is, in milliseconds; 0: now or past. */
 static uint64_t
 millisecondsUntil(const struct msm_timespec * when)
@@ -711,7 +824,7 @@ AnnibaleGPUUserClient::gemInfo(struct msm_gem_info * request)
 	struct gpu_buffer * b;
 	IOReturn ret = kIOReturnSuccess;
 
-	IOLockLock(gGPULock);
+	gpuLockIoctl(kMsmGemInfo);
 	b = buffer(request->handle);
 	if (b == NULL) {
 		ret = kIOReturnBadArgument;
@@ -894,7 +1007,7 @@ AnnibaleGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 	}
 	if (selector != kAnnibaleShow) {
 		if (gGPULock == NULL) return kIOReturnNotReady;
-		IOLockLock(gGPULock);
+		gpuLockIoctl(selector);
 		bool available = !gGPUReported && annibale_gpu_ready();
 		IOLockUnlock(gGPULock);
 		if (!available) return kIOReturnNotReady;
@@ -904,7 +1017,7 @@ AnnibaleGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 
 	switch (selector) {
 	case kMsmGetParam:
-		IOLockLock(gGPULock);
+		gpuLockIoctl(kMsmGetParam);
 		ret = annibale_gpu_parameter(r.param.param, &r.param.value) ? kIOReturnSuccess : kIOReturnBadArgument;
 		IOLockUnlock(gGPULock);
 		break;
@@ -928,13 +1041,17 @@ AnnibaleGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 		break;
 	case kMsmGemCpuPrep:                            /* is the GPU done with a buffer */
 		waitBegan = mach_absolute_time();
-		IOLockLock(gGPULock);
+		gpuLockIoctl(kMsmGemCpuPrep);
 		patience = (r.cpuPrep.op & MSM_PREP_NOSYNC) ? 0 : millisecondsUntil(&r.cpuPrep.timeout);
 		fence = lastUse(r.cpuPrep.handle);
-		if (fence != 0 && !gpuWait(fence, patience)) {
-			ret = kIOReturnBusy;
-			if (patience == 0 && !(r.cpuPrep.op & MSM_PREP_NOSYNC)) {
-				waitOver(&r.cpuPrep.timeout, fence);
+		if (fence != 0) {
+			fenceWaitEntry("cpu-prep", fence, patience);
+			if (!gpuWait(fence, patience)) {
+				fenceWaitFailed("cpu-prep", fence);
+				ret = kIOReturnBusy;
+				if (patience == 0 && !(r.cpuPrep.op & MSM_PREP_NOSYNC)) {
+					waitOver(&r.cpuPrep.timeout, fence);
+				}
 			}
 		}
 		IOLockUnlock(gGPULock);
@@ -945,9 +1062,11 @@ AnnibaleGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 		break;
 	case kMsmWaitFence:
 		waitBegan = mach_absolute_time();
-		IOLockLock(gGPULock);
+		gpuLockIoctl(kMsmWaitFence);
 		patience = millisecondsUntil(&r.waitFence.timeout);
+		fenceWaitEntry("fence", r.waitFence.fence, patience);
 		if (!gpuWait(r.waitFence.fence, patience)) {
+			fenceWaitFailed("fence", r.waitFence.fence);
 			ret = kIOReturnTimeout;
 			if (patience == 0) {
 				waitOver(&r.waitFence.timeout, r.waitFence.fence);
@@ -972,7 +1091,7 @@ AnnibaleGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 		}
 		break;
 	case kDrmGemClose:
-		IOLockLock(gGPULock);
+		gpuLockIoctl(kDrmGemClose);
 		b = buffer(r.close.handle);
 		if (b == NULL) {
 			ret = kIOReturnBadArgument;
@@ -996,7 +1115,7 @@ AnnibaleGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 		 * bytes gets as many as it asked for, and the rest of the numbers are lost with
 		 * the reset, which is the one way to misuse this request.
 		 */
-		IOLockLock(gGPULock);
+		gpuLockIoctl(kAnnibaleGPUWorked);
 		annibale_gpu_worked(&r.worked.microseconds, &r.worked.submissions, r.worked.by);
 		IOLockUnlock(gGPULock);
 		break;

@@ -30,17 +30,45 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request)
 		ret = kIOReturnVMError;
 		goto out;
 	}
-	IOLockLock(gGPULock);
+	gpuLockIoctl(kMsmGemSubmit);
 	roomed = mach_absolute_time();
 	/*
 	 * The A830's queue holds adreno8_context_depth() submissions ahead of the GPU. With that many
 	 * outstanding, the backend would wait for the oldest with this lock held, and every other
 	 * buffer request and the display's driver with it; gpuWait() lets go of the lock meanwhile.
+	 *
+	 * The fence waited for is fixed once, here: the core retires in order, so `target` retiring
+	 * means at most depth - 1 of the submissions this one was behind are still outstanding --
+	 * the room this one needs. Re-reading annibale_gpu_last() on every round instead (as this
+	 * loop did) made the target advance with every submission another program made while
+	 * gpuWait() slept: with work arriving faster than the core retires it, the wait outlasted
+	 * the flood itself and one ioctl could be held for tens of milliseconds. Submissions made
+	 * meanwhile are throttled by their own waits, and should more of them crowd in anyway, the
+	 * backend's own depth check (adreno8_context_submit) is the backstop.
 	 */
-	for (uint32_t depth = a830 ? adreno8_context_depth() : 0, last; depth != 0 && !gGPUReported && annibale_gpu_ready() &&
-	    (last = annibale_gpu_last()) >= depth && !annibale_gpu_done(last - depth + 1);) {
-		if (!gpuWait(last - depth + 1, GPU_PATIENCE_MS)) {
-			break;                                  /* (the backend's own wait says what is wrong) */
+	{ /* (a scope of its own: the early exits above jump to the end of the function) */
+		uint32_t depth = a830 ? adreno8_context_depth() : 0, target = 0;
+
+		if (depth != 0 && !gGPUReported && annibale_gpu_ready()) {
+			uint32_t last = annibale_gpu_last();
+
+			if (last >= depth) {
+				target = last - depth + 1;
+			}
+		}
+		uint64_t depthBegan = mach_absolute_time();
+		bool depthWaited = target != 0 && !annibale_gpu_done(target);
+
+		if (depthWaited) {
+			depthWaitEntry(target, depth);
+		}
+		while (target != 0 && !gGPUReported && annibale_gpu_ready() && !annibale_gpu_done(target)) {
+			if (!gpuWait(target, GPU_PATIENCE_MS)) {
+				break;                          /* (the backend's own wait says what is wrong) */
+			}
+		}
+		if (depthWaited) {
+			depthWaitExit(target, depthBegan);
 		}
 	}
 	gGPUStat.rooming += mach_absolute_time() - roomed;
@@ -190,6 +218,7 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request)
 	absolutetime_to_nanoseconds(mach_absolute_time() - gGPUStat.since, &nanos);
 	if (nanos >= 5 * NSEC_PER_SEC) {
 		uint64_t flushing, waiting, taking, worked, submitting, rooming;
+		uint64_t statsBegan = mach_absolute_time();
 		uint32_t timed, by[7];
 
 		absolutetime_to_nanoseconds(gGPUStat.submitting, &submitting);
@@ -246,6 +275,19 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request)
 			IOLog("AnnibaleGPU: addresses: %llu MB in %u buffers, longest run free %llu MB, %u holes "
 			    "(%u at most, of 1024), %llu KB lost, %u allocations refused\n", used >> 20, live,
 			    largest >> 20, holes, most, lost >> 10, refused);
+		}
+		/*
+		 * What printing the statistics themselves cost, with the lock held throughout: the
+		 * suspect for whole-ioctl stalls that no other line can see (kernel-submit-blocking
+		 * report, batch 5). Into the ring rather than the log, which is the suspect itself.
+		 */
+		if (gWaitLines) {
+			uint64_t cost, at;
+
+			absolutetime_to_nanoseconds(mach_absolute_time() - statsBegan, &cost);
+			absolutetime_to_nanoseconds(mach_absolute_time(), &at);
+			annibale_tl("tl: I %d %llu %llu at %llu\n", proc_pid(current_proc()),
+			    (unsigned long long)thread_tid(current_thread()), cost / 1000, at / 1000);
 		}
 		bzero(&gGPUStat, sizeof(gGPUStat));
 	}

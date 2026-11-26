@@ -67,6 +67,42 @@ rw_sync_draws(void)
 	return on != 0;
 }
 
+/*
+ * GPU YIELDING, on unless ANNIBALE_GPU_NO_YIELD is set. The GPU is one timeline shared by
+ * every process, a submission once handed over cannot be interrupted, and the camera's
+ * still-image kernels run one dispatch for as long as a photograph's width times height
+ * times taps takes them -- measured at 17 and 41.7 ms on device (round7 s024, fences 21982
+ * and 21869), while the compositor needs the GPU every 8.3 ms at the panel's 120 Hz. A
+ * compositor submission that lands behind one of those waits the whole of it, which is the
+ * preview gap after a shutter press. With this on, a large compute dispatch is recorded as
+ * several pieces of the same grid (annibalemetal_compute_argencoder.inc) and a commit whose
+ * compute work is large hands the pieces over one at a time, waiting for each piece's fence
+ * before the next piece is submitted (annibalemetal_commandbuffer_submit.inc), so the queue
+ * the compositor's work lands in is never longer than one piece. Ordering inside the grid
+ * does not change: the pieces are the same threadgroups in the same order, and Metal has
+ * never promised any other ordering than the one a serial execution is.
+ */
+static bool
+rw_gpu_yield(void)
+{
+	static int on = -1;
+
+	if (on < 0)
+		on = getenv("ANNIBALE_GPU_NO_YIELD") == NULL;
+	return on != 0;
+}
+
+/* A dispatch smaller than this is never cut into pieces, and a commit whose compute
+ * dispatches total less than it does not pace: the compositor's own work is several
+ * hundred microseconds a submission, and a piece of this size is measured at one to five
+ * milliseconds for the camera's kernels -- small enough not to hold a frame off, large
+ * enough that the fence round trip between pieces is a few percent of it. */
+#define RW_YIELD_THREADS (768ull * 1024ull)
+/* At most this many pieces for one dispatch: every piece of a grid is a shader variant of
+ * its own at dispatch time (the grid offset is compiled in, tools/mesa/air/air_metal_compute.inc),
+ * and the compiler library keeps the last eight per kernel. */
+#define RW_YIELD_MAX_PIECES 8u
+
 /* ANNIBALE_SYNC_MATCHED_DRAWS=1..16 selects THUMB_MATCH names; the old global switch wins.
  * The process-wide attempt budget is consumed under rw_commit_lock and never replenished.
  * A selected finish also waits for preceding work; it does not isolate that draw's failure. */

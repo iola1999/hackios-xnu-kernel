@@ -1,0 +1,79 @@
+diff --git a/bsd/kern/hvg_sysctl.c b/bsd/kern/hvg_sysctl.c
+index fb0b67c..7746afa 100644
+--- a/bsd/kern/hvg_sysctl.c
++++ b/bsd/kern/hvg_sysctl.c
+@@ -27,8 +27,10 @@
+  */
+ 
+ #include <sys/sysctl.h>
++#include <sys/proc.h>
+ #include <libkern/libkern.h>
+ #include <kern/hvg_hypercall.h>
++#include <pexpert/pexpert.h>
+ #include <stdbool.h>
+ 
+ /* Translate hypercall error code to syscall error code */
+@@ -132,6 +134,39 @@ sysctl_get_bootsessionuuid(__unused struct sysctl_oid *oidp,
+ 	return SYSCTL_OUT(req, &uuid, sizeof(uuid));
+ }
+ 
++/*
++ * Processes named here are told they run on a hypervisor even when the machine
++ * does not. Espresso (the neural network runtime behind Vision and the camera
++ * pipelines) rewrites any engine it is asked for to its CPU engine inside a VM,
++ * and this machine has no Apple Neural Engine for the ANE engine it is asked
++ * for: the inference the callers want exists either way, the VM answer only
++ * selects the backend that can actually run it. Every other process keeps the
++ * true answer -- bluetoothd picks its transport on it, the haptic server waits
++ * for firmware on it. Boot-arg ane_vmm_procs replaces the default list.
++ */
++static char vmm_spoof_procs[128] = "cameracaptured,mediaanalysisd";
++
++static bool
++vmm_spoof_listed(const char *name)
++{
++	const char *item = vmm_spoof_procs;
++
++	while (*item != '\0') {
++		const char *end = item;
++		size_t len;
++
++		while (*end != '\0' && *end != ',') {
++			end++;
++		}
++		len = (size_t)(end - item);
++		if (len != 0 && strlen(name) == len && strncmp(item, name, len) == 0) {
++			return true;
++		}
++		item = *end == ',' ? end + 1 : end;
++	}
++	return false;
++}
++
+ static int
+ sysctl_vmm_present(__unused struct sysctl_oid *oidp,
+     __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+@@ -146,6 +181,14 @@ sysctl_vmm_present(__unused struct sysctl_oid *oidp,
+ 	vmm_present = cpuid_vmm_present();
+ #endif
+ 
++	if (!vmm_present) {
++		char name[32] = "";
++
++		proc_selfname(name, sizeof(name));
++		if (vmm_spoof_listed(name)) {
++			vmm_present = 1;
++		}
++	}
+ 	vmm_present = !!vmm_present;
+ 	return SYSCTL_OUT(req, &vmm_present, sizeof(vmm_present));
+ }
+@@ -207,6 +250,8 @@ hvg_sysctl_init(void)
+ 			sysctl_register_oid_early(hvg_sysctl[i].oid);
+ 		}
+ 	}
++
++	(void) PE_parse_boot_argn("ane_vmm_procs", vmm_spoof_procs, sizeof(vmm_spoof_procs) - 1);
+ }
+ 
+ STARTUP(SYSCTL, STARTUP_RANK_MIDDLE, hvg_sysctl_init);

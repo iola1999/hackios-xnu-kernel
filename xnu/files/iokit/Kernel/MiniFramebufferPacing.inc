@@ -112,7 +112,22 @@ IOMobileFramebuffer::presenter(void)
 		IOLockLock(fSwapLock);
 		while (fSwapsWaiting == 0) {
 			if (!unsettled) {
-				IOLockSleep(fSwapLock, fSwap, THREAD_UNINT);
+				if (!flip.pending) {
+					IOLockSleep(fSwapLock, fSwap, THREAD_UNINT);
+				} else {
+					/* A flip out and nothing queued: the latch would otherwise go unlooked at
+					 * until a swap came -- which is what everything else may be waiting for.
+					 * (This thread alone writes flip.pending, so no lock for the condition.) */
+					AbsoluteTime watch;
+
+					clock_interval_to_deadline(FLIP_WATCH_MS, kMillisecondScale, &watch);
+					if (IOLockSleepDeadline(fSwapLock, fSwap, watch, THREAD_UNINT) == THREAD_TIMED_OUT &&
+					    fSwapsWaiting == 0) {
+						IOLockUnlock(fSwapLock);
+						flipWatchdog();
+						IOLockLock(fSwapLock);
+					}
+				}
 			} else if (IOLockSleepDeadline(fSwapLock, fSwap, deadline, THREAD_UNINT) == THREAD_TIMED_OUT &&
 			    fSwapsWaiting == 0) {
 				IOLockUnlock(fSwapLock);

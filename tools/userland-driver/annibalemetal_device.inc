@@ -127,6 +127,12 @@ rw_image_uuid(const void *addr, char *out, size_t out_size)
 	rw_print("targetDeviceInfo answers {0, 0, \"%s\"} -- _MTLDevice's own entry "
 	         "answers NULL and Metal reads it without looking, so the precompiled pipelines "
 	         "this device will be asked for are pipelines.%s\n", _target.name, _target.name);
+	/* The prewarm replay starts with the first device that can build: pipeline creation
+	 * is per-device, and the replayed pipelines must land in the cache of the device the
+	 * compositor will actually ask. */
+	if (_mesa != NULL && mesa.render_create != NULL) {
+		rw_prewarm_start(self, _mesa);
+	}
 	return self;
 }
 
@@ -450,6 +456,16 @@ rw_image_uuid(const void *addr, char *out, size_t out_size)
 		    &shape, linked, num_linked);
 	render = rw_pipe_find(_mesa, key, &info);
 	bool reused = render != NULL;
+	bool building = false;
+	if (!reused) {
+		/* the prewarm replay may be mid-build of this very key: wait for it rather
+		 * than pay the same build a second time, then read the cache again */
+		building = rw_pipe_inflight_enter(_mesa, key);
+		if (!building) {
+			render = rw_pipe_find(_mesa, key, &info);
+			reused = render != NULL;
+		}
+	}
 	if (!reused) {
 		render = mesa.render_create_linked != NULL
 		    ? mesa.render_create_linked(_mesa, [vertex_air bytes], [vertex_air length], vertex_name,
@@ -460,6 +476,21 @@ rw_image_uuid(const void *addr, char *out, size_t out_size)
 			  &shape, &info, why, sizeof(why));
 		if (render != NULL) {
 			rw_pipe_keep(_mesa, key, render, &info);
+		}
+		/* leaving the exclusion after the keep, not before it: a waiter woken while the
+		 * cache is still empty reads the miss as a failed build and builds a second copy,
+		 * which is the duplicated work the exclusion exists to prevent */
+		if (building) {
+			rw_pipe_inflight_leave(_mesa, key);
+		}
+		if (render != NULL) {
+			/* harvested with the exact inputs of the build, before the linked
+			 * scratch goes: next boot's prewarm rebuilds this pipeline before
+			 * anyone asks for it */
+			rw_harvest_record(key, [vertex_air bytes], [vertex_air length], vertex_name,
+					  [fragment_air bytes], [fragment_air length],
+					  fragment != nil ? fragment_name : NULL,
+					  &shape, linked, num_linked);
 		}
 	}
 	rw_linked_free(linked_scratch);

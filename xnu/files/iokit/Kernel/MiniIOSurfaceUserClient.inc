@@ -17,13 +17,14 @@ IOSurfaceRootUserClient::methodCreate(IOExternalMethodArguments * args)
 	size_t inSize = args->structureInputSize;
 	OSObject * obj;
 	OSDictionary * props;
-	MiniIOSurface * s;
+	MiniIOSurface * s, * parent = NULL;
 	struct minisurf_client_ref * ref;
 	uint64_t began = mach_absolute_time();
 
 	if (args->scalarInputCount >= 1 && args->scalarInput[0] != 0) {
-		IOLog("MiniIOSurface: child surfaces are not supported (parent %llu)\n", args->scalarInput[0]);
-		return kIOReturnUnsupported;
+		if (args->scalarInput[0] >= MINISURF_TABLE_SIZE) {
+			return kIOReturnBadArgument;
+		}
 	}
 	if (args->structureInputDescriptor != NULL) {
 		inMap = args->structureInputDescriptor->map(kIOMapReadOnly);
@@ -40,8 +41,18 @@ IOSurfaceRootUserClient::methodCreate(IOExternalMethodArguments * args)
 		OSSafeReleaseNULL(obj);
 		return kIOReturnBadArgument;
 	}
+	if (args->scalarInputCount >= 1 && args->scalarInput[0] != 0) {
+		parent = MiniIOSurfaceCopy((uint32_t) args->scalarInput[0]);
+		if (parent == NULL) {
+			props->release();
+			return kIOReturnNotFound;
+		}
+	}
 	uint64_t made_at = mach_absolute_time();
-	s = surfaceCreate(props, &ret);
+	s = surfaceCreate(props, &ret, parent);
+	if (parent != NULL) {
+		MiniIOSurfaceDrop(parent);
+	}
 	made_at = mach_absolute_time() - made_at;
 	if (s == NULL) {
 		IOLog("MiniIOSurface: create failed 0x%x: %ux%u format 0x%x alloc %u\n", ret,

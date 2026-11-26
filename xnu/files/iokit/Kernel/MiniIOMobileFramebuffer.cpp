@@ -336,6 +336,8 @@ public:
 	MiniIOSurface * defaultSurface(void);
 	void present(const uint8_t * swap);
 	void show(const uint8_t * swap, MiniIOSurface ** surfaces);
+	void noteLatch(uint64_t frame_when);
+	void flipWatchdog(void);
 	void finishSwapLocked();
 	void presenter(void);
 	static void presenterMain(void * self, wait_result_t result);
@@ -771,15 +773,57 @@ IOMobileFramebuffer::finishSwapLocked()
 	IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
 }
 
+/*
+ * A latch as the panel took it, once: the frame-timing books and, under touch_lat, the line that
+ * is the only report of a flip's being taken. Called from show() with its copy's start and from
+ * flipWatchdog() with now, under fLock either way; without a flip engine the caller's time
+ * stands in for a frame's.
+ */
+void
+IOMobileFramebuffer::noteLatch(uint64_t frame_when)
+{
+	uint64_t latched = 0, nanos;
+	uint32_t latch_swap = 0, latch_frame = 0;
+	bool has_latch = flip_latch(&latch_swap, &latched, &latch_frame);
+
+	if (has_latch || !flip.ready) {
+		uint64_t frame_at = has_latch ? latched : frame_when;
+
+		if (fLastFrame != 0) {
+			uint32_t refreshes = has_latch ? latch_frame - fLastFrameRefresh : 0;
+			bool counted = fLastFrameRefresh != 0 && refreshes > 0 && refreshes <= 240;
+
+			if (counted) {
+				nanos = (uint64_t) refreshes * NSEC_PER_SEC / refreshHz();
+			} else {
+				absolutetime_to_nanoseconds(frame_at - fLastFrame, &nanos);
+			}
+			nanos /= NSEC_PER_MSEC;
+			if (nanos >= FRAME_PAUSE) {
+				fFramePauses++;
+			} else {
+				fFrameTimes[nanos < FRAME_TIMES ? nanos : FRAME_TIMES]++;
+				fFrameLongest = nanos > fFrameLongest ? (uint32_t) nanos : fFrameLongest;
+			}
+		}
+		fLastFrame = frame_at;
+		fLastFrameRefresh = has_latch ? latch_frame : 0;
+	}
+	if (gTouchLat && has_latch) {
+		annibale_tl("tl: l %u at %llu frame %u source ctl_flush\n", latch_swap,
+		    (unsigned long long)micros(latched), latch_frame);
+	}
+}
+
 /* A swap's surfaces onto the panel, once the GPU is done with them. */
 void
 IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 {
 	uint32_t set = swapWord(swap, SWAP_LAYERS_SET);
-	uint64_t began = mach_absolute_time(), nanos, ready, copy_began, drawn, latched = 0;
-	uint32_t layers = 0, latch_swap = 0, latch_frame = 0;
+	uint64_t began = mach_absolute_time(), nanos, ready, copy_began, drawn;
+	uint32_t layers = 0;
 	MiniIOSurface * recorded = NULL;
-	bool report, has_latch, cleared_black = false, drew_panel;
+	bool report, cleared_black = false, drew_panel;
 
 	bool unfinished = false, gpu_up = true;
 
@@ -870,34 +914,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	fLastBy0 = fLastBy1 = -1;
 	fLastBufSeqBefore = fLastBufSeqAfter = fBufferSeq[flip.ready ? (flip.shown ^ 1) : 0];
 	fLastAllDirty = false;
-	has_latch = flip_latch(&latch_swap, &latched, &latch_frame);
-	if (has_latch || !flip.ready) {
-		uint64_t frame_at = has_latch ? latched : copy_began;
-
-		if (fLastFrame != 0) {
-			uint32_t refreshes = has_latch ? latch_frame - fLastFrameRefresh : 0;
-			bool counted = fLastFrameRefresh != 0 && refreshes > 0 && refreshes <= 240;
-
-			if (counted) {
-				nanos = (uint64_t) refreshes * NSEC_PER_SEC / refreshHz();
-			} else {
-				absolutetime_to_nanoseconds(frame_at - fLastFrame, &nanos);
-			}
-			nanos /= NSEC_PER_MSEC;
-			if (nanos >= FRAME_PAUSE) {
-				fFramePauses++;
-			} else {
-				fFrameTimes[nanos < FRAME_TIMES ? nanos : FRAME_TIMES]++;
-				fFrameLongest = nanos > fFrameLongest ? (uint32_t) nanos : fFrameLongest;
-			}
-		}
-		fLastFrame = frame_at;
-		fLastFrameRefresh = has_latch ? latch_frame : 0;
-	}
-	if (gTouchLat && has_latch) {
-		annibale_tl("tl: l %u at %llu frame %u source ctl_flush\n", latch_swap,
-		    (unsigned long long)micros(latched), latch_frame);
-	}
+	noteLatch(copy_began);
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
 		int32_t src[4], dst[4];
@@ -1051,6 +1068,88 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		fStatFrames = 0;
 		fStatDrawing = 0;
 		fStatSince = 0;
+	}
+	IOLockUnlock(fLock);
+}
+
+/*
+ * The keeper of a pending flip while the queue is empty (FLIP_WATCH_*): the display controller's
+ * answer is looked for once, a taken flip is latched as show() would, and one still out after
+ * FLIP_WATCH_DUMP_MS gets the interfaces' state on the log once and flip_kick's two writes --
+ * the point, then the mixers' flush, the write pattern that ends a stall -- every
+ * FLIP_WATCH_KICK_MS, until FLIP_WATCH_CEASE_MS of that -- after which the ctl is left
+ * alone and the bit to the next swap's own poll. Runs on the presenter's thread with fLock held
+ * around the registers, as show() does; flip_look_intfs is the only part that is not locking's
+ * business, being two reads 200 ms apart of a stalled display.
+ */
+void
+IOMobileFramebuffer::flipWatchdog(void)
+{
+	uint64_t now = mach_absolute_time(), ns;
+
+	if (!flip.ready || !flip.pending) {
+		flip.watch_began = 0;
+		return;
+	}
+	IOLockLock(fLock);
+	if (flip_taken(0, false)) {
+		flip.pending = false;
+		noteLatch(now);
+		flip.watch_began = 0;
+		IOLockUnlock(fLock);
+		return;
+	}
+	if (flip.watch_began == 0) {
+		flip.watch_began = now;
+		flip.watch_dumped = flip.watch_ceased = false;
+		flip.watch_kicked = flip.watch_last = 0;
+	}
+	absolutetime_to_nanoseconds(now - flip.watch_began, &ns);
+	ns /= NSEC_PER_MSEC;
+	if (ns < FLIP_WATCH_DUMP_MS) {
+		IOLockUnlock(fLock);
+		return;                         /* late, not stuck yet: looked at again on the next wake */
+	}
+	if (!flip.watch_dumped) {
+		uint32_t c = FLIP_CTL(flip.ctl);
+
+		flip.watch_dumped = true;
+		IOLog("MiniIOMobileFramebuffer: flip: swap %u pending %llu ms and ctl%u took no flush: layers "
+		    "%08x %08x top %08x flush %08x start %08x intf %08x fetch %08x\n", flip.pending_swap,
+		    (unsigned long long) ns, flip.ctl, flip_rd(c + FLIP_CTL_LAYER(0)), flip_rd(c + FLIP_CTL_LAYER(1)),
+		    flip_rd(c + FLIP_CTL_TOP), flip_rd(c + FLIP_CTL_FLUSH), flip_rd(c + FLIP_CTL_START),
+		    flip_rd(c + FLIP_CTL_INTF_ACTIVE), flip_rd(c + FLIP_CTL_FETCH_ACTIVE));
+		IOLockUnlock(fLock);
+		flip_look_intfs();
+		IOLockLock(fLock);
+		if (flip_taken(0, false)) {
+			/* (the 200 ms the dump took was itself enough: latched, and no pointing again needed) */
+			flip.pending = false;
+			noteLatch(mach_absolute_time());
+			flip.watch_began = 0;
+		} else {
+			flip.watch_kicked = flip.watch_last = mach_absolute_time();
+			flip_kick();
+		}
+		IOLockUnlock(fLock);
+		return;
+	}
+	absolutetime_to_nanoseconds(now - flip.watch_kicked, &ns);
+	ns /= NSEC_PER_MSEC;
+	if (ns >= FLIP_WATCH_CEASE_MS) {
+		if (!flip.watch_ceased) {
+			flip.watch_ceased = true;
+			IOLog("MiniIOMobileFramebuffer: flip: swap %u still pending after %llu ms of pointing it "
+			    "again; ctl%u is left alone now\n", flip.pending_swap, (unsigned long long) ns, flip.ctl);
+		}
+		IOLockUnlock(fLock);
+		return;
+	}
+	absolutetime_to_nanoseconds(now - flip.watch_last, &ns);
+	ns /= NSEC_PER_MSEC;
+	if (ns >= FLIP_WATCH_KICK_MS) {
+		flip.watch_last = now;
+		flip_kick();
 	}
 	IOLockUnlock(fLock);
 }

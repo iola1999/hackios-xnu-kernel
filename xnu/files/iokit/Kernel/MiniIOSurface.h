@@ -54,6 +54,16 @@ public:
 	IOBufferMemoryDescriptor *      memory;         /* one page of shared state, then the pixels */
 	uint8_t *                       kbase;          /* the same, in the kernel */
 	/*
+	 * A child surface shares the backing of its parent but keeps its own shared-state page.
+	 * `backing` is the parent's pixel memory object, retained independently of the parent surface;
+	 * `backingOffset`/`backingLength` describe byte zero and the length of the shared coordinate space
+	 * inside that object. `backing` is NULL when the pixels are in `memory` or `client`; the range
+	 * fields then describe that surface's own pixel storage for GPU users.
+	 */
+	IOMemoryDescriptor *            backing;
+	uint64_t                        backingOffset;
+	uint64_t                        backingLength;
+	/*
 	 * ... unless the surface was made around memory its maker has already (IOSurfaceAddress):
 	 * then the pixels are that memory, held in place and seen from the kernel as well, and
 	 * `memory` is the page of shared state alone.
@@ -76,6 +86,8 @@ public:
 	init(void) APPLE_KEXT_OVERRIDE
 	{
 		sharedABI = MINISURF_UNCLAIMED;
+		backing = NULL;
+		backingOffset = backingLength = 0;
 		return OSObject::init();
 	}
 	virtual void free(void) APPLE_KEXT_OVERRIDE;

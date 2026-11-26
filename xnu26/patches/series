@@ -80,3 +80,5 @@
 78-pexpert%arm%pe_identify_machine.c.patch
 79-osfmk%arm64%genassym.c.patch
 80-osfmk%arm64%locore.s.patch
+81-bsd%kern%hvg_sysctl.c.patch
+82-bsd%vfs%vfs_lookup.c.patch
