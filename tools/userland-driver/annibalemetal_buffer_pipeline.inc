@@ -46,10 +46,13 @@
 		[self release];
 		return nil;
 	}
-	if (IOConnectCallStructMethod(gpu, kMsmGemNew, &request, sizeof(request), &request,
-				      &size) != KERN_SUCCESS || request.handle == 0) {
-		rw_print("the kernel would not allocate %lu bytes\n",
-		         (unsigned long)length);
+	kern_return_t made = IOConnectCallStructMethod(gpu, kMsmGemNew, &request, sizeof(request),
+						       &request, &size);
+	if (made != KERN_SUCCESS || request.handle == 0) {
+		/* the IOReturn says which shortage it was (AnnibaleGPUMemory.inc): handles all in use,
+		 * no span of GPU addresses, no page table, wired memory, or the GPU going or gone */
+		rw_print("the kernel would not allocate %lu bytes: IOReturn %#x\n",
+		         (unsigned long)length, made);
 		[self release];
 		return nil;
 	}

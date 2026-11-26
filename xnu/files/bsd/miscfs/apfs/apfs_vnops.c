@@ -420,6 +420,7 @@ apfs_vnop_getattr(struct vnop_getattr_args *ap)
 	VATTR_RETURN(vap, va_fsid, (uint32_t)vfs_statfs(am->am_mp)->f_fsid.val[0]);
 	VATTR_RETURN(vap, va_filerev, 0);
 	VATTR_RETURN(vap, va_gen, 0);
+	VATTR_RETURN(vap, va_write_gencount, ino.write_gen);   /* E5RT's cache fingerprint asks for it; the inode's counter is read from disk already */
 	VATTR_RETURN(vap, va_type, vnode_vtype(vp));
 	VATTR_RETURN(vap, va_dataprotect_class, ino.pclass != 0 ? ino.pclass : PROTECTION_CLASS_D);
 	VATTR_RETURN(vap, va_document_id, ino.doc_id);

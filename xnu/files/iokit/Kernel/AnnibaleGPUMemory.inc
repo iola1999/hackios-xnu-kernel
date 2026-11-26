@@ -176,16 +176,26 @@ AnnibaleGPUUserClient::lastUse(uint32_t handle)
 
 /*
  * A handle and addresses of the GPU's for `size` bytes of a memory descriptor, from byte `from`
- * of it on (wired memory; both in whole pages). With the lock held; NULL: allocation or mapping failed.
+ * of it on (wired memory; both in whole pages). With the lock held; NULL: allocation or mapping
+ * failed, and `error` then says which shortage it was, so a caller's answer to the program can
+ * say more than "no memory" for every one of them (kIOReturnNoResources: this client's handles
+ * are all in use; kIOReturnNoSpace: no free span in the GPU's address space; kIOReturnVMError: no
+ * page table for the span; kIOReturnNotReady: the GPU is going or gone, whenever in the making
+ * that came to be known).
  */
 struct gpu_buffer *
-AnnibaleGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle)
+AnnibaleGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle, IOReturn * error)
 {
 	struct gpu_buffer * b = NULL;
 	bool mapped = true;
 
-	if (gGPUReported || !annibale_gpu_ready() || size == 0 || from > memory->getLength() ||
+	if (gGPUReported || !annibale_gpu_ready()) {
+		*error = kIOReturnNotReady;
+		return NULL;
+	}
+	if (size == 0 || from > memory->getLength() ||
 	    size > memory->getLength() - from || ((from | size) & 4095) != 0) {
+		*error = kIOReturnBadArgument;
 		return NULL;
 	}
 	for (uint32_t n = 0; n < GPU_BUFFERS; n++) {
@@ -198,8 +208,17 @@ AnnibaleGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uin
 			break;
 		}
 	}
-	if (b == NULL || (b->address = annibale_gpu_address(size)) == 0) {
-		IOLog("AnnibaleGPU: no %s left for a buffer of %llu bytes\n", b ? "addresses" : "handles", size);
+	if (b == NULL) {
+		IOLog("AnnibaleGPU: no handles left for a buffer of %llu bytes\n", size);
+		*error = kIOReturnNoResources;
+		return NULL;
+	}
+	uint32_t refusal = 0;
+
+	if ((b->address = annibale_gpu_address(size, &refusal)) == 0) {
+		/* adreno8's own lines say the same refusal in words */
+		*error = refusal == GPU_REFUSE_NO_RANGE ? kIOReturnNoSpace :
+		    refusal == GPU_REFUSE_NO_TABLE ? kIOReturnVMError : kIOReturnNotReady;
 		return NULL;
 	}
 	/* one entry for each 4 KB, one lookup for each physically contiguous run of them */
@@ -227,6 +246,8 @@ AnnibaleGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uin
 			fBufferBytes += size;
 		}
 		IOLog("AnnibaleGPU: a buffer of %llu bytes cannot be entered into the GPU's address space\n", size);
+		/* mapping and its commit fail on the GPU's health, never on how full anything is */
+		*error = kIOReturnNotReady;
 		return NULL;
 	}
 	b->size = size;
@@ -377,7 +398,9 @@ AnnibaleGPUUserClient::gemNew(struct msm_gem_new * request, uint64_t * iova)
 
 	gpuLockIoctl(kMsmGemNew);
 	gGPUStat.locking += mach_absolute_time() - allocated;
-	b = newBuffer(memory, 0, size, request->flags, &request->handle);
+	IOReturn error = kIOReturnNoMemory;
+
+	b = newBuffer(memory, 0, size, request->flags, &request->handle, &error);
 	if (b != NULL) {
 		b->memory = memory;
 		b->kernel = (uint8_t *) memory->getBytesNoCopy();
@@ -390,7 +413,7 @@ AnnibaleGPUUserClient::gemNew(struct msm_gem_new * request, uint64_t * iova)
 	IOLockUnlock(gGPULock);
 	if (b == NULL) {
 		memory->release();
-		return kIOReturnNoMemory;
+		return error;
 	}
 	return kIOReturnSuccess;
 }
@@ -457,10 +480,12 @@ AnnibaleGPUUserClient::surfaceBuffer(struct annibale_surface * request)
 			break;
 		}
 	}
+	IOReturn error = kIOReturnNoMemory;
+
 	if (b != NULL) {
 		memory->release();
 		MiniIOSurfaceDrop(s);
-	} else if ((b = newBuffer(pixelsMemory, pixelsOffset, size, 0, &request->handle)) != NULL) {
+	} else if ((b = newBuffer(pixelsMemory, pixelsOffset, size, 0, &request->handle, &error)) != NULL) {
 		b->memory = memory;
 		b->kernel = s->kpixels;
 		b->surface = s;
@@ -481,7 +506,7 @@ AnnibaleGPUUserClient::surfaceBuffer(struct annibale_surface * request)
 	if (b == NULL) {
 		memory->release();
 		MiniIOSurfaceDrop(s);
-		return kIOReturnNoMemory;
+		return error;
 	}
 	return kIOReturnSuccess;
 }
@@ -531,14 +556,18 @@ AnnibaleGPUUserClient::memoryBuffer(struct annibale_memory * request)
 		return ret;
 	}
 	gpuLockIoctl(kAnnibaleMemory);
-	if (!gGPUReported && annibale_gpu_ready() && (b = newBuffer(memory, 0, request->size, flags, &request->handle)) != NULL) {
+	IOReturn error = kIOReturnNoMemory;
+
+	if (gGPUReported || !annibale_gpu_ready()) {
+		error = kIOReturnNotReady;
+	} else if ((b = newBuffer(memory, 0, request->size, flags, &request->handle, &error)) != NULL) {
 		b->memory = memory;
 		b->kernel = NULL;
 	}
 	IOLockUnlock(gGPULock);
 	if (b == NULL) {
 		memory->release();
-		return kIOReturnNoMemory;
+		return error;
 	}
 	return kIOReturnSuccess;
 }

@@ -12,7 +12,13 @@
 #define HID_USAGE_APPLE_ALS             0x0004
 #define HID_USAGE_APPLE_PROXIMITY       0x0005
 
-/* Sensor sample source flags */
+/* Sensor sample source flags. Publication contract with input26-service: the ALS HID service
+ * is registered, and the auto-brightness control loop with it fed, only while at least one of
+ * HW_I2C, ADSP_SSC or INJECTED is set; the compile-time placeholder carries DEFAULT alone and
+ * never reaches the system. INJECTED is asserted only by writes that carry ALS data (the als_lux
+ * boot-arg, the kern.annibale.als_lux sysctl, lux or plain-number writes and whole-sample writes
+ * to /dev/annibale-sensors); proximity-only writes must not assert it, or the placeholder
+ * als_lux would become publishable. */
 #define ANNIBALE_SENSOR_SRC_DEFAULT      (1u << 0)
 #define ANNIBALE_SENSOR_SRC_HW_I2C       (1u << 1)
 #define ANNIBALE_SENSOR_SRC_ADSP_SSC     (1u << 2)

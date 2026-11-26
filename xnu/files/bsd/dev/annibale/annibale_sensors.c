@@ -11,15 +11,17 @@
  *       channel scale factor ~ 1.034x (1034 milli-units).
  *   - Rear ALS: stk6a2x_back (sm8750_stk6a2x_back.json.stk6a2x_back_0_platform.config)
  *     bus_type = 0 (I2C), bus_instance = 11 (QUPv3 SE10 at 0x00888000), slave = 0x47 (71),
- *     400 kHz, DRI IRQ = TLMM GPIO 35.
+ *     400 kHz, DRI IRQ = TLMM GPIO 35, reg_addr_type = 0.
  *
- * Bus ownership and non-faulting MMIO invariant:
- *   On SM8750, sensor I2C buses can be routed to the ADSP/SLPI Sensor Subsystem (SSC) island
- *   or left with their AP QUPv3 wrapper 2 branch clocks gated off (CLK_OFF bit 31 = 1).
- *   Reading any QUP GENI SE register while its GCC AHB or SE branch clock is off triggers a
- *   synchronous external abort. Therefore this driver checks GCC_QUPV3_WRAP_2_M_AHB_CBCR,
- *   GCC_QUPV3_WRAP_2_S_AHB_CBCR, and the SE's CBCR before any SE MMIO read, and only touches
- *   the SE registers when the clocks report CLK_OFF == 0.
+ * Bus access: open-drain GPIO bitbang (bitbang) on the SE pin pairs, the same technique the front
+ * camera driver validated on-device on SE9 (annibale_camera_hw.inc). It needs neither the GCC
+ * branch clocks nor the GENI firmware: the AP QUPv3 wrapper-2 controllers are disabled in the
+ * Android device tree and the buses belong to the sensor island, whose clocks stay off while no
+ * SSC client subscribes. The SE clock halt registers are still observed before any bitbang; seen
+ * activity means another master may own the bus and the hardware path stays disengaged.
+ *
+ * Clock offsets are the SM8750 voting-model values of mainline gcc-sm8750.c (BRANCH_HALT_VOTED):
+ * the branch registers are halt-status-only, the enable votes live in the AP voting register.
  *
  * Userland contract:
  *   - /dev/annibale-sensors character device (read, write, ioctl)
@@ -39,12 +41,14 @@
 #include <sys/errno.h>
 #include <sys/proc.h>
 #include <sys/annibale_input.h>
+#include <sys/annibale_rpmh.h>
 #include <sys/annibale_sensors.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
 extern void loader_log_putc(char c);
 extern void loader_log_line(const char *line);
@@ -53,76 +57,54 @@ extern bool disable_kprintf_output;
 
 SYSCTL_DECL(_kern_annibale);
 
-/* ---- SM8750 GCC, TLMM, and QUPv3 Wrapper 2 (I2C Hub) physical addresses ------------------- */
+/* ---- SM8750 GCC and TLMM physical addresses ------------------------------------------------------ */
+/* mainline gcc-sm8750.c: the wrapper-2 branches are voted clocks. The halt registers below are
+ * read-only status (bit 31 CLK_OFF, bits 30:28 NoC FSM status); the AP's enable votes are in
+ * GCC_QUPV3_WRAP2_VOTE (bit1 s_ahb, bit2 m_ahb, bit0 core, bit3 core_2x, bit6 SE10/s2, bit8 SE12/s4). */
 
 #define GCC_BASE_PHYS                   0x00100000UL
-#define GCC_MAP_SIZE                    0x00040000UL
-#define GCC_QUPV3_WRAP2_M_AHB_CBCR      0x1f008UL
-#define GCC_QUPV3_WRAP2_S_AHB_CBCR      0x1f00cUL
-#define GCC_QUPV3_WRAP2_S2_CBCR         0x1f288UL       /* SE10 (rear ALS stk6a2x) */
-#define GCC_QUPV3_WRAP2_S4_CBCR         0x1f504UL       /* SE12 (front ALS+Prox gls6151) */
-#define GCC_CBCR_CLK_ENABLE             (1u << 0)
-#define GCC_CBCR_CLK_OFF                (1u << 31)
-
-#define QUPV3_SE10_PHYS                 0x00888000UL
-#define QUPV3_SE12_PHYS                 0x00890000UL
-#define QUPV3_SE_SIZE                   0x00004000UL
-
-#define GENI_STATUS                     0x0040UL
-#define GENI_FW_REVISION_RO             0x0068UL
-#define GENI_I2C_TX_TRANS_LEN           0x026cUL
-#define GENI_I2C_RX_TRANS_LEN           0x0270UL
-#define GENI_M_CMD0                     0x0600UL
-#define GENI_M_CMD_CTRL_REG             0x0604UL
-#define GENI_M_IRQ_STATUS               0x0610UL
-#define GENI_M_IRQ_CLEAR                0x0618UL
-#define GENI_TX_FIFOn                   0x0700UL
-#define GENI_RX_FIFOn                   0x0780UL
-#define GENI_RX_FIFO_STATUS             0x0804UL
-
-#define GENI_M_GENI_ACTIVE              (1u << 0)
-#define GENI_FW_PROTO_MASK              0x0000ff00u
-#define GENI_FW_PROTO_I2C               0x00000300u
-
-#define M_CMD_I2C_WRITE                 0x1u
-#define M_CMD_I2C_READ                  0x2u
-#define M_CMD_I2C_WRITE_READ            0x3u
-#define M_CMD_SLV_ADDR_SHIFT            9
-#define M_IRQ_CMD_DONE                  (1u << 0)
-#define M_IRQ_CMD_OVERRUN               (1u << 1)
-#define M_IRQ_ILLEGAL_CMD               (1u << 2)
-#define M_IRQ_CMD_FAILURE               (1u << 3)
-#define M_IRQ_CMD_CANCEL                (1u << 4)
-#define M_IRQ_CMD_ABORT                 (1u << 5)
-#define M_IRQ_GP_ERR_MASK               (0x7fu << 6)
-#define M_IRQ_NACK                      (1u << 26)
-#define M_IRQ_ERR_ALL                   (M_IRQ_CMD_OVERRUN | M_IRQ_ILLEGAL_CMD | M_IRQ_CMD_FAILURE | \
-                                         M_IRQ_CMD_CANCEL | M_IRQ_CMD_ABORT | M_IRQ_GP_ERR_MASK | M_IRQ_NACK)
+#define GCC_MAP_SIZE                    0x00060000UL
+#define GCC_QUPV3_WRAP2_VOTE            0x52010UL       /* the application processor's votes */
+#define GCC_QUPV3_WRAP2_M_AHB_HALT      0x23298UL
+#define GCC_QUPV3_WRAP2_S_AHB_HALT      0x2329cUL
+#define GCC_QUPV3_WRAP2_S2_HALT         0x1e27cUL       /* SE10 (rear ALS stk6a2x) */
+#define GCC_QUPV3_WRAP2_S4_HALT         0x1e4f4UL       /* SE12 (front ALS+Prox gls6151) */
 
 #define TLMM_BASE_PHYS                  0x0f100000UL
 #define TLMM_MAP_SIZE                   0x00100000UL
 #define TLMM_GPIO_CFG(pin)              (0x1000UL * (uint32_t)(pin))
 #define TLMM_GPIO_IN_OUT(pin)           (0x1000UL * (uint32_t)(pin) + 0x04UL)
 
-/* gls6151 register offsets (standard 8-bit register addresses) */
+/* gls6151 register offsets, 8-bit register numbers and not yet verified on-device; the chip's
+ * persist registry reg_addr_type = 1 hints at 16-bit register addressing, which the driver and
+ * the probes both try. Layout matches a low-byte-first Sensortek-family arrangement. */
 #define GLS6151_REG_SYSM_CTRL           0x00
 #define GLS6151_REG_INT_FLAG            0x01
 #define GLS6151_REG_PS_DATA_LOW         0x02
 #define GLS6151_REG_ALS_CLEAR_LOW       0x04
 #define GLS6151_REG_ALS_IR_LOW          0x06
 #define GLS6151_REG_PRODUCT_ID          0x3e
+#define GLS6151_STATE_EN_PS_ALS         0x03            /* Sensortek family: bit0 PS, bit1 ALS */
 
-/* stk6a2x register offsets */
+/* stk6a2x register offsets (mainline drivers/iio/light/stk3310.c) */
 #define STK6A2X_REG_STATE               0x00
+#define STK6A2X_REG_PS_DATA_MSB         0x11
 #define STK6A2X_REG_ALS_DATA_MSB        0x13
 #define STK6A2X_REG_PDT_ID              0x3e
+#define STK6A2X_STATE_EN_PS_ALS         0x03
 
 static LCK_GRP_DECLARE(sensors_lck_grp, "annibale-sensors");
 static LCK_MTX_DECLARE(sensors_lck, &sensors_lck_grp);
 
-static vm_offset_t gcc_base, tlmm_base, se10_base, se12_base;
+static vm_offset_t gcc_base, tlmm_base;
 static bool initialized;
 static int hw_i2c_mode;
+static int probe_mode;
+
+/* Bitbang driver state, written once at init and then read-only in the poll loop. */
+static bool front_online, back_online;
+static bool front_reg16, back_reg16;
+static bool hw_refused;         /* SE clock activity seen: another master may own the buses */
 
 static struct annibale_sensors_state sensor_state = {
 	.sample = {
@@ -172,111 +154,103 @@ rd(vm_offset_t address)
 	return *(volatile uint32_t *)address;
 }
 
-static inline void
-wr(vm_offset_t address, uint32_t value)
+#include "annibale_sensors_i2c.inc"
+#include "annibale_sensors_probe.inc"
+
+/* ---- bitbang hardware driver ------------------------------------------------------------------------ */
+
+static bool
+sns_read_regs(uint32_t sda, uint32_t scl, uint8_t slave, bool reg16, uint8_t reg,
+    uint8_t *buf, uint32_t len)
 {
-	*(volatile uint32_t *)address = value;
+	uint8_t reg8[1] = { reg };
+	uint8_t reg16b[2] = { 0x00, reg };
+
+	return od_i2c_read_regs(sda, scl, slave, reg16 ? reg16b : reg8, reg16 ? 2 : 1, buf, len);
 }
 
+static bool
+sns_write_reg(uint32_t sda, uint32_t scl, uint8_t slave, bool reg16, uint8_t reg, uint8_t value)
+{
+	uint8_t write8[2] = { reg, value };
+	uint8_t write16[3] = { 0x00, reg, value };
+
+	return od_i2c_write_bytes(sda, scl, slave, reg16 ? write16 : write8, reg16 ? 3 : 2);
+}
+
+/*
+ * Detect one chip: bare address ACK, then the product-ID read decides the register addressing
+ * width (8-bit first, then 16-bit). True when the ID read succeeds in either width.
+ */
+static bool
+sns_detect(uint32_t sda, uint32_t scl, uint8_t slave, const char *name, bool *reg16_out, bool verbose)
+{
+	uint8_t id = 0;
+
+	if (!od_i2c_ack_probe(sda, scl, slave)) {
+		if (verbose) {
+			say("sensors: %s 0x%02x NACK\n", name, slave);
+		}
+		return false;
+	}
+	for (uint32_t width = 0; width < 2; width++) {
+		bool reg16 = width != 0;
+		if (sns_read_regs(sda, scl, slave, reg16, 0x3e, &id, 1)) {   /* both chips keep their id at 0x3e */
+			*reg16_out = reg16;
+			say("sensors: %s 0x%02x ACK, id@0x3e=%#x (%u-bit addressing)\n",
+			    name, slave, id, reg16 ? 16u : 8u);
+			return true;
+		}
+	}
+	if (verbose) {
+		say("sensors: %s 0x%02x ACKs its address but the id read fails in both widths\n", name, slave);
+	}
+	return false;
+}
+
+/* Detect one chip and write its Sensortek-family enable sequence. Power-on after a rail vote
+ * takes time the registry does not specify, so the poll loop reruns this for missing chips. */
+static bool
+sns_bring_up(uint32_t sda, uint32_t scl, uint8_t slave, bool *reg16_io, const char *name,
+    uint8_t state_reg, uint8_t state_enable, bool verbose)
+{
+	if (!sns_detect(sda, scl, slave, name, reg16_io, verbose)) {
+		return false;
+	}
+	bool ok = sns_write_reg(sda, scl, slave, *reg16_io, state_reg, state_enable);
+	if (verbose || ok) {
+		say("sensors: %s enable ALS+PS %s\n", name, ok ? "written" : "WRITE NACK");
+	}
+	return ok;
+}
+
+/*
+ * Engage the hardware path: refuse when an SE clock was seen running, vote any boot-arg rails,
+ * let the rails settle, then bring up both chips. Chips missing here are retried in the poll loop.
+ */
 static void
-spin_us(uint32_t us)
+sensors_hw_init(void)
 {
-	uint64_t until;
+	if (sns_se_clock_active_scan(1000, 1000)) {
+		hw_refused = true;
+		say("sensors: SE10/SE12 clock activity seen, bitbang refused (another master may own the bus)\n");
+		return;
+	}
+	sns_bus_idle(SNS_FRONT_SDA_GPIO, SNS_FRONT_SCL_GPIO);
+	sns_bus_idle(SNS_BACK_SDA_GPIO, SNS_BACK_SCL_GPIO);
 
-	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &until);
-	until += mach_absolute_time();
-	while (mach_absolute_time() < until) {
+	for (uint32_t i = 0; i < probe_rail_count; i++) {
+		sns_rail_vote(probe_rails[i].name, probe_rails[i].mv);
 	}
-}
+	if (probe_rail_count != 0) {
+		delay_for_interval(20, NSEC_PER_MSEC);
+	}
 
-/*
- * Check whether a QUPv3 Wrapper 2 SE has both wrapper AHB clocks and its own branch clock running.
- * Never read SE MMIO unless CLK_OFF (bit 31) is 0 on all three CBCR registers.
- */
-static bool
-qup_se_clock_ready(uint32_t se_cbcr_offset)
-{
-	uint32_t m_ahb, s_ahb, se_cbcr;
-
-	if (gcc_base == 0) {
-		return false;
-	}
-	m_ahb = rd(gcc_base + GCC_QUPV3_WRAP2_M_AHB_CBCR);
-	s_ahb = rd(gcc_base + GCC_QUPV3_WRAP2_S_AHB_CBCR);
-	se_cbcr = rd(gcc_base + se_cbcr_offset);
-	if ((m_ahb & GCC_CBCR_CLK_OFF) != 0 || (s_ahb & GCC_CBCR_CLK_OFF) != 0 || (se_cbcr & GCC_CBCR_CLK_OFF) != 0) {
-		return false;
-	}
-	if ((m_ahb & GCC_CBCR_CLK_ENABLE) == 0 || (s_ahb & GCC_CBCR_CLK_ENABLE) == 0 || (se_cbcr & GCC_CBCR_CLK_ENABLE) == 0) {
-		return false;
-	}
-	return true;
-}
-
-/*
- * Perform a bounded QUP GENI I2C write-then-read transaction when the SE clock is verified active
- * and the GENI engine is loaded with I2C firmware.
- */
-static bool
-geni_i2c_read_regs(vm_offset_t se_base, uint32_t se_cbcr_offset, uint8_t slave_addr,
-    uint8_t reg_addr, uint8_t *buf, uint32_t len)
-{
-	uint32_t fw_rev, gstatus, irq, rx_cnt, word;
-	uint64_t start, timeout;
-
-	if (se_base == 0 || len == 0 || len > 8 || !qup_se_clock_ready(se_cbcr_offset)) {
-		return false;
-	}
-	fw_rev = rd(se_base + GENI_FW_REVISION_RO);
-	if ((fw_rev & GENI_FW_PROTO_MASK) != GENI_FW_PROTO_I2C) {
-		return false;
-	}
-	gstatus = rd(se_base + GENI_STATUS);
-	if ((gstatus & GENI_M_GENI_ACTIVE) != 0) {
-		return false;
-	}
-	nanoseconds_to_absolutetime(2000ULL * NSEC_PER_USEC, &timeout);
-
-	/* Clear sticky master IRQ status */
-	irq = rd(se_base + GENI_M_IRQ_STATUS);
-	if (irq != 0) {
-		wr(se_base + GENI_M_IRQ_CLEAR, irq);
-	}
-	wr(se_base + GENI_I2C_TX_TRANS_LEN, 1);
-	wr(se_base + GENI_I2C_RX_TRANS_LEN, len);
-	wr(se_base + GENI_M_CMD0, (M_CMD_I2C_WRITE_READ << 27) | ((uint32_t)(slave_addr & 0x7f) << M_CMD_SLV_ADDR_SHIFT));
-	wr(se_base + GENI_TX_FIFOn, (uint32_t)reg_addr);
-
-	start = mach_absolute_time();
-	do {
-		irq = rd(se_base + GENI_M_IRQ_STATUS);
-		if ((irq & (M_IRQ_CMD_DONE | M_IRQ_ERR_ALL)) != 0) {
-			break;
-		}
-		spin_us(5);
-	} while (mach_absolute_time() - start < timeout);
-
-	if ((irq & M_IRQ_CMD_DONE) == 0 || (irq & M_IRQ_ERR_ALL) != 0) {
-		if ((rd(se_base + GENI_STATUS) & GENI_M_GENI_ACTIVE) != 0) {
-			wr(se_base + GENI_M_CMD_CTRL_REG, 0x2); /* ABORT */
-			spin_us(50);
-		}
-		wr(se_base + GENI_M_IRQ_CLEAR, rd(se_base + GENI_M_IRQ_STATUS));
-		return false;
-	}
-	rx_cnt = rd(se_base + GENI_RX_FIFO_STATUS) & 0x3f;
-	if (rx_cnt == 0) {
-		wr(se_base + GENI_M_IRQ_CLEAR, irq);
-		return false;
-	}
-	for (uint32_t i = 0; i < len; i += 4) {
-		word = rd(se_base + GENI_RX_FIFOn);
-		for (uint32_t b = 0; b < 4 && (i + b) < len; b++) {
-			buf[i + b] = (uint8_t)((word >> (8 * b)) & 0xff);
-		}
-	}
-	wr(se_base + GENI_M_IRQ_CLEAR, irq);
-	return true;
+	front_online = sns_bring_up(SNS_FRONT_SDA_GPIO, SNS_FRONT_SCL_GPIO,
+	    ANNIBALE_GLS6151_I2C_ADDR, &front_reg16, "gls6151", GLS6151_REG_SYSM_CTRL, GLS6151_STATE_EN_PS_ALS, true);
+	back_online = sns_bring_up(SNS_BACK_SDA_GPIO, SNS_BACK_SCL_GPIO,
+	    ANNIBALE_STK6A2X_I2C_ADDR, &back_reg16, "stk6a2x", STK6A2X_REG_STATE, STK6A2X_STATE_EN_PS_ALS, true);
+	say("sensors: bitbang driver front=%u back=%u\n", front_online ? 1u : 0u, back_online ? 1u : 0u);
 }
 
 static void
@@ -325,11 +299,23 @@ poll_hardware_sensors(void)
 	}
 	lck_mtx_unlock(&sensors_lck);
 
-	if (hw_i2c_mode <= 0) {
+	if (hw_i2c_mode <= 0 || hw_refused) {
 		return;
 	}
-	if (geni_i2c_read_regs(se12_base, GCC_QUPV3_WRAP2_S4_CBCR, ANNIBALE_GLS6151_I2C_ADDR,
-	    GLS6151_REG_PS_DATA_LOW, raw, 6)) {
+	/* Chips that missed the boot bring-up (late rail power, slow power-on) get a retry every
+	 * two seconds; an ACK probe of a missing chip costs under a millisecond. */
+	if ((!front_online || !back_online) && (sensor_state.poll_count % 8u) == 1u) {
+		if (!front_online) {
+			front_online = sns_bring_up(SNS_FRONT_SDA_GPIO, SNS_FRONT_SCL_GPIO,
+			    ANNIBALE_GLS6151_I2C_ADDR, &front_reg16, "gls6151", GLS6151_REG_SYSM_CTRL, GLS6151_STATE_EN_PS_ALS, false);
+		}
+		if (!back_online) {
+			back_online = sns_bring_up(SNS_BACK_SDA_GPIO, SNS_BACK_SCL_GPIO,
+			    ANNIBALE_STK6A2X_I2C_ADDR, &back_reg16, "stk6a2x", STK6A2X_REG_STATE, STK6A2X_STATE_EN_PS_ALS, false);
+		}
+	}
+	if (front_online && sns_read_regs(SNS_FRONT_SDA_GPIO, SNS_FRONT_SCL_GPIO,
+	    ANNIBALE_GLS6151_I2C_ADDR, front_reg16, GLS6151_REG_PS_DATA_LOW, raw, 6)) {
 		uint32_t ps = (uint32_t)raw[0] | ((uint32_t)raw[1] << 8);
 		uint32_t clr = (uint32_t)raw[2] | ((uint32_t)raw[3] << 8);
 		uint32_t ir = (uint32_t)raw[4] | ((uint32_t)raw[5] << 8);
@@ -342,8 +328,8 @@ poll_hardware_sensors(void)
 		update_proximity_from_raw_locked(ps, ANNIBALE_SENSOR_SRC_HW_I2C | ANNIBALE_SENSOR_SRC_FRONT_OK);
 		lck_mtx_unlock(&sensors_lck);
 	}
-	if (geni_i2c_read_regs(se10_base, GCC_QUPV3_WRAP2_S2_CBCR, ANNIBALE_STK6A2X_I2C_ADDR,
-	    STK6A2X_REG_ALS_DATA_MSB, raw, 2)) {
+	if (back_online && sns_read_regs(SNS_BACK_SDA_GPIO, SNS_BACK_SCL_GPIO,
+	    ANNIBALE_STK6A2X_I2C_ADDR, back_reg16, STK6A2X_REG_ALS_DATA_MSB, raw, 2)) {
 		uint32_t back_raw = ((uint32_t)raw[0] << 8) | (uint32_t)raw[1];
 
 		lck_mtx_lock(&sensors_lck);
@@ -418,7 +404,7 @@ sysctl_prox_near(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused
 	sensor_state.sample.prox_near = value ? 1 : 0;
 	sensor_state.sample.prox_distance_mm = value ? 0 : 50;
 	sensor_state.sample.prox_raw = value ? (sensor_state.prox_near_thresh + 200) : sensor_state.prox_crosstalk;
-	sensor_state.sample.source_flags |= ANNIBALE_SENSOR_SRC_INJECTED;
+	/* INJECTED stays clear: it covers ALS data only (annibale_sensors.h). */
 	sensor_state.sample.timestamp = mach_absolute_time();
 	lck_mtx_unlock(&sensors_lck);
 	say("sensors: sysctl kern.annibale.prox_near set to %d\n", value ? 1 : 0);
@@ -526,28 +512,31 @@ sensors_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 				sensor_state.sample.prox_distance_mm = v ? 0 : 50;
 				sensor_state.sample.prox_raw = v ? (sensor_state.prox_near_thresh + 200) : sensor_state.prox_crosstalk;
 			} else {
-				update_proximity_from_raw_locked(v, ANNIBALE_SENSOR_SRC_INJECTED);
+				update_proximity_from_raw_locked(v, 0);
 			}
 		}
 	} else if (strncmp(buf, "raw", 3) == 0) {
 		uint32_t v = 0;
 		if (parse_uint(buf + 3, &v)) {
-			update_proximity_from_raw_locked(v, ANNIBALE_SENSOR_SRC_INJECTED);
+			update_proximity_from_raw_locked(v, 0);
 		}
 	} else if (strncmp(buf, "lux", 3) == 0) {
 		uint32_t v = 0;
 		if (parse_uint(buf + 3, &v) && v <= 100000) {
 			sensor_state.sample.als_lux = v;
 			sensor_state.sample.clear_raw = v * 4;
+			sensor_state.sample.source_flags |= ANNIBALE_SENSOR_SRC_INJECTED;
 		}
 	} else {
 		uint32_t v = 0;
 		if (parse_uint(buf, &v) && v <= 100000) {
 			sensor_state.sample.als_lux = v;
 			sensor_state.sample.clear_raw = v * 4;
+			sensor_state.sample.source_flags |= ANNIBALE_SENSOR_SRC_INJECTED;
 		}
 	}
-	sensor_state.sample.source_flags |= ANNIBALE_SENSOR_SRC_INJECTED;
+	/* INJECTED is asserted inside the lux-carrying branches only (annibale_sensors.h):
+	 * proximity-only and unparsable writes leave the ALS publication contract untouched. */
 	sensor_state.sample.timestamp = mach_absolute_time();
 	lck_mtx_unlock(&sensors_lck);
 	return 0;
@@ -605,27 +594,76 @@ static const struct cdevsw sensors_cdevsw = {
 	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
 };
 
+/* sensors_rails=ldob5@1800,bob1@3000: comma-separated cmd-db names with an optional millivolt. */
+static void
+parse_rails_boot_arg(void)
+{
+	char arg[96] = { 0 };
+	uint32_t count = 0;
+	char *cursor = arg;
+
+	if (!PE_parse_boot_arg_str("sensors_rails", arg, sizeof(arg)) || arg[0] == '\0') {
+		return;
+	}
+	while (*cursor != '\0' && count < SNS_PROBE_RAILS_MAX) {
+		uint32_t len = 0, mv = 1800;
+
+		while (cursor[len] != '\0' && cursor[len] != ',' && cursor[len] != '@' && len < 8) {
+			len++;
+		}
+		if (len == 0) {
+			break;
+		}
+		memcpy(probe_rails[count].name, cursor, len);
+		probe_rails[count].name[len] = '\0';
+		cursor += len;
+		if (*cursor == '@') {
+			uint32_t parsed = 0;
+			cursor++;
+			if (parse_uint(cursor, &parsed) && parsed >= 100 && parsed <= 4000) {
+				mv = parsed;
+			}
+			while (*cursor >= '0' && *cursor <= '9') {
+				cursor++;
+			}
+		}
+		probe_rails[count].mv = mv;
+		count++;
+		if (*cursor == ',') {
+			cursor++;
+		}
+	}
+	probe_rail_count = count;
+	if (count != 0) {
+		say("sensors: sensors_rails: %u candidate(s), first %s @ %u mV\n",
+		    count, probe_rails[0].name, probe_rails[0].mv);
+	}
+}
+
 static void
 sensors_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	tlmm_base = ml_io_map(TLMM_BASE_PHYS, TLMM_MAP_SIZE);
-	if (hw_i2c_mode > 0) {
+	if (hw_i2c_mode > 0 || probe_mode > 0) {
 		gcc_base = ml_io_map(GCC_BASE_PHYS, GCC_MAP_SIZE);
-		se10_base = ml_io_map(QUPV3_SE10_PHYS, QUPV3_SE_SIZE);
-		se12_base = ml_io_map(QUPV3_SE12_PHYS, QUPV3_SE_SIZE);
 	}
-
-	bool se12_clk = (hw_i2c_mode > 0) ? qup_se_clock_ready(GCC_QUPV3_WRAP2_S4_CBCR) : false;
-	bool se10_clk = (hw_i2c_mode > 0) ? qup_se_clock_ready(GCC_QUPV3_WRAP2_S2_CBCR) : false;
 	uint32_t gpio163_cfg = tlmm_base ? rd(tlmm_base + TLMM_GPIO_CFG(ANNIBALE_GLS6151_IRQ_GPIO)) : 0;
 	uint32_t gpio35_cfg = tlmm_base ? rd(tlmm_base + TLMM_GPIO_CFG(ANNIBALE_STK6A2X_IRQ_GPIO)) : 0;
 
-	say("sensors: gls6151 (0x%02x, SE12 clk=%d, GPIO%d cfg=%#x) & stk6a2x (0x%02x, SE10 clk=%d, GPIO%d cfg=%#x); "
-	    "cal offset=%u near=%u far=%u lux=%u\n",
-	    ANNIBALE_GLS6151_I2C_ADDR, se12_clk, ANNIBALE_GLS6151_IRQ_GPIO, gpio163_cfg,
-	    ANNIBALE_STK6A2X_I2C_ADDR, se10_clk, ANNIBALE_STK6A2X_IRQ_GPIO, gpio35_cfg,
+	say("sensors: gls6151 (0x%02x, SE12/GPIO16-17, GPIO%d cfg=%#x) & stk6a2x (0x%02x, SE10/GPIO8-9, GPIO%d cfg=%#x); "
+	    "hw_i2c=%d probe=%d cal offset=%u near=%u far=%u lux=%u\n",
+	    ANNIBALE_GLS6151_I2C_ADDR, ANNIBALE_GLS6151_IRQ_GPIO, gpio163_cfg,
+	    ANNIBALE_STK6A2X_I2C_ADDR, ANNIBALE_STK6A2X_IRQ_GPIO, gpio35_cfg,
+	    hw_i2c_mode, probe_mode,
 	    sensor_state.prox_crosstalk, sensor_state.prox_near_thresh, sensor_state.prox_far_thresh,
 	    sensor_state.sample.als_lux);
+
+	if (probe_mode > 0) {
+		sensors_probe_run();
+	}
+	if (hw_i2c_mode > 0) {
+		sensors_hw_init();
+	}
 
 	for (;;) {
 		poll_hardware_sensors();
@@ -648,13 +686,17 @@ annibale_sensors_init(void)
 	if (PE_parse_boot_argn("als_lux", &boot_lux, sizeof(boot_lux)) && boot_lux <= 100000) {
 		sensor_state.sample.als_lux = boot_lux;
 		sensor_state.sample.clear_raw = boot_lux * 4;
+		sensor_state.sample.source_flags |= ANNIBALE_SENSOR_SRC_INJECTED;
 	}
 	if (PE_parse_boot_argn("prox_near", &boot_prox, sizeof(boot_prox))) {
 		sensor_state.sample.prox_near = boot_prox ? 1 : 0;
 		sensor_state.sample.prox_distance_mm = boot_prox ? 0 : 50;
 		sensor_state.sample.prox_raw = boot_prox ? (ANNIBALE_GLS6151_PROX_NEAR + 200) : ANNIBALE_GLS6151_PROX_OFFSET;
+		/* INJECTED stays clear: it covers ALS data only (annibale_sensors.h). */
 	}
 	PE_parse_boot_argn("sensors_hw_i2c", &hw_i2c_mode, sizeof(hw_i2c_mode));
+	PE_parse_boot_argn("sensors_probe", &probe_mode, sizeof(probe_mode));
+	parse_rails_boot_arg();
 	sensor_state.sample.timestamp = mach_absolute_time();
 
 	major = cdevsw_add(-1, &sensors_cdevsw);

@@ -136,6 +136,33 @@ static void run_case(id<MTLDevice> device, unsigned fourcc, unsigned plane, unsi
     [queue release]; [state release]; [target release]; CFRelease(surface);
 }
 
+static void run_integer_alias_case(unsigned fourcc, unsigned plane, unsigned format,
+                                   unsigned view_width, unsigned height)
+{
+    IOSurfaceRef surface = make_surface(fourcc,1,2);
+    assert(surface);
+    struct ann_texture_shape shape = {format,2,view_width,height,1,1,1,1,5};
+    struct ann_surface selected = {};
+    char why[768] = {};
+    if (ann_surface_plane(surface,plane,&shape,&selected,NULL,why,sizeof(why))) {
+        fprintf(stderr,"NV12 integer alias rejected plane %u format %u: %s\n",plane,format,why);
+        exit(2);
+    }
+    assert(selected.width == IOSurfaceGetWidthOfPlane(surface,plane));
+    assert(selected.height == IOSurfaceGetHeightOfPlane(surface,plane));
+    shape.width = view_width+1;
+    assert(ann_surface_plane(surface,plane,&shape,&selected,NULL,why,sizeof(why)) != 0);
+    shape.width = view_width;
+    if (format != 53) {
+        /* format 53 is a valid alias on both planes; the other formats stay plane-specific */
+        shape.height = IOSurfaceGetHeightOfPlane(surface,!plane);
+        assert(ann_surface_plane(surface,!plane,&shape,&selected,NULL,why,sizeof(why)) != 0);
+    }
+    CFRelease(surface);
+    printf("NV12 integer alias FourCC=%08x plane=%u format=%u view=%ux%u passed\n",
+        fourcc,plane,format,view_width,height);
+}
+
 int main(void) { @autoreleasepool {
     setvbuf(stdout,NULL,_IOLBF,0);
     id<MTLDevice> device = MTLCreateSystemDefaultDevice(); assert(device);
@@ -146,7 +173,12 @@ int main(void) { @autoreleasepool {
         run_case(device,fourcc,0,ten?20:10,64,4,ten?2:1);
         run_case(device,fourcc,1,ten?60:30,32,5,ten?4:2);
         run_case(device,fourcc,0,ten?60:80,ten?32:16,ten?2:0,ten?2:1);
-        if (!ten) run_case(device,fourcc,1,80,16,1,2);
+        if (!ten) {
+            run_case(device,fourcc,1,80,16,1,2);
+            run_integer_alias_case(fourcc,0,53,16,8);
+            run_integer_alias_case(fourcc,1,23,32,4);
+            run_integer_alias_case(fourcc,1,53,16,4);
+        }
         IOSurfaceRef wrong = make_surface(fourcc,4,4);
         struct ann_texture_shape shape = {ten?60:80,2,ten?32:16,8,1,1,1,1,5};
         struct ann_surface selected; char why[768]={};
@@ -158,5 +190,5 @@ int main(void) { @autoreleasepool {
         }
     }
     [device release];
-    puts("native packed views: 14 GPU plane writes, byte order, physical geometry, guards and rejection passed");
+    puts("native packed views: 14 GPU plane writes, 5 NV12 integer alias descriptors, byte order, physical geometry, guards and rejection passed");
 } }

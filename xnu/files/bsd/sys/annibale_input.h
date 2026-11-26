@@ -108,7 +108,9 @@ bool annibale_wifi_radio_address(uint8_t *address);      /* the radio's own addr
  */
 bool annibale_gpu_ready(void);
 bool annibale_gpu_parameter(uint32_t which, uint64_t *value);
-uint64_t annibale_gpu_address(uint64_t size);
+/* A GPU address for `size` bytes, 0 when refused; `refusal` then says why (ADRENO8_BO_REFUSE_* of
+ * bsd/dev/adreno8/adreno8_bo_private.h, which this header's readers repeat by value). */
+uint64_t annibale_gpu_address(uint64_t size, uint32_t *refusal);
 void annibale_gpu_address_free(uint64_t address, uint64_t size);
 void annibale_gpu_space(uint64_t *used, uint32_t *live, uint64_t *largest, unsigned *holes, unsigned *most,
     uint64_t *lost, uint32_t *refused);

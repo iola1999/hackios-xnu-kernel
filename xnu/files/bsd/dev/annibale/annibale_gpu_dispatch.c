@@ -64,9 +64,13 @@ annibale_gpu_parameter(uint32_t which, uint64_t *value)
 }
 
 uint64_t
-annibale_gpu_address(uint64_t size)
+annibale_gpu_address(uint64_t size, uint32_t *refusal)
 {
-	return annibale_platform_is_annibale() ? adreno8_bo_reserve(size) : 0;
+	if (!annibale_platform_is_annibale()) {
+		*refusal = ADRENO8_BO_REFUSE_NOT_READY;
+		return 0;
+	}
+	return adreno8_bo_reserve(size, refusal);
 }
 
 void

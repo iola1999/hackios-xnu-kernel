@@ -393,6 +393,13 @@ cam_native_sensor_power(bool up)
 	return true;
 }
 
+/*
+ * What one frame's apply calls wrote, for the capture path's "tl: C" lines
+ * (annibale_camera_native.inc): zeroed before them, read after. The lens count is in
+ * cam_native_lens_walk, so it also counts the power-on/off walks; only frames' own are ever read.
+ */
+static uint32_t cam_native_exp_writes, cam_native_focus_steps;
+
 static bool
 cam_native_apply_exposure_regs(bool force)
 {
@@ -446,6 +453,7 @@ cam_native_apply_exposure_regs(bool force)
 			    cam_profile->sensor, exp_ops[k].reg);
 			return false;
 		}
+		cam_native_exp_writes++;
 	}
 	cam_native_applied_frame_lines = fll;
 	cam_native_applied_exposure_lines = lines;
@@ -483,6 +491,7 @@ cam_native_lens_walk(uint32_t from, uint32_t to)
 		if (!wide_bus_write(OVX8000_LENS_SLAVE, 0x03u, (uint8_t)(next >> 8), (uint8_t)next, 3u)) {
 			return false;
 		}
+		cam_native_focus_steps++;
 		from = next;
 		if (from != to) {
 			delay_for_interval(OVX8000_LENS_STEP_US, NSEC_PER_USEC);

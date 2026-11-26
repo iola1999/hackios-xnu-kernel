@@ -536,13 +536,20 @@ ann_surface_plane(void *iosurface, unsigned long plane, const struct ann_texture
 		unsigned pf = want->pixel_format;
 		bool native_p0 = plane == 0 && (pf == 10 || pf == 12 || pf == 13 || pf == 14);
 		bool native_p1 = plane == 1 && (pf == 30 || pf == 32 || pf == 33 || pf == 34);
-		if (!native_p0 && !native_p1 && pf != 80 && pf != 123) {
-			ann_say(why, why_size, "NV12 plane %lu requires Metal format %u/uint or packed BGRA8/RGBA32Uint; requested %u",
-			    plane, plane == 0 ? 10u : 30u, pf);
+		/* VTMetalTransferSession reads NV12 through integer aliases of the same byte
+		 * layout: one R16Uint texel covers one interleaved CbCr element, and one
+		 * R32Uint texel covers four consecutive luma bytes. The 1x1 compute pass
+		 * samples both planes at matching coordinates, so it binds the chroma
+		 * plane as R32Uint too (one texel then covers one CbCr pair). */
+		bool alias_p0 = plane == 0 && pf == 53;
+		bool alias_p1 = plane == 1 && (pf == 23 || pf == 53);
+		if (!native_p0 && !native_p1 && !alias_p0 && !alias_p1 && pf != 80 && pf != 123) {
+			ann_say(why, why_size, "NV12 plane %lu requires Metal format %u/uint, integer alias %u, or packed BGRA8/RGBA32Uint; requested %u",
+			    plane, plane == 0 ? 10u : 30u, plane == 0 ? 53u : 23u, pf);
 			return -1;
 		}
 		bpp = plane == 0 ? 1 : 2;
-		view_bpp = pf == 123 ? 16 : (pf == 80 ? 4 : bpp);
+		view_bpp = pf == 123 ? 16 : ((pf == 80 || pf == 53) ? 4 : bpp);
 	} else if (fourcc == '_RB4' && planes == 2) {
 		/* RGB8_444_2P: plane 0 is G (R8), plane 1 is B, R (RG8), both full size. */
 		unsigned pixel_format = plane == 0 ? 10 : 30;
@@ -602,7 +609,8 @@ ann_surface_plane(void *iosurface, unsigned long plane, const struct ann_texture
 	}
 	size_t most_w = w + right, most_h = h + bottom;
 	uintptr_t pixels = (uintptr_t)address(iosurface, plane);
-	/* Affine and VTMetalTransferSession use packed BGRA8/RG16/RGBA32Uint row views.
+	/* Affine and VTMetalTransferSession bind row views over the original storage: packed
+	 * BGRA8/RG16/RGBA32Uint formats, or NV12 planes as R16Uint/R32Uint integer aliases.
 	 * The IOSurface element size and physical plane bounds still describe the original storage. */
 	if (w == 0 || h == 0 || w > UINT32_MAX || h > UINT32_MAX || stride > UINT32_MAX ||
 	    begin > UINT32_MAX || pixels == 0 || pixels < begin || element(iosurface, plane) != bpp ||

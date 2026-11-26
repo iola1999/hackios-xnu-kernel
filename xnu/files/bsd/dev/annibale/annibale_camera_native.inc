@@ -62,6 +62,7 @@
 #define CAM980_PATH_FATAL        0x20186001u
 
 extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
+extern void annibale_tl(const char *format, ...) __printflike(1, 2);
 #ifdef KERNEL
 extern boolean_t ml_set_interrupts_enabled(boolean_t enable);
 #endif
@@ -70,6 +71,7 @@ static bool cam_native_path_configured, cam_native_reset_failed;
 static uint32_t cam_native_dma_bytes;
 static uint64_t cam_native_slot_address[2];
 static uint32_t cam_native_sof_ms, cam_native_overflow_ms, cam_native_overflow_stale;
+static uint32_t cam_native_wait_spun;   /* the wait loop's own microseconds where it last looked */
 
 /*
  * Errors after which no comp_done can arrive. The sensor is stopped and CSID is reset globally;
@@ -355,6 +357,7 @@ cam_native_wait_frame(void)
 {
 	cam_native_sof_ms = cam_native_overflow_ms = UINT32_MAX;
 	for (uint32_t elapsed = 0; elapsed < 1000000u; elapsed += 1000u) {
+		cam_native_wait_spun = elapsed;
 		if (elapsed == 10000u) {
 			cam_diag_midframe_sample();
 		}
@@ -523,6 +526,82 @@ cam_native_stream_advance(void)
 	cam_hw_dma_verified = true;
 }
 
+/*
+ * "tl: C PID TID seq N exp W/E foc S/F wait W spin S adv A del D tot T fll F at US" -- one frame of
+ * the streaming capture ioctl, under the same touch_lat=1 switch as the rest of the tl: lines, all
+ * the times in microseconds:
+ *
+ * exp, foc    the frame's exposure/gain/frame-length and lens writes before the wait; W and S how
+ *             many registers and lens positions were written (both zero when nothing changed). The
+ *             lens time is the GT9764V's stepping, the positions 10.8 ms apart.
+ * wait, spin  the poll for the frame, and the time the loop itself counted. wait past spin is time
+ *             the poll was not running: the thread was woken late from its millisecond or kept off
+ *             the processor.
+ * adv         the slot advance, the finished buffer's cache flush inside.
+ * del         the frame's completion (cam_capture.time, when the poll saw it) to the end of the
+ *             ioctl's work: what the delivery added after the frame existed. adv is part of it, so
+ *             del far past adv is the thread's rather than the flush's.
+ * tot         the whole ioctl. fll the frame length applied to the sensor: wait is legitimately up
+ *             to the frame time fll x line_ns (5333 ns back, 10000 ns front) makes.
+ *
+ * A line is written for a frame that wrote registers or moved the lens -- the metering window is
+ * the shutter's own -- for one whose tot or del passed the notice level, for CAM_TL_ARM frames
+ * after one did, and for one frame in CAM_TL_BASELINE otherwise: a quiet stream costs the log one
+ * line in about three seconds.
+ */
+#define CAM_TL_TOTAL_NOTICE_US  40000u   /* one frame time at 30 fps is 33 ms */
+#define CAM_TL_DEL_NOTICE_US    5000u
+#define CAM_TL_ARM              8u
+#define CAM_TL_BASELINE         90u
+
+static uint32_t cam_native_tl_armed;
+
+static void
+cam_native_tl_frame(uint64_t began, uint64_t exp_at, uint64_t focus_at, uint64_t wait_at, uint64_t end)
+{
+	static int8_t tl_on = -1;
+	uint64_t exp_us, focus_us, wait_us, adv_us, del_us, tot_us, at;
+
+	if (tl_on < 0) {
+		uint32_t on = 0;
+		tl_on = PE_parse_boot_argn("touch_lat", &on, sizeof(on)) && on != 0;
+	}
+	if (!tl_on) {
+		return;
+	}
+	absolutetime_to_nanoseconds(exp_at - began, &exp_us);
+	absolutetime_to_nanoseconds(focus_at - exp_at, &focus_us);
+	absolutetime_to_nanoseconds(wait_at - focus_at, &wait_us);
+	absolutetime_to_nanoseconds(end - wait_at, &adv_us);
+	absolutetime_to_nanoseconds(end - cam_capture.time, &del_us);
+	absolutetime_to_nanoseconds(end - began, &tot_us);
+	absolutetime_to_nanoseconds(end, &at);
+	exp_us /= 1000;
+	focus_us /= 1000;
+	wait_us /= 1000;
+	adv_us /= 1000;
+	del_us /= 1000;
+	tot_us /= 1000;
+	bool notice = cam_native_exp_writes != 0 || cam_native_focus_steps != 0 ||
+	    tot_us >= CAM_TL_TOTAL_NOTICE_US || del_us >= CAM_TL_DEL_NOTICE_US;
+	bool line = notice || cam_native_tl_armed != 0 ||
+	    cam_capture.sequence % CAM_TL_BASELINE == 0;
+	if (tot_us >= CAM_TL_TOTAL_NOTICE_US || del_us >= CAM_TL_DEL_NOTICE_US) {
+		cam_native_tl_armed = CAM_TL_ARM;
+	} else if (cam_native_tl_armed != 0) {
+		cam_native_tl_armed--;
+	}
+	if (!line) {
+		return;
+	}
+	annibale_tl("tl: C %d %llu seq %llu exp %u/%llu foc %u/%llu wait %llu spin %llu adv %llu "
+	    "del %llu tot %llu fll %u at %llu\n",
+	    proc_pid(current_proc()), (unsigned long long)thread_tid(current_thread()),
+	    (unsigned long long)cam_capture.sequence, cam_native_exp_writes, exp_us,
+	    cam_native_focus_steps, focus_us, wait_us, (uint64_t)cam_native_wait_spun, adv_us,
+	    del_us, tot_us, cam_native_applied_frame_lines, at / 1000);
+}
+
 /* One more frame of a running stream. */
 static void
 cam_native_stream_next(void)
@@ -531,16 +610,21 @@ cam_native_stream_next(void)
 	int error = 0;
 
 	cam_capture.flags = cam_capture.buf_done = cam_capture.top_irq = cam_capture.rx_irq = cam_capture.path_irq = 0;
+	cam_native_exp_writes = cam_native_focus_steps = 0;
 	if (!cam_native_apply_exposure_regs(false)) {
 		error = EIO;
 	}
+	uint64_t exp_at = mach_absolute_time();
 	cam_native_apply_focus(false);
 	cam_native_exposure_shown(false);
+	uint64_t focus_at = mach_absolute_time();
 	if (error == 0) {
 		error = cam_native_wait_frame();
 	}
+	uint64_t wait_at = mach_absolute_time();
 	if (error == 0) {
 		cam_native_stream_advance();
+		cam_native_tl_frame(began, exp_at, focus_at, wait_at, mach_absolute_time());
 		return;
 	}
 	cam_native_report_failure(error, cam_capture.sequence, began);

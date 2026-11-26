@@ -55,7 +55,13 @@ extern "C" {
 bool annibale_platform_is_annibale(void);
 bool annibale_gpu_ready(void);
 bool annibale_gpu_parameter(uint32_t which, uint64_t * value);
-uint64_t annibale_gpu_address(uint64_t size);
+uint64_t annibale_gpu_address(uint64_t size, uint32_t * refusal);
+/* What `refusal` of annibale_gpu_address says when no address is given: the values of
+ * ADRENO8_BO_REFUSE_* in bsd/dev/adreno8/adreno8_bo_private.h, repeated here because the
+ * headers of the two sides are not shared. */
+#define GPU_REFUSE_NOT_READY    1    /* the GPU is going or gone (its health check inside the reservation refused) */
+#define GPU_REFUSE_NO_RANGE     2    /* no free span in the GPU's address space */
+#define GPU_REFUSE_NO_TABLE     3    /* no page table for the span: the table slots or the memory for one */
 void annibale_gpu_address_free(uint64_t address, uint64_t size);
 void annibale_gpu_space(uint64_t * used, uint32_t * live, uint64_t * largest, unsigned * holes, unsigned * most,
     uint64_t * lost, uint32_t * refused);
@@ -762,7 +768,7 @@ class AnnibaleGPUUserClient : public IOUserClient
 
 	struct gpu_buffer * buffer(uint32_t handle);
 	uint32_t lastUse(uint32_t handle);
-	struct gpu_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle);
+	struct gpu_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle, IOReturn * error);
 	void freeBuffer(struct gpu_buffer * b);
 	bool keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags);
 	bool dropKept(struct gpu_kept * k);

@@ -9,7 +9,14 @@ bool adreno8_bo_enable(void);
 bool adreno8_bo_ready(void);
 /* Close all BO admission without releasing pages or IOVAs. */
 void adreno8_bo_stop(void);
-uint64_t adreno8_bo_reserve(uint64_t size);
+/* Why a reservation was refused, written through adreno8_bo_reserve's `refusal` when it returns
+ * 0, so the user client can answer with a return code that says which shortage it was instead of
+ * one kIOReturnNoMemory for all of them. iokit/Kernel/AnnibaleGPU.cpp repeats these values (the
+ * headers of the two sides are not shared). */
+#define ADRENO8_BO_REFUSE_NOT_READY    1   /* the health check inside the reservation refused: the GPU is going or gone */
+#define ADRENO8_BO_REFUSE_NO_RANGE     2   /* no free span in the GPU's address space */
+#define ADRENO8_BO_REFUSE_NO_TABLE     3   /* no page table for the span: the table slots or the memory for one */
+uint64_t adreno8_bo_reserve(uint64_t size, uint32_t *refusal);
 /* The existing GEM interface identifies only read-only versus writable BOs.
  * Mesa uses it for shader, IB and data pages; all retain READ/EXEC permission. */
 bool adreno8_bo_map(uint64_t address, uint64_t phys, bool read_only);

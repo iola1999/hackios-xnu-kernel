@@ -215,17 +215,21 @@ adreno8_bo_describe_owner(const char *what, uint32_t address)
 static uint64_t bo_mapped_low = UINT64_MAX, bo_mapped_high;
 
 uint64_t
-adreno8_bo_reserve(uint64_t size)
+adreno8_bo_reserve(uint64_t size, uint32_t *refusal)
 {
 	uint32_t address, from = bo_free_from;
 	uint64_t span = size + SMMU_GRANULE;   /* the BO and its guard page */
-	if (!adreno8_bo_ready()) return 0;
+	if (!adreno8_bo_ready()) {
+		*refusal = ADRENO8_BO_REFUSE_NOT_READY;
+		return 0;
+	}
 	/* size 0 has to be refused here: its span is the guard page alone, which bo_range accepts */
 	if (!size || !bo_range(ADRENO8_GPU_IOVA_START, span) ||
 	    (!adreno8_space_find_range(&adreno8_gpu_space, from, ADRENO8_GPU_IOVA_END, (uint32_t)span, SMMU_GRANULE, &address) &&
 	    (from == ADRENO8_GPU_IOVA_START || !adreno8_space_find_range(&adreno8_gpu_space, ADRENO8_GPU_IOVA_START,
 	    ADRENO8_GPU_IOVA_END, (uint32_t)span, SMMU_GRANULE, &address)))) {
 		printf("adreno8: no GPU addresses for a buffer of %llu KB: this one buffer is refused\n", size >> 10);
+		*refusal = ADRENO8_BO_REFUSE_NO_RANGE;
 		return 0;
 	}
 	/* Populate tables before marking any leaf. A partial table allocation is retained on failure
@@ -235,6 +239,7 @@ adreno8_bo_reserve(uint64_t size)
 		if (!adreno8_space_prepare_page(&adreno8_gpu_space, address + at)) {
 			printf("adreno8: no page table for GPU address %#llx: a buffer of %llu KB is refused\n",
 			    address + at, size >> 10);
+			*refusal = ADRENO8_BO_REFUSE_NO_TABLE;
 			return 0;
 		}
 	}
