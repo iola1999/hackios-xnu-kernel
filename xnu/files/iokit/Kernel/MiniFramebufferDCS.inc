@@ -46,6 +46,12 @@
 
 static TUNABLE(uint32_t, gDcs, "fb_dcs", DCS_DEFAULT);
 
+/* MiniAppleARMBacklight.cpp's: bl_trace=1 traces every request there and every write the panel gets here. */
+extern "C" {
+extern uint32_t annibale_bl_trace;
+void annibale_tl(const char * format, ...) __printflike(1, 2);
+}
+
 #define DCS_DSI0_PHYS           0x0ae94000UL
 #define DCS_DSI_SIZE            0x1000UL
 
@@ -332,7 +338,11 @@ dcs_write(uint32_t value, bool log)
 		return false;
 	}
 	dcs.sent = value;
-	__atomic_store_n(&dcs.sentAt, mach_absolute_time(), __ATOMIC_RELEASE);
+	uint64_t sent_now = mach_absolute_time();
+	__atomic_store_n(&dcs.sentAt, sent_now, __ATOMIC_RELEASE);
+	if (annibale_bl_trace != 0) {
+		annibale_tl("tl: B dcs #%u dbv %u at %llu\n", dcs.writes, value, micros(sent_now));
+	}
 	return true;
 }
 
@@ -499,6 +509,13 @@ MiniIOMobileFramebufferDCS(uint32_t value)
 	next = __atomic_load_n(&dcs.sentAt, __ATOMIC_ACQUIRE) + dcs.period;
 	thread_call_enter_delayed(dcs.call, next > now ? next : now);
 	return true;
+}
+
+/* The value last asked for, 0 none: the backlight's "tl: B" lines report it before and after a request. */
+uint32_t
+MiniIOMobileFramebufferDCSWanted(void)
+{
+	return __atomic_load_n(&dcs.want, __ATOMIC_ACQUIRE);
 }
 
 /* From flip_start, MDSS mapped and its register clocks on. The checks run on a thread call: boot goes on. */

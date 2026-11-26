@@ -193,7 +193,7 @@ hci_cmd(uint16_t op, const uint8_t *param, uint32_t n, uint8_t *ev, uint32_t max
 		    (ev[1] == EV_COMMAND_STATUS && got >= 7 && (ev[5] | ev[6] << 8) == op)) {
 			return got;
 		}
-		annibale_bt_hex("an event on the way", ev, got);
+		bt_say("bt: command %#06x: other event %#x, %u parameter bytes\n", op, ev[1], ev[2]);
 	}
 	return 0;
 }
@@ -511,6 +511,29 @@ le_scan(void)
 	return unique;
 }
 
+/* The FIFO may stop in the middle of an H4 startup event. Keep its header with its body. */
+static void
+discard_startup_rx(void)
+{
+	uint32_t have, used = 0;
+	const uint8_t *rx = annibale_bt_uart_rx(&have);
+
+	while (used < have && rx[used] == H4_EVENT) {
+		uint32_t left = have - used;
+		if (left < 3 || left < 3u + rx[used + 2]) {
+			break;
+		}
+		used += 3u + rx[used + 2];
+	}
+	if (used < have && rx[used] != H4_EVENT) {
+		used = have;
+	}
+	if (have != 0) {
+		bt_say("bt: before ROM command: %u bytes buffered, %u retained for event reassembly\n", have, have - used);
+		annibale_bt_uart_take(used);
+	}
+}
+
 /* bt=2: the UART up and the ROM answering, at oversampling 16 (QUP 2.5 and later), else 32 */
 static bool
 rom_answers(void)
@@ -518,8 +541,6 @@ rom_answers(void)
 	static const uint32_t oversampling[2] = { 16, 32 };
 
 	for (unsigned i = 0; i < 2; i++) {
-		uint32_t have;
-		const uint8_t *rx;
 		uint8_t ev[64];
 		uint32_t n;
 
@@ -528,11 +549,7 @@ rom_answers(void)
 		}
 		ms(50);
 		(void)annibale_bt_uart_poll();
-		rx = annibale_bt_uart_rx(&have);
-		if (have) {
-			annibale_bt_hex("before anything was sent", rx, have);
-			annibale_bt_uart_take(have);
-		}
+		discard_startup_rx();
 		if (rom_version("from ROM")) {
 			return true;
 		}

@@ -51,6 +51,48 @@
 #define kBLLogMS                100u
 
 /*
+ * How long an integer-nits request waits for its 16.16 companion before it applies on its own.
+ * b5r23 pairs them tens of microseconds apart (median 64 us, 90% within 411 us); 2 ms is far below
+ * the panel's frame time and the pace of any ramp, so slider drags and fades are not delayed in
+ * practice, while integer-only writes (never seen paired) are applied essentially at once.
+ */
+#define kBLDedupUS              2000u
+
+/*
+ * Boot-arg bl_arb (default 1): one writer to the panel. CoreBrightness hands the brightness to both
+ * this service (brightness, brightness-nits, DisplayBrightness) and the framebuffer
+ * (IOMFBBrightnessLevel), in different units and at different moments of its control cycle, and both
+ * used to land in the panel's DCS 0x51 -- the end of the boot's convergence alternated a few steps
+ * up and down, visible as a slight flicker. With arbitration on, the service's first positive
+ * request makes it the only writer; IOMFBBrightnessLevel goes on updating the driver's state and the
+ * log but no longer reaches the panel. Before that first request the framebuffer writes the panel as
+ * before, so the early boot is not left without brightness control; and once the service has asked
+ * for the panel off, the framebuffer does not relight it. bl_arb=0 keeps the old both-write behaviour.
+ *
+ * Boot-arg bl_dedup (default 1): inside the service path, one logical brightness reaches the panel
+ * once. CoreBrightness emits DisplayBrightness's NitsPhysical/Nits (whole nits) and brightness-nits
+ * (16.16, the same brightness with the fraction) together per control iteration, the integer form
+ * first tens of microseconds ahead. Applied as they come, the panel gets the integer-stepped value
+ * and then the precise one of every pair (b5r23: up to 17 DBV apart, a visible shimmer). The 16.16
+ * form is strictly more accurate, so with dedup on an integer-nits request that matches the whole
+ * nits of the last 16.16 value is dropped as a coarser restatement, and one that does not is held
+ * back kBLDedupUS: a 16.16 request arriving within the window supersedes it, otherwise it applies
+ * late -- integer-only sequences (if any) keep working with a sub-frame delay. bl_dedup=0 applies
+ * every request as it comes, the pre-dedup behaviour.
+ *
+ * Boot-arg bl_trace=1: a "tl: B" line into the loader's log for every brightness request of either
+ * path and every DCS write the panel gets, each with the kernel's time in microseconds -- the merged
+ * logging below keeps only one line of a 100 ms burst, which is where the alternation used to hide.
+ * The variable is shared with MiniFramebufferDCS.inc, which traces the writes themselves.
+ */
+static TUNABLE(uint32_t, gBLArb, "bl_arb", 1);
+static TUNABLE(uint32_t, gBLDedup, "bl_dedup", 1);
+extern "C" {
+TUNABLE(uint32_t, annibale_bl_trace, "bl_trace", 0);
+void annibale_tl(const char * format, ...) __printflike(1, 2);
+}
+
+/*
  * What CoreBrightness's display setup (23G90, the function at 0x1e2741c1c) reads besides IODisplayParameters,
  * through -[CBBacklightNode ...]: its CBIORegistryReader looks in this service and then in its parents in the
  * IOService plane (0x1e26bd4b4: plane "IOService", options 3, kIORegistryIterateRecursively | Parents).
@@ -133,17 +175,30 @@ static struct {
 	AppleARMBacklight *     service;
 	IOLock *                lock;           /* around this, the level, and the mixers' writes */
 	thread_call_t           later;          /* prints the last request of a burst */
+	thread_call_t           defcall;        /* applies a held-back integer-nits request (bl_dedup) */
 	uint64_t                logged;         /* when the last line was printed */
 	uint64_t                last_slider_t;  /* timestamp of previous DisplayBrightness update */
 	uint64_t                last_slider_pos;/* last seen slider position */
 	uint64_t                user_until;     /* deadline until which slider updates are active */
 	uint64_t                last_v;         /* current panel brightness value */
 	uint64_t                last_millinits; /* current brightness in millinits */
+	uint64_t                precise_mn;     /* millinits of the last 16.16 nits request of either path */
+	uint64_t                def_v;          /* the held-back request: panel value, millinits, raw key value */
+	uint64_t                def_millinits;
+	uint64_t                def_raw;
 	uint32_t                unlogged;       /* requests since then, not printed yet */
 	bool                    initialized;    /* true once boot or user brightness has been applied */
 	bool                    slider_initialized; /* true once initial slider position is recorded */
 	bool                    nvram_seeded;   /* true once NVRAM holds a restored or saved level */
+	bool                    service_active; /* the service has asked for a positive brightness: it alone writes the panel (bl_arb) */
+	bool                    service_off;    /* ... and before that it asked for the panel off: the framebuffer does not relight it */
+	bool                    precise_valid;  /* precise_mn is meaningful */
+	bool                    def_pending;    /* a held-back integer-nits request waits on defcall */
+	bool                    def_touch;      /* the held-back request counts as user interaction for NVRAM */
+	const char *            def_tkey;       /* its key name (a static string) */
+	char                    def_who[24];    /* its requester */
 	char                    line[320];      /* the last request, as it is printed */
+	char                    def_line[320];  /* the held-back request's line, printed if it applies */
 } bl;
 
 static OSDictionary *
@@ -298,6 +353,120 @@ bl_log_later(thread_call_param_t, thread_call_param_t)
  * Slider position records interaction; CoreBrightness supplies the mapped nits.
  * The result is a panel value, nits, and the level given to the mixers when it changes.
  */
+static inline uint64_t
+bl_micros(uint64_t absolute)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(absolute, &ns);
+	return ns / 1000;
+}
+
+/*
+ * With arbitration on (bl_arb), may the writer of this request change the panel? The service always
+ * may; the framebuffer may until the service's first positive request, and not once the service has
+ * asked for the panel off either. A request that may not is still state and log, nothing physical.
+ */
+static bool
+bl_may_write(bool from_service)
+{
+	return from_service || gBLArb == 0 || (!bl.service_active && !bl.service_off);
+}
+
+/*
+ * A positive brightness request takes effect: driver state, the arbitration activation, the NVRAM
+ * copy of user brightnesses, the panel and the mixers, the trace line, the published parameters and
+ * the merged log line. The request's line prefix is in bl.line. DEFERRED marks the trace of one
+ * that was held back by bl_dedup. With bl.lock held.
+ */
+static void
+bl_commit(uint64_t v, uint64_t millinits, const char * tkey, uint64_t traw, const char * who,
+    bool from_service, bool touch_save, bool deferred)
+{
+	size_t used = strlen(bl.line);
+	uint32_t level;
+	int alpha;
+	char shown[32];
+
+	bl.last_v = v;
+	bl.last_millinits = millinits;
+	bl.initialized = true;
+	if (from_service) {
+		if (!bl.service_active && gBLArb != 0) {
+			IOLog("MiniAppleARMBacklight: the first service brightness (%llu.%03llu nits): "
+			    "the panel takes the service's alone from here\n", millinits / 1000, millinits % 1000);
+		}
+		bl.service_active = true;
+		bl.service_off = false;
+	}
+	if (touch_save) {
+		annibale_backlight_save((uint32_t) v, (uint32_t) millinits);
+		bl.nvram_seeded = true;
+		bl.service->setProperty("annibale-bl-restored", kOSBooleanTrue);
+	}
+	level = (uint32_t) (millinits * kBLLevelFull / kBLMilliNitsMax);
+	bool may = bl_may_write(from_service);
+	uint32_t want_before = MiniIOMobileFramebufferDCSWanted();
+	if (may) {
+		/* with fb_dcs=4 the panel takes v itself, and the mixers are given the full level */
+		uint32_t mixed = MiniIOMobileFramebufferDCS((uint32_t) v) ? kBLLevelFull : level;
+
+		if (mixed != annibale_backlight_level) {
+			annibale_backlight_level = mixed;
+			MiniIOMobileFramebufferDim(mixed);
+		}
+	}
+	if (annibale_bl_trace != 0) {
+		annibale_tl("tl: B %s %s %s=%llu mn %llu dbv %llu want %u>%u %s at %llu\n",
+		    from_service ? "svc" : "mfb", who, tkey != NULL ? tkey : "-", traw, millinits, v,
+		    want_before, MiniIOMobileFramebufferDCSWanted(),
+		    deferred ? "dwr" : may ? "wr" : "blk",
+		    bl_micros(mach_absolute_time()));
+	}
+	bl.service->publish(v, millinits);
+	/* (read back from the mixer: a burst prints only its last request, which may not have changed the level) */
+	alpha = MiniIOMobileFramebufferDimShown();
+	if (alpha >= 0) {
+		snprintf(shown, sizeof(shown), ", lm0 alpha %d of 1023", alpha);
+	} else {
+		snprintf(shown, sizeof(shown), ", not darkened");
+	}
+	snprintf(bl.line + used, sizeof(bl.line) - used, "; value %llu, %llu.%03llu nits, level %u of %u%s%s", v,
+	    millinits / 1000, millinits % 1000, level, kBLLevelFull, shown, may ? "" : ", not written");
+	bl_log();
+}
+
+/* With bl.lock held: a held-back integer-nits request is superseded; its trace pairs with the "def" line. */
+static void
+bl_def_drop(bool from_service, const char * who)
+{
+	bl.def_pending = false;
+	(void) thread_call_cancel(bl.defcall);
+	if (annibale_bl_trace != 0) {
+		annibale_tl("tl: B %s %s - defdrop at %llu\n",
+		    from_service ? "svc" : "mfb", who, bl_micros(mach_absolute_time()));
+	}
+}
+
+/* kBLDedupUS after the request, when no 16.16 request superseded it: the held-back request applies. */
+static void
+bl_def_fire(thread_call_param_t, thread_call_param_t)
+{
+	IOLockLock(bl.lock);
+	if (bl.def_pending) {
+		uint64_t v = bl.def_v, millinits = bl.def_millinits, raw = bl.def_raw;
+		const char * tkey = bl.def_tkey;
+		bool touch = bl.def_touch;
+		char who[24];
+
+		bl.def_pending = false;
+		strlcpy(who, bl.def_who, sizeof(who));
+		memcpy(bl.line, bl.def_line, sizeof(bl.line));
+		bl_commit(v, millinits, tkey, raw, who, true, touch, true);
+	}
+	IOLockUnlock(bl.lock);
+}
+
 static void
 bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 {
@@ -305,21 +474,24 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 	OSNumber * value = value_key != NULL ? OSDynamicCast(OSNumber, dict->getObject(value_key)) : NULL;
 	OSDictionary * db_dict = OSDynamicCast(OSDictionary, dict->getObject("DisplayBrightness"));
 	bool plain_nits = false;
+	bool from_service = value_key != NULL;
 	uint64_t now = mach_absolute_time(), active_win;
 	uint64_t v, millinits;
-	uint32_t level, mixed;
-	int alpha;
-	char who[24] = "?", shown[32];
+	char who[24] = "?";
 	size_t used;
 
+	const char * tkey = NULL;
+	uint64_t traw = 0;
 	bool slider_moved = false;
 	bool touch_recent = false;
 	uint64_t slider_pos = 0;
 	if (value_key != NULL && nits == NULL && value == NULL) {
 		if (db_dict != NULL) {
 			nits = OSDynamicCast(OSNumber, db_dict->getObject("NitsPhysical"));
+			tkey = "NitsPhysical";
 			if (nits == NULL) {
 				nits = OSDynamicCast(OSNumber, db_dict->getObject("Nits"));
+				tkey = "Nits";
 			}
 			plain_nits = nits != NULL;
 		}
@@ -367,15 +539,42 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 		uint64_t n16 = nits->unsigned64BitValue();
 		int64_t s16 = (int64_t) n16;
 
+		if (tkey == NULL) {
+			tkey = nits_key;
+		}
+		traw = n16;
 		if (s16 <= 0) {
-			if (!MiniIOMobileFramebufferDCS(0) && annibale_backlight_level != 0) {
+			bool may = bl_may_write(from_service);
+			uint32_t want_before = MiniIOMobileFramebufferDCSWanted();
+
+			if (from_service) {
+				bl.service_off = true;
+			}
+			if (may && bl.def_pending) {
+				/* the panel goes dark: a held-back positive request must not relight it */
+				bl_def_drop(from_service, who);
+			}
+			/*
+			 * The relight after a dark panel may restate the brightness from before it in whole
+			 * nits; with the 16.16 reference forgotten it cannot be mistaken for a duplicate and
+			 * suppressed, which would leave the panel dark.
+			 */
+			bl.precise_valid = false;
+			if (may && !MiniIOMobileFramebufferDCS(0) && annibale_backlight_level != 0) {
 				annibale_backlight_level = 0;
 				MiniIOMobileFramebufferDim(0);
 			}
 			snprintf(bl.line + used, sizeof(bl.line) - used,
-			    "; panel off (%lld), keeping %llu.%03llu nits",
-			    (long long) s16, bl.last_millinits / 1000, bl.last_millinits % 1000);
+			    "; panel off (%lld), keeping %llu.%03llu nits%s",
+			    (long long) s16, bl.last_millinits / 1000, bl.last_millinits % 1000,
+			    may ? "" : ", not written");
 			bl_log();
+			if (annibale_bl_trace != 0) {
+				annibale_tl("tl: B %s %s %s=%lld off want %u>%u %s at %llu\n",
+				    from_service ? "svc" : "mfb", who, tkey, (long long) s16,
+				    want_before, MiniIOMobileFramebufferDCSWanted(), may ? "off" : "blk",
+				    bl_micros(mach_absolute_time()));
+			}
 			return;
 		}
 
@@ -389,15 +588,40 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 		v = kBLValueMin + (millinits - kBLMilliNitsMin) * (kBLValueMax - kBLValueMin) / (kBLMilliNitsMax - kBLMilliNitsMin);
 	} else if (value != NULL) {
 		v = value->unsigned64BitValue();
+		tkey = value_key;
+		traw = v;
 		if (v == 0) {
-			if (!MiniIOMobileFramebufferDCS(0) && annibale_backlight_level != 0) {
+			bool may = bl_may_write(from_service);
+			uint32_t want_before = MiniIOMobileFramebufferDCSWanted();
+
+			if (from_service) {
+				bl.service_off = true;
+			}
+			if (may && bl.def_pending) {
+				/* the panel goes dark: a held-back positive request must not relight it */
+				bl_def_drop(from_service, who);
+			}
+			/*
+			 * The relight after a dark panel may restate the brightness from before it in whole
+			 * nits; with the 16.16 reference forgotten it cannot be mistaken for a duplicate and
+			 * suppressed, which would leave the panel dark.
+			 */
+			bl.precise_valid = false;
+			if (may && !MiniIOMobileFramebufferDCS(0) && annibale_backlight_level != 0) {
 				annibale_backlight_level = 0;
 				MiniIOMobileFramebufferDim(0);
 			}
 			snprintf(bl.line + used, sizeof(bl.line) - used,
-			    "; panel off (value 0), keeping %llu.%03llu nits",
-			    bl.last_millinits / 1000, bl.last_millinits % 1000);
+			    "; panel off (value 0), keeping %llu.%03llu nits%s",
+			    bl.last_millinits / 1000, bl.last_millinits % 1000,
+			    may ? "" : ", not written");
 			bl_log();
+			if (annibale_bl_trace != 0) {
+				annibale_tl("tl: B %s %s %s=0 off want %u>%u %s at %llu\n",
+				    from_service ? "svc" : "mfb", who, tkey,
+				    want_before, MiniIOMobileFramebufferDCSWanted(), may ? "off" : "blk",
+				    bl_micros(mach_absolute_time()));
+			}
 			return;
 		}
 		v = v < kBLValueMin ? kBLValueMin : v > kBLValueMax ? kBLValueMax : v;
@@ -405,34 +629,69 @@ bl_take(OSDictionary * dict, const char * value_key, const char * nits_key)
 	} else {
 		snprintf(bl.line + used, sizeof(bl.line) - used, "; nothing taken");
 		bl_log();
+		if (annibale_bl_trace != 0) {
+			annibale_tl("tl: B %s %s - skip at %llu\n",
+			    from_service ? "svc" : "mfb", who, bl_micros(mach_absolute_time()));
+		}
 		return;
 	}
-	bl.last_v = v;
-	bl.last_millinits = millinits;
-	bl.initialized = true;
-	if (touch_recent || slider_moved) {
-		annibale_backlight_save((uint32_t) v, (uint32_t) millinits);
-		bl.nvram_seeded = true;
-		bl.service->setProperty("annibale-bl-restored", kOSBooleanTrue);
+	/*
+	 * The request's brightness is in v and millinits. A 16.16 nits request applies at once and is
+	 * the reference the integer-nits dedup goes by; a bare brightness request applies at once too.
+	 * Either supersedes a held-back integer-nits request: they are the newer word on the brightness.
+	 */
+	if (!plain_nits) {
+		if (nits != NULL) {
+			bl.precise_mn = millinits;
+			bl.precise_valid = true;
+		}
+		if (bl.def_pending) {
+			bl_def_drop(from_service, who);
+		}
+		bl_commit(v, millinits, tkey, traw, who, from_service, touch_recent || slider_moved, false);
+		return;
 	}
-	level = (uint32_t) (millinits * kBLLevelFull / kBLMilliNitsMax);
-	/* with fb_dcs=4 the panel takes v itself, and the mixers are given the full level */
-	mixed = MiniIOMobileFramebufferDCS((uint32_t) v) ? kBLLevelFull : level;
-	if (mixed != annibale_backlight_level) {
-		annibale_backlight_level = mixed;
-		MiniIOMobileFramebufferDim(mixed);
+	if (gBLDedup != 0) {
+		uint32_t want_now = MiniIOMobileFramebufferDCSWanted();
+
+		if (bl.precise_valid && bl.precise_mn / 1000 == traw) {
+			/* the last 16.16 request's brightness restated in whole nits: nothing new to apply */
+			if (annibale_bl_trace != 0) {
+				annibale_tl("tl: B %s %s %s=%llu mn %llu dbv %llu want %u>%u dup at %llu\n",
+				    from_service ? "svc" : "mfb", who, tkey, traw, millinits, v,
+				    want_now, want_now, bl_micros(mach_absolute_time()));
+			}
+			return;
+		}
+		/*
+		 * Whole nits that do not match the last 16.16 request: the brightness crossed into another
+		 * integer, in which case the pair's 16.16 half follows within tens of microseconds -- or
+		 * an integer-only writer, in which case nothing follows. Hold the request back kBLDedupUS
+		 * so the precise half wins where there is one; the newest hold replaces any earlier one.
+		 */
+		bl.def_v = v;
+		bl.def_millinits = millinits;
+		bl.def_raw = traw;
+		bl.def_tkey = tkey;
+		bl.def_touch = touch_recent || slider_moved;
+		strlcpy(bl.def_who, who, sizeof(bl.def_who));
+		memcpy(bl.def_line, bl.line, sizeof(bl.def_line));
+		bl.def_pending = true;
+		{
+			uint64_t interval;
+
+			nanoseconds_to_absolutetime(kBLDedupUS * (uint64_t) NSEC_PER_USEC, &interval);
+			(void) thread_call_cancel(bl.defcall);
+			thread_call_enter_delayed(bl.defcall, now + interval);
+		}
+		if (annibale_bl_trace != 0) {
+			annibale_tl("tl: B %s %s %s=%llu mn %llu dbv %llu want %u>%u def at %llu\n",
+			    from_service ? "svc" : "mfb", who, tkey, traw, millinits, v,
+			    want_now, want_now, bl_micros(mach_absolute_time()));
+		}
+		return;
 	}
-	bl.service->publish(v, millinits);
-	/* (read back from the mixer: a burst prints only its last request, which may not have changed the level) */
-	alpha = MiniIOMobileFramebufferDimShown();
-	if (alpha >= 0) {
-		snprintf(shown, sizeof(shown), ", lm0 alpha %d of 1023", alpha);
-	} else {
-		snprintf(shown, sizeof(shown), ", not darkened");
-	}
-	snprintf(bl.line + used, sizeof(bl.line) - used, "; value %llu, %llu.%03llu nits, level %u of %u%s", v,
-	    millinits / 1000, millinits % 1000, level, kBLLevelFull, shown);
-	bl_log();
+	bl_commit(v, millinits, tkey, traw, who, from_service, touch_recent || slider_moved, false);
 }
 
 /*
@@ -609,7 +868,8 @@ MiniAppleARMBacklightStart(IOService * provider)
 
 	bl.lock = IOLockAlloc();
 	bl.later = thread_call_allocate(bl_log_later, NULL);
-	if (bl.lock == NULL || bl.later == NULL || backlight == NULL || !backlight->init()) {
+	bl.defcall = thread_call_allocate(bl_def_fire, NULL);
+	if (bl.lock == NULL || bl.later == NULL || bl.defcall == NULL || backlight == NULL || !backlight->init()) {
 		OSSafeReleaseNULL(backlight);
 		IOLog("MiniAppleARMBacklight: cannot create the service\n");
 		return;

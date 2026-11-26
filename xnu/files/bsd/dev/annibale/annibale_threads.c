@@ -199,7 +199,7 @@ annibale_thread_dump_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg
 /*
  * With boot-arg touch_lat=1, on every tick of the processor governor (annibale_cpufreq.c, 50 ms), the
  * threads of backboardd, SpringBoard and the input service go into the log as thread_dump writes
- * them in two cases:
+ * them in three cases:
  *   - a gesture with no answer: a touch began (the first after GESTURE_GAP_MS without one), and
  *     QUIET_MS later the panel has had fewer than QUIET_FRAMES new frames. In kernel-12377-cmd40-bo16
  *     and cmd41-bo17 the swipes that moved the screen had 9 to 26 frames by then, the others 0 to 4
@@ -209,9 +209,18 @@ annibale_thread_dump_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg
  *     moving since the gesture began (two changes at most STALL_FLOWING_MS apart, the last after the
  *     gesture's first touch), has not moved for STALL_MS since, and the last finger sample is under
  *     STALL_TOUCH_MS old, so the finger is still on the glass.
- * Each case dumps once per gesture or stall, and at most STALL_DUMPS times a boot. Only finger
- * samples count as touches (annibale_touch_last). In kernel-12377-cmd43-bo20, with button presses
- * counted and a stall allowed up to a second after the last touch, the six home presses on the
+ *   - a gap in a flowing stream of frames, armed per measurement through kern.annibale.tdump:
+ *     the frame count had been advancing by at least FLOW_FRAMES a tick (a 50 ms tick, so 40 Hz
+ *     or faster, which the settled screen's 10 Hz redraw never reaches), then has not moved for
+ *     FLOW_GAP_MS. A second dump follows at FLOW_GAP2_MS when the gap lasts that long. This case
+ *     is for the production silence of kernel-12377-flipwd9-b5r22: a page swipe's settle stopped
+ *     producing for 216-225 ms at 615 ms after the finger lifted, which both cases above miss --
+ *     the gap never reached STALL_MS, and the touch was far older than STALL_TOUCH_MS. The arming
+ *     write carries the number of dumps it buys; it stays 0 until the host arms it, so the
+ *     animations of a boot or an app opening spend nothing.
+ * Each of the first two cases dumps once per gesture or stall, and at most STALL_DUMPS times a boot.
+ * Only finger samples count as touches (annibale_touch_last). In kernel-12377-cmd43-bo20, with button
+ * presses counted and a stall allowed up to a second after the last touch, the six home presses on the
  * first page, which draw nothing, used most of the first case's dumps, and all eight of the second
  * case's came 445 to 954 ms after the finger had lifted, once a page swipe had settled.
  */
@@ -222,12 +231,33 @@ annibale_thread_dump_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg
 #define STALL_FLOWING_MS        100
 #define STALL_TOUCH_MS          100
 #define STALL_DUMPS             8
+#define FLOW_FRAMES             2
+#define FLOW_GAP_MS             60
+#define FLOW_GAP2_MS            160
 
+static int tdump_dumps;         /* the dumps kern.annibale.tdump has armed and not yet spent */
+
+/* Microseconds since boot, on the timeline of the other "tl:" lines. */
+static uint64_t
+tdump_micros(uint64_t absolute)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(absolute, &ns);
+	return ns / 1000;
+}
+
+/*
+ * The "tl: tdump mark" lines bracket each dump with exact timestamps: the dump lines themselves
+ * carry none, and on kernel-12377-flipwd9-b5r22 a dump's place in time had to be estimated from
+ * the frame lines around it, which put it up to 180 ms off its actual window.
+ */
 static void
 freeze_dump(void)
 {
 	static const char *const names[] = { "backboardd", "SpringBoard", "input26-service" };
 
+	annibale_tl("tl: tdump mark at %llu begin\n", (unsigned long long)tdump_micros(mach_absolute_time()));
 	for (int pid = 1; pid < 2000; pid++) {
 		char name[32] = "";
 
@@ -239,6 +269,7 @@ freeze_dump(void)
 			}
 		}
 	}
+	annibale_tl("tl: tdump mark at %llu end\n", (unsigned long long)tdump_micros(mach_absolute_time()));
 }
 
 void
@@ -246,6 +277,7 @@ annibale_freeze_check(uint64_t touched)
 {
 	static int enabled = -1;
 	static uint32_t frames, dumps, began_frames, quiet_dumps, first_touch_frames;
+	static uint32_t flow_frames, flow_delta, flow_stage;
 	static uint64_t moved, moved_before, touch_seen, began, first_touch;
 	static bool dumped, began_dumped, first_touch_logged;
 	uint64_t now = mach_absolute_time(), touch_ns, still_ns, flowing_ns;
@@ -298,11 +330,38 @@ annibale_freeze_check(uint64_t touched)
 		}
 	}
 	if (annibale_frames_shown != frames || moved == 0) {
+		flow_delta = annibale_frames_shown - flow_frames;
+		flow_frames = annibale_frames_shown;
+		flow_stage = 0;
 		frames = annibale_frames_shown;
 		moved_before = moved;
 		moved = now;
 		dumped = false;
 		return;
+	}
+	/*
+	 * The flow-gap case. flow_delta is the count the tick that saw the last change had gained:
+	 * at 120 Hz that is about 6, at the settled screen's 10 Hz redraw never more than 1, so a
+	 * gap behind a delta of FLOW_FRAMES or more is one the flowing stream stopped for. The tick
+	 * is 50 ms, which puts the first dump 60-110 ms into the gap and the second 160-210 ms in;
+	 * both land inside the 216-225 ms silences this is for.
+	 */
+	if (tdump_dumps > 0 && flow_delta >= FLOW_FRAMES && flow_stage < 2) {
+		absolutetime_to_nanoseconds(now - moved, &still_ns);
+		if (flow_stage == 0 && still_ns >= FLOW_GAP_MS * NSEC_PER_MSEC) {
+			flow_stage = 1;
+			tdump_dumps--;
+			printf("freeze: no frame for %llu ms in a stream of %u frames a tick (frame %u); the "
+			    "threads of backboardd, SpringBoard and input26-service follow\n",
+			    still_ns / NSEC_PER_MSEC, flow_delta, frames);
+			freeze_dump();
+		} else if (flow_stage == 1 && still_ns >= FLOW_GAP2_MS * NSEC_PER_MSEC) {
+			flow_stage = 2;
+			tdump_dumps--;
+			printf("freeze: still no frame at %llu ms into the gap (frame %u); a second set of "
+			    "threads follows\n", still_ns / NSEC_PER_MSEC, frames);
+			freeze_dump();
+		}
 	}
 	if (dumped || dumps >= STALL_DUMPS || began == 0 || moved_before == 0 || moved < began) {
 		return;         /* (a screen that stopped before this gesture began is the other case's) */
@@ -325,6 +384,10 @@ annibale_freeze_check(uint64_t touched)
 SYSCTL_PROC(_kern_annibale, OID_AUTO, thread_dump, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
     NULL, 0, annibale_thread_dump_sysctl, "I",
     "write a pid: one line per thread of it (id, state, wait event, priority, user pc)");
+
+SYSCTL_INT(_kern_annibale, OID_AUTO, tdump, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &tdump_dumps, 0,
+    "arm the flow-gap thread dumps: the number of dumps to buy; each fired dump spends one, 0 disarms");
 
 /* "SEQ TEXT": SEQ is 0 and TEXT empty until the host has sent a command. */
 static int

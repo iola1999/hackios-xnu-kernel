@@ -156,6 +156,7 @@ rd(vm_offset_t address)
 
 #include "annibale_sensors_i2c.inc"
 #include "annibale_sensors_probe.inc"
+#include "annibale_sensors_scan.inc"
 
 /* ---- bitbang hardware driver ------------------------------------------------------------------------ */
 
@@ -644,20 +645,23 @@ static void
 sensors_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	tlmm_base = ml_io_map(TLMM_BASE_PHYS, TLMM_MAP_SIZE);
-	if (hw_i2c_mode > 0 || probe_mode > 0) {
+	if (hw_i2c_mode > 0 || probe_mode > 0 || scan_group_count != 0) {
 		gcc_base = ml_io_map(GCC_BASE_PHYS, GCC_MAP_SIZE);
 	}
 	uint32_t gpio163_cfg = tlmm_base ? rd(tlmm_base + TLMM_GPIO_CFG(ANNIBALE_GLS6151_IRQ_GPIO)) : 0;
 	uint32_t gpio35_cfg = tlmm_base ? rd(tlmm_base + TLMM_GPIO_CFG(ANNIBALE_STK6A2X_IRQ_GPIO)) : 0;
 
 	say("sensors: gls6151 (0x%02x, SE12/GPIO16-17, GPIO%d cfg=%#x) & stk6a2x (0x%02x, SE10/GPIO8-9, GPIO%d cfg=%#x); "
-	    "hw_i2c=%d probe=%d cal offset=%u near=%u far=%u lux=%u\n",
+	    "hw_i2c=%d probe=%d scan=%u cal offset=%u near=%u far=%u lux=%u\n",
 	    ANNIBALE_GLS6151_I2C_ADDR, ANNIBALE_GLS6151_IRQ_GPIO, gpio163_cfg,
 	    ANNIBALE_STK6A2X_I2C_ADDR, ANNIBALE_STK6A2X_IRQ_GPIO, gpio35_cfg,
-	    hw_i2c_mode, probe_mode,
+	    hw_i2c_mode, probe_mode, scan_group_count,
 	    sensor_state.prox_crosstalk, sensor_state.prox_near_thresh, sensor_state.prox_far_thresh,
 	    sensor_state.sample.als_lux);
 
+	if (scan_group_count != 0) {
+		sensors_scan_run();
+	}
 	if (probe_mode > 0) {
 		sensors_probe_run();
 	}
@@ -696,7 +700,18 @@ annibale_sensors_init(void)
 	}
 	PE_parse_boot_argn("sensors_hw_i2c", &hw_i2c_mode, sizeof(hw_i2c_mode));
 	PE_parse_boot_argn("sensors_probe", &probe_mode, sizeof(probe_mode));
+	parse_scan_boot_arg();
 	parse_rails_boot_arg();
+	/* The scan replaces the hardware paths for the boot: its pin-localization verdict decides
+	 * where the driver points next, and the gpio16/17 bitbang of the retired assignment must not
+	 * run in a scan round (it breaks the WCN7850 WLAN enable, see the scan's header comment). */
+	if (scan_group_count != 0) {
+		if (hw_i2c_mode > 0 || probe_mode > 0) {
+			say("sensors: sensors_scan present, sensors_hw_i2c/sensors_probe disengaged\n");
+		}
+		hw_i2c_mode = 0;
+		probe_mode = 0;
+	}
 	sensor_state.sample.timestamp = mach_absolute_time();
 
 	major = cdevsw_add(-1, &sensors_cdevsw);

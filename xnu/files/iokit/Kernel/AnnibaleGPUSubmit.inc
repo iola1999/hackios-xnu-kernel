@@ -1,12 +1,12 @@
 /* Submission validation precedes cache maintenance and backend publication. */
 IOReturn
-AnnibaleGPUUserClient::submit(struct msm_gem_submit * request)
+AnnibaleGPUUserClient::submit(struct msm_gem_submit * request, struct gpu_io_stat * io)
 {
 	struct msm_gem_submit_bo * bos = NULL;
 	struct msm_gem_submit_cmd * cmds = NULL;
 	uint64_t addresses[GPU_SUBMIT_CMDS];
 	uint32_t words[GPU_SUBMIT_CMDS], count = 0;
-	uint64_t entered = mach_absolute_time(), began, nanos, again, roomed;
+	uint64_t entered = mach_absolute_time(), began, nanos, again, roomed, acq;
 	IOReturn ret = kIOReturnBadArgument;
 	const bool a830 = annibale_platform_is_annibale();
 
@@ -30,7 +30,7 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request)
 		ret = kIOReturnVMError;
 		goto out;
 	}
-	gpuLockIoctl(kMsmGemSubmit);
+	acq = ioLock(io, kMsmGemSubmit);
 	roomed = mach_absolute_time();
 	/*
 	 * The A830's queue holds adreno8_context_depth() submissions ahead of the GPU. With that many
@@ -73,7 +73,7 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request)
 	}
 	gGPUStat.rooming += mach_absolute_time() - roomed;
 	if (gGPUReported || !annibale_gpu_ready()) {
-		IOLockUnlock(gGPULock);
+		ioUnlock(io, acq);
 		ret = kIOReturnNotReady;
 		goto out;
 	}
@@ -91,14 +91,14 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request)
 		    address >= (1ull << 32) || cmds[i].size > (1ull << 32) - address))) {
 			IOLog("AnnibaleGPU: command buffer %u of a submission: buffer %u, offset %u, %u bytes, %u relocations: not taken\n",
 			    i, cmds[i].submit_idx, cmds[i].submit_offset, cmds[i].size, cmds[i].nr_relocs);
-			IOLockUnlock(gGPULock);
+			ioUnlock(io, acq);
 			goto out;
 		}
 		addresses[count] = address;
 		words[count++] = cmds[i].size / 4;
 	}
 	if (count == 0) {
-		IOLockUnlock(gGPULock);
+		ioUnlock(io, acq);
 		goto out;
 	}
 	/*
@@ -291,7 +291,7 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request)
 		}
 		bzero(&gGPUStat, sizeof(gGPUStat));
 	}
-	IOLockUnlock(gGPULock);
+	ioUnlock(io, acq);
 	ret = request->fence != 0 ? kIOReturnSuccess : kIOReturnTimeout;
 out:
 	if (bos != NULL) {

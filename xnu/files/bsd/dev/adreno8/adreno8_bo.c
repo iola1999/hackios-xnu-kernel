@@ -58,6 +58,18 @@ adreno8_bo_ready(void)
 	return true;
 }
 
+/*
+ * The state alone, for a caller that cannot take part in the health check: once BO_ENABLED is
+ * left it is never entered again in this run (adreno8_bo_stop, bo_fail), so a stale answer only
+ * ever says "enabled" a moment too long, and whoever was let through meets the real check under
+ * the GPU lock. A single aligned word, so the unlocked read cannot tear.
+ */
+bool
+adreno8_bo_enabled(void)
+{
+	return bo_state == BO_ENABLED;
+}
+
 bool
 adreno8_bo_enable(void)
 {

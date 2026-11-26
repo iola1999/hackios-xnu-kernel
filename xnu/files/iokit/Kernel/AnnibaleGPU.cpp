@@ -54,6 +54,7 @@ extern "C" {
 /* bsd/dev/annibale_adreno.c ("the GPU kept on"; declared in bsd/sys/annibale_input.h, which is not seen from here) */
 bool annibale_platform_is_annibale(void);
 bool annibale_gpu_ready(void);
+bool annibale_gpu_accepting(void);              /* annibale_gpu_ready() without its health check: safe with no lock held */
 bool annibale_gpu_parameter(uint32_t which, uint64_t * value);
 uint64_t annibale_gpu_address(uint64_t size, uint32_t * refusal);
 /* What `refusal` of annibale_gpu_address says when no address is given: the values of
@@ -569,6 +570,66 @@ gpuLockIoctl(uint32_t selector)
 	}
 }
 
+/*
+ * Boot-arg gpu_io_log=1: one line for every WriteRead ioctl of the five that make up the
+ * desktop's traffic (gemNew, gemInfo, submit, surface, memory), however fast it was -- "tl: L"
+ * answers only how often the queueing passed 2 ms, and a distribution needs the fast ones too.
+ *
+ * "tl: io PID TID sel SEL queue Q held H total T at US", all of Q, H, T and US in microseconds:
+ * Q is what acquiring the GPU lock cost in all, summed when a request takes it more than once
+ * (gemNew does, once for the pool and once for the making); H is the span from each acquisition
+ * to its release, summed the same way -- for submit() the depth wait is part of the span because
+ * the wait starts and ends inside it (gpuWait() lets go of the lock meanwhile; the "tl: D/d"
+ * lines price the wait itself), and gemInfo takes no lock at all since batch 8, so both stay 0
+ * there, which is what the lines are for; T is the whole ioctl and US when it began.
+ */
+static TUNABLE(uint32_t, gGPUIoLog, "gpu_io_log", 0);
+
+struct gpu_io_stat {
+	uint64_t queueing;                      /* of the processor's clock, as mach_absolute_time() counts */
+	uint64_t span;
+};
+
+/* gpuLockIoctl() with the queueing added to the stat; the acquisition time is the answer, for ioUnlock(). */
+static uint64_t
+ioLock(struct gpu_io_stat * io, uint32_t selector)
+{
+	uint64_t pre = 0, acq;
+
+	if (gGPUIoLog) {
+		pre = mach_absolute_time();
+	}
+	gpuLockIoctl(selector);
+	if (!gGPUIoLog) {
+		return 0;
+	}
+	acq = mach_absolute_time();
+	io->queueing += acq - pre;
+	return acq;
+}
+
+static void
+ioUnlock(struct gpu_io_stat * io, uint64_t acq)
+{
+	if (gGPUIoLog) {
+		io->span += mach_absolute_time() - acq;
+	}
+	IOLockUnlock(gGPULock);
+}
+
+static void
+ioLine(uint32_t selector, struct gpu_io_stat * io, uint64_t began)
+{
+	uint64_t now = mach_absolute_time(), queueing, span, total, at;
+
+	absolutetime_to_nanoseconds(io->queueing, &queueing);
+	absolutetime_to_nanoseconds(io->span, &span);
+	absolutetime_to_nanoseconds(now - began, &total);
+	absolutetime_to_nanoseconds(began, &at);
+	annibale_tl("tl: io %d %llu sel %#x queue %llu held %llu total %llu at %llu\n", proc_pid(current_proc()),
+	    (unsigned long long)thread_tid(current_thread()), selector, queueing / 1000, span / 1000, total / 1000, at / 1000);
+}
+
 /* How long from now a time of msm's is, in milliseconds; 0: now or past. */
 static uint64_t
 millisecondsUntil(const struct msm_timespec * when)
@@ -734,6 +795,14 @@ struct gpu_left {
  * cache gives buffers back the same way). At most GPU_KEPT_BYTES are kept (the one kept longest
  * makes way), none for longer than GPU_KEPT_SECONDS. rc.jobs.fps, Search: 8 such textures made
  * slowly instead of 77, the window server's frames drawn in 6.8 ms instead of 9.3-10 (median).
+ *
+ * Small buffers are kept since batch 8: the making of one is the same allocation, address space
+ * reservation, page table writes and lock round trips whatever its size, and the desktop's icon
+ * textures ran the whole lifecycle hundreds of times a frame while only buffers of 256 KB or
+ * more were kept. Sizes under 256 KB are rounded up to a power of two when made (gemNew()), so
+ * near sizes share one entry. A kept small buffer costs at most its bucket of wired memory, and
+ * the byte cap below bounds the pool as before; none of this applies to a surface's or the
+ * program's own memory, which keep() never takes.
  */
 struct gpu_kept {
 	IOMemoryDescriptor *            memory;         /* NULL: this place is free */
@@ -741,10 +810,10 @@ struct gpu_kept {
 	uint64_t                        address, size, since;
 	uint32_t                        flags;
 };
-#define GPU_KEPT                48
+#define GPU_KEPT                128             /* the desktop's small buffers churn through hundreds a frame (batch 5 kernel-submit-blocking) */
 #define GPU_KEPT_BYTES          (160ull << 20)
 #define GPU_KEPT_SECONDS        60              /* a buffer not asked for again in so long is let go */
-#define GPU_KEEP_FROM           (256u << 10)    /* bytes: smaller ones are not worth it */
+#define GPU_BUCKET_TO           (256u << 10)    /* smaller sizes are made in power-of-two buckets, this one and up exact */
 static TUNABLE(uint32_t, gGPUKeep, "gpu_keep", 1);      /* boot-arg gpu_keep=0 (a test): none kept; gpu_keep=2: kept ones cleared when given again */
 
 class AnnibaleGPUUserClient : public IOUserClient
@@ -763,7 +832,7 @@ class AnnibaleGPUUserClient : public IOUserClient
 	uint32_t                fStrangers;             /* requests that named a buffer the client does not have */
 	struct gpu_left         fLeft[GPU_LEFT];
 	uint32_t                fLeftCount;
-	struct gpu_kept         fKept[GPU_KEPT];
+	struct gpu_kept *       fKept;                  /* allocated with fBuffers: GPU_KEPT of them would not fit the object itself */
 	uint64_t                fKeptBytes;
 
 	struct gpu_buffer * buffer(uint32_t handle);
@@ -773,11 +842,11 @@ class AnnibaleGPUUserClient : public IOUserClient
 	bool keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags);
 	bool dropKept(struct gpu_kept * k);
 	void reap(void);
-	IOReturn gemNew(struct msm_gem_new * request, uint64_t * iova);
-	IOReturn surfaceBuffer(struct annibale_surface * request);
-	IOReturn memoryBuffer(struct annibale_memory * request);
+	IOReturn gemNew(struct msm_gem_new * request, uint64_t * iova, struct gpu_io_stat * io);
+	IOReturn surfaceBuffer(struct annibale_surface * request, struct gpu_io_stat * io);
+	IOReturn memoryBuffer(struct annibale_memory * request, struct gpu_io_stat * io);
 	IOReturn gemInfo(struct msm_gem_info * request);
-	IOReturn submit(struct msm_gem_submit * request);
+	IOReturn submit(struct msm_gem_submit * request, struct gpu_io_stat * io);
 	IOReturn show(const struct annibale_show * request);
 	IOReturn iogpuControlMethod(uint32_t selector, IOExternalMethodArguments * args);
 
@@ -819,55 +888,19 @@ AnnibaleGPUUserClient::start(IOService * provider)
 		return false;
 	}
 	fBuffers = IONewZero(struct gpu_buffer, GPU_BUFFERS);
-	return fBuffers != NULL;
+	if (fBuffers == NULL) {
+		return false;
+	}
+	fKept = IONewZero(struct gpu_kept, GPU_KEPT);
+	if (fKept == NULL) {
+		IODelete(fBuffers, struct gpu_buffer, GPU_BUFFERS);
+		fBuffers = NULL;
+		return false;
+	}
+	return true;
 }
 
 #include "AnnibaleGPUMemory.inc"
-
-IOReturn
-AnnibaleGPUUserClient::gemInfo(struct msm_gem_info * request)
-{
-	struct gpu_buffer * b;
-	IOReturn ret = kIOReturnSuccess;
-
-	gpuLockIoctl(kMsmGemInfo);
-	b = buffer(request->handle);
-	if (b == NULL) {
-		ret = kIOReturnBadArgument;
-	} else if (request->info == MSM_INFO_GET_OFFSET) {
-		request->value = (uint64_t) request->handle << 32;      /* nobody maps by it here */
-	} else if (request->info == MSM_INFO_GET_IOVA) {
-		/*
-		 * The address the buffer was given when it was made, and the buffer's until it is
-		 * given back. Nothing here ever moves a live buffer, so a caller may ask once and
-		 * keep the answer -- which is what freedreno does (fd_bo_init_common).
-		 */
-		request->value = b->address;
-	} else if (request->info == MSM_INFO_SET_IOVA) {
-		/*
-		 * Where a buffer goes is not the program's to choose here: every client is in the
-		 * one SMMU context 0, so an address one program picked would be a place in every
-		 * other program's space as well. Linux draws the line in the same place for the
-		 * two parameters that describe a space -- VA_START and VA_SIZE are refused unless
-		 * the client has page tables of its own (adreno_gpu.c, adreno_get_param) -- and
-		 * placing a buffer is the stronger request of the two. Said once, by name, rather
-		 * than returned as a bare code nobody can look up.
-		 */
-		if (!gGPUSaidSetIova) {
-			gGPUSaidSetIova = true;
-			IOLog("AnnibaleGPU: a program asked to place buffer %u at %#llx itself: refused. There is one "
-			    "page table here for every client, so addresses are the kernel's to give and "
-			    "MSM_INFO_GET_IOVA is how to learn them\n", request->handle, request->value);
-		}
-		ret = kIOReturnUnsupported;
-	} else if (request->info == MSM_INFO_GET_FLAGS) {
-		request->value = b->flags;
-	} else if (request->info != MSM_INFO_SET_NAME) {            /* a name for somebody's debugger: not kept */
-		ret = kIOReturnUnsupported;
-	}
-	IOLockUnlock(gGPULock);
-	return ret;
-}
 
 #include "AnnibaleGPUSubmit.inc"
 
@@ -1004,6 +1037,8 @@ AnnibaleGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 	IOReturn ret = kIOReturnSuccess;
 	uint64_t zero = 0, patience, waitBegan;
 	uint32_t fence;
+	struct gpu_io_stat io = { 0, 0 };
+	uint64_t ioBegan = gGPUIoLog ? mach_absolute_time() : 0;
 
 	if (fClientType == 1u) {
 		return iogpuControlMethod(selector, args);
@@ -1011,12 +1046,20 @@ AnnibaleGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 	if (args->structureInput == NULL || size > sizeof(r) || fBuffers == NULL) {
 		return kIOReturnBadArgument;
 	}
-	if (selector != kAnnibaleShow) {
-		if (gGPULock == NULL) return kIOReturnNotReady;
-		gpuLockIoctl(selector);
-		bool available = !gGPUReported && annibale_gpu_ready();
-		IOLockUnlock(gGPULock);
-		if (!available) return kIOReturnNotReady;
+	/*
+	 * The availability check without the lock (batch 8): it used to take gGPULock here, once
+	 * per request and again in the case itself, so even a request that needs no lock queued
+	 * behind whatever held it. gGPUReported and the backend's state both move one way only --
+	 * once stopped, nothing is started again in this run -- so a stale read at worst lets a
+	 * request through that the case's own locked check then refuses (every case that touches
+	 * the GPU asks annibale_gpu_ready() again with the lock held, and the health check stays
+	 * there: adreno8_bo_ready() drains the HFI queues, which only the lock may). gemInfo does
+	 * not ask again, and does not need to: it reads this client's own bookkeeping, never the
+	 * GPU.
+	 */
+	if (selector != kAnnibaleShow &&
+	    (gGPULock == NULL || __atomic_load_n(&gGPUReported, __ATOMIC_RELAXED) || !annibale_gpu_accepting())) {
+		return kIOReturnNotReady;
 	}
 	bzero(&r, sizeof(r));
 	memcpy(&r, args->structureInput, size);
@@ -1040,7 +1083,7 @@ AnnibaleGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 	case kMsmSubmitQueueClose:
 		break;
 	case kMsmGemNew:
-		ret = gemNew(&r.gemNew.request, size == sizeof(r.gemNew) ? &r.gemNew.iova : NULL);
+		ret = gemNew(&r.gemNew.request, size == sizeof(r.gemNew) ? &r.gemNew.iova : NULL, &io);
 		break;
 	case kMsmGemInfo:
 		ret = gemInfo(&r.gemInfo);
@@ -1064,7 +1107,7 @@ AnnibaleGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 		slowWait("cpu-prep", waitBegan);
 		break;
 	case kMsmGemSubmit:
-		ret = submit(&r.submit);
+		ret = submit(&r.submit, &io);
 		break;
 	case kMsmWaitFence:
 		waitBegan = mach_absolute_time();
@@ -1126,10 +1169,10 @@ AnnibaleGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 		IOLockUnlock(gGPULock);
 		break;
 	case kAnnibaleSurface:
-		ret = surfaceBuffer(&r.surface);
+		ret = surfaceBuffer(&r.surface, &io);
 		break;
 	case kAnnibaleMemory:
-		ret = memoryBuffer(&r.memory);
+		ret = memoryBuffer(&r.memory, &io);
 		break;
 	case kAnnibaleShow:
 		ret = show(&r.show);
@@ -1138,6 +1181,10 @@ AnnibaleGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 		IOLog("AnnibaleGPU: request %#x (%zu bytes) is not known here\n", selector, size);
 		ret = kIOReturnUnsupported;
 		break;
+	}
+	if (gGPUIoLog && (selector == kMsmGemNew || selector == kMsmGemInfo || selector == kMsmGemSubmit ||
+	    selector == kAnnibaleSurface || selector == kAnnibaleMemory)) {
+		ioLine(selector, &io, ioBegan);
 	}
 	if (ret == kIOReturnSuccess && args->structureOutput != NULL) {
 		if (args->structureOutputSize > size) {

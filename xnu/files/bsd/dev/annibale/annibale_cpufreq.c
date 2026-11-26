@@ -43,6 +43,7 @@
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void loader_log_putc(char c);
 extern void loader_log_line(const char *line);
+extern void annibale_tl(const char *format, ...) __printflike(1, 2);
 extern bool disable_serial_output;
 extern bool disable_kprintf_output;
 extern bool ml_cpu_idle_time(int cpu_id, uint64_t *idle);
@@ -430,13 +431,20 @@ perf_describe(uint32_t d, uint32_t version)
 	pd->known = (attributes & PERF_LEVEL_SET_ALLOWED) != 0;
 }
 
-/* The domain to level i (of its own, slowest first); its time at the old one counted up to `now`. */
+/*
+ * The domain to level i (of its own, slowest first); its time at the old one counted up to `now`.
+ * `boosts` carries the governor tick's boost states (bit 0 touch, bit 1 work interval, bit 2
+ * overrun), which go onto the log line of every change: the 30 s histogram says where the level
+ * sat on average, and whether a production stall came with a frequency dive needs the level and
+ * the boosts at the moment of the change (b5r22's 10 Hz settle section: the boost mechanism
+ * lapses across a wide enough frame gap, and only a per-change line can show it).
+ */
 static void
-perf_go(uint32_t d, uint32_t i, uint64_t now, uint64_t *then)
+perf_go(uint32_t d, uint32_t i, uint64_t now, uint64_t *then, uint32_t boosts)
 {
 	__typeof__(perf_domain[0]) *pd = &perf_domain[d];
 	uint32_t in[2] = { d, pd->key[i] }, words = 0;
-	uint64_t began = mach_absolute_time();
+	uint64_t began = mach_absolute_time(), ns;
 	int32_t status;
 
 	pd->at[pd->now] += now - *then;
@@ -453,6 +461,9 @@ perf_go(uint32_t d, uint32_t i, uint64_t now, uint64_t *then)
 	}
 	pd->now = i;
 	pd->changes++;
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	annibale_tl("tl: cf %u %u %u at %llu t%u w%u o%u\n", d, i, pd->khz[i] / 1000, ns / 1000,
+	    boosts & 1, (boosts >> 1) & 1, (boosts >> 2) & 1);
 }
 
 /* The level the governor wants for domain d, given its busiest core's thousandths busy. */
@@ -700,6 +711,9 @@ governor_thread(void *arg __unused, wait_result_t wr __unused)
 		uint32_t ui_q = os_atomic_xchg(&ui_quantum_expiries, 0, relaxed);
 		bool wi_boost = now < os_atomic_load(&wi_boost_until, relaxed);
 		bool overrun_boost = now < os_atomic_load(&wi_overrun_until, relaxed) || ui_q >= 2;
+		uint64_t touched = os_atomic_load(&touch_at, relaxed);
+		uint32_t boosts = (touched != 0 && now - touched < boost_abs ? 1 : 0) |
+		    (wi_boost ? 2 : 0) | (overrun_boost ? 4 : 0);
 		for (uint32_t d = 0; d < PERF_DOMAINS; d++) {
 			__typeof__(perf_domain[0]) *pd = &perf_domain[d];
 			int32_t t = 0, per[TSENS_SENSORS];
@@ -746,14 +760,14 @@ governor_thread(void *arg __unused, wait_result_t wr __unused)
 			want = perf_want(d, busy[d], now, boost_abs, valid, t, wi_boost, overrun_boost);
 			if (want > pd->now || pd->limit < pd->now) {
 				pd->low_since = 0;
-				perf_go(d, want, now, &level_since[d]);
+				perf_go(d, want, now, &level_since[d], boosts);
 			} else if (want < pd->now) {
 				pd->low_since = pd->low_since ? pd->low_since : now;
-				perf_go(d, now - pd->low_since >= down_abs ? want : pd->now, now, &level_since[d]);
+				perf_go(d, now - pd->low_since >= down_abs ? want : pd->now, now, &level_since[d], boosts);
 				pd->low_since = pd->now == want ? 0 : pd->low_since;
 			} else {
 				pd->low_since = 0;
-				perf_go(d, want, now, &level_since[d]);
+				perf_go(d, want, now, &level_since[d], boosts);
 			}
 		}
 		absolutetime_to_nanoseconds(span, &ns);

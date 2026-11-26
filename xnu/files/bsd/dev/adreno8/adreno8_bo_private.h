@@ -7,6 +7,10 @@
  * The caller serializes these operations with every GPU submission. */
 bool adreno8_bo_enable(void);
 bool adreno8_bo_ready(void);
+/* bo_state alone, without the health check adreno8_bo_ready() runs: monotonic once the GPU is
+ * gone, so a lock-free caller may ask it as a first refusal (AnnibaleGPU's ioctl entry check);
+ * the hardware check stays inside the lock. */
+bool adreno8_bo_enabled(void);
 /* Close all BO admission without releasing pages or IOVAs. */
 void adreno8_bo_stop(void);
 /* Why a reservation was refused, written through adreno8_bo_reserve's `refusal` when it returns

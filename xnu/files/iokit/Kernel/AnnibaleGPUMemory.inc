@@ -130,6 +130,10 @@ AnnibaleGPUUserClient::clientClose(void)
 void
 AnnibaleGPUUserClient::free(void)
 {
+	if (fKept != NULL) {
+		IODelete(fKept, struct gpu_kept, GPU_KEPT);
+		fKept = NULL;
+	}
 	if (fBuffers != NULL) {
 		IODelete(fBuffers, struct gpu_buffer, GPU_BUFFERS);
 		fBuffers = NULL;
@@ -172,6 +176,71 @@ AnnibaleGPUUserClient::lastUse(uint32_t handle)
 		fence = b->surface->drawn;
 	}
 	return fence;
+}
+
+/*
+ * What a buffer of this client's is, without the GPU lock (batch 8). Everything asked here is
+ * fixed when the buffer is made and never written again while it lives (address, flags), or is
+ * no state at all (offset, name), so the only thing the read can catch mid-write is the making
+ * itself. Against that, every path that fills a slot writes the memory reference last and with
+ * release ordering, and the read of it here is acquire: a slot either reads as empty or with
+ * every field of its making visible, never half of it. Two residues, both accepted:
+ *
+ * - A close that races the query can read as the old buffer still there (fine: the answer is
+ *   right about the buffer as it was) or, if the slot has since been given out again, as the
+ *   new one. The lock never made that race meaningful either -- it only picked one order --
+ *   and a program that closes a buffer while asking about it gets nothing useful in any order.
+ * - The "not there" note buffer() writes (and its fStrangers count) is a write of shared
+ *   state, so it is not repeated here; a bad handle is still a bad argument, only silent.
+ *
+ * MSM_INFO_SET_IOVA's once-a-run note writes gGPUSaidSetIova, one boolean everyone writes the
+ * same value into: the worst a race does is print the refusal twice.
+ */
+IOReturn
+AnnibaleGPUUserClient::gemInfo(struct msm_gem_info * request)
+{
+	struct gpu_buffer * b;
+	IOReturn ret = kIOReturnSuccess;
+
+	if (request->handle == 0 || request->handle > GPU_BUFFERS) {
+		return kIOReturnBadArgument;
+	}
+	b = &fBuffers[request->handle - 1];
+	if (__atomic_load_n(&b->memory, __ATOMIC_ACQUIRE) == NULL) {
+		return kIOReturnBadArgument;
+	}
+	if (request->info == MSM_INFO_GET_OFFSET) {
+		request->value = (uint64_t) request->handle << 32;      /* nobody maps by it here */
+	} else if (request->info == MSM_INFO_GET_IOVA) {
+		/*
+		 * The address the buffer was given when it was made, and the buffer's until it is
+		 * given back. Nothing here ever moves a live buffer, so a caller may ask once and
+		 * keep the answer -- which is what freedreno does (fd_bo_init_common).
+		 */
+		request->value = b->address;
+	} else if (request->info == MSM_INFO_SET_IOVA) {
+		/*
+		 * Where a buffer goes is not the program's to choose here: every client is in the
+		 * one SMMU context 0, so an address one program picked would be a place in every
+		 * other program's space as well. Linux draws the line in the same place for the
+		 * two parameters that describe a space -- VA_START and VA_SIZE are refused unless
+		 * the client has page tables of its own (adreno_gpu.c, adreno_get_param) -- and
+		 * placing a buffer is the stronger request of the two. Said once, by name, rather
+		 * than returned as a bare code nobody can look up.
+		 */
+		if (!gGPUSaidSetIova) {
+			gGPUSaidSetIova = true;
+			IOLog("AnnibaleGPU: a program asked to place buffer %u at %#llx itself: refused. There is one "
+			    "page table here for every client, so addresses are the kernel's to give and "
+			    "MSM_INFO_GET_IOVA is how to learn them\n", request->handle, request->value);
+		}
+		ret = kIOReturnUnsupported;
+	} else if (request->info == MSM_INFO_GET_FLAGS) {
+		request->value = b->flags;
+	} else if (request->info != MSM_INFO_SET_NAME) {            /* a name for somebody's debugger: not kept */
+		ret = kIOReturnUnsupported;
+	}
+	return ret;
 }
 
 /*
@@ -237,11 +306,12 @@ AnnibaleGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uin
 		if (!gpuReleaseMapping(b->address, size)) {
 			/* The caller releases its reference on failure; this record retains the backing pages. */
 			memory->retain();
-			b->memory = memory;
 			b->surface = NULL;
 			b->size = size;
 			b->flags = flags;
 			b->fence = 0;
+			/* the memory reference is the slot's validity, published last for gemInfo's lock-free read */
+			__atomic_store_n(&b->memory, memory, __ATOMIC_RELEASE);
 			fBufferCount++;
 			fBufferBytes += size;
 		}
@@ -284,7 +354,7 @@ AnnibaleGPUUserClient::keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint6
 {
 	struct gpu_kept * place = NULL;
 
-	if (gGPUKeep == 0 || size < GPU_KEEP_FROM || size > GPU_KEPT_BYTES / 4 || memory == NULL ||
+	if (gGPUKeep == 0 || size > GPU_KEPT_BYTES / 4 || memory == NULL ||
 	    (kernel == NULL && OSDynamicCast(IOBufferMemoryDescriptor, memory) == NULL)) {
 		return false;
 	}
@@ -317,7 +387,7 @@ AnnibaleGPUUserClient::keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint6
 }
 
 IOReturn
-AnnibaleGPUUserClient::gemNew(struct msm_gem_new * request, uint64_t * iova)
+AnnibaleGPUUserClient::gemNew(struct msm_gem_new * request, uint64_t * iova, struct gpu_io_stat * io)
 {
 	uint64_t size = round_page_64(request->size), began = mach_absolute_time();
 	struct gpu_buffer * b;
@@ -327,6 +397,22 @@ AnnibaleGPUUserClient::gemNew(struct msm_gem_new * request, uint64_t * iova)
 		return kIOReturnBadArgument;
 	}
 	/*
+	 * Small sizes in power-of-two buckets, so that near sizes share one kept buffer: an icon's
+	 * texture of 15 pages and another of 10 are both 64 KB here, where exact sizes would sit in
+	 * the pool side by side, each waiting for its own repetition. The program is never told a
+	 * size -- nothing in the interface hands it back -- so only the making and the matching see
+	 * the bucket, and the spare pages are mapped and unused, as a quarter-larger kept buffer's
+	 * always were. Sizes of GPU_BUCKET_TO and more are left as asked.
+	 */
+	if (size < GPU_BUCKET_TO) {
+		uint64_t bucket = PAGE_SIZE;
+
+		while (bucket < size) {
+			bucket <<= 1;
+		}
+		size = bucket;
+	}
+	/*
 	 * One kept of this kind and of this size or up to a quarter larger, if there is one: the smallest,
 	 * and of those the one kept last (likeliest still in the caches' way). CoreAnimation's blur
 	 * targets change size from frame to frame of an animation, and with exact sizes only the 160 MB
@@ -334,9 +420,10 @@ AnnibaleGPUUserClient::gemNew(struct msm_gem_new * request, uint64_t * iova)
 	 * backboardd made 218 buffers of 8 MB or more. The program sees the size it asked for; the rest
 	 * is mapped and unused.
 	 */
-	gpuLockIoctl(kMsmGemNew);
+	uint64_t acq = ioLock(io, kMsmGemNew);
+
 	if (gGPUReported || !annibale_gpu_ready()) {
-		IOLockUnlock(gGPULock);
+		ioUnlock(io, acq);
 		return kIOReturnNotReady;
 	}
 	struct gpu_kept * found = NULL;
@@ -347,7 +434,7 @@ AnnibaleGPUUserClient::gemNew(struct msm_gem_new * request, uint64_t * iova)
 		struct gpu_kept * k = &fKept[i];
 
 		if (k->memory != NULL && began - k->since > old && !dropKept(k)) {
-			IOLockUnlock(gGPULock);
+			ioUnlock(io, acq);
 			return kIOReturnNotReady;
 		}
 
@@ -362,11 +449,12 @@ AnnibaleGPUUserClient::gemNew(struct msm_gem_new * request, uint64_t * iova)
 		if (fBuffers[h].memory == NULL) {
 			b = &fBuffers[h];
 			bzero(b, sizeof(*b));
-			b->memory = found->memory;
 			b->kernel = found->kernel;
 			b->address = found->address;
 			b->size = found->size;
 			b->flags = found->flags;
+			/* the memory reference is the slot's validity, published last for gemInfo's lock-free read */
+			__atomic_store_n(&b->memory, found->memory, __ATOMIC_RELEASE);
 			fNextBuffer = h + 1;
 			fBufferCount++;
 			fBufferBytes += found->size;
@@ -375,14 +463,14 @@ AnnibaleGPUUserClient::gemNew(struct msm_gem_new * request, uint64_t * iova)
 			found->memory = NULL;
 			fKeptBytes -= found->size;
 			gGPUStat.given_again++;
-			IOLockUnlock(gGPULock);
+			ioUnlock(io, acq);
 			if (gGPUKeep == 2) {
 				bzero(b->kernel, (size_t) b->size);
 			}
 			return kIOReturnSuccess;
 		}
 	}
-	IOLockUnlock(gGPULock);
+	ioUnlock(io, acq);
 	/* (the memory comes zeroed, and making it write-combined pushes the zeroes out of the cache) */
 	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
 	    (gGPUCached ? 0 : kIOMapWriteCombineCache), (vm_size_t) size, PAGE_SIZE);
@@ -396,21 +484,22 @@ AnnibaleGPUUserClient::gemNew(struct msm_gem_new * request, uint64_t * iova)
 	}
 	uint64_t allocated = mach_absolute_time();
 
-	gpuLockIoctl(kMsmGemNew);
+	acq = ioLock(io, kMsmGemNew);
 	gGPUStat.locking += mach_absolute_time() - allocated;
 	IOReturn error = kIOReturnNoMemory;
 
 	b = newBuffer(memory, 0, size, request->flags, &request->handle, &error);
 	if (b != NULL) {
-		b->memory = memory;
 		b->kernel = (uint8_t *) memory->getBytesNoCopy();
 		if (iova) *iova = b->address;
 		gGPUStat.made++;
 		gGPUStat.making += mach_absolute_time() - began;
 		gGPUStat.allocating += allocated - began;
 		gGPUStat.made_by_size[size < (64u << 10) ? 0 : size < (1u << 20) ? 1 : size < (8u << 20) ? 2 : 3]++;
+		/* the memory reference is the slot's validity, published last for gemInfo's lock-free read */
+		__atomic_store_n(&b->memory, memory, __ATOMIC_RELEASE);
 	}
-	IOLockUnlock(gGPULock);
+	ioUnlock(io, acq);
 	if (b == NULL) {
 		memory->release();
 		return error;
@@ -426,7 +515,7 @@ AnnibaleGPUUserClient::gemNew(struct msm_gem_new * request, uint64_t * iova)
  * lock it gives buffers back under). Asked only to describe (kAnnibaleDescribe), no buffer is made.
  */
 IOReturn
-AnnibaleGPUUserClient::surfaceBuffer(struct annibale_surface * request)
+AnnibaleGPUUserClient::surfaceBuffer(struct annibale_surface * request, struct gpu_io_stat * io)
 {
 	MiniIOSurface * s = MiniIOSurfaceCopy(request->surface);
 	struct gpu_buffer * b = NULL;
@@ -464,11 +553,11 @@ AnnibaleGPUUserClient::surfaceBuffer(struct annibale_surface * request)
 		return kIOReturnSuccess;
 	}
 
-	gpuLockIoctl(kAnnibaleSurface);
+	uint64_t acq = ioLock(io, kAnnibaleSurface);
 	uint64_t inLock = mach_absolute_time();
 
 	if (gGPUReported || !annibale_gpu_ready()) {
-		IOLockUnlock(gGPULock);
+		ioUnlock(io, acq);
 		memory->release();
 		MiniIOSurfaceDrop(s);
 		return kIOReturnNotReady;
@@ -486,10 +575,11 @@ AnnibaleGPUUserClient::surfaceBuffer(struct annibale_surface * request)
 		memory->release();
 		MiniIOSurfaceDrop(s);
 	} else if ((b = newBuffer(pixelsMemory, pixelsOffset, size, 0, &request->handle, &error)) != NULL) {
-		b->memory = memory;
 		b->kernel = s->kpixels;
 		b->surface = s;
 		gGPUStat.surfaces++;
+		/* the memory reference is the slot's validity, published last for gemInfo's lock-free read */
+		__atomic_store_n(&b->memory, memory, __ATOMIC_RELEASE);
 	}
 	gGPUStat.taking += mach_absolute_time() - began;
 	if (gWaitLines) {
@@ -502,7 +592,7 @@ AnnibaleGPUUserClient::surfaceBuffer(struct annibale_surface * request)
 			    (unsigned long long)thread_tid(current_thread()), request->surface, size >> 10, cost / 1000, at / 1000);
 		}
 	}
-	IOLockUnlock(gGPULock);
+	ioUnlock(io, acq);
 	if (b == NULL) {
 		memory->release();
 		MiniIOSurfaceDrop(s);
@@ -521,7 +611,7 @@ AnnibaleGPUUserClient::surfaceBuffer(struct annibale_surface * request)
  * cache, and there the GPU snoops the caches itself.
  */
 IOReturn
-AnnibaleGPUUserClient::memoryBuffer(struct annibale_memory * request)
+AnnibaleGPUUserClient::memoryBuffer(struct annibale_memory * request, struct gpu_io_stat * io)
 {
 	static uint32_t refused;
 	IOMemoryDescriptor * memory;
@@ -555,16 +645,17 @@ AnnibaleGPUUserClient::memoryBuffer(struct annibale_memory * request)
 		memory->release();
 		return ret;
 	}
-	gpuLockIoctl(kAnnibaleMemory);
+	uint64_t acq = ioLock(io, kAnnibaleMemory);
 	IOReturn error = kIOReturnNoMemory;
 
 	if (gGPUReported || !annibale_gpu_ready()) {
 		error = kIOReturnNotReady;
 	} else if ((b = newBuffer(memory, 0, request->size, flags, &request->handle, &error)) != NULL) {
-		b->memory = memory;
 		b->kernel = NULL;
+		/* the memory reference is the slot's validity, published last for gemInfo's lock-free read */
+		__atomic_store_n(&b->memory, memory, __ATOMIC_RELEASE);
 	}
-	IOLockUnlock(gGPULock);
+	ioUnlock(io, acq);
 	if (b == NULL) {
 		memory->release();
 		return error;

@@ -39,6 +39,13 @@ annibale_gpu_ready(void)
 	return annibale_platform_is_annibale() && adreno8_bo_ready();
 }
 
+/* Without the health check annibale_gpu_ready() runs: safe to ask with no lock held. */
+bool
+annibale_gpu_accepting(void)
+{
+	return annibale_platform_is_annibale() && adreno8_bo_enabled();
+}
+
 bool
 annibale_gpu_parameter(uint32_t which, uint64_t *value)
 {

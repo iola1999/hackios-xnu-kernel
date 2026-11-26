@@ -46,5 +46,6 @@ IOReturn MiniAppleARMBacklightFramebufferProperties(OSObject * properties);
 void MiniIOMobileFramebufferDim(uint32_t level);
 int MiniIOMobileFramebufferDimShown(void);
 bool MiniIOMobileFramebufferDCS(uint32_t value);
+uint32_t MiniIOMobileFramebufferDCSWanted(void);
 
 #endif /* _IOKIT_MINIDRIVERS_H */
