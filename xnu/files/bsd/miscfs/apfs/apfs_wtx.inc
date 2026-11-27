@@ -259,6 +259,53 @@ wtx_poison(struct apfs_wtx *w, int error)
 	}
 }
 
+/*
+ * Revert an open transaction only when it holds a single operation (w->ops == expected_ops)
+ * and the caller verified it was closed beforehand: frees all dirty blocks back to bitmaps
+ * and avoids leaving an empty checkpoint after a 0-byte write failure.
+ */
+bool
+apfs_wtx_discard_solo(struct apfs_wtx *w, uint64_t expected_ops)
+{
+	if (w == NULL || w->broken || !w->open || w->ops != expected_ops) {
+		return false;
+	}
+	for (uint32_t i = 0; i < WTX_HASH; i++) {
+		for (struct wblk *b = w->hash[i]; b != NULL; b = b->next) {
+			if (wsp_free_now(w, b->addr, 1) != 0) {
+				wtx_poison(w, EIO);
+				return false;
+			}
+		}
+	}
+	wtx_drop_all(w);
+	w->sp.nfreed = 0;
+	w->sp.nip_freed = 0;
+	for (uint64_t c = 0; c < w->sp.chunk_count; c++) {
+		w->sp.chunks[c].dirty = false;
+	}
+	for (uint32_t c = 0; c < w->sp.cib_count; c++) {
+		w->sp.cib_dirty[c] = false;
+	}
+	*w->vol = w->saved_vol;
+	w->nx->omap.tree.root = w->saved_nx_omap_root;
+	w->next_oid = w->saved_next_oid;
+	memcpy(w->vsb, w->saved_vsb, w->bs);
+	w->fs.root = w->vol->tree.root;
+	w->fs.root_oid = w->vol->tree.root_oid;
+	w->omap.root = w->vol->omap.tree.root;
+	w->omap.root_oid = w->vol->omap.tree.root;
+	w->eref.root = w->vol->extentref_oid;
+	w->eref.root_oid = w->vol->extentref_oid;
+	w->nx_omap.root = w->nx->omap.tree.root;
+	w->nx_omap.root_oid = w->nx->omap.tree.root;
+	w->nx->view_xid = 0;
+	w->open = false;
+	apfs_nx_cache_flush(w->nx);
+	apfs_omap_cache_clear(w->nx);
+	return true;
+}
+
 /* ------------------------------------------------------------------ commit */
 
 struct wwrite {

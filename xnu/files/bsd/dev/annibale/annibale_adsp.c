@@ -607,6 +607,7 @@ static void handle_incoming_gpr(const uint8_t *data, uint32_t len)
 static void glink_poll_rx(void);
 #include "annibale_adsp_intents.inc"
 #include "annibale_adsp_ipcrtr.inc"
+#include "annibale_adsp_fastrpc.inc"
 
 static int adsp_pmic_glink_tx(const void *data, uint32_t len)
 {
@@ -689,6 +690,7 @@ static void glink_poll_rx(void)
 			glink_send_cmd2(GLINK_VERSION_ACK, param, w1 & 1u);
 		} else if (cmd == GLINK_VERSION_ACK) {
 			adsp_ipcrtr_request_open();
+			adsp_fastrpc_request_open();
 		} else if (cmd == GLINK_CLOSE_ACK || cmd == GLINK_RX_INTENT_REQ_ACK) {
 			/* Fixed 8-byte acknowledgment messages. */
 		} else if (cmd == GLINK_OPEN) {
@@ -724,6 +726,8 @@ static void glink_poll_rx(void)
 					adsp_ipcrtr_their_cid = param;
 					adsp_ipcrtr_request_open();
 					ipcrtr_attach = adsp_ipcrtr_note_ready() || ipcrtr_attach;
+				} else {
+					adsp_fastrpc_on_open(name, param);
 				}
 			}
 		} else if (cmd == GLINK_OPEN_ACK) {
@@ -735,6 +739,8 @@ static void glink_poll_rx(void)
 			} else if (param == adsp_ipcrtr_our_cid) {
 				adsp_ipcrtr_our_ack = true;
 				ipcrtr_attach = adsp_ipcrtr_note_ready() || ipcrtr_attach;
+			} else {
+				adsp_fastrpc_on_open_ack(param);
 			}
 		} else if (cmd == GLINK_CLOSE) {
 			glink_send_cmd2(GLINK_CLOSE_ACK, param, 0);
@@ -746,6 +752,8 @@ static void glink_poll_rx(void)
 				glink_queue_intents(glink_pmic_our_cid);
 			} else if (param == adsp_ipcrtr_their_cid && adsp_ipcrtr_our_cid != 0) {
 				adsp_ipcrtr_queue_intents(adsp_ipcrtr_our_cid);
+			} else {
+				adsp_fastrpc_on_intent_req(param);
 			}
 		} else if (cmd == GLINK_INTENT) {
 			uint32_t count = w1;
@@ -764,6 +772,8 @@ static void glink_poll_rx(void)
 						say("GPR intent id %u size %u\n", iid, sz);
 					} else if (param == adsp_ipcrtr_their_cid && adsp_ipcrtr_their_cid != 0) {
 						glink_add_their_intent(&adsp_ipcrtr_intents, iid, sz);
+					} else {
+						adsp_fastrpc_on_intent(param, iid, sz);
 					}
 				}
 			}
@@ -793,6 +803,8 @@ static void glink_poll_rx(void)
 				if (param == adsp_ipcrtr_their_cid && adsp_ipcrtr_their_cid != 0) {
 					adsp_ipcrtr_rx_chunk(cmd, param, glink_their_q, glink_their_q_size, r,
 					    chunk, left, &ipcrtr_pkt, &ipcrtr_len);
+				} else if (param == adsp_fastrpc_their_cid && adsp_fastrpc_their_cid != 0) {
+					(void)adsp_fastrpc_rx_chunk(cmd, param, glink_their_q, glink_their_q_size, r, chunk, left);
 				} else if (reasm != NULL) {
 					if (cmd == GLINK_TX_DATA) {
 						uint64_t total = (uint64_t)chunk + (uint64_t)left;
@@ -856,8 +868,7 @@ static void glink_poll_rx(void)
 					}
 				}
 				if (left == 0) {
-					uint16_t our_cid = (param == adsp_ipcrtr_their_cid && adsp_ipcrtr_their_cid != 0) ?
-					    adsp_ipcrtr_our_cid : ((param == glink_pmic_their_cid) ? glink_pmic_our_cid : glink_gpr_our_cid);
+					uint16_t our_cid = adsp_glink_our_cid_for(param);
 					if (our_cid != 0) {
 						glink_send_cmd2(GLINK_DONE_REUSE, our_cid, w1);
 					}
@@ -921,6 +932,7 @@ static bool glink_init_queues(bool cold_boot)
 	glink_their_q = smem_item(ITEM_GLINK_THEIR_Q, &glink_their_q_size);
 	bzero(glink_rx_reasm, sizeof(glink_rx_reasm));
 	adsp_ipcrtr_reset();
+	adsp_fastrpc_reset();
 	glink_send_cmd2(GLINK_VERSION, 1, 1);
 	return true;
 }
@@ -1152,12 +1164,9 @@ static void annibale_adsp_boot_thread(void *arg __unused, wait_result_t w __unus
 						}
 					}
 				}
-				fw_release(&dtb_fw);
-				fw_release(&main_fw);
-			} else {
-				fw_release(&dtb_fw);
-				fw_release(&main_fw);
 			}
+			fw_release(&dtb_fw);
+			fw_release(&main_fw);
 		}
 	}
 

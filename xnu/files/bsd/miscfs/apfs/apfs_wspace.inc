@@ -566,6 +566,46 @@ wsp_free_blocks(struct apfs_wtx *w)
 	return w->sp.free_count;
 }
 
+uint64_t
+wsp_ip_free_blocks(const struct apfs_wtx *w)
+{
+	const struct wspace *sp = &w->sp;
+	uint64_t used = 0;
+
+	for (uint64_t i = 0; i < sp->ip_blocks; i++) {
+		if (bit_get(sp->ip_bm, (uint32_t)i)) {
+			used++;
+		}
+	}
+	return sp->ip_blocks > used ? sp->ip_blocks - used : 0;
+}
+
+/* Worst-case internal-pool blocks wsp_commit() would need for dirty metadata plus extra_chunks. */
+uint64_t
+wsp_ip_commit_need(const struct apfs_wtx *w, uint64_t extra_chunks)
+{
+	const struct wspace *sp = &w->sp;
+	uint64_t dirty_chunks = 0, dirty_cibs = 0;
+
+	for (uint64_t c = 0; c < sp->chunk_count; c++) {
+		if (sp->chunks[c].dirty) {
+			dirty_chunks++;
+		}
+	}
+	for (uint32_t c = 0; c < sp->cib_count; c++) {
+		if (sp->cib_dirty[c]) {
+			dirty_cibs++;
+		}
+	}
+	uint64_t clean_chunks = sp->chunk_count > dirty_chunks ? sp->chunk_count - dirty_chunks : 0;
+	uint64_t new_chunks = extra_chunks < clean_chunks ? extra_chunks : clean_chunks;
+	uint64_t clean_cibs = sp->cib_count > dirty_cibs ? sp->cib_count - dirty_cibs : 0;
+	uint64_t new_cibs = new_chunks < clean_cibs ? new_chunks : clean_cibs;
+	uint64_t cabs = (dirty_cibs + new_cibs) > 0 ? sp->cab_count : 0;
+
+	return dirty_chunks + dirty_cibs + cabs + new_chunks + new_cibs;
+}
+
 /* ------------------------------------------------------------------ the internal pool */
 
 static int

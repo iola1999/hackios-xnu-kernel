@@ -253,17 +253,30 @@ uint32_t
 AnnibaleGPUUserClient::lastUse(uint32_t handle)
 {
 	struct gpu_buffer * b = buffer(handle);
-	uint32_t fence;
+	uint32_t fence, drawn;
 
 	if (b == NULL) {
 		return annibale_gpu_last();
 	}
 	fence = b->fence;
-	if (b->surface != NULL && b->surface->drawn != 0 &&
-	    (fence == 0 || (int32_t) (b->surface->drawn - fence) > 0)) {
-		fence = b->surface->drawn;
+	drawn = b->surface != NULL ? b->surface->drawn : 0;
+	if (drawn == 0) {
+		return fence;
 	}
-	return fence;
+	if (fence == 0) {
+		return drawn;
+	}
+	if (((drawn ^ fence) & 0x80000000u) == 0) {
+		if ((int32_t) ((uint32_t) (drawn - fence) << 1) > 0) {
+			fence = drawn;
+		}
+		return fence;
+	}
+	/* Cross-slot fences encode different ring timestamps; never replace an in-flight fence with a retired one. */
+	if (!annibale_gpu_ready() || !annibale_gpu_done(fence)) {
+		return fence;
+	}
+	return drawn;
 }
 
 /*

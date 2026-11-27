@@ -670,6 +670,8 @@ iris_psc_geometry_ok(const struct iris_session *s)
 	return true;
 }
 
+static int iris_reconfigure_p010(struct iris_session *s, uint32_t raw_target);
+
 static int
 iris_start_output(struct iris_session *s)
 {
@@ -678,12 +680,14 @@ iris_start_output(struct iris_session *s)
 	required |= s->codec_type == IRIS_CODEC_H264 ?
 	    (1u << PSC_CODED) | (1u << PSC_POC) : 1u << PSC_TIER;
 	uint32_t count = s->psc_values[PSC_MIN_COUNT];
+	bool is_10bit = s->codec_type == IRIS_CODEC_HEVC && s->psc_values[PSC_DEPTH] == 0x000a000au;
+	bool depth_ok = s->psc_values[PSC_DEPTH] == 0x00080008u || is_10bit;
 	iris_say("PSC sid=%u seen=0x%x required=0x%x resolution=0x%x crop=0x%x/0x%x depth=0x%x min=%u\n",
 	    s->wire_session_id, s->psc_seen, required, s->psc_values[PSC_RES],
 	    s->psc_values[PSC_CROP_LT], s->psc_values[PSC_CROP_RB], s->psc_values[PSC_DEPTH], count);
 	if ((s->psc_seen & required) != required ||
 	    !iris_psc_geometry_ok(s) ||
-	    s->psc_values[PSC_DEPTH] != 0x00080008u || count == 0 ||
+	    !depth_ok || count == 0 ||
 	    count > IRIS_RAW_POOL_MAX || s->raw_frame_size == 0 ||
 	    (uint64_t)s->raw_frame_size * count > IRIS_IOVA_RAW_SESSION_STRIDE ||
 	    s->dpb_frame_size == 0 || count > s->intern_dpb.size / s->dpb_frame_size ||
@@ -691,8 +695,13 @@ iris_start_output(struct iris_session *s)
 		s->psc_rejected = true;
 		return EOPNOTSUPP;
 	}
+	uint32_t raw_target = count < IRIS_RAW_POOL_COUNT ? IRIS_RAW_POOL_COUNT : count;
+	if (is_10bit) {
+		int p010_err = iris_reconfigure_p010(s, raw_target);
+		if (p010_err != 0) return p010_err;
+	}
 	/* Keep the initial RAW allocations and add the buffers required by input PSC. */
-	while (s->raw_count < count) {
+	while (s->raw_count < raw_target) {
 		uint32_t i = s->raw_count;
 		uint32_t address = IRIS_IOVA_RAW_BASE + (s->session_id - 1u) *
 		    IRIS_IOVA_RAW_SESSION_STRIDE + i * s->raw_frame_size;
@@ -705,7 +714,7 @@ iris_start_output(struct iris_session *s)
 		(s->uv_stride << 16) | s->uv_scanlines };
 	if (!pkt_add_u32(&b, HFI_PROP_OPB_ENABLE, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32, HFI_PORT_RAW, 1u) ||
 	    !pkt_add_u32(&b, HFI_PROP_COLOR_FORMAT, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32_ENUM,
-	    HFI_PORT_RAW, HFI_COLOR_FMT_NV12) ||
+	    HFI_PORT_RAW, s->is_10bit ? HFI_COLOR_FMT_P010 : HFI_COLOR_FMT_NV12) ||
 	    !pkt_add(&b, HFI_PROP_LINEAR_STRIDE_SCANLINE, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_64_PACKED,
 	    HFI_PORT_RAW, stride_scan, sizeof(stride_scan)) || !iris_cmdq_write(&b)) return EIO;
 	/* Initial PSC resumes input before RAW START; DPB is queued after RAW START. */
@@ -948,14 +957,14 @@ iris_copy_decoded_nv12(struct iris_session *s, uint32_t raw_idx, struct iris_dec
 	const struct iris_dma_buf *rb = &s->raw[raw_idx];
 	iris_cache_clean_inval((const void *)rb->kva, rb->size);
 
+	uint32_t copy_w = s->width * (s->is_10bit ? 2u : 1u);
 	uint32_t dst_stride = req->out_stride ? req->out_stride : s->y_stride;
-	if (dst_stride < s->width) {
+	if (dst_stride < copy_w) {
 		return EINVAL;
 	}
 
 	const uint8_t *src_y = (const uint8_t *)rb->kva;
 	const uint8_t *src_uv = src_y + (size_t)s->y_stride * s->y_scanlines;
-	uint32_t copy_w = s->width;
 	uint32_t uv_rows = (s->height + 1u) / 2u;
 
 	if (req->out_user_y != 0) {

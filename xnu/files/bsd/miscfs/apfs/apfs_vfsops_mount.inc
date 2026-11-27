@@ -456,6 +456,10 @@ apfs_unmount(mount_t mp, int mntflags, vfs_context_t ctx)
 	error = apfs_wmount_detach(am);
 	if (error) {
 		printf("apfs: unmount of \"%s\": the last commit failed (%d)\n", am->am_vol.name, error);
+		if ((mntflags & MNT_FORCE) == 0) {
+			/* Keep mount private data valid if VFS aborts a non-forced unmount. */
+			return error;
+		}
 	}
 	/* vflush let go of the grafted volumes' vnodes too: they are this mount's */
 	while (am->am_grafts != NULL) {
@@ -467,5 +471,5 @@ apfs_unmount(mount_t mp, int mntflags, vfs_context_t ctx)
 	}
 	vfs_setfsprivate(mp, NULL);
 	apfs_volume_close(am, ctx);
-	return 0;
+	return error;
 }

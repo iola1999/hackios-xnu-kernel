@@ -441,6 +441,8 @@ static const struct pmic_gpio sleep_clock_pin = { "the PMK8550's GPIO3 (sleep cl
 	{ { 0x41, 0x00 }, { 0x42, 0x05 }, { 0x45, 0x01 }, { 0x40, 0x01 }, { 0x44, 0x02 }, { 0x46, 0x80 } } };
 static const struct pmic_gpio bt_en_pin = { "the PM8550VE-F's GPIO3 (BT_EN)", 0x58a,
 	{ { 0x41, 0x01 }, { 0x42, 0x05 }, { 0x45, 0x01 }, { 0x40, 0x01 }, { 0x44, 0x80 }, { 0x46, 0x80 } } };
+static const struct pmic_gpio bt_en_pin_low = { "the PM8550VE-F's GPIO3 (BT_EN low)", 0x58a,
+	{ { 0x41, 0x01 }, { 0x42, 0x05 }, { 0x45, 0x01 }, { 0x40, 0x01 }, { 0x44, 0x00 }, { 0x46, 0x80 } } };
 
 static uint32_t
 spmi_wait(vm_offset_t channel)
@@ -771,7 +773,14 @@ mhi_pcie_power_up(const struct mhi_pcie_windows *windows)
 		uint32_t bt_en = 0;
 
 		(void)PE_parse_boot_argn("pcie_bt_en", &bt_en, sizeof(bt_en));
-		pmic_gpio(&bt_en_pin, bt_en != 0);
+		if (bt_en != 0) {
+			/* Pulse BT_EN low before WLAN_EN so warm reboots reset WCN7850 BT back to ROM 115200. */
+			pmic_gpio(&bt_en_pin_low, true);
+			delay_for_interval(20, NSEC_PER_MSEC);
+			pmic_gpio(&bt_en_pin, true);
+		} else {
+			pmic_gpio(&bt_en_pin, false);
+		}
 	}
 	wr(PIN_IO(PIN_WLAN_EN), PIN_IO_OUT_HIGH);
 	delay_for_interval(50, NSEC_PER_MSEC);

@@ -25,6 +25,7 @@
 #include "annibale_bt_private.h"
 
 extern const uint8_t *annibale_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+extern void AnnibaleBTGetAddress(uint8_t out[6]);
 extern kern_return_t thread_terminate(thread_t thread);
 
 #define H4_COMMAND              0x01
@@ -294,8 +295,9 @@ nvm_edits(const uint8_t *data, uint32_t size, struct edit *edit, unsigned *count
 			edit[(*count)++] = (struct edit){ d, (uint8_t)(data[d] & 0xfe) };
 			edit[(*count)++] = (struct edit){ d + 1, 0 };
 		} else if (id == NVM_TAG_BD_ADDR && len == 6 && *count + 6 <= 12) {
-			static const uint8_t bd[6] = { 0x02, 0x41, 0x4e, 0x4e, 0x00, 0x02 };
+			uint8_t bd[6];
 
+			AnnibaleBTGetAddress(bd);
 			bt_say("bt: nvm: tag 2 (address) %02x:%02x:%02x:%02x:%02x:%02x -> %02x:%02x:%02x:%02x:%02x:%02x\n",
 			    data[d + 5], data[d + 4], data[d + 3], data[d + 2], data[d + 1], data[d],
 			    bd[0], bd[1], bd[2], bd[3], bd[4], bd[5]);

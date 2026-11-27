@@ -160,7 +160,7 @@ extern int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t ar
 #define IRIS_IOVA_BITSTREAM_BASE        0x26000000u
 #define IRIS_IOVA_BITSTREAM_STRIDE      0x01000000u
 #define IRIS_IOVA_INTERNAL_BASE         0x30000000u
-#define IRIS_IOVA_SESSION_STRIDE        0x04000000u
+#define IRIS_IOVA_SESSION_STRIDE        0x06000000u
 #define IRIS_IOVA_RAW_BASE              0x60000000u
 #define IRIS_IOVA_RAW_SESSION_STRIDE    0x03000000u
 #define IRIS_IOVA_DEV_QTIMER            0xffade000u
@@ -248,6 +248,7 @@ extern int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t ar
 #define HFI_CODEC_DECODE_AVC             1u
 #define HFI_CODEC_DECODE_HEVC            3u
 #define HFI_COLOR_FMT_NV12               1u
+#define HFI_COLOR_FMT_P010               4u
 
 #define HFI_PORT_NONE                   0u
 #define HFI_PORT_BITSTREAM              1u
@@ -366,6 +367,7 @@ struct iris_session {
 	bool                drain_ack;
 	bool                drain_last;
 	bool                psc_rejected;   /* input PSC failed host checks before RAW START */
+	bool                is_10bit;       /* HEVC Main 10 P010 (2 B/pixel) output negotiated */
 	uint32_t            started_ports;
 	uint32_t            drain_packet_id;
 	uint32_t            wire_session_id;

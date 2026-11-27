@@ -766,6 +766,14 @@ held_irq_mask(void)
 }
 /* LC-IRQ-END */
 
+static int usb_recently_active(void);
+
+static void
+lc_watch_wfe_idle(void)
+{
+	__asm__ volatile ("dsb sy\nwfe" : : : "memory");
+}
+
 /* LC-WATCH-BEGIN -- extracted verbatim by tools/test-loader-lifecycle.py: one round of
  * watching the started core, exactly what run_on_other_cpu's loop runs per pass. It
  * returns nonzero when the loop must stop: the core returned (status stays 0) or a timeout
@@ -822,7 +830,7 @@ lc_watch_round(const struct kernel_live *live, uint64_t slide, uint64_t started,
 		block_poll();
 	}
 	usb_poll_command();
-	if (block_enabled) {
+	if (block_enabled && hc_list_is_uefis()) {
 		/*
 		 * The pause is spent looking at the kernel's mailbox: with one look a pass, a
 		 * request waited 60-75 us on average before this core noticed it, more than a
@@ -833,9 +841,11 @@ lc_watch_round(const struct kernel_live *live, uint64_t slide, uint64_t started,
 			for (volatile int i = 0; i < 300; i++) {
 			}
 		}
-	} else {
-		for (volatile int i = 0; i < 20000; i++) {
+	} else if (usb_recently_active()) {
+		for (volatile int i = 0; i < 2000; i++) {
 		}
+	} else {
+		lc_watch_wfe_idle();
 	}
 	return 0;
 }
@@ -920,6 +930,15 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 		flush_log();
 	}
 	/* LC-ENTER-END */
+	uint64_t saved_cntkctl = 0;
+	int evnten_on = 0;
+	if (status == 0 && PLAT == &platform_annibale) {
+		saved_cntkctl = READ_SYSREG(CNTKCTL_EL1);
+		/* EVNTEN=1 (bit 2), EVNTDIR=0 (bit 3), EVNTI=14 (bits 7:4) -> ~1.71 ms at 19.2 MHz. */
+		uint64_t v = (saved_cntkctl & ~((0xfull << 4) | (1ull << 3))) | (1ull << 2) | (14ull << 4);
+		__asm__ volatile ("msr cntkctl_el1, %0\nisb" : : "r" (v));
+		evnten_on = 1;
+	}
 	while (status == 0) {
 		/* Storage logging needs firmware interrupts during NOTE_SECONDS on other platforms. */
 		if (!watching_only && seconds_since(started) >= noted + 2) {
@@ -943,6 +962,9 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 			break;  /* returned, or a timeout decided at once: the hold stands, no service after it */
 		}
 		ui_watch_kernel_boot(live, slide);
+	}
+	if (evnten_on) {
+		__asm__ volatile ("msr cntkctl_el1, %0\nisb" : : "r" (saved_cntkctl));
 	}
 	/* LC-TAIL-BEGIN -- extracted verbatim by tools/test-loader-lifecycle.py: the loop tail
 	 * after a round decided the hold, where the mask lands before the caller writes. */

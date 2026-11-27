@@ -147,7 +147,7 @@ struct apfs_wtx {
 	uint8_t         *saved_vsb;
 
 	/* counters */
-	uint64_t         commits, commit_blocks, commit_ticks, cow_blocks, splits;
+	uint64_t         ops, commits, commit_blocks, commit_ticks, cow_blocks, splits;
 
 	/* the host's converter only (apfs_wadopt.inc); always 0 in the kernel */
 	uint64_t         place;         /* the next allocation takes exactly this block on */
@@ -170,6 +170,8 @@ static int  wsp_alloc(struct apfs_wtx *w, uint64_t goal, uint64_t want, uint64_t
 static int  wsp_free_now(struct apfs_wtx *w, uint64_t addr, uint64_t count);
 static int  wsp_free_later(struct apfs_wtx *w, uint64_t addr, uint64_t count, bool vol_owned);
 static uint64_t wsp_free_blocks(struct apfs_wtx *w);
+static uint64_t wsp_ip_free_blocks(const struct apfs_wtx *w);
+static uint64_t wsp_ip_commit_need(const struct apfs_wtx *w, uint64_t extra_chunks);
 static int  wsp_commit(struct apfs_wtx *w);
 
 /* apfs_wbt.inc */

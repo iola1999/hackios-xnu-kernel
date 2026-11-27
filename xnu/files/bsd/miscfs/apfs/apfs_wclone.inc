@@ -82,6 +82,22 @@ wcl_entry(void *ctx, const char *name, size_t len, uint64_t id, uint8_t dtype)
 	return c->error;
 }
 
+static int
+wcl_xattr_count(void *ctx, const char *name, size_t len, const struct apfs_xattr *xa)
+{
+	struct wcl *c = ctx;
+
+	if (len >= 128 || strncmp(name, "com.apple.fs.", 13) == 0) {
+		return 0;
+	}
+	if (xa->flags & APFS_XATTR_DATA_STREAM) {
+		c->blocks += (xa->stream_size + c->w->bs - 1) / c->w->bs;
+	} else if (xa->data_len > APFS_XATTR_MAX_EMBEDDED_SIZE) {
+		c->blocks += (xa->data_len + c->w->bs - 1) / c->w->bs;
+	}
+	return 0;
+}
+
 /* Every object of the tree, parents before children, and the data blocks they hold. */
 static int
 wcl_collect(struct wcl *c)
@@ -106,6 +122,9 @@ wcl_collect(struct wcl *c)
 
 			wi_dstream(i, &size, &alloced);
 			c->blocks += (alloced - WCL_MIN(alloced, wi_sparse(i))) / c->w->bs;
+		}
+		if (error == 0) {
+			error = apfs_xattr_list(c->w->vol, c->items[k].src, wcl_xattr_count, c);
 		}
 	}
 	if (i != NULL) {
@@ -290,8 +309,8 @@ apfs_w_clone(struct apfs_wtx *w, uint64_t src, uint64_t dir, const char *name, s
 			error = EINVAL;
 		}
 	}
-	if (error == 0 && wsp_free_blocks(w) < c.blocks + (uint64_t)c.n * 2 + WOP_RESERVE) {
-		error = ENOSPC;
+	if (error == 0) {
+		error = wop_begin(w, c.blocks + (uint64_t)c.n * 4);
 	}
 	/* from the first change on, a failure is the transaction's */
 	for (uint32_t k = 0; error == 0 && k < c.n; k++) {

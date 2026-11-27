@@ -204,7 +204,7 @@ hc_make_read(struct hc_cmd *c, uint8_t lun, uint8_t tag, uint32_t lba, uint32_t 
 }
 
 static void
-hc_make_write(struct hc_cmd *c, uint8_t lun, uint8_t tag, uint32_t lba, uint32_t blocks)
+hc_make_write(struct hc_cmd *c, uint8_t lun, uint8_t tag, uint32_t lba, uint32_t blocks, bool fua)
 {
 	uint32_t bytes = blocks * BLOCK;
 
@@ -218,6 +218,7 @@ hc_make_write(struct hc_cmd *c, uint8_t lun, uint8_t tag, uint32_t lba, uint32_t
 	c->upiu[14] = (uint8_t)(bytes >> 8);
 	c->upiu[15] = (uint8_t)bytes;
 	c->upiu[16] = 0x2a;                     /* WRITE(10) */
+	c->upiu[17] = fua ? 0x08 : 0x00;
 	c->upiu[18] = (uint8_t)(lba >> 24);
 	c->upiu[19] = (uint8_t)(lba >> 16);
 	c->upiu[20] = (uint8_t)(lba >> 8);
@@ -317,11 +318,11 @@ hc_whitelist_selftest(void)
 		hc_write_range[1].end = 30008;
 		hc_write_ranges = 2;
 
-		hc_make_write(&c, 0, 1, 12000, 16);
+		hc_make_write(&c, 0, 1, 12000, 16, false);
 		right &= (hc_refusal(c.upiu, c.dw0, 1u << 0, false) == NULL);
 
 		/* FUA write (cdb[1] = 0x08) */
-		c.upiu[17] = 0x08;
+		hc_make_write(&c, 0, 1, 12000, 16, true);
 		right &= (hc_refusal(c.upiu, c.dw0, 1u << 0, false) == NULL);
 		c.upiu[17] = 0x00;
 
@@ -330,19 +331,19 @@ hc_whitelist_selftest(void)
 		right &= (hc_refusal(c.upiu, c.dw0, 1u << 0, false) != NULL);
 		c.upiu[17] = 0x00;
 
-		hc_make_write(&c, 0, 1, 9000, 16);   /* under start */
+		hc_make_write(&c, 0, 1, 9000, 16, false);   /* under start */
 		right &= (hc_refusal(c.upiu, c.dw0, 1u << 0, false) != NULL);
 
-		hc_make_write(&c, 0, 1, 19990, 20);  /* past end */
+		hc_make_write(&c, 0, 1, 19990, 20, false);  /* past end */
 		right &= (hc_refusal(c.upiu, c.dw0, 1u << 0, false) != NULL);
 
-		hc_make_write(&c, 0, 1, 30000, 8);   /* the second range */
+		hc_make_write(&c, 0, 1, 30000, 8, false);   /* the second range */
 		right &= (hc_refusal(c.upiu, c.dw0, 1u << 0, false) == NULL);
 
-		hc_make_write(&c, 0, 1, 30004, 8);   /* past its end */
+		hc_make_write(&c, 0, 1, 30004, 8, false);   /* past its end */
 		right &= (hc_refusal(c.upiu, c.dw0, 1u << 0, false) != NULL);
 
-		hc_make_write(&c, 1, 1, 12000, 16);  /* wrong LUN */
+		hc_make_write(&c, 1, 1, 12000, 16, false);  /* wrong LUN */
 		right &= (hc_refusal(c.upiu, c.dw0, 1u << 0, false) != NULL);
 
 		/* SYNCHRONIZE CACHE(10) when write enabled on target LUN */
@@ -825,7 +826,7 @@ ufshc_read(uint8_t lun, uint64_t offset, uint8_t *dst, uint64_t len)
 }
 
 int
-ufshc_write(uint8_t lun, uint64_t offset, const uint8_t *src, uint64_t len)
+ufshc_write(uint8_t lun, uint64_t offset, const uint8_t *src, uint64_t len, bool fua)
 {
 	struct {
 		struct hc_slot *slot;
@@ -865,8 +866,7 @@ ufshc_write(uint8_t lun, uint64_t offset, const uint8_t *src, uint64_t len)
 				error = EINVAL;
 				break;
 			}
-
-			hc_make_write(&c, lun, (uint8_t)s->number, (uint32_t)first, (uint32_t)blocks);
+			hc_make_write(&c, lun, (uint8_t)s->number, (uint32_t)first, (uint32_t)blocks, fua);
 			memcpy(s->data, src, (size_t)blocks * BLOCK);
 			FlushPoC_DcacheRegion((vm_offset_t)s->data, (size_t)blocks * BLOCK);
 
@@ -949,8 +949,7 @@ ufshc_write_polled(uint8_t lun, uint64_t offset, const uint8_t *src, uint64_t le
 			}
 			__builtin_arm_yield();
 		}
-		hc_make_write(&c, lun, (uint8_t)hc_polled, (uint32_t)(offset / BLOCK), blocks);
-		c.upiu[17] = 0x08; /* FUA: commit directly to non-volatile flash before panic reset */
+		hc_make_write(&c, lun, (uint8_t)hc_polled, (uint32_t)(offset / BLOCK), blocks, true);
 		c.dw0 &= ~UTRD_INT;
 		memcpy(s->data, src, (size_t)blocks * BLOCK);
 		FlushPoC_DcacheRegion((vm_offset_t)s->data, (size_t)blocks * BLOCK);
@@ -1048,7 +1047,8 @@ ufshc_strategy_async(buf_t bp, uint8_t lun, uint64_t lun_offset, bool is_write)
 			}
 		}
 	} else {
-		hc_make_write(&c, lun, (uint8_t)s->number, (uint32_t)first_lba, blocks);
+		bool fua = (buf_flags(bp) & B_FUA) != 0;
+		hc_make_write(&c, lun, (uint8_t)s->number, (uint32_t)first_lba, blocks, fua);
 		if (!hc_dma_coherent) {
 			for (uint32_t i = 0; i < nsegs; i++) {
 				ufshc_dcache_sg_poc(sg[i].pa, sg[i].len, true);
@@ -1065,14 +1065,14 @@ ufshc_strategy_async(buf_t bp, uint8_t lun, uint64_t lun_offset, bool is_write)
 		lck_mtx_unlock(&hc_lock);
 		return err;
 	}
-
 	s->bp = bp;
+	s->lun = lun;
+	s->lun_offset = lun_offset;
 	s->blocks = blocks;
 	s->is_write = is_write;
 	s->is_async = true;
 	s->done = false;
 	s->error = 0;
-
 	err = hc_ring(s);
 	if (err != 0) {
 		s->bp = NULL;

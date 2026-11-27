@@ -36,7 +36,7 @@ static bool adreno8_direct_ring;
 static vm_offset_t adreno8_hfi_view_table, adreno8_hfi_view_cmd;
 static vm_offset_t adreno8_hfi_view_resp, adreno8_hfi_view_debug;
 static uint32_t adreno8_step = 22, adreno8_gpu8_secure_mode = 4, adreno8_inflight;
-static bool adreno8_reset_required;
+static bool adreno8_reset_required, adreno8_gpu8_preempt;
 static bool gpu_ready, hardware_fault, closed, idle_ok = true;
 static unsigned failures, snapshots, idle_calls, command_count, dispatches, sleeps, mode;
 static uint64_t clock_ns;
@@ -282,11 +282,17 @@ static void reset(unsigned next_mode) {
     clock_ns = ack_status = pending_timestamp = pending_read = last_packet_words = 0;
     adreno8_gpu_space.context = 0; adreno8_gpu_space.is_on = true;
     adreno8_gpu_space.table_count = 1; adreno8_gpu_space.tables[0].phys = 0x300123000ULL;
-    context_state = CONTEXT_COLD;
-    context_queue = context_timestamps = test_ib = test_result = NULL;
-    context_queue_view = context_timestamp_view = 0;
-    context_last = context_sequence = 0;
-    context_tested = false;
+    context_slots[0].state = CONTEXT_COLD;
+    context_slots[1].state = CONTEXT_COLD;
+    context_slots[0].queue = context_slots[0].timestamps = context_slots[0].user_record = NULL;
+    context_slots[1].queue = context_slots[1].timestamps = context_slots[1].user_record = NULL;
+    context_slots[0].queue_view = context_slots[0].timestamp_view = 0;
+    context_slots[1].queue_view = context_slots[1].timestamp_view = 0;
+    context_slots[0].last = context_slots[0].sequence = 0;
+    context_slots[1].last = context_slots[1].sequence = 0;
+    context_slots[0].checked = context_slots[1].checked = 0;
+    test_ib = test_result = NULL;
+    context_tested = context_failed = adreno8_gpu8_preempt = false;
     adreno8_inflight = 4;
     mode = next_mode;
 }
@@ -306,39 +312,39 @@ int main(void) {
     assert(!adreno8_context_wait_idle("before self-test") && idle_calls == 0 && !closed);
     reset(NORMAL); ack_status = 7; /* Vendor accepts every status except UINT32_MAX. */
     assert(adreno8_context_test() && allocation_count == 4 && dispatches == 2 && command_count == 3);
-    assert(context_state == CONTEXT_PREPARED && context_last == 2 && idle_calls == 4);
+    assert(context_slots[0].state == CONTEXT_PREPARED && context_slots[0].last == 2 && idle_calls == 4);
     assert(adreno8_context_wait_idle("after self-test") && idle_calls == 5);
-    context_last = 0;
+    context_slots[0].last = 0;
     assert(adreno8_context_wait_idle("without a pending timestamp") && idle_calls == 6);
     /* A submission still running: the bounded drain says no and closes nothing. */
-    context_last = 3; unsigned idle_before = idle_calls;
-    assert(!adreno8_context_drained("GPU speed", 1000) && !closed && context_state != CONTEXT_FAILED);
+    context_slots[0].last = 3; unsigned idle_before = idle_calls;
+    assert(!adreno8_context_drained("GPU speed", 1000) && !closed && context_slots[0].state != CONTEXT_FAILED);
     assert(idle_calls == idle_before);
-    context_last = 2;
+    context_slots[0].last = 2;
     assert(adreno8_context_drained("GPU speed", 1000) && idle_calls == idle_before + 1);
     assert(allocations[0].publishes == 1 && allocations[1].publishes == 1);
     assert(allocations[0].acquires == 0 && allocations[1].acquires == 0);
     assert(!adreno8_context_done(3) && adreno8_context_done(2));
     assert(adreno8_context_prepare() && allocation_count == 4 && submit() == 3);
     assert(command_count == 5 && adreno8_context_done(3) && adreno8_context_close());
-    assert(command_count == 6 && context_state == CONTEXT_PREPARED);
+    assert(command_count == 6 && context_slots[0].state == CONTEXT_PREPARED);
 
     reset(DELAY_EOP); assert(adreno8_context_test() && sleeps == 10);
     /* EOP and idle can be visible before the GMU advances the queue read index. */
     reset(DELAY_READ); assert(adreno8_context_test() && dispatches == 2 && sleeps == 6);
-    reset(STUCK_READ); assert(!adreno8_context_test() && dispatches == 1 && context_state == CONTEXT_FAILED);
+    reset(STUCK_READ); assert(!adreno8_context_test() && dispatches == 1 && context_slots[0].state == CONTEXT_FAILED);
     assert(clock_ns >= 20000000ULL && closed);
     reset(NORMAL); prepare_ib();
-    uint32_t *q = (uint32_t *)context_queue_view;
-    q[5] = q[6] = 1008; context_sequence = 4095;
+    uint32_t *q = (uint32_t *)context_slots[0].queue_view;
+    q[5] = q[6] = 1008; context_slots[0].sequence = 4095;
     assert(submit() == 1 && q[5] == 8 && q[6] == 8);
     assert(last_packet_words == 11 && last_packet[0] >> 20 == 0 && adreno8_context_done(1));
 
-    reset(NORMAL); prepare_ib(); q = (uint32_t *)context_queue_view; q[5] = 12;
-    assert(submit() == 0 && dispatches == 0 && context_state == CONTEXT_FAILED && closed && clock_ns >= 2000000000ULL);
+    reset(NORMAL); prepare_ib(); q = (uint32_t *)context_slots[0].queue_view; q[5] = 12;
+    assert(submit() == 0 && dispatches == 0 && context_slots[0].state == CONTEXT_FAILED && closed && clock_ns >= 2000000000ULL);
     assert(q[6] == 0 && allocation_count == 4);
-    reset(NORMAL); prepare_ib(); q = (uint32_t *)context_queue_view; q[5] = 3;
-    assert(submit() == 0 && dispatches == 0 && context_state == CONTEXT_FAILED);
+    reset(NORMAL); prepare_ib(); q = (uint32_t *)context_slots[0].queue_view; q[5] = 3;
+    assert(submit() == 0 && dispatches == 0 && context_slots[0].state == CONTEXT_FAILED);
 
     reset(NORMAL); prepare_ib();
     uint64_t addresses[83]; uint32_t lengths[83];
@@ -348,23 +354,23 @@ int main(void) {
     assert(adreno8_context_submit(addresses, lengths, 83) == 0 && allocation_count == 0 && command_count == 0);
 
     reset(RETIRE_ONLY); assert(!adreno8_context_test() && dispatches == 1 && clock_ns == 30000000000ULL);
-    assert(allocation_count == 4 && closed && context_last == 1 && !adreno8_context_done(1));
+    assert(allocation_count == 4 && closed && context_slots[0].last == 1 && !adreno8_context_done(1));
     assert(!adreno8_context_prepare() && !adreno8_context_close() && command_count == 2);
     reset(BAD_ACK); assert(!adreno8_context_test() && command_count == 1 && clock_ns == 1000000000ULL);
     for (unsigned m = NACK_REGISTER; m <= NACK_CLOSE; m++) {
-        reset(m); assert(!adreno8_context_test() && closed && context_state == CONTEXT_FAILED);
+        reset(m); assert(!adreno8_context_test() && closed && context_slots[0].state == CONTEXT_FAILED);
         unsigned count = command_count;
         assert(!adreno8_context_prepare() && !adreno8_context_close() && command_count == count && allocation_count == 4);
     }
     for (unsigned m = CONTEXT_BAD; m <= SMMU_FAULT; m++) {
-        reset(m); assert(!adreno8_context_test() && closed && context_state == CONTEXT_FAILED && allocation_count == 4);
-        assert(!adreno8_context_done(context_last));
+        reset(m); assert(!adreno8_context_test() && closed && context_slots[0].state == CONTEXT_FAILED && allocation_count == 4);
+        assert(!adreno8_context_done(context_slots[0].last));
     }
     reset(ALIAS_FAILURE); assert(!adreno8_context_test() && allocation_count == 2 && command_count == 0);
-    reset(CORRUPT_CONTEXT); assert(!adreno8_context_test() && context_state == CONTEXT_FAILED);
-    reset(EOP_AHEAD); assert(!adreno8_context_test() && context_state == CONTEXT_FAILED);
-    reset(NORMAL); prepare_ib(); context_last = UINT32_MAX;
-    ((uint32_t *)context_timestamp_view)[2] = UINT32_MAX;
+    reset(CORRUPT_CONTEXT); assert(!adreno8_context_test() && context_slots[0].state == CONTEXT_FAILED);
+    reset(EOP_AHEAD); assert(!adreno8_context_test() && context_slots[0].state == CONTEXT_FAILED);
+    reset(NORMAL); prepare_ib(); context_slots[0].last = UINT32_MAX;
+    ((uint32_t *)context_slots[0].timestamp_view)[2] = UINT32_MAX;
     assert(submit() == 1 && adreno8_context_done(1));
     /* Four submissions queue without waiting; the fifth waits for the first to retire. */
     reset(NORMAL); prepare_ib(); mode = HOLD;
@@ -379,12 +385,12 @@ int main(void) {
     reset(NORMAL); prepare_ib(); mode = HOLD; adreno8_inflight = 9;
     assert(submit() == 1 && submit() == 2 && sleeps == 1);
     /* A full queue is waited on until the GMU reads it; it fails only after the budget (above). */
-    reset(NORMAL); prepare_ib(); q = (uint32_t *)context_queue_view; q[5] = 12; pending_read = 0 + 1;
-    assert(submit() == 1 && sleeps == 3 && context_state == CONTEXT_REGISTERED);
+    reset(NORMAL); prepare_ib(); q = (uint32_t *)context_slots[0].queue_view; q[5] = 12; pending_read = 0 + 1;
+    assert(submit() == 1 && sleeps == 3 && context_slots[0].state == CONTEXT_REGISTERED);
     reset(NORMAL); gpu_ready = false;
     assert(!adreno8_context_test() && allocation_count == 0 && dispatches == 0);
     reset(NORMAL); idle_ok = false;
-    assert(!adreno8_context_test() && dispatches == 1 && context_state == CONTEXT_FAILED);
+    assert(!adreno8_context_test() && dispatches == 1 && context_slots[0].state == CONTEXT_FAILED);
     reset(NORMAL);
     puts("HWSCHED context: wire sizes, permissions, cache views, wrap/full queue, submissions in flight, reopen, ACK/EOP faults and retention: PASS");
     return 0;

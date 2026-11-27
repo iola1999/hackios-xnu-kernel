@@ -27,6 +27,7 @@ typedef uintptr_t vm_offset_t;
 #define PAGE_MASK (PAGE_SIZE - 1)
 #define PRD_MAX (256 * 1024)
 #define B_READ 1
+#define B_FUA 0x00000400
 
 static uint32_t pages[] = {3, 1, 5, 2, 4};
 static _Alignas(PAGE_SIZE) char memory[5 * PAGE_SIZE];
@@ -103,6 +104,10 @@ static int ufs_write(uint32_t part, uint64_t off, const uint8_t *src, uint64_t l
     memcpy(disk, src, len);
     copied++;
     return 0;
+}
+static int ufs_write_fua(uint32_t part, uint64_t off, const uint8_t *src, uint64_t len, bool fua) {
+    (void)fua;
+    return ufs_write(part, off, src, len);
 }
 static void
 @STRATEGY@

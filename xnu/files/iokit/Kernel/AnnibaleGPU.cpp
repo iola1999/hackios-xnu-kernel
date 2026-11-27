@@ -75,6 +75,7 @@ uint32_t annibale_gpu_submit(const uint64_t * addresses, const uint32_t * words,
 extern uint32_t gpu_log;
 bool annibale_gpu_done(uint32_t fence);
 uint32_t annibale_gpu_retired(void);
+uint32_t annibale_gpu_retired_for(uint32_t fence);
 uint32_t annibale_gpu_irqs(void);
 void annibale_gpu_pause(uint32_t seen, uint32_t poll_us, uint32_t longest_us);
 uint32_t annibale_gpu_last(void);
@@ -386,7 +387,7 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 	if (milliseconds >= 1000 && !gGPUReported && annibale_gpu_ready()) {
 		static uint32_t stalledAt;
 		static uint64_t stalledSince;
-		uint32_t retired = annibale_gpu_retired();
+		uint32_t retired = annibale_gpu_retired_for(fence);
 		uint64_t stalled;
 
 		if (stalledSince == 0 || retired != stalledAt) {
@@ -497,7 +498,7 @@ fenceWaitFailed(const char * kind, uint32_t fence)
 	absolutetime_to_nanoseconds(mach_absolute_time(), &at);
 	annibale_tl("tl: X %d %llu %s %u retired %u last %u at %llu\n", proc_pid(current_proc()),
 	    (unsigned long long)thread_tid(current_thread()), kind, fence,
-	    annibale_gpu_retired(), annibale_gpu_last(), at / 1000);
+	    annibale_gpu_retired_for(fence), annibale_gpu_last(), at / 1000);
 }
 
 /*
@@ -535,7 +536,7 @@ depthWaitEntry(uint32_t target, uint32_t depth)
 	absolutetime_to_nanoseconds(mach_absolute_time(), &at);
 	annibale_tl("tl: D %d %llu target %u inflight %u depth %u at %llu\n", proc_pid(current_proc()),
 	    (unsigned long long)thread_tid(current_thread()), target,
-	    annibale_gpu_last() - annibale_gpu_retired(), depth, at / 1000);
+	    (annibale_gpu_last() - annibale_gpu_retired_for(target)) & 0x7fffffffu, depth, at / 1000);
 }
 
 static void
@@ -667,6 +668,24 @@ waitOver(const struct msm_timespec * when, uint32_t fence)
 		IOLog("AnnibaleGPU: a wait for submission %u, which is not done, until %lld.%09lld s, asked for at %llu.%09llu s: "
 		    "over before it began\n", fence, when->seconds, when->nanoseconds, now / NSEC_PER_SEC, now % NSEC_PER_SEC);
 	}
+}
+
+static bool
+waitTimedFence(const char * kind, uint32_t fence, const struct msm_timespec * timeout, bool nosync,
+    IOReturn failRet, IOReturn * ret)
+{
+	uint64_t patience = nosync ? 0 : millisecondsUntil(timeout);
+
+	fenceWaitEntry(kind, fence, patience);
+	if (gpuWait(fence, patience)) {
+		return true;
+	}
+	fenceWaitFailed(kind, fence);
+	*ret = failRet;
+	if (patience == 0 && !nosync) {
+		waitOver(timeout, fence);
+	}
+	return false;
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
@@ -1094,51 +1113,38 @@ AnnibaleGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 	case kMsmGemInfo:
 		ret = gemInfo(&r.gemInfo);
 		break;
+	case kMsmGemSubmit:
+		ret = submit(&r.submit, &io);
+		break;
 	case kMsmGemCpuPrep:                            /* is the GPU done with a buffer */
+	case kMsmWaitFence:
 		waitBegan = mach_absolute_time();
-		gpuLockIoctl(kMsmGemCpuPrep);
-		patience = (r.cpuPrep.op & MSM_PREP_NOSYNC) ? 0 : millisecondsUntil(&r.cpuPrep.timeout);
-		fence = lastUse(r.cpuPrep.handle);
-		if (fence != 0) {
-			fenceWaitEntry("cpu-prep", fence, patience);
-			if (!gpuWait(fence, patience)) {
-				fenceWaitFailed("cpu-prep", fence);
-				ret = kIOReturnBusy;
-				if (patience == 0 && !(r.cpuPrep.op & MSM_PREP_NOSYNC)) {
-					waitOver(&r.cpuPrep.timeout, fence);
+		gpuLockIoctl(selector);
+		if (selector == kMsmWaitFence) {
+			waitTimedFence("fence", r.waitFence.fence, &r.waitFence.timeout, false, kIOReturnTimeout, &ret);
+		} else {
+			for (int pass = 0; pass < 2 && (fence = lastUse(r.cpuPrep.handle)) != 0; pass++) {
+				if (!waitTimedFence("cpu-prep", fence, &r.cpuPrep.timeout, r.cpuPrep.op & MSM_PREP_NOSYNC,
+				    kIOReturnBusy, &ret) || lastUse(r.cpuPrep.handle) == fence) {
+					break;
 				}
 			}
 		}
 		IOLockUnlock(gGPULock);
-		slowWait("cpu-prep", waitBegan);
-		break;
-	case kMsmGemSubmit:
-		ret = submit(&r.submit, &io);
-		break;
-	case kMsmWaitFence:
-		waitBegan = mach_absolute_time();
-		gpuLockIoctl(kMsmWaitFence);
-		patience = millisecondsUntil(&r.waitFence.timeout);
-		fenceWaitEntry("fence", r.waitFence.fence, patience);
-		if (!gpuWait(r.waitFence.fence, patience)) {
-			fenceWaitFailed("fence", r.waitFence.fence);
-			ret = kIOReturnTimeout;
-			if (patience == 0) {
-				waitOver(&r.waitFence.timeout, r.waitFence.fence);
-			}
-		}
-		IOLockUnlock(gGPULock);
-		slowWait("fence", waitBegan);
+		slowWait(selector == kMsmWaitFence ? "fence" : "cpu-prep", waitBegan);
 		break;
 	case kMsmGemMadvise:
 		r.madvise.retained = 1;
 		break;
 	case kMsmSubmitQueueNew:
-		if (annibale_platform_is_annibale() && (r.queue.flags != 0 || r.queue.prio != 0)) {
-			ret = kIOReturnBadArgument;
-			break;
+		if (annibale_platform_is_annibale()) {
+			uint64_t prios = 1;
+			gpuLockIoctl(kMsmSubmitQueueNew);
+			ret = !annibale_gpu_parameter(0x07, &prios) ? kIOReturnNotReady
+			    : (r.queue.flags != 0 || r.queue.prio >= prios) ? kIOReturnBadArgument : kIOReturnSuccess;
+			IOLockUnlock(gGPULock);
 		}
-		r.queue.id = ++fNextQueue;
+		if (ret == kIOReturnSuccess) { r.queue.id = ++fNextQueue; }
 		break;
 	case kMsmSubmitQueueQuery:                      /* how often the GPU has faulted on this client's commands */
 		if (r.query.data != 0 && r.query.len >= sizeof(zero)) {

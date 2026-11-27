@@ -296,6 +296,7 @@ extern struct adreno8_gpu_space adreno8_gmu_space;
 extern struct adreno8_gpu_space adreno8_secure_space;
 extern bool adreno8_gpu8_keep;
 extern bool adreno8_gpu8_ifpc;
+extern bool adreno8_gpu8_preempt;
 extern bool adreno8_reset_required;
 extern bool adreno8_gpu8_return;
 extern uint32_t adreno8_gpu8_secure_mode; /* boot-args adreno8_secure_preflight=N; unknown values parse to 0 */
@@ -411,6 +412,8 @@ void
 adreno8_space_off(struct adreno8_gpu_space *space, uint32_t match);
 bool
 adreno8_space_faulted(struct adreno8_gpu_space *space);
+bool
+adreno8_space_clear_fault(struct adreno8_gpu_space *space);
 bool
 adreno8_translation_walk(struct adreno8_gpu_space *space, uint32_t iova, vm_offset_t memory,
     uint32_t size, uint32_t prot);

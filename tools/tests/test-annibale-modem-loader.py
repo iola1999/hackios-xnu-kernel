@@ -282,6 +282,8 @@ _Alignas(64) static uint8_t mock_lowdma[192 * 1024];
 static uint8_t mock_rmtfs_shm[4 * 1024 * 1024];
 static uint8_t mock_memshare_shm[10 * 1024 * 1024];
 static bool carveout_mapped, lowdma_enabled;
+static vm_offset_t carveout_pa;
+static vm_size_t carveout_sz;
 static unsigned map_calls, unmap_calls, mem_setup_before_map, host_dsb_count;
 static unsigned lowdma_map_calls, lowdma_map_fl;
 static unsigned cacheclean_calls;
@@ -320,19 +322,19 @@ static vm_offset_t ml_io_map_unmappable(vm_offset_t pa, vm_size_t sz, unsigned i
     if (pa >= 0xce800000ULL && pa + sz <= 0xcf200000ULL) {{
         return (vm_offset_t)(mock_memshare_shm + (pa - 0xce800000ULL));
     }}
-    assert(sz <= sizeof(mock_carveout));
-    memset(mock_carveout, 0xaa, sz);
+    assert(!carveout_mapped && pa >= 0x9b080000ULL && (pa - 0x9b080000ULL) + sz <= sizeof(mock_carveout));
+    carveout_pa = pa;
+    carveout_sz = sz;
     carveout_mapped = true;
     map_calls++;
-    return (vm_offset_t)mock_carveout;
+    return (vm_offset_t)(mock_carveout + (pa - 0x9b080000ULL));
 }}
 static void ml_io_unmap(vm_offset_t addr, vm_size_t sz) {{
-    (void)sz;
     if (addr == (vm_offset_t)mock_lowdma || addr == (vm_offset_t)mock_rmtfs_shm ||
         (addr >= (vm_offset_t)mock_memshare_shm && addr < (vm_offset_t)(mock_memshare_shm + sizeof(mock_memshare_shm)))) {{
         return;
     }}
-    assert(addr == (vm_offset_t)mock_carveout && carveout_mapped);
+    assert(carveout_mapped && addr == (vm_offset_t)(mock_carveout + (carveout_pa - 0x9b080000ULL)) && sz == carveout_sz);
     carveout_mapped = false;
     unmap_calls++;
 }}
@@ -1066,10 +1068,11 @@ int main(void) {{
     strcpy(mock_files.names[2], "ipa_fws.b03"); mock_files.data[2] = b03; mock_files.sizes[2] = sizeof(b03);
 
     reject_init_0x82 = false;
+    memset(mock_carveout, 0xaa, sizeof(mock_carveout));
     uint32_t used_pas = 0;
     assert(annibale_load_mdt_image("ipa_fws", 15, 0, 0x9b080000ULL, 0x10000ULL, &used_pas));
     assert(used_pas == 15);
-    assert(mem_setup_before_map == 1 && map_calls == 1 && unmap_calls == 1);
+    assert(mem_setup_before_map == 1 && map_calls >= 1 && map_calls == unmap_calls);
     assert(last_setup_size == 0x10000ULL);
     assert(cacheclean_calls >= 64); /* 64B dc civac across whole page */
     assert(smc_count == 2);
@@ -1186,7 +1189,7 @@ with tempfile.TemporaryDirectory() as tmp:
     src.write_text(harness)
     subprocess.run([
         "cc", "-std=gnu11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
-        "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
+        "-I", str(ANNIBALE), "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
         str(src), "-o", str(exe),
     ], check=True)
     subprocess.run([str(exe)], check=True)

@@ -89,12 +89,17 @@ static uint64_t cleaned_since(unsigned from, const uint64_t *entry, uint64_t val
     }
     return bytes;
 }
+static uint32_t last_refusal;
+static uint64_t bo_reserve(uint64_t size) {
+    last_refusal = 0;
+    return adreno8_bo_reserve(size, &last_refusal);
+}
 static void stays_closed(uint64_t address, uint64_t size) {
     unsigned old_writes = writes, old_allocations = allocation_count;
     assert(!adreno8_bo_ready() && closed && adreno8_reset_required);
     assert(!adreno8_bo_map(address, 0x50000000, false));
     assert(!adreno8_bo_commit() && !adreno8_bo_unmap(address, size));
-    assert(!adreno8_bo_release(address, size) && !adreno8_bo_reserve(4096));
+    assert(!adreno8_bo_release(address, size) && !bo_reserve(4096) && last_refusal == ADRENO8_BO_REFUSE_NOT_READY);
     sync_ok = hfi_healthy = memory_healthy = true;
     assert(!adreno8_bo_enable());
     assert(writes == old_writes && allocation_count == old_allocations);
@@ -137,44 +142,44 @@ int main(int argc, char **argv) {
     if (mode >= BAD_SIZE_0 && mode <= BAD_SIZE_4G) {
         const uint64_t bad_sizes[] = {0, 1, 4095, UINT64_MAX, (1ULL << 32)};
         unsigned allocations = allocation_count;
-        assert(!adreno8_bo_reserve(bad_sizes[mode - BAD_SIZE_0]));
+        assert(!bo_reserve(bad_sizes[mode - BAD_SIZE_0]));
         assert(allocation_count == allocations && adreno8_bo_ready() && !closed);
         assert(*adreno8_space_entry(&adreno8_gpu_space, ADRENO8_GPU_IOVA_START) == startup_pte);
         assert(*adreno8_space_entry(&adreno8_gpu_space, ADRENO8_GPU_IOVA_START + PAGE_SIZE) == 0);
         /* only this request is refused: the next one gets the first room */
-        assert(adreno8_bo_reserve(4096) == ADRENO8_GPU_IOVA_START + PAGE_SIZE);
+        assert(bo_reserve(4096) == ADRENO8_GPU_IOVA_START + PAGE_SIZE);
         release_all(); return 0;
     }
     if (mode == TABLE_FAIL) {
         /* 5 MB from the first free page needs two new leaf tables; the second cannot be had */
         unsigned tables = adreno8_gpu_space.table_count;
         alloc_fail_after = 1;
-        assert(!adreno8_bo_reserve(5u << 20) && adreno8_bo_ready() && !closed);
+        assert(!bo_reserve(5u << 20) && last_refusal == ADRENO8_BO_REFUSE_NO_TABLE && adreno8_bo_ready() && !closed);
         /* the table made before the failure stays, and no leaf of this buffer was marked */
         assert(adreno8_gpu_space.table_count == tables + 1);
         assert(*adreno8_space_entry(&adreno8_gpu_space, ADRENO8_GPU_IOVA_START + PAGE_SIZE) == 0);
         alloc_fail_after = -1;
-        assert(adreno8_bo_reserve(5u << 20) == ADRENO8_GPU_IOVA_START + PAGE_SIZE);
+        assert(bo_reserve(5u << 20) == ADRENO8_GPU_IOVA_START + PAGE_SIZE);
         assert(adreno8_gpu_space.table_count == tables + 2 && adreno8_bo_ready() && !closed);
         release_all(); return 0;
     }
     if (mode == CURSOR) {
-        uint64_t a = adreno8_bo_reserve(4096), b = adreno8_bo_reserve(4096);
+        uint64_t a = bo_reserve(4096), b = bo_reserve(4096);
         assert(a == ADRENO8_GPU_IOVA_START + PAGE_SIZE && b == a + 8192);
         assert(adreno8_bo_release(a, 4096));
         /* the search starts after the last reservation, not in the room just given back */
-        uint64_t c = adreno8_bo_reserve(4096);
+        uint64_t c = bo_reserve(4096);
         assert(c == b + 8192);
         /* one that ends past BO_WINDOW sends the next search back to the start, where it finds that room */
-        assert(adreno8_bo_reserve(BO_WINDOW) == c + 8192);
-        assert(adreno8_bo_reserve(4096) == a && adreno8_bo_ready() && !closed);
+        assert(bo_reserve(BO_WINDOW) == c + 8192);
+        assert(bo_reserve(4096) == a && adreno8_bo_ready() && !closed);
         release_all(); return 0;
     }
     uint64_t size = mode == TWO_LEAVES ? (2u << 20) + 4096 : 3 * 4096;
-    uint64_t address = adreno8_bo_reserve(size);
+    uint64_t address = bo_reserve(size);
     assert(address == ADRENO8_GPU_IOVA_START + PAGE_SIZE);
     /* each reservation is followed by its guard page, and the next one starts after that */
-    uint64_t next = adreno8_bo_reserve(4096);
+    uint64_t next = bo_reserve(4096);
     assert(next == address + size + 4096);
     uint32_t unused;
     assert(adreno8_space_find_range(&adreno8_gpu_space, ADRENO8_GPU_IOVA_START,
@@ -275,7 +280,7 @@ int main(int argc, char **argv) {
     }
     assert(adreno8_bo_release(address, size) && *first == 0 && *guard == 0);
     /* the next search starts after the last reservation, not in the room just given back */
-    assert(adreno8_bo_reserve(4096) == next + 8192);
+    assert(bo_reserve(4096) == next + 8192);
     assert(*adreno8_space_entry(&adreno8_gpu_space, ADRENO8_GPU_IOVA_START) == startup_pte);
     assert(*adreno8_space_entry(&adreno8_gpu_space, next) == ADRENO8_PTE_EXTERNAL);
     assert(adreno8_bo_ready() && !closed);

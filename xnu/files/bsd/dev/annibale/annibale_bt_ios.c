@@ -113,7 +113,7 @@ bt_ring_fill(void)
 			} else if (h4_type == 0x02 && h4_hdr_pos == 3) {
 				h4_len_lo = b;
 			} else if (h4_type == 0x02 && h4_hdr_pos == 4) {
-				h4_rem = h4_len_lo | ((uint32_t)(b & 0x0f) << 8);
+				h4_rem = h4_len_lo | ((uint32_t)b << 8);
 				h4_type = 0;
 			} else if (h4_type == 0x03 && h4_hdr_pos == 3) {
 				h4_rem = b;
@@ -185,6 +185,7 @@ bt_uart_send_locked(const uint8_t *data, uint32_t len)
 static uuid_t btsk_dom_uuid, btsk_prov_uuid, btsk_nx_uuid;
 static nexus_controller_t btsk_ncd;
 static kern_pbufpool_t btsk_rx_pp;
+static kern_channel_t btsk_active_ch;
 static kern_channel_ring_t btsk_txring, btsk_rxring;
 static uint64_t btsk_bufsz;
 static volatile int btsk_up;
@@ -208,39 +209,57 @@ btsk_dom_fini(kern_nexus_domain_provider_t domprov __unused)
 
 static errno_t
 btsk_pre_connect(kern_nexus_provider_t nxprov __unused, proc_t p __unused, kern_nexus_t nexus,
-    nexus_port_t port, kern_channel_t channel __unused, void **ch_ctx)
+    nexus_port_t port, kern_channel_t channel, void **ch_ctx)
 {
 	if (!__atomic_load_n(&bt_serving, __ATOMIC_ACQUIRE)) {
 		*ch_ctx = NULL;
 		return ENXIO;
 	}
-	kern_pbufpool_t tx_pp = NULL;
-	errno_t error = kern_nexus_get_pbufpool(nexus, &tx_pp, &btsk_rx_pp);
+	kern_pbufpool_t tx_pp = NULL, rx_pp = NULL;
+	errno_t error = kern_nexus_get_pbufpool(nexus, &tx_pp, &rx_pp);
 
+	if (error == 0) {
+		lck_mtx_lock(bt_ring_lock);
+		btsk_active_ch = channel;
+		btsk_rx_pp = rx_pp;
+		lck_mtx_unlock(bt_ring_lock);
+	}
 	*ch_ctx = NULL;
 	BTSK_SAY("bluetoothd opens a channel (port %u): pools %d\n", port, error);
 	return error;
 }
 
 static errno_t
-btsk_connected(kern_nexus_provider_t nxprov __unused, kern_nexus_t nexus __unused, kern_channel_t channel __unused)
+btsk_connected(kern_nexus_provider_t nxprov __unused, kern_nexus_t nexus __unused, kern_channel_t channel)
 {
+	lck_mtx_lock(bt_ring_lock);
+	btsk_active_ch = channel;
 	btsk_up = 1;
+	lck_mtx_unlock(bt_ring_lock);
 	BTSK_SAY("channel is connected: the H4 stream runs through it\n");
 	return 0;
 }
 
 static void
-btsk_pre_disconnect(kern_nexus_provider_t nxprov __unused, kern_nexus_t nexus __unused, kern_channel_t channel __unused)
+btsk_pre_disconnect(kern_nexus_provider_t nxprov __unused, kern_nexus_t nexus __unused, kern_channel_t channel)
 {
-	btsk_up = 0;
+	lck_mtx_lock(bt_ring_lock);
+	if (channel == btsk_active_ch) {
+		btsk_up = 0;
+	}
+	lck_mtx_unlock(bt_ring_lock);
 }
 
 static void
-btsk_disconnected(kern_nexus_provider_t nxprov __unused, kern_nexus_t nexus __unused, kern_channel_t channel __unused)
+btsk_disconnected(kern_nexus_provider_t nxprov __unused, kern_nexus_t nexus __unused, kern_channel_t channel)
 {
-	btsk_up = 0;
-	btsk_rx_pp = NULL;
+	lck_mtx_lock(bt_ring_lock);
+	if (channel == btsk_active_ch) {
+		btsk_up = 0;
+		btsk_rx_pp = NULL;
+		btsk_active_ch = NULL;
+	}
+	lck_mtx_unlock(bt_ring_lock);
 	BTSK_SAY("channel is closed\n");
 }
 
@@ -652,7 +671,7 @@ bt_answer_vendor(const uint8_t *packet, uint32_t n)
 		}
 		pass = answer == 0;
 	}
-	if (pass || n < 4 || packet[0] != 0x01) {
+	if (pass || n < 4 || packet[0] != 0x01 || n != 4u + packet[3]) {
 		return false;
 	}
 	if ((packet[2] & 0xfc) != 0xfc) {
@@ -709,7 +728,7 @@ bt_answer_vendor(const uint8_t *packet, uint32_t n)
 			wakeup(&bt_ring_in);
 			lck_mtx_unlock(bt_ring_lock);
 			selwakeup(&bt_sel);
-			return false;
+			return true;
 		}
 
 		/* 2. 等待芯片以当前波特率回复 Command Complete 事件（最多等待 200 ms） */
@@ -744,7 +763,7 @@ bt_answer_vendor(const uint8_t *packet, uint32_t n)
 			wakeup(&bt_ring_in);
 			lck_mtx_unlock(bt_ring_lock);
 			selwakeup(&bt_sel);
-			return false;
+			return true;
 		}
 
 		/* 3. 延时 10 ms 待物理总线稳定 */
@@ -754,7 +773,7 @@ bt_answer_vendor(const uint8_t *packet, uint32_t n)
 		if (!annibale_bt_uart_set_baud(req_baud)) {
 			bt_say("bt: stop: host UART switch to %u failed; performing rollback to %u baud\n", req_baud, old_baud);
 			(void)annibale_bt_uart_set_baud(old_baud ? old_baud : 115200u);
-			return false;
+			return true;
 		}
 
 		delay_for_interval(10, NSEC_PER_MSEC);

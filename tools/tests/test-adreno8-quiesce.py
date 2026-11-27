@@ -58,6 +58,7 @@ static int quiet_printf(const char *format, ...) { return 0; }
 #define printf quiet_printf
 static void mock_wfe(void) { parks++; longjmp(parked, 1); }
 static void loader_log_putc(char ch) { assert(ch); log_chars++; }
+static void loader_log_line(const char *line) { while (*line) loader_log_putc(*line++); }
 static void adreno8_wr(vm_offset_t address, uint32_t value) { mmio_writes++; }
 static uint32_t adreno8_rd(vm_offset_t address) { mmio_reads++; return 2; }
 static void adreno8_put(struct adreno8_block *block, const char *name,

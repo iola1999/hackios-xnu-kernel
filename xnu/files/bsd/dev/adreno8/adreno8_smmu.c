@@ -1124,6 +1124,21 @@ adreno8_space_faulted(struct adreno8_gpu_space *space)
 	return true;
 }
 
+/* Clear W1C context fault status bits in SMMU_CB_FSR and verify none remain set. */
+bool
+adreno8_space_clear_fault(struct adreno8_gpu_space *space)
+{
+	if (!space || !adreno8_smmu.base || !adreno8_smmu_pages || !adreno8_smmu_page)
+		return false;
+	uint32_t cb = (adreno8_smmu_pages + space->context) * adreno8_smmu_page;
+	uint32_t fsr = adreno8_rd(adreno8_smmu.base + cb + SMMU_CB_FSR) & FSR_ALL;
+	if (fsr == 0)
+		return true;
+	adreno8_put(&adreno8_smmu, "clear cb fsr", cb + SMMU_CB_FSR, fsr);
+	adreno8_settle();
+	return (adreno8_rd(adreno8_smmu.base + cb + SMMU_CB_FSR) & FSR_ALL) == 0;
+}
+
 /*
  * Invalidate Stage-1 TLB for a virtual address range (TLBI VAE1IS).
  * Avoids global SMMU TLBIALLNSNH flush on external buffer unmap.

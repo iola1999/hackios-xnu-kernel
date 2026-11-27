@@ -26,7 +26,7 @@ static uint32_t table[1024], commands[1024], responses[1024], debug[1024], regs[
 static bool adreno8_direct_ring;
 static vm_offset_t adreno8_hfi_view_table, adreno8_hfi_view_cmd;
 static vm_offset_t adreno8_hfi_view_resp, adreno8_hfi_view_debug;
-static bool adreno8_gmu_talks, adreno8_gpu8_keep, adreno8_gpu8_ifpc, adreno8_gpu8_return, adreno8_reset_required;
+static bool adreno8_gmu_talks, adreno8_gpu8_keep, adreno8_gpu8_ifpc, adreno8_gpu8_preempt, adreno8_gpu8_return, adreno8_reset_required;
 static bool cx_ready, allocation_ok, clock_ok;
 static unsigned clock_calls, memory_failures;
 static unsigned adreno8_step, mode, alloc_calls, result_fault, failure_snapshots, sleeps;
@@ -207,7 +207,7 @@ static void reset(unsigned next_mode) {
     adreno8_gmu_talks = adreno8_gpu8_keep = cx_ready = allocation_ok = adreno8_hfi_tables_sent = true;
     adreno8_direct_ring = false;
     adreno8_hwsched_attempted = adreno8_hwsched_started = false;
-    adreno8_gpu8_ifpc = adreno8_gpu8_return = adreno8_reset_required = false;
+    adreno8_gpu8_ifpc = adreno8_gpu8_preempt = adreno8_gpu8_return = adreno8_reset_required = false;
     clock_ok = true; clock_calls = memory_failures = 0;
     adreno8_hfi_seq = 4090;
     mode = next_mode; alloc_calls = result_fault = failure_snapshots = sleeps = 0;
@@ -245,6 +245,10 @@ int main(void) {
     reset(NORMAL); adreno8_gpu8_ifpc = true;
     assert(adreno8_hwsched_start() && adreno8_hwsched_ready());
     assert((captured[0][0] & 0xff) == 11 && captured[0][1] == 9 && captured[0][2] == 1 && captured[0][3] == 0);
+    assert(captured[4][1] == 2 && captured[4][2] == 0 && captured[4][3] == 0);
+    reset(NORMAL); adreno8_gpu8_preempt = true;
+    assert(adreno8_hwsched_start() && adreno8_hwsched_ready());
+    assert(captured[4][1] == 2 && captured[4][2] == 1 && captured[4][3] == 0);
     reset(NORMAL); hwsched_ack_value = 7; check_boot();
     uint32_t pm4[10] = {0x70000000};
     assert(adreno8_hwsched_raw(pm4, 10, "CP init"));

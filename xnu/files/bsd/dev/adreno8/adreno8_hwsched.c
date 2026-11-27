@@ -137,7 +137,7 @@ bool
 adreno8_hwsched_start(void)
 {
 	const uint32_t features[][3] = {{9, adreno8_gpu8_ifpc ? 1u : 0u, 0}, {1, 1, 0}, {16, 1, 0}};
-	const uint32_t handle = 0, preemption[] = {2, 0, 0}, aqe[] = {29, 1, 0};
+	const uint32_t handle = 0, preemption[] = {2, adreno8_gpu8_preempt ? 1u : 0u, 0}, aqe[] = {29, 1, 0};
 
 	if (adreno8_direct_ring || adreno8_hwsched_attempted || !adreno8_cx_ready() || !adreno8_gmu_talks ||
 	    !adreno8_hfi_tables_sent || !adreno8_gpu8_keep || adreno8_gpu8_return) {
@@ -154,7 +154,8 @@ adreno8_hwsched_start(void)
 		}
 	}
 	if (!adreno8_hfi_send(14, &handle, 1, "HWSCHED core firmware") ||
-	    !adreno8_hfi_send(11, preemption, 3, "disable HWSCHED preemption") ||
+	    !adreno8_hfi_send(11, preemption, 3,
+	        adreno8_gpu8_preempt ? "enable HWSCHED preemption" : "disable HWSCHED preemption") ||
 	    !adreno8_hfi_send(11, aqe, 3, "enable AQE") ||
 	    !adreno8_hfi_send(10, NULL, 0, "HWSCHED START")) {
 		return false;
@@ -164,8 +165,8 @@ adreno8_hwsched_start(void)
 		return false;
 	}
 	adreno8_hwsched_started = true;
-	printf("adreno8: HWSCHED START acknowledged (ifpc=%u); GPU execution initialization is pending\n",
-	    adreno8_gpu8_ifpc ? 1u : 0u);
+	printf("adreno8: HWSCHED START acknowledged (ifpc=%u, preempt=%u); GPU execution initialization is pending\n",
+	    adreno8_gpu8_ifpc ? 1u : 0u, adreno8_gpu8_preempt ? 1u : 0u);
 	return true;
 }
 

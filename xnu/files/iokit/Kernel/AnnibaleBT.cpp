@@ -17,6 +17,7 @@
 #include <libkern/c++/OSString.h>
 
 extern "C" void AnnibaleBTStart(const char * bsdname, const uint8_t * address);
+extern "C" void AnnibaleBTGetAddress(uint8_t out[6]);
 extern "C" void AnnibaleBTSetAddress(const uint8_t * address);
 extern "C" void AnnibaleBTSetPowerState(bool on);
 extern "C" void AnnibaleDiskStart(uint64_t size_bytes);
@@ -161,6 +162,14 @@ AnnibaleBTStart(const char * bsdname, const uint8_t * address)
 		IOLog("AnnibaleBT: published IOKit service 'bluetooth' (BSD Name %s, address %02x:%02x:%02x:%02x:%02x:%02x)\n",
 		    bsdname, initial[0], initial[1], initial[2], initial[3], initial[4], initial[5]);
 		gAnnibaleBT = bt;
+	}
+}
+
+void
+AnnibaleBTGetAddress(uint8_t out[6])
+{
+	if (out != NULL) {
+		bt_default_address(out);
 	}
 }
 

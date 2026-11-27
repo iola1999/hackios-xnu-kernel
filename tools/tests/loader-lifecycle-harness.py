@@ -114,6 +114,9 @@ static uint64_t loader_ctx[16];
 static uint64_t kernel_return_intent;
 static uint64_t seconds_since(uint64_t then) { return (clk_now - then) / clk_freq; }
 static int wdt_armed = 1, pets, charger_polls, block_polls, hung_snaps, charger_enabled;
+static int watch_wfe_calls;
+static int usb_recently_active(void);
+static void lc_watch_wfe_idle(void) { watch_wfe_calls++; }
 static void wdt_pet(void) { pets++; seq('W'); }
 static void charger_poll(void) { charger_polls++; }
 static void block_poll(void) { block_polls++; }

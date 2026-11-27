@@ -148,6 +148,8 @@ struct hc_slot {
 	uint64_t data_pa;
 	/* Asynchronous strategy fields */
 	buf_t bp;
+	uint8_t lun;
+	uint64_t lun_offset;
 	uint32_t blocks;
 	uint64_t start_time;
 	bool is_write;

@@ -139,7 +139,7 @@ ufs_write_allowed(uint32_t part, uint64_t offset, uint64_t len)
  * when ufs_native_on is active, or through the loader's Block I/O mailbox otherwise.
  */
 static int
-ufs_write(uint32_t part, uint64_t offset, const uint8_t *src, uint64_t len)
+ufs_write_fua(uint32_t part, uint64_t offset, const uint8_t *src, uint64_t len, bool fua)
 {
 	uint64_t nbs, per;
 	int error = ufs_write_allowed(part, offset, len);
@@ -149,7 +149,7 @@ ufs_write(uint32_t part, uint64_t offset, const uint8_t *src, uint64_t len)
 	}
 	nbs = ufs_page->part[part].block_size;
 	if (ufs_native_on && ufs_lun[part] != 0xff) {
-		return ufshc_write(ufs_lun[part], ufs_lun_offset[part] + offset, src, len);
+		return ufshc_write(ufs_lun[part], ufs_lun_offset[part] + offset, src, len, fua);
 	}
 	per = ufs_buffer_size / nbs;
 	lck_mtx_lock(&ufs_lock);
@@ -168,6 +168,12 @@ ufs_write(uint32_t part, uint64_t offset, const uint8_t *src, uint64_t len)
 		ufs_write_errors++;
 	}
 	return error;
+}
+
+static int
+ufs_write(uint32_t part, uint64_t offset, const uint8_t *src, uint64_t len)
+{
+	return ufs_write_fua(part, offset, src, len, false);
 }
 
 /* ---- the devices ---- */
@@ -259,7 +265,7 @@ ufs_strategy(buf_t bp)
 	}
 
 	if (!is_read) {
-		error = ufs_write(part, offset, (const uint8_t *)data, len);
+		error = ufs_write_fua(part, offset, (const uint8_t *)data, len, (buf_flags(bp) & B_FUA) != 0);
 	} else {
 		error = ufs_read(part, offset, (uint8_t *)data, len);
 	}

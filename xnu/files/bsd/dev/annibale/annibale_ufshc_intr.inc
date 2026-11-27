@@ -40,6 +40,8 @@
 static uint32_t hc_completion_event;
 static uint32_t hc_watchdog_event;
 static thread_t hc_completion_thread_ref = THREAD_NULL;
+#define HC_ASYNC_ERR_LOG_CAP 16u
+static uint32_t hc_async_err_logs;
 
 extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
 extern void gic_v3_spi_mask(uint32_t intid);
@@ -96,8 +98,9 @@ ufshc_process_completions(void)
 			s->bp = NULL;
 			bool is_write = s->is_write;
 			uint32_t count = (uint32_t)s->blocks * BLOCK;
+			bool ok = hc_answer_ok(s, false);
 
-			if (ocs == OCS_SUCCESS) {
+			if (ok) {
 				buf_setresid(bp, 0);
 				if (is_write) {
 					os_atomic_inc(&hc_write_requests, relaxed);
@@ -108,12 +111,20 @@ ufshc_process_completions(void)
 				}
 			} else {
 				volatile const uint8_t *r = (volatile const uint8_t *)s->ucd + UCD_RESPONSE;
+				uint64_t start = s->lun_offset;
+				uint64_t end = count > 0 ? start + count - 1 : start;
+				uint32_t logged = os_atomic_inc_orig(&hc_async_err_logs, relaxed);
 
-				/* The same fields as the synchronous path prints, so an async EIO can be traced to its slot. */
-				hc_say("ufs: native: slot %u (async %s, %u blocks): OCS %x, response %02x tag %02x, "
-				    "response %02x status %02x, sense key %x asc %02x ascq %02x\n", s->number,
-				    is_write ? "write" : "read", s->blocks, ocs, r[0], r[3], r[6], r[7],
-				    r[34 + 2] & 0x0f, r[34 + 12], r[34 + 13]);
+				/* Match synchronous hc_answer_ok() checks and keep async error logging bounded. */
+				if (logged < HC_ASYNC_ERR_LOG_CAP) {
+					hc_say("ufs: native: slot %u (async %s, LUN %u, bytes %llu..%llu): OCS %x, response %02x tag %02x, "
+					    "response %02x status %02x, sense key %x asc %02x ascq %02x\n", s->number,
+					    is_write ? "write" : "read", s->lun, start, end, ocs, r[0], r[3], r[6], r[7],
+					    r[34 + 2] & 0x0f, r[34 + 12], r[34 + 13]);
+				} else if (logged == HC_ASYNC_ERR_LOG_CAP) {
+					hc_say("ufs: native: further async error logs suppressed (limit %u)\n", HC_ASYNC_ERR_LOG_CAP);
+				}
+				buf_setresid(bp, count);
 				buf_seterror(bp, EIO);
 				if (is_write) {
 					os_atomic_inc(&hc_write_errors, relaxed);
@@ -126,7 +137,7 @@ ufshc_process_completions(void)
 			 * Non-coherent DMA async read completion:
 			 * Flush CPU cache lines for PRDT physical segments before buf_biodone.
 			 */
-			if (!is_write && !hc_dma_coherent && ocs == OCS_SUCCESS) {
+			if (ok && !is_write && !hc_dma_coherent) {
 				uint32_t nsegs = s->utrd[7] & 0xffff;
 				if (nsegs > UCD_PRDT_ENTRIES) {
 					nsegs = UCD_PRDT_ENTRIES;

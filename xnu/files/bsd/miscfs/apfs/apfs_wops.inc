@@ -20,6 +20,11 @@ wop_begin(struct apfs_wtx *w, uint64_t data_blocks)
 	if (wsp_free_blocks(w) < WOP_RESERVE + data_blocks) {
 		return ENOSPC;
 	}
+	uint64_t max_chunks = 1 + (data_blocks + WOP_RESERVE + w->sp.per_chunk - 1) / w->sp.per_chunk;
+	if (wsp_ip_free_blocks(w) < wsp_ip_commit_need(w, max_chunks)) {
+		return ENOSPC;
+	}
+	w->ops++;
 	return 0;
 }
 
@@ -44,6 +49,12 @@ bool
 apfs_wtx_broken(const struct apfs_wtx *w)
 {
 	return w == NULL || w->broken;
+}
+
+uint64_t
+apfs_wtx_ops(const struct apfs_wtx *w)
+{
+	return w != NULL ? w->ops : 0;
 }
 
 uint32_t

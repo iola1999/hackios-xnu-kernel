@@ -4,6 +4,9 @@
 #include "../adreno8/adreno8_context_private.h"
 #include "../adreno8/adreno8_hwsched_private.h"
 #include <sys/annibale_input.h>
+#ifdef KERNEL
+#include <sys/proc.h>
+#endif
 
 extern bool AnnibaleGPUStart(void);
 
@@ -61,7 +64,7 @@ annibale_gpu_parameter(uint32_t which, uint64_t *value)
 	case 0x03: *value = 0x44050001; break;          /* CHIP_ID: running Android DT */
 	case 0x04: *value = adreno8_gx_hz[adreno8_gx_count - 1]; break; /* MAX_FREQ: the fastest speed of the table */
 	case 0x06: *value = 0x04000000; break;          /* GMEM_BASE: GPU setup */
-	case 0x07: *value = 1; break;                   /* PRIORITIES: RB0 only */
+	case 0x07: *value = adreno8_gpu8_preempt ? ADRENO8_CONTEXT_SLOTS : 1; break; /* PRIORITIES */
 	case 0x08:                                      /* PP_PGTABLE */
 	case 0x09:                                      /* FAULTS: unhealthy state is rejected above */
 	case 0x0a:                                      /* SUSPENDS: no suspend transition */
@@ -125,6 +128,19 @@ annibale_gpu_to_memory(void *start, uint64_t size)
 	}
 }
 
+static uint32_t
+annibale_gpu_caller_slot(void)
+{
+	char who[24] = "";
+
+	if (!adreno8_gpu8_preempt) {
+		return ADRENO8_CONTEXT_SLOT_HIGH;
+	}
+	proc_selfname(who, sizeof(who));
+	return strcmp(who, "backboardd") == 0 ?
+	    ADRENO8_CONTEXT_SLOT_HIGH : ADRENO8_CONTEXT_SLOT_NORMAL;
+}
+
 uint32_t
 annibale_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
 {
@@ -132,7 +148,9 @@ annibale_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t c
 		return 0;
 	}
 	adreno8_speed_tick();
-	return adreno8_context_submit(addresses, words, count);
+	return adreno8_gpu8_preempt ?
+	    adreno8_context_submit_slot(annibale_gpu_caller_slot(), addresses, words, count) :
+	    adreno8_context_submit(addresses, words, count);
 }
 
 bool
@@ -164,9 +182,20 @@ annibale_gpu_retired(void)
 }
 
 uint32_t
+annibale_gpu_retired_for(uint32_t fence)
+{
+	return annibale_platform_is_annibale() ? adreno8_context_retired_for(fence) : 0;
+}
+
+uint32_t
 annibale_gpu_last(void)
 {
-	return annibale_platform_is_annibale() ? adreno8_context_last() : 0;
+	if (!annibale_platform_is_annibale()) {
+		return 0;
+	}
+	return adreno8_gpu8_preempt ?
+	    adreno8_context_last_slot(annibale_gpu_caller_slot()) :
+	    adreno8_context_last();
 }
 
 void

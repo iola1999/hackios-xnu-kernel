@@ -401,18 +401,31 @@ static void last_buffer_check(struct iris_session *s, const char *name)
 	assert(memcmp(&s->intern_dpb, &dpb, sizeof(dpb)) == 0);
 	assert(iris_hfi_session_close(s) == 0 && free_calls == 11);
 }
-static void output_copy_check(struct iris_session *s)
+static void output_copy_check(struct iris_session *s, bool hevc10)
 {
 	open_output(s);
+	uint32_t bpp = hevc10 ? 2u : 1u;
+	assert(s->is_10bit == hevc10 && s->y_stride == (hevc10 ? 1280u : 640u));
+	if (hevc10) {
+		memset((void *)s->raw[0].kva, 0x5c, s->raw[0].size);
+	}
 	emit_buffer(s->wire_session_id, 2, 2, 0, s->raw[0].iova, s->raw[0].size, s->raw[0].size, 0x2345, 0);
 	assert(iris_receive(s, NULL) == 1 && s->raw_state[0] == 2);
 	uint8_t *y = calloc(1, s->y_stride * s->height), *uv = calloc(1, s->uv_stride * s->height / 2);
 	struct iris_decode_frame req = { .out_user_y = (uintptr_t)y, .out_user_uv = (uintptr_t)uv };
+	if (hevc10) {
+		req.out_stride = s->width; /* too narrow for 2 B/pixel P010 */
+		assert(iris_take_output(s, &req) == -EINVAL && s->raw_state[0] == 2);
+		req.out_stride = s->y_stride;
+	}
 	size_t before = tx_size; copyout_fail = true;
 	assert(iris_take_output(s, &req) == -EFAULT && s->raw_state[0] == 2 && tx_size == before);
 	copyout_fail = false; copyout_calls = 0;
 	assert(iris_take_output(s, &req) == 1 && s->raw_state[0] == 1 && tx_size > before);
 	assert(req.out_tag == 0x2345 && req.flags == 1 && copyout_calls == s->height * 3 / 2);
+	if (hevc10) {
+		assert(y[s->width * bpp - 1u] == 0x5c && uv[s->width * bpp - 1u] == 0x5c);
+	}
 	free(y); free(uv);
 }
 static void later_error_check(struct iris_session *s, const char *name)
@@ -732,7 +745,8 @@ int main(int argc, char **argv)
 	else if (strstr(name, "caller") || strncmp(name, "alloc-", 6) == 0) caller_check(s, name);
 	else if (strncmp(name, "drain-", 6) == 0) drain_check(s, name);
 	else if (strncmp(name, "last-", 5) == 0) last_buffer_check(s, name);
-	else if (strcmp(name, "output-copy") == 0) output_copy_check(s);
+	else if (strcmp(name, "output-copy") == 0) output_copy_check(s, false);
+	else if (strcmp(name, "output-copy-hevc10") == 0) output_copy_check(s, true);
 	else if (strncmp(name, "later-", 6) == 0) later_error_check(s, name);
 	else if (strncmp(name, "corrupt-", 8) == 0) corrupt_check(s, name);
 	else if (strcmp(name, "input-immutable") == 0) {
@@ -750,12 +764,33 @@ int main(int argc, char **argv)
 	}
 	else if (strncmp(name, "psc-", 4) == 0) {
 		if (strstr(name, "coded")) s->height = 474;
+		if (strstr(name, "1080p")) { s->width = 1920; s->height = 1080; }
 		assert(iris_hfi_session_open(s) == 0); size_t before = tx_size;
 		s->input_queued = true; s->next_input_idx = 1;
 		push_psc(s->wire_session_id); int r = iris_receive(s, NULL);
 		if (strncmp(name, "psc-valid", 9) == 0) {
 			assert(r == 1 && s->error == 0 && s->started_ports == 6 && s->dpb_count == 2);
 			assert(count_type(0x01000009u, 2) == 6);
+			if (strstr(name, "hevc10")) {
+				uint32_t exp_stride = s->width == 1920 ? 3840u : 1280u;
+				uint32_t exp_y_scan = s->height == 1080 ? 1088u : 480u;
+				uint32_t exp_uv_scan = s->height == 1080 ? 544u : 240u;
+				assert(s->is_10bit && s->y_stride == exp_stride && s->uv_stride == exp_stride);
+				assert(s->raw_frame_size == ((exp_stride * exp_y_scan + exp_stride * exp_uv_scan + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u)));
+				bool saw_p010 = false, saw_stride = false;
+				for (size_t pos = before; pos < tx_size; pos += get32(tx + pos)) {
+					for (uint32_t off = 32; off < get32(tx + pos); off += get32(tx + pos + off)) {
+						const uint8_t *p = tx + pos + off;
+						if (get32(p + 4) == 0x03000101u && get32(p + 16) == 2 && get32(p + 32) == 4u) saw_p010 = true;
+						if (get32(p + 4) == HFI_PROP_LINEAR_STRIDE_SCANLINE && get32(p + 16) == 2 &&
+						    get32(p + 32) == ((exp_stride << 16) | exp_y_scan) &&
+						    get32(p + 36) == ((exp_stride << 16) | exp_uv_scan)) saw_stride = true;
+					}
+				}
+				assert(saw_p010 && saw_stride);
+				s->input_queued = false;
+				assert(iris_hfi_session_close(s) == 0 && !s->opened && s->started_ports == 0);
+			}
 		} else assert(r < 0 && s->error != 0 && s->started_ports == 2 && tx_size == before &&
 		    s->input_queued && free_calls == 0);
 		if (strstr(name, "-close")) {

@@ -149,6 +149,17 @@ slot_set_active_other(void)
  * efi.h has no request id: attribution assumes one unfinished request per endpoint and one
  * terminal per request. Firmware behavior still requires device validation. */
 static int usb_rx_queued;       /* usb_poll_command() has left the receive for the next command with the controller */
+static uint64_t usb_last_activity_ticks;
+
+static int
+usb_recently_active(void)
+{
+	uint64_t freq = READ_SYSREG(CNTFRQ_EL0);
+	if (usb_last_activity_ticks == 0 || freq == 0) {
+		return 0;
+	}
+	return (READ_SYSREG(CNTVCT_EL0) - usb_last_activity_ticks) < (freq / 10ULL);
+}
 static int usb_out_owned;       /* the OUT buffer is with the controller, its end unconfirmed */
 static int usb_in_owned;        /* the IN buffer is with the controller, its end unconfirmed */
 static int usb_out_lost;        /* structurally isolated: an external reset is the recovery boundary */
@@ -991,6 +1002,9 @@ usb_poll_command(void)
 	}
 	if (EFI_ERROR(USB->handle_event(&msg, &size, &data))) {
 		return;         /* a failed call delivered no event to act on */
+	}
+	if (msg != UsbDeviceEventNoEvent) {
+		usb_last_activity_ticks = READ_SYSREG(CNTVCT_EL0);
 	}
 	if (msg == UsbDeviceEventDeviceStateChange) {
 		if (size >= sizeof(data.device_state)) {

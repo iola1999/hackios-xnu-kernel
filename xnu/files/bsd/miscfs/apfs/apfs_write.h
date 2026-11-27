@@ -51,6 +51,8 @@ void apfs_wtx_detach(struct apfs_wtx *w);
 int  apfs_wtx_commit(struct apfs_wtx *w);
 bool apfs_wtx_dirty(const struct apfs_wtx *w);          /* changes not yet committed */
 bool apfs_wtx_broken(const struct apfs_wtx *w);
+uint64_t apfs_wtx_ops(const struct apfs_wtx *w);        /* mutating ops begun on this handle */
+bool apfs_wtx_discard_solo(struct apfs_wtx *w, uint64_t expected_ops);
 uint32_t apfs_wtx_dirty_blocks(const struct apfs_wtx *w);
 uint64_t apfs_wtx_free_blocks(const struct apfs_wtx *w);
 void apfs_wtx_stats(const struct apfs_wtx *w, uint64_t *commits, uint64_t *blocks, uint64_t *ticks);

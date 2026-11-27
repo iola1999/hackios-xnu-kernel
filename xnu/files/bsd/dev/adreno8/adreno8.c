@@ -70,6 +70,7 @@
  * adreno8_gmuclk=2    full stages 1..5 or 1..17 and later: highest supported CX/MX WRITE completion;
  *                  same explicit zero parameters, no preceding ARC READ, keep=1 return=0;
  *                  retain requests until cold reset; stage 17 and later permit START and CP commands
+ * adreno8_preempt=1   enable HWSCHED preemption and dual RB0/RB1 contexts (default 0: single RB0 context)
  * adreno8_return=1    return to the resident loader after cleanup
  *
  * Firmware family is gen80000, as loaded by Android and specified by the vendor gen8.0.0
@@ -267,7 +268,7 @@ adreno8_wait_for(struct adreno8_block *b, uint32_t offset, uint32_t mask, uint32
 
 /* ---- leaving --------------------------------------------------------------------------------------------- */
 
-bool adreno8_gpu8_keep, adreno8_gpu8_ifpc, adreno8_gpu8_return;
+bool adreno8_gpu8_keep, adreno8_gpu8_ifpc, adreno8_gpu8_preempt, adreno8_gpu8_return;
 bool adreno8_init_done;
 uint32_t adreno8_gpu8_secure_mode;
 bool adreno8_reset_required;
@@ -393,6 +394,8 @@ adreno8_init(void)
 	adreno8_gpu8_keep = PE_parse_boot_argn("adreno8_keep", &one, sizeof(one)) && one != 0;
 	one = 0;
 	adreno8_gpu8_ifpc = PE_parse_boot_argn("adreno8_ifpc", &one, sizeof(one)) && one != 0;
+	one = 0;
+	adreno8_gpu8_preempt = PE_parse_boot_argn("adreno8_preempt", &one, sizeof(one)) && one != 0;
 	one = 0;
 	adreno8_gpu8_return = PE_parse_boot_argn("adreno8_return", &one, sizeof(one)) && one != 0;
 	one = 0;

@@ -27,8 +27,9 @@ iris_return_buffer(struct iris_session *s, const struct hfi_packet *pkt, bool da
 			returned.flags &= ~HFI_BUF_FW_FLAG_READONLY;
 		}
 		if ((returned.flags & HFI_BUF_FW_FLAG_READONLY) != 0) return EIO;
+		uint32_t row_bytes = s->width * (s->is_10bit ? 2u : 1u);
 		uint32_t needed = s->y_stride * s->y_scanlines +
-		    s->uv_stride * (s->height / 2u - 1u) + s->width;
+		    s->uv_stride * (s->height / 2u - 1u) + row_bytes;
 		/* Damaged frames can be empty or short; their bytes are never copied to userland. */
 		if (!data_corrupt && returned.data_size != 0 && returned.data_size < needed) return EIO;
 		if ((returned.flags & HFI_BUF_FW_FLAG_PSC_LAST) != 0) return EOPNOTSUPP;
@@ -90,4 +91,37 @@ iris_trace_reply_error(struct iris_session *s, const struct hfi_header *hdr,
 #else
 	(void)s;
 #endif
+}
+
+static int
+iris_reconfigure_p010(struct iris_session *s, uint32_t raw_target)
+{
+	uint32_t y_stride = iris_align(s->width * 2u, 256u);
+	uint32_t raw_size = iris_align(y_stride * s->y_scanlines +
+	    y_stride * s->uv_scanlines, (uint32_t)PAGE_SIZE);
+	uint32_t old_stride = s->y_stride;
+	s->y_stride = y_stride;
+	uint32_t dpb_frame = iris_qc08c_size(s);
+	s->y_stride = old_stride;
+	uint32_t dpb_size = iris_align(dpb_frame * IRIS_DPB_POOL_COUNT, 65536u);
+	uint32_t dpb_iova = s->intern_dpb.iova;
+	uint32_t intern_base = IRIS_IOVA_INTERNAL_BASE + (s->session_id - 1u) * IRIS_IOVA_SESSION_STRIDE;
+	if (raw_size == 0 || dpb_frame == 0 ||
+	    (uint64_t)raw_size * raw_target > IRIS_IOVA_RAW_SESSION_STRIDE ||
+	    dpb_iova < intern_base || (uint64_t)(dpb_iova - intern_base) + dpb_size > IRIS_IOVA_SESSION_STRIDE) {
+		s->psc_rejected = true;
+		return EOPNOTSUPP;
+	}
+	if (!iris_dma_free_unmap(&s->intern_dpb)) return EIO;
+	for (uint32_t i = 0; i < s->raw_count; i++) {
+		if (!iris_dma_free_unmap(&s->raw[i])) return EIO;
+		s->raw_state[i] = IRIS_RAW_HOST;
+	}
+	s->raw_count = 0;
+	s->y_stride = y_stride;
+	s->uv_stride = y_stride;
+	s->raw_frame_size = raw_size;
+	s->dpb_frame_size = dpb_frame;
+	s->is_10bit = true;
+	return iris_dma_alloc_map(&s->intern_dpb, dpb_iova, dpb_size, false) ? 0 : ENOMEM;
 }

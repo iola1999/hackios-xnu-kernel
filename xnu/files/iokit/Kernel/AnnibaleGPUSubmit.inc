@@ -60,9 +60,10 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request, struct gpu_io_sta
 
 		if (depth != 0 && !gGPUReported && annibale_gpu_ready()) {
 			uint32_t last = annibale_gpu_last();
+			uint32_t raw = last & 0x7fffffffu;
 
-			if (last >= depth) {
-				target = last - depth + 1;
+			if (raw >= depth) {
+				target = (last & 0x80000000u) | (raw - depth + 1);
 			}
 		}
 		uint64_t depthBegan = mach_absolute_time();

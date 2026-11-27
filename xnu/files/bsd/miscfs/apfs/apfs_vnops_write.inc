@@ -162,28 +162,60 @@ apfs_vnop_write(struct vnop_write_args *ap)
 		goto out;
 	}
 	size = MAX(old, end);
-	if (apfs_wtx_free_blocks(w) < (uint64_t)resid / am->am_nx.block_size + APFS_WSPARE_BLOCKS) {
+	uint64_t bs = am->am_nx.block_size;
+	uint64_t need_blocks = ((uint64_t)uio_offset(uio) % bs + (uint64_t)resid + bs - 1) / bs;
+	if (apfs_wtx_free_blocks(w) < need_blocks + APFS_WSPARE_BLOCKS) {
 		error = ENOSPC;
 		goto out;
 	}
+	bool was_open = false;
+	uint64_t after_ops = 0, saved_wseq = an->an_wseq;
+	struct apfs_inode saved_ino = an->an_ino;
 	if (size > old) {
+		apfs_lock(am);
+		was_open = apfs_wtx_dirty(w);
+		apfs_unlock(am);
 		error = apfs_wresize(vp, an, (uint64_t)size, 0);
-	} else {
-		struct apfs_wattr t = { .set = APFS_WA_MTIME, .mtime = apfs_now_ns() };
-
-		error = APFS_WCALL(am, an, NULL, apfs_w_setattr(w, an->an_id, &t));
+		if (error) {
+			goto out;
+		}
+		apfs_lock(am);
+		after_ops = apfs_wtx_ops(w);
+		apfs_unlock(am);
 	}
-	if (error) {
-		goto out;
-	}
-	apfs_lock(am);
-	apfs_wnote(am, an->an_id);
-	apfs_unlock(am);
 	error = cluster_write(vp, uio, old, size, 0, 0,
 	    ioflag & ~(IO_TAILZEROFILL | IO_HEADZEROFILL | IO_NOZEROVALID | IO_NOZERODIRTY));
-	if (error && size > old && uio_offset(uio) < size) {
+	if (error && size > old && uio_resid(uio) == resid) {
+		bool reverted = false;
+
+		apfs_lock_exclusive(am);
+		if (!was_open && apfs_wtx_discard_solo(w, after_ops)) {
+			ubc_setsize(vp, (off_t)old);
+			an->an_size = (uint64_t)old;
+			an->an_ino = saved_ino;
+			an->an_wseq = saved_wseq;
+			reverted = true;
+		}
+		apfs_unlock_exclusive(am);
+		if (!reverted) {
+			(void)apfs_wresize(vp, an, (uint64_t)old, 0);
+		}
+	} else if (error && size > old && uio_offset(uio) < size) {
 		/* what was not written does not stay as a hole at the end */
 		(void)apfs_wresize(vp, an, (uint64_t)MAX(old, uio_offset(uio)), 0);
+	}
+	if (uio_resid(uio) < resid) {
+		if (size <= old) {
+			struct apfs_wattr t = { .set = APFS_WA_MTIME, .mtime = apfs_now_ns() };
+			int m_err = APFS_WCALL(am, an, NULL, apfs_w_setattr(w, an->an_id, &t));
+
+			if (error == 0) {
+				error = m_err;
+			}
+		}
+		apfs_lock(am);
+		apfs_wnote(am, an->an_id);
+		apfs_unlock(am);
 	}
 	if (error == 0 && (ioflag & IO_SYNC)) {
 		error = apfs_wcommit(am, false, an->an_wseq, APFS_WHY_IOSYNC);

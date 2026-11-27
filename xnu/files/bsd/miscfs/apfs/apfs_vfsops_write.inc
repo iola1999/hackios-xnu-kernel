@@ -253,11 +253,14 @@ apfs_wio_start(struct apfs_mount *am, buf_t bp)
  * lock held, which it may have let go; returns how long it was let go (mach ticks).
  */
 static uint64_t
-apfs_wio_drain(struct apfs_mount *am)
+apfs_wio_drain(struct apfs_mount *am, int *err_out)
 {
 	struct apfs_wmount *wm = am->am_w;
 	uint64_t deadline, held, free = 0, gone;
 
+	if (err_out != NULL) {
+		*err_out = 0;
+	}
 	clock_interval_to_deadline(APFS_WDRAIN_MS, NSEC_PER_MSEC, &deadline);
 	clock_interval_to_deadline(APFS_WDRAIN_HELD_MS, NSEC_PER_MSEC, &held);
 	lck_spin_lock(&wm->wm_spin);
@@ -266,7 +269,7 @@ apfs_wio_drain(struct apfs_mount *am)
 		uint64_t now = mach_absolute_time();
 
 		if (now >= deadline) {
-			/* a mapping the cluster layer gave up on: its pages stay dirty and are mapped again */
+			/* Keep wm_nmap intact and fail the commit so metadata never overtakes unsent writes. */
 			printf("apfs: commit: %u mappings and %u data writes still out after %u ms\n",
 			    wm->wm_nmap, wm->wm_io, APFS_WDRAIN_MS);
 			for (uint32_t i = 0; i < wm->wm_nmap && i < 4; i++) {
@@ -274,8 +277,10 @@ apfs_wio_drain(struct apfs_mount *am)
 				    wm->wm_map[i].id, wm->wm_map[i].off, wm->wm_map[i].left,
 				    wm->wm_map[i].end - wm->wm_map[i].addr, wm->wm_map[i].addr);
 			}
-			wm->wm_nmap = 0;
 			wm->wm_slow_drains++;
+			if (err_out != NULL) {
+				*err_out = ETIMEDOUT;
+			}
 			break;
 		}
 		if (wm->wm_nmap == 0 || now < held) {
@@ -325,7 +330,11 @@ apfs_wcommit_locked(struct apfs_mount *am, enum apfs_wwhy why)
 			return 0;
 		}
 		/* MAP_SHARED in-place writes leave metadata untouched, so drain I/O and flush cache. */
-		(void)apfs_wio_drain(am);
+		int drain_err = 0;
+		(void)apfs_wio_drain(am, &drain_err);
+		if (drain_err != 0) {
+			return drain_err;
+		}
 		error = am->am_nx.dev.flush != NULL ? am->am_nx.dev.flush(am->am_nx.dev.ctx) : 0;
 		if (error == 0) {
 			lck_spin_lock(&wm->wm_spin);
@@ -334,13 +343,18 @@ apfs_wcommit_locked(struct apfs_mount *am, enum apfs_wwhy why)
 		}
 		return error;
 	}
+	int drain_err = 0;
 	t0 = mach_absolute_time();
-	free = apfs_wio_drain(am);
+	free = apfs_wio_drain(am, &drain_err);
 	t1 = mach_absolute_time();
 	wm->wm_drain_ticks += t1 - t0;
 	wm->wm_drain_max = MAX(wm->wm_drain_max, t1 - t0);
 	wm->wm_drain_free_ticks += free;
 	wm->wm_drain_held_max = MAX(wm->wm_drain_held_max, t1 - t0 - free);
+	if (drain_err != 0) {
+		wm->wm_errors++;
+		return drain_err;
+	}
 	if (!apfs_wtx_dirty(wm->wm_wtx)) {       /* committed by another thread while the lock was let go */
 		return apfs_wtx_broken(wm->wm_wtx) ? EIO : 0;
 	}
@@ -459,8 +473,13 @@ apfs_wflush(struct apfs_mount *am)
 		error = apfs_wcommit_locked(am, APFS_WHY_FULLFSYNC);
 	} else {
 		struct apfs_wmount *wm = am->am_w;
+		int drain_err = 0;
 
-		(void)apfs_wio_drain(am);
+		(void)apfs_wio_drain(am, &drain_err);
+		if (drain_err != 0) {
+			apfs_unlock_exclusive(am);
+			return drain_err;
+		}
 		error = am->am_nx.dev.flush != NULL ? am->am_nx.dev.flush(am->am_nx.dev.ctx) : 0;
 		if (error == 0) {
 			lck_spin_lock(&wm->wm_spin);
@@ -642,8 +661,13 @@ apfs_data_flush(void)
 	int error = 0;
 
 	lck_mtx_lock(&apfs_pool_lock);
-	if (apfs_data_mount != NULL && vfs_busy(apfs_data_mount->am_mp, LK_NOWAIT) == 0) {
-		mp = apfs_data_mount->am_mp;
+	if (apfs_data_mount != NULL) {
+		int busy_err = vfs_busy(apfs_data_mount->am_mp, LK_NOWAIT);
+		if (busy_err == 0) {
+			mp = apfs_data_mount->am_mp;
+		} else {
+			error = busy_err;
+		}
 	}
 	lck_mtx_unlock(&apfs_pool_lock);
 	if (mp != NULL) {

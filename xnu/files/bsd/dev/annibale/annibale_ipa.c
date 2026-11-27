@@ -701,6 +701,96 @@ ipa_wcomb_zero(volatile uint8_t *dst, uint32_t len)
 	}
 }
 
+#define IPA_CARVEOUT_MAP_CHUNK  0x00400000ULL
+
+static vm_offset_t
+ipa_carveout_map_range(uint64_t phys, uint64_t len, vm_size_t *map_sz_out, uint64_t *va_off_out)
+{
+	uint64_t pa_start, pa_end, span_sz;
+	vm_size_t map_sz;
+
+	if (len == 0 || len > UINT64_MAX - (uint64_t)PAGE_MASK ||
+	    phys > UINT64_MAX - len - (uint64_t)PAGE_MASK) {
+		return 0;
+	}
+	pa_start = phys & ~(uint64_t)PAGE_MASK;
+	pa_end = (phys + len + (uint64_t)PAGE_MASK) & ~(uint64_t)PAGE_MASK;
+	span_sz = pa_end - pa_start;
+	map_sz = (vm_size_t)span_sz;
+	if (pa_end <= pa_start || (uint64_t)map_sz != span_sz) {
+		return 0;
+	}
+	*map_sz_out = map_sz;
+	*va_off_out = phys - pa_start;
+	return ml_io_map_unmappable((vm_offset_t)pa_start, map_sz, VM_WIMG_WCOMB);
+}
+
+static bool
+ipa_carveout_copy(uint64_t phys, const uint8_t *src, uint32_t len)
+{
+	uint32_t done = 0;
+
+	while (done < len) {
+		uint32_t chunk = len - done;
+		vm_size_t map_sz = 0;
+		uint64_t va_off = 0;
+		vm_offset_t va;
+
+		if (chunk > IPA_CARVEOUT_MAP_CHUNK) {
+			chunk = (uint32_t)IPA_CARVEOUT_MAP_CHUNK;
+		}
+		va = ipa_carveout_map_range(phys + done, chunk, &map_sz, &va_off);
+		if (va == 0) {
+			return false;
+		}
+		ipa_wcomb_copy((volatile uint8_t *)(va + va_off), src + done, chunk);
+		__builtin_arm_dsb(0xf);
+		ml_io_unmap(va, map_sz);
+		done += chunk;
+	}
+	return true;
+}
+
+static bool
+ipa_carveout_zero(uint64_t phys, uint64_t len)
+{
+	uint64_t done = 0;
+
+	while (done < len) {
+		uint64_t rem = len - done;
+		uint32_t chunk = rem > IPA_CARVEOUT_MAP_CHUNK ?
+		    (uint32_t)IPA_CARVEOUT_MAP_CHUNK : (uint32_t)rem;
+		vm_size_t map_sz = 0;
+		uint64_t va_off = 0;
+		vm_offset_t va;
+
+		va = ipa_carveout_map_range(phys + done, chunk, &map_sz, &va_off);
+		if (va == 0) {
+			return false;
+		}
+		ipa_wcomb_zero((volatile uint8_t *)(va + va_off), chunk);
+		__builtin_arm_dsb(0xf);
+		ml_io_unmap(va, map_sz);
+		done += chunk;
+	}
+	return true;
+}
+
+static bool
+ipa_carveout_read32(uint64_t phys, uint32_t *val_out)
+{
+	vm_size_t map_sz = 0;
+	uint64_t va_off = 0;
+	vm_offset_t va = ipa_carveout_map_range(phys, sizeof(uint32_t), &map_sz, &va_off);
+
+	if (va == 0) {
+		return false;
+	}
+	*val_out = *(volatile const uint32_t *)(va + va_off);
+	ml_io_unmap(va, map_sz);
+	return true;
+}
+
 static int64_t
 pas_init_try(uint32_t pas, uint64_t hdr_pa, uint64_t *res1)
 {
@@ -908,7 +998,6 @@ annibale_load_mdt_image(const char *prefix, uint32_t pas_id, uint32_t alt_pas_id
 	bool mdt_free = false, ok = false, reloc = false;
 	uint8_t *mdt_buf;
 	uint32_t phnum, lowest = ~0u, highest_off = 0, base_paddr, span, active_pas = pas_id;
-	vm_offset_t carveout = 0;
 	int64_t rc;
 
 	snprintf(mdt_name, sizeof(mdt_name), "%s.mdt", prefix);
@@ -1008,11 +1097,7 @@ annibale_load_mdt_image(const char *prefix, uint32_t pas_id, uint32_t alt_pas_id
 	}
 	printf("annibale-ipa: PAS_MEM_SETUP(%s, pas=%u) ok phys=%#llx sz=%#llx span=%#x\n",
 	    prefix, active_pas, mem_phys, region_size, span);
-	carveout = ml_io_map_unmappable(mem_phys, region_size, VM_WIMG_WCOMB);
-	if (carveout == 0) {
-		printf("annibale-ipa: %s carveout map failed (phys=%#llx sz=%#llx)\n", mdt_name, mem_phys, region_size);
-		goto out;
-	}
+	/* Map each segment and zeroing pass as bounded page-aligned windows to avoid multi-hundred-MiB kmem_alloc. */
 	for (uint32_t i = 0; i < phnum; i++) {
 		struct ipa_elf32_phdr ph;
 		char seg_name[32];
@@ -1030,6 +1115,8 @@ annibale_load_mdt_image(const char *prefix, uint32_t pas_id, uint32_t alt_pas_id
 			snprintf(seg_name, sizeof(seg_name), "%s.b%02u", prefix, i);
 			seg_buf = annibale_read_fw_override(seg_name, &seg_sz, &seg_free);
 			if (seg_buf != NULL) {
+				bool copied;
+
 				if (seg_sz != ph.filesz) {
 					printf("annibale-ipa: %s seg %s size mismatch (%llu != %u)\n",
 					    mdt_name, seg_name, seg_sz, ph.filesz);
@@ -1038,28 +1125,55 @@ annibale_load_mdt_image(const char *prefix, uint32_t pas_id, uint32_t alt_pas_id
 					}
 					goto out;
 				}
-				ipa_wcomb_copy((volatile uint8_t *)(carveout + rel_off), seg_buf, ph.filesz);
+				copied = ipa_carveout_copy(mem_phys + rel_off, seg_buf, ph.filesz);
 				if (seg_free) {
 					kfree_data(seg_buf, seg_sz);
 				}
-			} else if (!annibale_ufs_fat16_fw_read(seg_name, &seg_sz,
-			    (volatile uint8_t *)(carveout + rel_off), ph.filesz) || seg_sz != ph.filesz) {
-				printf("annibale-ipa: %s seg %s read failed (got=%llu exp=%u)\n",
-				    mdt_name, seg_name, seg_sz, ph.filesz);
-				goto out;
+				if (!copied) {
+					printf("annibale-ipa: %s seg %s map failed (phys=%#llx sz=%#x)\n",
+					    mdt_name, seg_name, mem_phys + rel_off, ph.filesz);
+					goto out;
+				}
+			} else {
+				vm_size_t seg_map_sz = 0;
+				uint64_t seg_va_off = 0;
+				vm_offset_t seg_va = ipa_carveout_map_range(mem_phys + rel_off,
+				    ph.filesz, &seg_map_sz, &seg_va_off);
+				bool read_ok;
+
+				if (seg_va == 0) {
+					printf("annibale-ipa: %s seg %s map failed (phys=%#llx sz=%#x)\n",
+					    mdt_name, seg_name, mem_phys + rel_off, ph.filesz);
+					goto out;
+				}
+				read_ok = annibale_ufs_fat16_fw_read(seg_name, &seg_sz,
+				    (volatile uint8_t *)(seg_va + seg_va_off), ph.filesz);
+				__builtin_arm_dsb(0xf);
+				ml_io_unmap(seg_va, seg_map_sz);
+				if (!read_ok || seg_sz != ph.filesz) {
+					printf("annibale-ipa: %s seg %s read failed (got=%llu exp=%u)\n",
+					    mdt_name, seg_name, seg_sz, ph.filesz);
+					goto out;
+				}
 			}
 		}
-		if (ph.memsz > ph.filesz) {
-			ipa_wcomb_zero((volatile uint8_t *)(carveout + rel_off + ph.filesz), ph.memsz - ph.filesz);
+		if (ph.memsz > ph.filesz &&
+		    !ipa_carveout_zero(mem_phys + rel_off + ph.filesz, ph.memsz - ph.filesz)) {
+			printf("annibale-ipa: %s seg %u zero map failed (phys=%#llx sz=%#x)\n",
+			    mdt_name, i, mem_phys + rel_off + ph.filesz, ph.memsz - ph.filesz);
+			goto out;
 		}
 	}
-	if (span > highest_off) {
-		ipa_wcomb_zero((volatile uint8_t *)(carveout + highest_off), span - highest_off);
+	if (span > highest_off && !ipa_carveout_zero(mem_phys + highest_off, span - highest_off)) {
+		printf("annibale-ipa: %s tail zero map failed (phys=%#llx sz=%#x)\n",
+		    mdt_name, mem_phys + highest_off, span - highest_off);
+		goto out;
 	}
-	__builtin_arm_dsb(0xf);
-	uint32_t w0 = *(volatile const uint32_t *)carveout;
-	uint32_t wlast = highest_off >= 4u ?
-	    *(volatile const uint32_t *)(carveout + ((highest_off - 4u) & ~3u)) : 0u;
+	uint32_t w0 = 0, wlast = 0;
+	(void)ipa_carveout_read32(mem_phys, &w0);
+	if (highest_off >= 4u) {
+		(void)ipa_carveout_read32(mem_phys + ((highest_off - 4u) & ~3u), &wlast);
+	}
 	printf("annibale-ipa: staged %s phys=%#llx span=%#x highest=%#x w0=%#x wlast=%#x\n",
 	    prefix, mem_phys, span, highest_off, w0, wlast);
 	if (used_pas_out != NULL) {
@@ -1067,9 +1181,6 @@ annibale_load_mdt_image(const char *prefix, uint32_t pas_id, uint32_t alt_pas_id
 	}
 	ok = true;
 out:
-	if (carveout != 0) {
-		ml_io_unmap(carveout, region_size);
-	}
 	if (mdt_buf != NULL && mdt_free) {
 		kfree_data(mdt_buf, mdt_sz);
 	}

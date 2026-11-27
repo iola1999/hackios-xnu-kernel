@@ -189,10 +189,12 @@ static bool annibale_gpu_map(uint64_t address, uint64_t phys, bool) {
 static bool annibale_gpu_mapped() { return mapped_ok; }
 static bool annibale_gpu_unmap(uint64_t, uint64_t) { ++unmap_calls; return unmap_ok; }
 static unsigned busy_for;                       /* annibale_gpu_done() says no so many times first */
-static bool annibale_gpu_done(uint32_t) { ++done_calls; return fence_done && done_calls > busy_for; }
+static bool (*done_hook)(uint32_t);
+static bool annibale_gpu_done(uint32_t f) { ++done_calls; return done_hook ? done_hook(f) : (fence_done && done_calls > busy_for); }
 static uint32_t annibale_gpu_last() { return 7; }
-static uint32_t retired_now;
+static uint32_t retired_now, retired_slot1;
 static uint32_t annibale_gpu_retired() { return retired_now; }
+static uint32_t annibale_gpu_retired_for(uint32_t f) { return (f & 0x80000000u) ? retired_slot1 : retired_now; }
 static uint32_t context_depth = 4;
 static uint32_t adreno8_context_depth() { return context_depth; }
 static uint32_t annibale_gpu_submit(const uint64_t *, const uint32_t *, uint32_t count) {
@@ -229,7 +231,8 @@ static void reset() {
     recover_ok = false;
     map_calls = unmap_calls = freed_addresses = done_calls = submit_calls = map_fail_at = 0;
     releases_in_lock = drops_in_lock = 0;
-    wrong_pages = busy_for = 0; context_depth = 4;
+    wrong_pages = busy_for = 0; context_depth = 4; done_hook = nullptr;
+    retired_now = retired_slot1 = 0;
     submit_answer = 17; next_address = 0x40000000; now = 0;
     gGPUReported = gGPUCached = gGPUCoherent = false; gGPUKeep = 0;
     flush_calls = 0; last_flush_ptr = nullptr; last_flush_size = 0;
@@ -561,10 +564,67 @@ static void full_fleft_reap_before_wait() {
     assert(now == before && c.fLeftCount < GPU_LEFT && releases_in_lock == 0);
     c.clientClose(); c.free();
 }
+static void cross_slot_last_use_and_stall() {
+    static uint32_t s0_done, s1_done;
+    auto check_done = [](uint32_t f) -> bool {
+        return (f & 0x80000000u) ? ((f & 0x7fffffffu) <= s1_done) : (f <= s0_done);
+    };
+    reset();
+    auto c = client();
+    auto *root = new IOBufferMemoryDescriptor(2 * PAGE_SIZE);
+    MiniIOSurface s{}; s.memory = root; s.kbase = root->bytes; s.info.allocSize = PAGE_SIZE;
+    surface_lookup = &s;
+    annibale_surface req{}; struct gpu_io_stat io{};
+    assert(c.surfaceBuffer(&req, &io) == kIOReturnSuccess);
+    auto *b = &c.fBuffers[req.handle - 1];
+    done_hook = check_done;
+
+    /* Slot 0 pending (16) vs slot 1 retired (0x80000005) must not pick retired slot 1 fence. */
+    s0_done = 10; s1_done = 10;
+    b->fence = 16u; s.drawn = 0x80000005u;
+    assert(c.lastUse(req.handle) == 16u);
+
+    /* Slot 1 retired (0x80000005) vs slot 0 pending (16) must pick pending slot 0 drawn. */
+    b->fence = 0x80000005u; s.drawn = 16u;
+    assert(c.lastUse(req.handle) == 16u);
+
+    /* Slot 1 pending (0x80000012) vs slot 0 retired (10) must pick pending slot 1 fence. */
+    b->fence = 0x80000012u; s.drawn = 10u;
+    assert(c.lastUse(req.handle) == 0x80000012u);
+
+    /* Same-slot 31-bit wraparound still picks newer drawn timestamp. */
+    s1_done = 0;
+    b->fence = 0xffffffffu; s.drawn = 0x80000002u;
+    assert(c.lastUse(req.handle) == 0x80000002u);
+
+    /* Per-slot stall detection: slot 1 advancing prevents false stall even when slot 0 retired_now is frozen. */
+    done_hook = nullptr;
+    fence_done = false;
+    retired_now = 99u; retired_slot1 = 0x80000001u;
+    IOLockLock(gGPULock);
+    assert(!gpuWait(0x80000005u, 1000));
+    assert(!gGPUReported);
+    now += (uint64_t)(GPU_STALL_MS + 100) * NSEC_PER_MSEC;
+    retired_slot1 = 0x80000002u; /* slot 1 made progress -> resets stall timer */
+    assert(!gpuWait(0x80000005u, 1000));
+    assert(!gGPUReported);
+    /* Slot 0 advancing must NOT mask a stalled slot 1 past GPU_STALL_MS. */
+    now += (uint64_t)(GPU_STALL_MS + 100) * NSEC_PER_MSEC;
+    retired_now = 105u;
+    assert(!gpuWait(0x80000005u, 1000));
+    assert(gGPUReported);
+    IOLockUnlock(gGPULock);
+
+    gGPUReported = false; s.drawn = 0; b->fence = 0; fence_done = true;
+    assert(c.gemClose(req.handle) == kIOReturnSuccess);
+    MiniIOSurfaceDrop(&s);
+    assert(root->freed); c.clientClose(); c.free();
+}
 int main() {
     healthy(); stopped(); failed_reap(); completed_reap(); failed_free(); partial_map(); segments(); kept();
     failed_surface(); surface_ownership(); full_pending(); long_pass(); failed_submit(); queue_room(); display();
-    out_of_lock_teardown(); keep_evict_bounded(); surface_fail_retain_not_pooled(); full_fleft_reap_before_wait(); reset();
+    out_of_lock_teardown(); keep_evict_bounded(); surface_fail_retain_not_pooled(); full_fleft_reap_before_wait();
+    cross_slot_last_use_and_stall(); reset();
     printf("AnnibaleGPU production lifecycle: 36 scenarios at %llu-byte pages passed\n", (unsigned long long)PAGE_SIZE);
 }
 '''

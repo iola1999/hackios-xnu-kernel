@@ -133,7 +133,8 @@ def psc(codec=1, variation='valid', native=False, malformed=None):
     if codec == 2:
         fields += [(0x03000109, 9, [0])]
     fields += [(0x03000155, 1, [0])]
-    changes = {'depth': (0x0300010f, [0x000a000a]), 'zero-count': (0x03000124, [0]),
+    changes = {'depth': (0x0300010f, [0x000a000a]), 'depth12': (0x0300010f, [0x000c000c]),
+               'zero-count': (0x03000124, [0]),
                'min7': (0x03000124, [7]), 'resolution': (0x03000103, [768 << 16 | 480]),
                'crop': (0x03000105, [1, 0]), 'interlace': (0x03000120, [0]),
                # A 640x474 session coded as 640x480: 6 rows cropped at the bottom, or a wrong crop.
@@ -262,6 +263,22 @@ def write_fixtures(directory):
         path.write_bytes(psc(variation=variation))
         cases.append((name, path, expected))
     cases.append(('psc-depth-close', directory / 'psc-depth.bin', expected))
+    hevc10_path = directory / 'psc-hevc10.bin'
+    hevc10_path.write_bytes(psc(codec=2, variation='depth', native=True))
+    cases.append(('psc-valid-hevc10', hevc10_path, expected))
+    cases.append(('output-copy-hevc10', hevc10_path, expected))
+    hevc10_1080p_path = directory / 'psc-hevc10-1080p.bin'
+    blob_1080p = bytearray(psc(codec=2, variation='depth', native=True))
+    off = 32
+    while off < len(blob_1080p):
+        if struct.unpack_from('<I', blob_1080p, off + 4)[0] == 0x03000103:
+            struct.pack_into('<I', blob_1080p, off + 32, (1920 << 16) | 1080)
+        off += struct.unpack_from('<I', blob_1080p, off)[0]
+    hevc10_1080p_path.write_bytes(blob_1080p)
+    cases.append(('psc-valid-hevc10-1080p', hevc10_1080p_path, expected))
+    hevc12_path = directory / 'psc-hevc12.bin'
+    hevc12_path.write_bytes(psc(codec=2, variation='depth12', native=True))
+    cases.append(('psc-depth-hevc12', hevc12_path, expected))
     for kind in (0x03000105, 0x0300010f, 0x03000120, 0x03000155):
         for mode in ('short', 'wrong-info', 'wrong-port', 'information', 'short-buffer'):
             name = f'psc-metadata-{kind:x}-{mode}'
@@ -510,7 +527,9 @@ def mutations():
         'psc_capacity': (HFI, 'static int\niris_start_output', 'struct iris_reply_wait',
                          'count > IRIS_RAW_POOL_MAX ||', '', ['raw-capacity-isolated']),
         'psc_depth': (HFI, 'static int\niris_start_output', 'struct iris_reply_wait',
-                      's->psc_values[PSC_DEPTH] != 0x00080008u ||', '', ['psc-depth']),
+                      '!depth_ok ||', '(!depth_ok && false) ||', ['psc-depth', 'psc-depth-hevc12']),
+        'p010_color_fmt': (PRIVATE, '#define HFI_COLOR_FMT_P010', '#define HFI_PORT_NONE',
+                           '4u', '1u', ['psc-valid-hevc10']),
         'raw_nv12': (PRIVATE, '#define HFI_COLOR_FMT_NV12', '#define HFI_PORT_NONE',
                      '1u', '2u', ['wire-psc-h264', 'wire-psc-hevc']),
         'stride_packed': (HFI, 'static int\niris_start_output', 'struct iris_reply_wait',
