@@ -248,19 +248,25 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request, struct gpu_io_sta
 		absolutetime_to_nanoseconds(gGPUStat.allocating, &allocating);
 		absolutetime_to_nanoseconds(gGPUStat.locking, &locking);
 		uint32_t kept_count = 0;
+		uint32_t kept_by_size[4] = { 0, 0, 0, 0 };
 
 		for (uint32_t i = 0; i < GPU_KEPT; i++) {
-			kept_count += fKept[i].memory != NULL;
+			if (fKept[i].memory != NULL) {
+				kept_count++;
+				kept_by_size[gpuKeptClass(fKept[i].size)]++;
+			}
 		}
 		IOLog("AnnibaleGPU: buffers: %u made in %llu us each (%llu getting the memory, %llu waiting for the GPU lock; %u under "
 		    "64 KB, %u under 1 MB, %u under 8 MB, %u larger), %u kept ones given again (%llu MB kept), hits by size %u/%u/%u/%u, "
-		    "%u in the pool; misses %u for size, %u for flags; evicted %u entry-cap, %u byte-cap, %u expired\n",
+		    "%u in the pool; misses %u for size, %u for flags; evicted %u entry-cap, %u byte-cap, %u expired; "
+		    "pool by size %u/%u/%u/%u\n",
 		    gGPUStat.made, gGPUStat.made ? making / NSEC_PER_USEC / gGPUStat.made : 0,
 		    gGPUStat.made ? allocating / NSEC_PER_USEC / gGPUStat.made : 0,
 		    gGPUStat.made ? locking / NSEC_PER_USEC / gGPUStat.made : 0, gGPUStat.made_by_size[0], gGPUStat.made_by_size[1],
 		    gGPUStat.made_by_size[2], gGPUStat.made_by_size[3], gGPUStat.given_again, fKeptBytes >> 20,
 		    gGPUStat.hit_by_size[0], gGPUStat.hit_by_size[1], gGPUStat.hit_by_size[2], gGPUStat.hit_by_size[3], kept_count,
-		    gGPUStat.miss_size, gGPUStat.miss_flags, gGPUStat.evict_entrycap, gGPUStat.evict_bytecap, gGPUStat.expire_drop);
+		    gGPUStat.miss_size, gGPUStat.miss_flags, gGPUStat.evict_entrycap, gGPUStat.evict_bytecap, gGPUStat.expire_drop,
+		    kept_by_size[0], kept_by_size[1], kept_by_size[2], kept_by_size[3]);
 		/* Three messages, one record each: what a window's submissions cost here, what the GPU did
 		 * with them, and what they named. */
 		IOLog("AnnibaleGPU: %u submissions in %llu ms: %llu us each in the kernel, %llu of them waiting for room in the queue; "

@@ -796,17 +796,16 @@ struct gpu_left {
  * a second and then lets it go. Each made afresh here took 2 to 3.5 ms of the window server's frame
  * (memory got, cleared, made write-combined, and entered page by page into the GPU's address
  * space). A buffer kept is given again as it is, not cleared: it was the same program's (Mesa's own
- * cache gives buffers back the same way). At most GPU_KEPT_BYTES are kept (the one kept longest
- * makes way), none for longer than GPU_KEPT_SECONDS. rc.jobs.fps, Search: 8 such textures made
- * slowly instead of 77, the window server's frames drawn in 6.8 ms instead of 9.3-10 (median).
+ * cache gives buffers back the same way). At most GPU_KEPT_BYTES are kept, none for longer than
+ * GPU_KEPT_SECONDS; a full entry array keeps soft size shares (keep()). rc.jobs.fps, Search: 8 such
+ * textures made slowly instead of 77, the window server's frames drawn in 6.8 ms instead of 9.3-10 (median).
  *
  * Small buffers are kept since batch 8: the making of one is the same allocation, address space
  * reservation, page table writes and lock round trips whatever its size, and the desktop's icon
  * textures ran the whole lifecycle hundreds of times a frame while only buffers of 256 KB or
  * more were kept. Sizes under 256 KB are rounded up to a power of two when made (gemNew()), so
- * near sizes share one entry. A kept small buffer costs at most its bucket of wired memory, and
- * the byte cap below bounds the pool as before; none of this applies to a surface's or the
- * program's own memory, which keep() never takes.
+ * near sizes share one entry. A kept small buffer costs at most its bucket of wired memory; the byte
+ * cap bounds the pool as before. None of this applies to a surface's or the program's own memory, which keep() never takes.
  */
 struct gpu_kept {
 	IOMemoryDescriptor *            memory;         /* NULL: this place is free */
@@ -814,10 +813,11 @@ struct gpu_kept {
 	uint64_t                        address, size, since;
 	uint32_t                        flags;
 };
-#define GPU_KEPT                128             /* the desktop's small buffers churn through hundreds a frame (batch 5 kernel-submit-blocking) */
-#define GPU_KEPT_BYTES          (160ull << 20)
-#define GPU_KEPT_SECONDS        60              /* a buffer not asked for again in so long is let go */
-#define GPU_BUCKET_TO           (256u << 10)    /* smaller sizes are made in power-of-two buckets, this one and up exact */
+#define GPU_KEPT_SMALL_TARGET   320             /* soft share when full: sizes under 64 KB are most gemNew requests */
+#define GPU_KEPT_MEDIUM_TARGET  128             /* 64 KB to 1 MB */
+#define GPU_KEPT_LARGE_TARGET   48              /* 1 MB to 8 MB */
+#define GPU_KEPT_HUGE_TARGET    16              /* 8 MB and up: few requests, but costly to make again */
+#define GPU_KEPT                (GPU_KEPT_SMALL_TARGET + GPU_KEPT_MEDIUM_TARGET + GPU_KEPT_LARGE_TARGET + GPU_KEPT_HUGE_TARGET)
 static TUNABLE(uint32_t, gGPUKeep, "gpu_keep", 1);      /* boot-arg gpu_keep=0 (a test): none kept; gpu_keep=2: kept ones cleared when given again */
 
 class AnnibaleGPUUserClient : public IOUserClient
