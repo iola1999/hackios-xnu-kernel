@@ -647,3 +647,27 @@ adreno8_step_gmu_start(void)
 	    adreno8_rd(adreno8_gmu.base + GMU_FW_INIT_RESULT), adreno8_gmu_log.address);
 	return true;
 }
+
+void
+adreno8_gmu_reset_for_recovery(void)
+{
+	if (adreno8_gmu.base != 0) {
+		adreno8_put(&adreno8_gmu, "mask ao interrupts for recovery", GMU_AO_INTERRUPT_MASK, ~0u);
+		adreno8_put(&adreno8_gmu, "mask gmu2host interrupts for recovery", GMU_GMU2HOST_MASK, ~0u);
+		adreno8_put(&adreno8_gmu, "clear ao interrupts for recovery", GMU_AO_INTERRUPT_CLR, ~0u);
+		adreno8_put(&adreno8_gmu, "clear gmu2host interrupts for recovery", GMU_GMU2HOST_CLR, ~0u);
+		adreno8_put(&adreno8_gmu, "hold CM3 in reset for recovery", GMU_CM3_SYSRESET, 1);
+		adreno8_put(&adreno8_gmu, "clear firmware init result for recovery", GMU_FW_INIT_RESULT, 0);
+		adreno8_settle();
+	}
+	adreno8_fw_loaded = false;
+	adreno8_gmu_runs = false;
+	adreno8_gmu_talks = false;
+	if (adreno8_hfi_view_table != 0) {
+		adreno8_hfi_init_table((uint32_t *)adreno8_hfi_view_table, adreno8_gmu_hfi.address, adreno8_direct_ring);
+		adreno8_settle();
+	}
+	if (adreno8_gmu_vrb != NULL) {
+		(void)adreno8_memory_publish(adreno8_gmu_vrb, 0, adreno8_gmu_vrb->size);
+	}
+}

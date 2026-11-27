@@ -487,7 +487,7 @@ surfaceCreate(OSDictionary * props, IOReturn * error, MiniIOSurface * parent = N
 	 * there is no wide gamut on this panel anyway. The surface is made as ordinary BGRA of
 	 * the same geometry, and says so: whoever uses it reads the format back from the surface.
 	 */
-	if (format == 'w30r' || format == 'l10r' || format == 'w30R') {
+	if (format == 'w30r' || format == 'w30R') {
 		format = 'BGRA';
 	}
 	/*

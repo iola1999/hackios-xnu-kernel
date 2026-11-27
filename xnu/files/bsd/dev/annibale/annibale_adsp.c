@@ -778,13 +778,10 @@ static void glink_poll_rx(void)
 				}
 			}
 		} else if (cmd == GLINK_RX_DONE || cmd == GLINK_DONE_REUSE) {
-			if (param == glink_pmic_their_cid) {
-				glink_complete_their_intent(&glink_pmic_intents, w1, cmd == GLINK_DONE_REUSE);
-			} else if (param == glink_gpr_their_cid) {
-				glink_complete_their_intent(&glink_gpr_intents, w1, cmd == GLINK_DONE_REUSE);
-			} else if (param == adsp_ipcrtr_their_cid && adsp_ipcrtr_their_cid != 0) {
-				glink_complete_their_intent(&adsp_ipcrtr_intents, w1, cmd == GLINK_DONE_REUSE);
-			}
+			if (param == glink_pmic_their_cid) glink_complete_their_intent(&glink_pmic_intents, w1, cmd == GLINK_DONE_REUSE);
+			else if (param == glink_gpr_their_cid) glink_complete_their_intent(&glink_gpr_intents, w1, cmd == GLINK_DONE_REUSE);
+			else if (param == adsp_ipcrtr_their_cid && adsp_ipcrtr_their_cid != 0) glink_complete_their_intent(&adsp_ipcrtr_intents, w1, cmd == GLINK_DONE_REUSE);
+			else if (param == adsp_fastrpc_their_cid && adsp_fastrpc_their_cid != 0) adsp_fastrpc_on_tx_done(w1, cmd == GLINK_DONE_REUSE);
 		} else if (cmd == GLINK_TX_DATA || cmd == GLINK_TX_DATA_CONT) {
 			uint32_t chunk = glink_q_read32(glink_their_q, glink_their_q_size, r + 8);
 			uint32_t left = glink_q_read32(glink_their_q, glink_their_q_size, r + 12);
@@ -886,9 +883,7 @@ static void glink_poll_rx(void)
 
 		r = (uint32_t)(((uint64_t)r + step_bytes) % (uint64_t)glink_their_q_size);
 		smem_poke(glink_their_read_at, r);
-		if (ipcrtr_attach || ipcrtr_pkt != NULL) {
-			break;
-		}
+		if (ipcrtr_attach || ipcrtr_pkt != NULL || adsp_fastrpc_has_pending()) break;
 		smem_peek(glink_their_write_at, &w, 4);
 	}
 	lck_mtx_unlock(&glink_rx_lock);
@@ -900,9 +895,8 @@ static void glink_poll_rx(void)
 		annibale_qrtr_input(ipcrtr_pkt, ipcrtr_len);
 		kfree_data(ipcrtr_pkt, ipcrtr_len);
 	}
-	if (!ipcrtr_attach && ipcrtr_pkt == NULL) {
-		break;
-	}
+	adsp_fastrpc_service();
+	if (!ipcrtr_attach && ipcrtr_pkt == NULL && !adsp_fastrpc_has_pending()) break;
 	}
 }
 
@@ -1177,6 +1171,7 @@ static void annibale_adsp_boot_thread(void *arg __unused, wait_result_t w __unus
 	}
 	for (;;) {
 		glink_poll_rx();
+		adsp_fastrpc_service();
 		sleep_ms(annibale_audio_reach_is_active() ? 1 : (glink_gpr_our_cid == 0 ? 5 : 20));
 	}
 }

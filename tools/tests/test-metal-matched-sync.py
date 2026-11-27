@@ -68,6 +68,14 @@ static void rw_print(const char *format, ...) {
 static void air_dump(const void *p, NSUInteger n, const char *s, const char *f, bool c) {
  (void)p;(void)n;(void)s;(void)f;(void)c; dumps++;
 }
+static uint64_t rw_yield_wait(struct rwa_device *d) { (void)d; return 0; }
+static void rw_yield_adopt(struct rwa_device *d) { (void)d; }
+static bool rw_gpu_yield(void) { return false; }
+#define RW_YIELD_THREADS 16
+static void rw_surface_commit_mark(id tex, unsigned commit) { (void)tex;(void)commit; }
+static bool rw_damage_probe_enabled(void) { return false; }
+static void rw_damage_commit_sample(const void *cb, NSArray *works) { (void)cb;(void)works; }
+static void rw_pixel_probe(id work, unsigned commit, unsigned index) { (void)work;(void)commit;(void)index; }
 static int flush(struct rwa_device *d,char *why,size_t n) { (void)d;(void)why;(void)n;event('F');return 0; }
 static int finish(struct rwa_device *d,char *why,size_t n) {
  (void)d; waits++;event('W');snprintf(why,n,"fixture finish");return finish_error ? -1:0;
@@ -87,10 +95,14 @@ static struct {
  int (*flush)(struct rwa_device *,char *,size_t);
  int (*finish)(struct rwa_device *,char *,size_t);
  struct rwa_fence *(*fence_take)(struct rwa_device *);
+ int (*fence_wait)(struct rwa_device *, struct rwa_fence *);
+ void (*fence_release)(struct rwa_device *, struct rwa_fence *);
  int (*texture_rgb2p_pass)(struct rwa_texture *,bool,char *,size_t);
  int (*texture_thumbnail)(struct rwa_texture *,unsigned,unsigned,uint8_t *);
  void (*buffer_textures_refresh)(struct rwa_device *);
+ void (*buffer_textures_writeback)(struct rwa_device *);
  __typeof__(&dispatch_async_mock) dispatch_nowait,dispatch_threadgroup;
+ int (*dispatch_split)(struct rwa_compute *,const struct rwa_bindings *,const struct rwa_buffer_bind *,unsigned,const unsigned *,const unsigned *,unsigned,const unsigned *,const unsigned *,bool,char *,size_t);
  int (*dispatch_nowait_imageblock)(struct rwa_compute *,const struct rwa_bindings *,const struct rwa_buffer_bind *,unsigned,const unsigned *,const unsigned *,unsigned,const unsigned *,char *,size_t);
  int (*dispatch_buffers)(struct rwa_compute *,const struct rwa_bindings *,const struct rwa_buffer_bind *,unsigned,const unsigned *,const unsigned *,char *,size_t);
  int (*dispatch)(struct rwa_compute *,const struct rwa_bindings *,const unsigned *,const unsigned *,char *,size_t);

@@ -252,6 +252,7 @@ extern uint32_t adreno8_inflight;
 extern uint32_t adreno8_gmu_from_pll;
 extern bool adreno8_gpu_stall;
 extern bool adreno8_gpu_coherent;
+extern bool adreno8_gpu_recover_enabled;
 extern uint32_t adreno8_step;
 extern uint32_t adreno8_newest_step;
 extern char adreno8_last_write[96];
@@ -436,6 +437,7 @@ bool
 adreno8_step_last_look(void);
 bool adreno8_context_test(void);
 bool adreno8_step_service(void);
+void adreno8_gmu_reset_for_recovery(void);
 void adreno8_quiesce(void);
 void adreno8_return_quiesce(void);
 

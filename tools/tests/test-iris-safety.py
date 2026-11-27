@@ -79,6 +79,7 @@ bool iris_hw_probe_firmware(void) {
 }
 bool iris_hw_ensure_ready(void) {
 	hardware_accesses++;
+	if (sim_hw_ready) g_iris.hw_ready = true;
 	return sim_hw_ready;
 }
 int iris_hfi_session_open(struct iris_session *s) {
@@ -157,13 +158,14 @@ int main(void) {
 	sp.width = 16;
 	assert(iris_cdevsw.d_ioctl(0, IRIS_IOC_OPEN_SESSION, (caddr_t)&sp, 0, &p1) == EINVAL);
 
-	/* Hardware ready: session table capacity, decode, flush, close, and PID cleanup */
+	/* Probe reports firmware and codecs without powering hardware on until OPEN_SESSION. */
 	sim_fw_present = true;
 	sim_hw_ready = true;
 	assert(iris_cdevsw.d_ioctl(0, IRIS_IOC_GET_INFO, (caddr_t)&info, 0, &p1) == 0);
 	assert((info.flags & (IRIS_INFO_DEV_PRESENT | IRIS_INFO_FW_PRESENT | IRIS_INFO_HW_READY)) ==
-	    (IRIS_INFO_DEV_PRESENT | IRIS_INFO_FW_PRESENT | IRIS_INFO_HW_READY));
+	    (IRIS_INFO_DEV_PRESENT | IRIS_INFO_FW_PRESENT));
 	assert(info.codecs_mask == (IRIS_CODEC_MASK_H264 | IRIS_CODEC_MASK_HEVC));
+	assert(!g_iris.hw_ready);
 
 	const unsigned half = IRIS_MAX_SESSIONS / 2u;
 	uint32_t sids[IRIS_MAX_SESSIONS];
@@ -176,6 +178,9 @@ int main(void) {
 		assert(sp.session_id == i + 1u);
 		sids[i] = sp.session_id;
 	}
+	assert(iris_cdevsw.d_ioctl(0, IRIS_IOC_GET_INFO, (caddr_t)&info, 0, &p1) == 0);
+	assert((info.flags & (IRIS_INFO_DEV_PRESENT | IRIS_INFO_FW_PRESENT | IRIS_INFO_HW_READY)) ==
+	    (IRIS_INFO_DEV_PRESENT | IRIS_INFO_FW_PRESENT | IRIS_INFO_HW_READY));
 	assert(iris_cdevsw.d_ioctl(0, IRIS_IOC_OPEN_SESSION, (caddr_t)&sp, 0, &p1) == EBUSY);
 
 	struct iris_decode_frame df;
@@ -252,6 +257,7 @@ enum {
 	kCMVideoCodecType_H264 = 0x61766331u,
 	kCMVideoCodecType_HEVC = 0x68766331u,
 	kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange = 0x34323076u,
+	kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange = 0x78343230u,
 	kCFNumberSInt32Type = 3,
 };
 
@@ -479,7 +485,7 @@ static int iris_sys_ioctl(int fd, unsigned long cmd, void *arg) {
 		struct iris_device_info *info = arg;
 		info->version = IRIS_ABI_VERSION;
 		info->flags = sim_info_flags;
-		info->codecs_mask = (sim_info_flags & IRIS_INFO_HW_READY) ?
+		info->codecs_mask = (sim_info_flags & IRIS_INFO_FW_PRESENT) ?
 		    (IRIS_CODEC_MASK_H264 | IRIS_CODEC_MASK_HEVC) : 0;
 		return 0;
 	}
@@ -677,6 +683,14 @@ static void test_hevc_format(VTDecoderSessionRef session) {
 	    "\x03\x00\x90\x00\x00\x03\x00\x00\x03\x00\x1e\xa0\x14\x20\x61\x36"
 	    "\x59\x59\xa4\x93\x2b\xc0\x5a\x02\x00\x00\x03\x00\x02\x00\x00\x03"
 	    "\x00\x02\x10\xa2\x00\x01\x00\x07\x44\x01\xc1\x72\xb4\x62\x40";
+	static const uint8_t twelve_config[] =
+	    "\x01\x02\x20\x00\x00\x00\x90\x00\x00\x00\x00\x00\x1e\xf0\x00\xfc"
+	    "\xfd\xfc\xfc\x00\x00\x0f\x03\xa0\x00\x01\x00\x18\x40\x01\x0c\x01"
+	    "\xff\xff\x02\x20\x00\x00\x03\x00\x90\x00\x00\x03\x00\x00\x03\x00"
+	    "\x1e\x95\x98\x09\xa1\x00\x01\x00\x2a\x42\x01\x01\x02\x20\x00\x00"
+	    "\x03\x00\x90\x00\x00\x03\x00\x00\x03\x00\x1e\xa0\x14\x20\x61\x36"
+	    "\x59\x59\xa4\x93\x2b\xc0\x5a\x02\x00\x00\x03\x00\x02\x00\x00\x03"
+	    "\x00\x02\x10\xa2\x00\x01\x00\x07\x44\x01\xc1\x72\xb4\x62\x40";
 	static const uint8_t main_frame[] =
 	    "\x00\x00\x00\x1a\x28\x01\xaf\x13\x44\xe8\xe6\x68\xe3\xff\xfd\x17"
 	    "\xcf\xc7\xf6\x40\x2d\x58\x98\xf3\x48\xa6\x3b\x29\x40\xe0";
@@ -696,14 +710,19 @@ static void test_hevc_format(VTDecoderSessionRef session) {
 		const struct iris_cm_vtable *vt = last_created_vtable;
 		struct fake_fmt eight = { .sub = codec, .w = 160, .h = 96, .cfg = { main_config, sizeof(main_config) - 1 } };
 		struct fake_fmt ten = { .sub = codec, .w = 160, .h = 96, .cfg = { ten_config, sizeof(ten_config) - 1 } };
+		struct fake_fmt twelve = { .sub = codec, .w = 160, .h = 96, .cfg = { twelve_config, sizeof(twelve_config) - 1 } };
 		unsigned opened = sim_opened_sessions;
-		assert(vt->derived_class->start_session(decoder, session, &ten) == kVTVideoDecoderUnsupportedDataFormatErr);
+		assert(vt->derived_class->start_session(decoder, session, &twelve) == kVTVideoDecoderUnsupportedDataFormatErr);
 		assert(sim_opened_sessions == opened);
+		assert(vt->derived_class->start_session(decoder, session, &ten) == noErr);
+		assert(sim_opened_sessions == opened + 1);
+		assert(vt->derived_class->can_accept_format(decoder, &ten));
+		assert(!vt->derived_class->can_accept_format(decoder, &eight));
 		assert(vt->derived_class->start_session(decoder, session, &eight) == noErr);
 		assert(vt->derived_class->can_accept_format(decoder, &eight));
 		assert(!vt->derived_class->can_accept_format(decoder, &ten));
-		assert(vt->derived_class->reset_format(decoder, session, &ten) == kVTVideoDecoderUnsupportedDataFormatErr);
-		assert(sim_opened_sessions == opened + 1);
+		assert(vt->derived_class->reset_format(decoder, session, &twelve) == kVTVideoDecoderUnsupportedDataFormatErr);
+		assert(sim_opened_sessions == opened + 2);
 		int outputs = emit_calls;
 		struct fake_sample frame = { main_frame, sizeof(main_frame) - 1, false };
 		assert(vt->derived_class->decode_frame(decoder, (VTDecodeFrameRef)(uintptr_t)1, &frame, 0, NULL) == noErr);
@@ -743,12 +762,12 @@ int main(int argc, char **argv) {
 	assert(vt_register_calls == 0);
 
 	sim_dev_exists = true;
-	sim_info_flags = IRIS_INFO_DEV_PRESENT | IRIS_INFO_FW_PRESENT;
+	sim_info_flags = IRIS_INFO_DEV_PRESENT;
 	register_iris_videotoolbox_decoders();
 	assert(vt_register_calls == 0);
 
-	/* 2. Ready VPU registers avc1, hvc1, hev1 */
-	sim_info_flags = IRIS_INFO_DEV_PRESENT | IRIS_INFO_FW_PRESENT | IRIS_INFO_HW_READY;
+	/* 2. Present device + firmware registers avc1, hvc1, hev1 even before HW_READY */
+	sim_info_flags = IRIS_INFO_DEV_PRESENT | IRIS_INFO_FW_PRESENT;
 	register_iris_videotoolbox_decoders();
 	assert(vt_register_calls == 3 && vt_create_cb != NULL);
 	if (argc == 2 && strcmp(argv[1], "hevc-format") == 0) {
@@ -967,7 +986,7 @@ with tempfile.TemporaryDirectory(prefix='iris-safety-') as tmp:
                    for line in vt_res.stderr.splitlines()), stage
     failures = [line for line in vt_res.stderr.splitlines() if 'decode ioctl failed ' in line]
     assert len(failures) == 1, failures
-    assert 'sid=1 mode=0x0 tag=3 bytes=6 errno=5' in failures[0], failures
+    assert 'sid=1 mode=0x0 tag=3 bytes=22 errno=5' in failures[0], failures
     print(vt_res.stdout.strip())
 
     vt_code = VT_SRC.read_text()
@@ -985,7 +1004,7 @@ with tempfile.TemporaryDirectory(prefix='iris-safety-') as tmp:
         'corrupt_current_tag': ('iris_pending_pop(dec, req.out_tag)', 'iris_pending_pop(dec, in_tag)'),
         'zero_oldest_tag': ('if (tag == 0) return NULL;', 'if (tag == 0) return iris_pending_pop(dec, dec->pending[0].tag);'),
         'corrupt_step_error': ('*out_emitted = true;', '*out_emitted = true; if (corrupt) status = kVTVideoDecoderBadDataErr;'),
-        'flush_error_ignored': ('if (iris_sys_ioctl(dec->fd, IRIS_IOC_FLUSH_SESSION, &sid) != 0 && status == noErr)\n\t\t\tstatus = kVTVideoDecoderMalfunctionErr;',
+        'flush_error_ignored': ('if (iris_sys_ioctl(dec->fd, IRIS_IOC_FLUSH_SESSION, &sid) != 0 && status == noErr)\n\t\t\t\tstatus = kVTVideoDecoderMalfunctionErr;',
                                 '(void)iris_sys_ioctl(dec->fd, IRIS_IOC_FLUSH_SESSION, &sid);'),
         'drain_error_ignored': ('status = iris_run_decode_step_Locked(dec, NULL, NULL, 0, 0, IRIS_FRAME_DRAIN, &emitted);',
                                 '(void)iris_run_decode_step_Locked(dec, NULL, NULL, 0, 0, IRIS_FRAME_DRAIN, &emitted);'),

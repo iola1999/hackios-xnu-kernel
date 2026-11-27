@@ -172,6 +172,29 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		args->scalarOutputCount = 1;
 		return kIOReturnSuccess;
 
+	case kFBMethodIsMainDisplay:                    /* out: 1 (primary built-in panel) */
+		if (args->scalarOutputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		out[0] = 1;
+		args->scalarOutputCount = 1;
+		return kIOReturnSuccess;
+
+	case kFBMethodSetDisplayType:                   /* in: display type from OpenByName */
+		if (args->scalarInputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		IOLockLock(fLock);
+		fDisplayType = (uint32_t) in[0];
+		IOLockUnlock(fLock);
+		return kIOReturnSuccess;
+
+	case kFBMethodSetBlock:                         /* in: blockType, chunkOffset, extra... + <=4096B struct */
+		if (args->scalarInputCount < 2) {
+			return kIOReturnBadArgument;
+		}
+		return kIOReturnSuccess;
+
 	case kFBMethodGetDotPitch:                      /* out: pixels per inch */
 		if (args->scalarOutputCount < 1) {
 			return kIOReturnBadArgument;

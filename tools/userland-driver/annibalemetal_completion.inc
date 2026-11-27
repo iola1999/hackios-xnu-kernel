@@ -36,7 +36,7 @@ static pthread_t rw_completion_tid;
  * the far side of that commit before it maps the surface. This is how the still pipeline's first
  * photograph came out black: the encoder read the engine's output surface while the commit that
  * wrote it was still in flight (kernel-12377-say16-ubo12). */
-#define RW_SURFACE_WRITES 64
+#define RW_SURFACE_WRITES 256
 static struct { uint32_t sid; unsigned commit; } rw_surface_writes[RW_SURFACE_WRITES];
 static unsigned rw_completed_commit;
 
@@ -53,21 +53,51 @@ rw_surface_commit_mark(id texture, unsigned commit)
 	}
 	uint32_t sid = ann_surface_id(sf);
 	pthread_mutex_lock(&rw_completion_lock);
-	unsigned slot = RW_SURFACE_WRITES, oldest = 0;
-	for (unsigned i = 0; i < RW_SURFACE_WRITES; i++) {
-		if (rw_surface_writes[i].sid == sid || rw_surface_writes[i].sid == 0) {
-			slot = i;
+	for (;;) {
+		unsigned slot = RW_SURFACE_WRITES, reclaim = RW_SURFACE_WRITES, oldest = 0;
+		for (unsigned i = 0; i < RW_SURFACE_WRITES; i++) {
+			if (rw_surface_writes[i].sid == sid) {
+				slot = i;
+				break;
+			}
+			if (reclaim == RW_SURFACE_WRITES &&
+			    (rw_surface_writes[i].sid == 0 ||
+			     rw_surface_writes[i].commit <= rw_completed_commit)) {
+				reclaim = i;
+			}
+			if (rw_surface_writes[i].commit < rw_surface_writes[oldest].commit) {
+				oldest = i;
+			}
+		}
+		if (slot == RW_SURFACE_WRITES) {
+			slot = reclaim;
+		}
+		if (slot < RW_SURFACE_WRITES) {
+			rw_surface_writes[slot].sid = sid;
+			rw_surface_writes[slot].commit = commit;
 			break;
 		}
-		if (rw_surface_writes[i].commit < rw_surface_writes[oldest].commit) {
-			oldest = i;
+		/* Table full of genuinely in-flight writes: wait for the oldest before reusing it. */
+		unsigned wait_target = rw_surface_writes[oldest].commit;
+		if (pthread_equal(pthread_self(), rw_completion_tid) ||
+		    rw_completed_commit >= wait_target) {
+			rw_surface_writes[oldest].sid = sid;
+			rw_surface_writes[oldest].commit = commit;
+			break;
+		}
+		struct timespec deadline;
+		clock_gettime(CLOCK_REALTIME, &deadline);
+		deadline.tv_sec += 4;
+		while (rw_completed_commit < wait_target) {
+			if (pthread_cond_timedwait(&rw_completion_done, &rw_completion_lock,
+			                           &deadline) != 0) {
+				rw_surface_writes[oldest].sid = sid;
+				rw_surface_writes[oldest].commit = commit;
+				goto done;
+			}
 		}
 	}
-	if (slot == RW_SURFACE_WRITES) {
-		slot = oldest;   /* table full: the oldest pending write is the one a reader misses least */
-	}
-	rw_surface_writes[slot].sid = sid;
-	rw_surface_writes[slot].commit = commit;
+done:
 	pthread_mutex_unlock(&rw_completion_lock);
 }
 

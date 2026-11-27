@@ -21,9 +21,22 @@ sample_at(int64_t i, int64_t in, int64_t out)
  * scaling a whole frame takes one processor some 9 ms, so with boot-arg fb_threads=N it is shared
  * out between N of them, each with rows of its own and a row of blending of its own.
  */
+/* 'l10r' (BGR10A2Unorm): B[9:0] G[19:10] R[29:20] A[31:30] -> BGRA8888 for 8-bit panel scanout. */
+static inline uint32_t
+l10r_to_bgra(uint32_t p)
+{
+	uint32_t b = ((p & 0x3ffu) * 255u + 511u) / 1023u;
+	uint32_t g = (((p >> 10) & 0x3ffu) * 255u + 511u) / 1023u;
+	uint32_t r = (((p >> 20) & 0x3ffu) * 255u + 511u) / 1023u;
+	uint32_t a = ((p >> 30) & 0x3u) * 85u;
+
+	return b | (g << 8) | (r << 16) | (a << 24);
+}
+
 struct RowJob {
 	const uint8_t * pixels;
 	uint32_t        stride;
+	uint32_t        pixelFormat;
 	int32_t         sx, sy, sw, sh, px0, py0, px1, py1, cx0, cx1;
 	int32_t         by0, by1;       /* the panel rows this frame draws (dirtyBand), within py0..py1 */
 	uint32_t        bufferSeq;      /* fRowSeq when the target panel buffer was last updated */
@@ -40,6 +53,7 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 	int32_t sx = job->sx, sy = job->sy, sw = job->sw, sh = job->sh;
 	int32_t px0 = job->px0, py0 = job->py0, px1 = job->px1, py1 = job->py1, cx0 = job->cx0, cx1 = job->cx1;
 	bool filter = job->filter;
+	bool is_l10r = job->pixelFormat == FOURCC('l', '1', '0', 'r');
 
 	for (int32_t y = y0; y < y1; y++) {
 		const uint32_t * from;
@@ -57,10 +71,17 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 				continue;
 			}
 			/* not scaled at all */
-			memcpy(to + px0, pixels + (size_t) (sy + r) * stride + (size_t) sx * 4, (size_t) sw * 4);
+			if (is_l10r) {
+				const uint32_t * srcRow = (const uint32_t *) (pixels + (size_t) (sy + r) * stride) + sx;
+				for (int32_t x = 0; x < sw; x++) {
+					to[px0 + x] = l10r_to_bgra(srcRow[x]);
+				}
+			} else {
+				memcpy(to + px0, pixels + (size_t) (sy + r) * stride + (size_t) sx * 4, (size_t) sw * 4);
+			}
 			continue;
 		}
-		if (filter) {
+		if (filter && !is_l10r) {
 			int64_t at = sample_at(y - py0, sh, py1 - py0);
 			uint32_t row = (uint32_t) (at >> 8), weight = (uint32_t) (at & 255);
 			uint32_t r0 = row > 0 ? row - 1 : 0;
@@ -90,12 +111,13 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 			    fRowChanged[row] <= job->bufferSeq) {
 				continue;
 			}
-			from = (const uint32_t *) (pixels + (size_t) (sy + row) * stride);
+			from = (const uint32_t *) (pixels + (size_t) (sy + row) * stride) + (filter ? sx : 0);
 		}
 		if (fDiff) {
 			for (int32_t x = cx0; x < cx1; x++) {
-				uint32_t value = filter ? blend(from[fColumn[x]], from[fColumn[x] + (fColumnWeight[x] != 0)], fColumnWeight[x]) :
-				    from[fColumn[x]];
+				uint32_t value = is_l10r ? l10r_to_bgra(from[fColumn[x]]) :
+				    (filter ? blend(from[fColumn[x]], from[fColumn[x] + (fColumnWeight[x] != 0)], fColumnWeight[x]) :
+				    from[fColumn[x]]);
 
 				if (to[x] != value) {
 					fDiffPixels++;
@@ -106,8 +128,12 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 				}
 			}
 		}
-		if (filter) {
+		if (filter && !is_l10r) {
 			scaleRow(from, to + cx0, fColumn + cx0, fColumnWeight + cx0, (uint32_t) (cx1 - cx0), (uint32_t) sw);
+		} else if (is_l10r) {
+			for (int32_t x = cx0; x < cx1; x++) {
+				to[x] = l10r_to_bgra(from[fColumn[x]]);
+			}
 		} else {
 			for (int32_t x = cx0; x < cx1; x++) {
 				to[x] = from[fColumn[x]];

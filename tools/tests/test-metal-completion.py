@@ -65,9 +65,9 @@ def prepare(folder):
     EXTRACTS.append({'source': str(AIR / 'air_metal_fence.inc'), 'line': 1,
                      'marker': 'entire fence implementation', 'sha256': digest(fence)})
     blocks = [locks, timeout,
-              extract(AIR / 'air_metal.c', 'static int\nfinish_or_say_why'),
-              extract(AIR / 'air_metal.c', 'int\nrwa_flush('),
-              extract(AIR / 'air_metal.c', 'int\nrwa_finish('), fence]
+              extract(AIR / 'air_metal_bind.inc', 'static int\nfinish_or_say_why'),
+              extract(AIR / 'air_metal_bind.inc', 'int\nrwa_flush('),
+              extract(AIR / 'air_metal_reflect_vertex.inc', 'int\nrwa_finish('), fence]
     (folder / 'air-extracts.inc').write_text('\n\n'.join(blocks) + '\n')
     blocks = [extract(SOURCE / 'annibalemetal_texture.inc', '- (instancetype)initWithAnnibaleDevice:'),
               extract(SOURCE / 'annibalemetal_texture.inc', '- (void)dealloc')]

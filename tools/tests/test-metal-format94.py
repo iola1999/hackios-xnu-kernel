@@ -110,6 +110,9 @@ static struct {
 #define rw_pipe_key(...) ((void)0)
 #define rw_pipe_find(...) NULL
 #define rw_pipe_keep(...) ((void)0)
+#define rw_pipe_inflight_enter(...) true
+#define rw_pipe_inflight_leave(...) ((void)0)
+#define rw_harvest_record(...) ((void)0)
 #define rw_linked_fragment_functions(...) 0u
 #define rw_linked_free(...) ((void)0)
 #define air_fail_dump(...) ((void)0)
@@ -310,7 +313,7 @@ def main():
         result = subprocess.run([str(binary)], text=True, capture_output=True)
         print(result.stdout, end="")
         print(result.stderr, end="")
-        if args.require_correct:
+        if args.require_correct or (args.revision is None and not args.preserve94):
             return result.returncode
         match = re.search(r"RESULT checks=(\d+) failures=(\d+)", result.stdout)
         expected = {"native l10r surface format", "surface import preserves BGR10A2",

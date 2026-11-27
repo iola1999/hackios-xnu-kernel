@@ -516,5 +516,6 @@ bool adreno8_gpu_cp_ready(void);
 /* Caller must successfully authenticate PAS 13 before this transition. */
 bool adreno8_gpu_secure_exit(void);
 bool adreno8_gpu_scratch_test(void);
+void adreno8_gpu_reset_for_recovery(void);
 
 #endif

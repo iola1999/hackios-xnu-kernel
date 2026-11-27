@@ -19,7 +19,24 @@ STUB = r'''
 #include <stdio.h>
 #include <string.h>
 typedef uintptr_t vm_offset_t;
-static bool annibale, adreno8_gpu8_keep, adreno8_gpu8_ifpc, adreno8_gpu8_preempt, adreno8_gpu8_return, bo_open, self_test, publish_ok;
+static bool annibale, adreno8_gpu8_keep, adreno8_gpu8_ifpc, adreno8_gpu8_preempt, adreno8_gpu8_return, adreno8_gpu_recover_enabled, adreno8_gpu_coherent, adreno8_gpu_stall, bo_open, self_test, publish_ok;
+struct adreno8_block { const char *name; uint32_t phys, size; vm_offset_t base; };
+struct adreno8_gpu_space { bool is_on; };
+#define SCTLR_ON (1u | 2u | 4u | 32u)
+#define SCTLR_CFCFG (1u << 7)
+#define SECURE_CONTEXT 3
+static struct adreno8_gpu_space adreno8_gpu_space, adreno8_gmu_space, adreno8_secure_space;
+void adreno8_gmu_reset_for_recovery(void);
+bool adreno8_step_firmware(void);
+bool adreno8_step_gmu_start(void);
+bool adreno8_step_queues(void);
+bool adreno8_step_tables(void);
+bool adreno8_step_gx_power(void);
+bool adreno8_cx_ready(void);
+bool adreno8_secure_lost(void);
+bool adreno8_space_faulted(struct adreno8_gpu_space *s);
+bool adreno8_space_clear_fault(struct adreno8_gpu_space *s);
+bool adreno8_space_sync(struct adreno8_gpu_space *s);
 static uint32_t adreno8_gx_hz[17] = {0, 160000000, 222000000, 342000000};
 static unsigned adreno8_gx_count = 4;
 static unsigned legacy_calls, enable_calls, close_calls, stop_calls, cache_calls, submit_calls, publish_calls, ready_checks, speed_ticks, oob_release_calls;
@@ -68,6 +85,32 @@ uint32_t adreno8_context_last_slot(uint32_t slot) { (void)slot; return 17; }
 uint32_t adreno8_context_retired(void) { return 17; }
 uint32_t adreno8_context_retired_for(uint32_t fence) { return (fence & 0x80000000u) ? (0x80000000u | 17u) : 17u; }
 void adreno8_gpu_hang_dump(void) {}
+void adreno8_gpu_reset_for_recovery(void) {}
+void adreno8_gmu_reset_for_recovery(void) {}
+void adreno8_hfi_reset_for_recovery(void) {}
+void adreno8_hfi_irq_resume(void) {}
+void adreno8_hwsched_reset_for_recovery(void) {}
+bool adreno8_hwsched_start(void) { return true; }
+bool adreno8_memory_reset_for_recovery(void) { return true; }
+void adreno8_memory_set_recover_armed(bool armed) { (void)armed; }
+bool adreno8_gpu_memory_verify(void) { return true; }
+bool adreno8_gpu_cp_init(void) { return true; }
+bool adreno8_gpu_secure_exit(void) { return true; }
+bool adreno8_gpu_scratch_test(void) { return true; }
+bool adreno8_step_firmware(void) { return true; }
+bool adreno8_step_gmu_start(void) { return true; }
+bool adreno8_step_queues(void) { return true; }
+bool adreno8_step_tables(void) { return true; }
+bool adreno8_step_gx_power(void) { return true; }
+bool adreno8_cx_ready(void) { return true; }
+bool adreno8_secure_lost(void) { return false; }
+bool adreno8_zap_ready(void) { return true; }
+bool adreno8_space_faulted(struct adreno8_gpu_space *s) { (void)s; return false; }
+bool adreno8_space_clear_fault(struct adreno8_gpu_space *s) { (void)s; return true; }
+bool adreno8_space_sync(struct adreno8_gpu_space *s) { (void)s; return true; }
+void adreno8_context_reset_for_recovery(void) {}
+bool adreno8_context_rebind_for_recovery(void) { return true; }
+bool adreno8_bo_reset_for_recovery(void) { bo_open = true; return true; }
 void adreno8_gpu_oob_release(void) { oob_release_calls++; }
 bool adreno8_gpu_oob_acquire(void) { return true; }
 bool adreno8_hfi_poll(void) { return false; }
@@ -317,7 +360,7 @@ def main():
         target=Path(folder); (target/"sys").mkdir()
         (target/"adreno8_private.h").write_text(STUB)
         (target/"sys/annibale_input.h").write_text("")
-        for name in ("adreno8_bo_private.h","adreno8_memory_private.h","adreno8_context_private.h","adreno8_hwsched_private.h"):
+        for name in ("adreno8_bo_private.h","adreno8_memory_private.h","adreno8_secure_private.h","adreno8_smmu_private.h","adreno8_context_private.h","adreno8_hwsched_private.h","adreno8_gpu_private.h","adreno8_zap_private.h"):
             (target/name).write_text((DEV/"adreno8"/name).read_text())
         unit='#include "adreno8_private.h"\n'+dispatch+BACKENDS+DISPATCH_CASES
         run(unit,target,"dispatch",False)

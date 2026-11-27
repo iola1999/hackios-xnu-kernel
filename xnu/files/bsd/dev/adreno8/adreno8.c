@@ -102,6 +102,7 @@ uint32_t adreno8_gmu_from_pll;                 /* adreno8_gmuclk */
 bool adreno8_direct_ring;                      /* cold-boot ordinary HFI/CP_INIT diagnostic */
 bool adreno8_gpu_stall;                        /* adreno8_gpu_stall=1 */
 bool adreno8_gpu_coherent;                     /* gpu_coherent=1 */
+bool adreno8_gpu_recover_enabled;              /* gpu_recover=1 */
 
 uint32_t adreno8_step;                         /* the one being performed */
 
@@ -417,6 +418,8 @@ adreno8_init(void)
 	adreno8_gpu_stall = PE_parse_boot_argn("adreno8_gpu_stall", &one, sizeof(one)) && one == 1;
 	one = 0;
 	adreno8_gpu_coherent = PE_parse_boot_argn("gpu_coherent", &one, sizeof(one)) && one == 1;
+	one = 0;
+	adreno8_gpu_recover_enabled = PE_parse_boot_argn("gpu_recover", &one, sizeof(one)) && one == 1;
 	PE_parse_boot_argn("adreno8_skip", &adreno8_skip_steps, sizeof(adreno8_skip_steps));
 	PE_parse_boot_argn("adreno8_empty_powerup", &empty_powerup, sizeof(empty_powerup));
 	PE_parse_boot_argn("adreno8_raw_nop", &raw_nop, sizeof(raw_nop));

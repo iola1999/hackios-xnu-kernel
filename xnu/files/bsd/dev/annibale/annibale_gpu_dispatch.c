@@ -1,8 +1,13 @@
 /* AnnibaleGPU C ABI backed by the SM8750 Adreno 830 driver. */
 #include "../adreno8/adreno8_private.h"
+#include "../adreno8/adreno8_memory_private.h"
+#include "../adreno8/adreno8_secure_private.h"
+#include "../adreno8/adreno8_smmu_private.h"
 #include "../adreno8/adreno8_bo_private.h"
 #include "../adreno8/adreno8_context_private.h"
 #include "../adreno8/adreno8_hwsched_private.h"
+#include "../adreno8/adreno8_gpu_private.h"
+#include "../adreno8/adreno8_zap_private.h"
 #include <sys/annibale_input.h>
 #ifdef KERNEL
 #include <sys/proc.h>
@@ -32,6 +37,7 @@ adreno8_step_service(void)
 		adreno8_bo_stop();
 		return false;
 	}
+	adreno8_memory_set_recover_armed(adreno8_gpu_recover_enabled);
 	if (adreno8_gpu8_ifpc) {
 		adreno8_gpu_oob_release();
 	}
@@ -233,13 +239,55 @@ annibale_gpu_report(const char *why)
 		adreno8_sleep_us(100000);
 	}
 	adreno8_gpu_hang_dump();
+}
+
+static bool
+annibale_gpu_recover_abort(bool *terminal)
+{
+	*terminal = true;
+	adreno8_memory_set_recover_armed(false);
 	adreno8_bo_stop();
+	return false;
 }
 
 bool
 annibale_gpu_recover(void)
 {
-	return false;
+	static bool recover_busy, recover_terminal;
+
+	if (!annibale_platform_is_annibale()) {
+		return false;
+	}
+	if (!adreno8_gpu_recover_enabled || recover_busy || recover_terminal) {
+		return annibale_gpu_recover_abort(&recover_terminal);
+	}
+	recover_busy = true;
+	if (!adreno8_cx_ready() || adreno8_secure_lost() || !adreno8_zap_ready() ||
+	    (adreno8_secure_space.is_on && adreno8_space_faulted(&adreno8_secure_space)) ||
+	    (adreno8_gmu_space.is_on && adreno8_space_faulted(&adreno8_gmu_space)) ||
+	    (adreno8_gpu_space.is_on &&
+	    (!adreno8_space_clear_fault(&adreno8_gpu_space) || !adreno8_space_sync(&adreno8_gpu_space))) ||
+	    !adreno8_memory_reset_for_recovery()) {
+		recover_busy = false;
+		return annibale_gpu_recover_abort(&recover_terminal);
+	}
+	adreno8_hfi_reset_for_recovery();
+	adreno8_hwsched_reset_for_recovery();
+	adreno8_gpu_reset_for_recovery();
+	adreno8_context_reset_for_recovery();
+	adreno8_gmu_reset_for_recovery();
+	if (!adreno8_step_firmware() || !adreno8_step_gmu_start() || !adreno8_step_queues() ||
+	    !adreno8_step_tables() || !adreno8_hwsched_start() || !adreno8_step_gx_power() ||
+	    !adreno8_gpu_memory_verify() || !adreno8_gpu_cp_init() ||
+	    !adreno8_gpu_secure_exit() || !adreno8_gpu_scratch_test() ||
+	    !adreno8_context_rebind_for_recovery() || !adreno8_bo_reset_for_recovery()) {
+		recover_busy = false;
+		return annibale_gpu_recover_abort(&recover_terminal);
+	}
+	adreno8_hfi_irq_resume();
+	recover_busy = false;
+	adreno8_say("adreno8: GPU recovery completed; submissions resumed\n");
+	return true;
 }
 
 void

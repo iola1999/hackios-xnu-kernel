@@ -25,6 +25,7 @@ static struct adreno8_memory_entry adreno8_memory_entries[MEMORY_COUNT];
 static uint32_t adreno8_memory_count;
 static uint64_t adreno8_memory_bytes;
 static bool adreno8_memory_failed;
+static bool adreno8_recover_armed;
 
 bool
 adreno8_memory_retained(void)
@@ -456,12 +457,38 @@ success:
 	return true;
 }
 
+void
+adreno8_memory_set_recover_armed(bool armed)
+{
+	adreno8_recover_armed = armed;
+}
+
+bool
+adreno8_memory_reset_for_recovery(void)
+{
+	if (adreno8_secure_lost() ||
+	    (adreno8_secure_space.is_on && adreno8_space_faulted(&adreno8_secure_space)) ||
+	    (adreno8_gmu_space.is_on && adreno8_space_faulted(&adreno8_gmu_space)) ||
+	    !adreno8_gpu_space.is_on || adreno8_space_faulted(&adreno8_gpu_space)) {
+		return false;
+	}
+	adreno8_memory_failed = false;
+	return true;
+}
+
 /* HFI owns the failure notification; this module owns allocation admission.
  * No failure returns assigned memory to HLOS or makes another transfer legal. */
 void
 adreno8_hwsched_memory_failed(void)
 {
 	if (adreno8_gpu8_secure_mode != SECURE_MODE_TRANSLATION_B) {
+		return;
+	}
+	/* Keep already-transferred kind-5 ownership across a recoverable hang; only a
+	 * permanent abort (recovery off, refused, or failed) closes adreno8_xfer_state. */
+	if (adreno8_recover_armed && !adreno8_secure_lost() &&
+	    !(adreno8_secure_space.is_on && adreno8_space_faulted(&adreno8_secure_space))) {
+		adreno8_memory_failed = true;
 		return;
 	}
 	adreno8_secure_xfer_abort();

@@ -135,7 +135,8 @@ def psc(codec=1, variation='valid', native=False, malformed=None):
     fields += [(0x03000155, 1, [0])]
     changes = {'depth': (0x0300010f, [0x000a000a]), 'depth12': (0x0300010f, [0x000c000c]),
                'zero-count': (0x03000124, [0]),
-               'min7': (0x03000124, [7]), 'resolution': (0x03000103, [768 << 16 | 480]),
+               'min7': (0x03000124, [7]), 'min8': (0x03000124, [8]), 'min17': (0x03000124, [17]),
+               'resolution': (0x03000103, [768 << 16 | 480]),
                'crop': (0x03000105, [1, 0]), 'interlace': (0x03000120, [0]),
                # A 640x474 session coded as 640x480: 6 rows cropped at the bottom, or a wrong crop.
                'coded': (0x03000105, [0, 6]), 'coded-mismatch': (0x03000105, [0, 4])}
@@ -190,14 +191,14 @@ def count_fixtures(directory, expected):
         path = directory / (name + '.bin'); path.write_bytes(blob)
         cases.append((name, path, expected))
     for codec in (1, 2):
-        for n in [0, 1, 2, 3, 4, 5, 6, 7, 0xffffffff]:
+        for n in [0, 1, 2, 3, 4, 5, 6, 7, 8, 16, 17, 0xffffffff]:
             add(f'raw-negotiated-{["h264", "hevc"][codec - 1]}-{n}', n, codec)
     for name in ['range-exact', 'range-over', 'range-wrap', 'zero-frame', 'dpb-short', 'closing',
                  'alloc-fail-first', 'alloc-fail-second', 'alloc-fail-first-retained', 'alloc-fail-second-retained',
                  'return-last', 'drain-last', 'repeat', 'changing', 'stop-fail-input', 'stop-fail-raw', 'slot4']:
         add('raw-' + name)
     add('raw-unallocated', 1)
-    add('raw-capacity-isolated', 7)
+    add('raw-capacity-isolated', 17)
     add('raw-cd21-actual')
     return cases
 
@@ -253,11 +254,14 @@ def write_fixtures(directory):
         'reject-index', 'reject-base', 'reject-port', 'reject-size',
         'reject-overflow', 'reject-offset', 'reject-readonly', 'reject-psc')]
     cases.extend((name, default, expected) for name in names)
-    for variation in ('missing', 'depth', 'zero-count', 'min7',
+    for variation in ('missing', 'depth', 'zero-count', 'min17',
                       'resolution', 'crop', 'interlace', 'bad-payload'):
         path = directory / f'psc-{variation}.bin'
         path.write_bytes(psc(variation=variation))
         cases.append(('psc-' + variation, path, expected))
+    min7_path = directory / 'psc-valid-min7.bin'
+    min7_path.write_bytes(psc(variation='min7'))
+    cases.append(('psc-valid-min7', min7_path, expected))
     for name, variation in (('psc-valid-coded', 'coded'), ('psc-coded-mismatch', 'coded-mismatch')):
         path = directory / f'psc-{variation}.bin'
         path.write_bytes(psc(variation=variation))
@@ -267,15 +271,32 @@ def write_fixtures(directory):
     hevc10_path.write_bytes(psc(codec=2, variation='depth', native=True))
     cases.append(('psc-valid-hevc10', hevc10_path, expected))
     cases.append(('output-copy-hevc10', hevc10_path, expected))
+    def patch_hevc10(blob_in, w=None, h=None, min_count=None):
+        blob = bytearray(blob_in)
+        off = 32
+        while off < len(blob):
+            kind = struct.unpack_from('<I', blob, off + 4)[0]
+            if kind == 0x03000103 and w is not None and h is not None:
+                struct.pack_into('<I', blob, off + 32, (w << 16) | h)
+            elif kind == 0x03000124 and min_count is not None:
+                struct.pack_into('<I', blob, off + 32, min_count)
+            off += struct.unpack_from('<I', blob, off)[0]
+        return bytes(blob)
+    hevc10_320_min7 = directory / 'psc-hevc10-320x240-min7.bin'
+    hevc10_320_min7.write_bytes(patch_hevc10(hevc10_path.read_bytes(), 320, 240, 7))
+    cases.append(('psc-valid-hevc10-320x240-min7', hevc10_320_min7, expected))
+    hevc10_min8 = directory / 'psc-hevc10-min8.bin'
+    hevc10_min8.write_bytes(patch_hevc10(hevc10_path.read_bytes(), min_count=8))
+    cases.append(('psc-valid-hevc10-min8', hevc10_min8, expected))
     hevc10_1080p_path = directory / 'psc-hevc10-1080p.bin'
-    blob_1080p = bytearray(psc(codec=2, variation='depth', native=True))
-    off = 32
-    while off < len(blob_1080p):
-        if struct.unpack_from('<I', blob_1080p, off + 4)[0] == 0x03000103:
-            struct.pack_into('<I', blob_1080p, off + 32, (1920 << 16) | 1080)
-        off += struct.unpack_from('<I', blob_1080p, off)[0]
-    hevc10_1080p_path.write_bytes(blob_1080p)
+    hevc10_1080p_path.write_bytes(patch_hevc10(hevc10_path.read_bytes(), 1920, 1080))
     cases.append(('psc-valid-hevc10-1080p', hevc10_1080p_path, expected))
+    hevc10_1080p_min8 = directory / 'psc-hevc10-1080p-min8.bin'
+    hevc10_1080p_min8.write_bytes(patch_hevc10(hevc10_path.read_bytes(), 1920, 1080, 8))
+    cases.append(('psc-valid-hevc10-1080p-min8', hevc10_1080p_min8, expected))
+    hevc10_1080p_min9 = directory / 'psc-hevc10-1080p-min9.bin'
+    hevc10_1080p_min9.write_bytes(patch_hevc10(hevc10_path.read_bytes(), 1920, 1080, 9))
+    cases.append(('psc-hevc10-1080p-min9', hevc10_1080p_min9, expected))
     hevc12_path = directory / 'psc-hevc12.bin'
     hevc12_path.write_bytes(psc(codec=2, variation='depth12', native=True))
     cases.append(('psc-depth-hevc12', hevc12_path, expected))
@@ -529,7 +550,7 @@ def mutations():
         'psc_depth': (HFI, 'static int\niris_start_output', 'struct iris_reply_wait',
                       '!depth_ok ||', '(!depth_ok && false) ||', ['psc-depth', 'psc-depth-hevc12']),
         'p010_color_fmt': (PRIVATE, '#define HFI_COLOR_FMT_P010', '#define HFI_PORT_NONE',
-                           '4u', '1u', ['psc-valid-hevc10']),
+                           '3u', '4u', ['psc-valid-hevc10']),
         'raw_nv12': (PRIVATE, '#define HFI_COLOR_FMT_NV12', '#define HFI_PORT_NONE',
                      '1u', '2u', ['wire-psc-h264', 'wire-psc-hevc']),
         'stride_packed': (HFI, 'static int\niris_start_output', 'struct iris_reply_wait',

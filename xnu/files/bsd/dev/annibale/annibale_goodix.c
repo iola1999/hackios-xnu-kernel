@@ -491,22 +491,95 @@ int_latch_on(void)
 	    rd(GPIO_INTR_CFG(PIN_INT)));
 }
 
+#define GOODIX_ACTIVE_POLL_US   2000u   /* active tier: 500 Hz, captures 240 Hz (4.17 ms) without phase slip */
+#define GOODIX_IDLE_POLL_US     8000u   /* idle tier: 125 Hz after all fingers lift for GOODIX_IDLE_HOLD_US */
+#define GOODIX_IDLE_HOLD_US     200000u /* stay in active tier for 200 ms after last touch or IRQ */
+#define GOODIX_FALLBACK_US      16000u  /* fallback SPI poll interval when IRQ line stays high */
+
+struct goodix_poll_sched {
+	uint32_t active_us;
+	uint32_t idle_us;
+	uint32_t hold_us;
+	uint64_t last_active_us;
+	uint64_t next_deadline_us;
+	bool     in_active;
+};
+
+static void
+goodix_poll_sched_init(struct goodix_poll_sched *s, bool has_boot_arg, uint32_t boot_poll_us)
+{
+	uint32_t active_us = GOODIX_ACTIVE_POLL_US;
+	uint32_t idle_us = GOODIX_IDLE_POLL_US;
+
+	if (has_boot_arg && boot_poll_us >= 250u && boot_poll_us <= 100000u) {
+		if (boot_poll_us < active_us) {
+			active_us = boot_poll_us;
+		}
+		if (boot_poll_us > idle_us) {
+			idle_us = boot_poll_us;
+		}
+	}
+	s->active_us = active_us;
+	s->idle_us = idle_us;
+	s->hold_us = GOODIX_IDLE_HOLD_US;
+	s->last_active_us = 0;
+	s->next_deadline_us = 0;
+	s->in_active = false;
+}
+
+static uint32_t
+goodix_poll_next_sleep_us(struct goodix_poll_sched *s, uint64_t looked_us, uint64_t done_us,
+    bool got_event, bool any_down)
+{
+	bool prev_active = s->in_active;
+
+	if (got_event || any_down) {
+		s->last_active_us = done_us;
+		s->in_active = true;
+	} else if (s->in_active && done_us >= s->last_active_us &&
+	    done_us - s->last_active_us >= s->hold_us) {
+		s->in_active = false;
+	}
+
+	uint32_t period = s->in_active ? s->active_us : s->idle_us;
+	uint64_t desired;
+
+	if (s->next_deadline_us == 0 || s->in_active != prev_active) {
+		desired = looked_us + period;
+	} else {
+		desired = s->next_deadline_us + period;
+	}
+	if (desired <= done_us) {
+		desired = done_us + period;
+	} else if (desired - done_us > (uint64_t)period * 2u) {
+		desired = done_us + period;
+	}
+	s->next_deadline_us = desired;
+	return (uint32_t)(desired - done_us);
+}
+
+static bool
+goodix_any_contact_down(void)
+{
+	for (uint32_t id = 0; id < GOODIX_MAX_TOUCHES; id++) {
+		if (contact[id].down) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static void
 goodix_thread(__unused void *parameter, __unused wait_result_t result)
 {
-	unsigned idle = 0, idle_looks;
-	uint32_t poll_us = 8000, latency = 0, reads = 0;
-	uint64_t before = 0, reading = 0;
+	struct goodix_poll_sched sched;
+	uint32_t boot_poll_us = 0, latency = 0, reads = 0;
+	bool has_poll_arg;
+	uint64_t before = 0, reading = 0, last_poll_us = 0, last_status_us = 0;
 
-	PE_parse_boot_argn("touch_poll_us", &poll_us, sizeof(poll_us));
+	has_poll_arg = PE_parse_boot_argn("touch_poll_us", &boot_poll_us, sizeof(boot_poll_us));
 	PE_parse_boot_argn("touch_lat", &latency, sizeof(latency));
-	if (poll_us < 250 || poll_us > 100000) {
-		poll_us = 8000;
-	}
-	idle_looks = 16000 / poll_us;   /* a report read every 16 ms even with the line high, in case it is missed */
-	if (idle_looks == 0) {
-		idle_looks = 1;
-	}
+	goodix_poll_sched_init(&sched, has_poll_arg, boot_poll_us);
 
 	tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
 	gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
@@ -528,7 +601,8 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 		return;
 	}
 	int_latch_on();
-	printf("goodix: %s touch screen ready; the interrupt line is looked at every %u us\n", chip_name(), poll_us);
+	printf("goodix: %s touch screen ready; polling active=%u us idle=%u us (hold=%u ms)\n",
+	    chip_name(), sched.active_us, sched.idle_us, sched.hold_us / 1000u);
 	{
 		uint32_t rate = 0;
 
@@ -541,12 +615,12 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 			    done ? "acknowledged" : "NOT ACKNOWLEDGED");
 		}
 	}
-	for (unsigned tick = 1;; tick++) {
-		uint64_t looked = micros_now(), read_at;
+	last_poll_us = last_status_us = micros_now();
+	for (;;) {
+		uint64_t looked = micros_now(), read_at = looked;
 
 		/* the interrupt line is low while a report waits, or an edge was latched since the last look.
-		 * do not blindly read SPI on touching==true every 4ms; read only when !gpio_get(PIN_INT)
-		 * or interrupt status is set, falling back to idle_looks (16ms). */
+		 * read only when !gpio_get(PIN_INT) or interrupt status is set, falling back every 16 ms. */
 		bool waiting = !gpio_get(PIN_INT);
 
 		if (int_latched && (rd(GPIO_INTR_STATUS(PIN_INT)) & 1)) {
@@ -554,28 +628,31 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 			waiting = true;
 		}
 		if (waiting) {
-			idle = 0;
 			chip_poll();
 			read_at = micros_now();
+			last_poll_us = read_at;
 			reads++;
 			reading += read_at - looked;
 			if (latency) {
 				annibale_tl("tl: c before %llu seen %llu read %llu\n", before, looked, read_at);
 			}
-		} else if (++idle >= idle_looks) {
-			idle = 0;
+		} else if (looked - last_poll_us >= GOODIX_FALLBACK_US) {
 			chip_poll();
+			read_at = micros_now();
+			last_poll_us = read_at;
 			reads++;
-			reading += micros_now() - looked;
+			reading += read_at - looked;
 		}
 		before = looked;
-		if (tick % (60 * (1000000 / poll_us)) == 0) {
+		if (read_at - last_status_us >= 60000000ULL) {
+			last_status_us = read_at;
 			printf("%s: so far %u reports in %u looks (%u bad), %u finger positions, the last at %u, %u; "
-			    "interrupt line %s; a report takes %llu us to read; the line looked at every %u us, reports %s a second\n",
+			    "interrupt line %s; a report takes %llu us to read; active=%u us idle=%u us, reports %s a second\n",
 			    chip_name(), seen.reports, seen.polls, seen.bad, seen.touches, seen.last_x, seen.last_y,
-			    gpio_get(PIN_INT) ? "high" : "low", reads ? reading / reads : 0, poll_us, report_rate);
+			    gpio_get(PIN_INT) ? "high" : "low", reads ? reading / reads : 0,
+			    sched.active_us, sched.idle_us, report_rate);
 		}
-		sleep_us(poll_us);
+		sleep_us(goodix_poll_next_sleep_us(&sched, looked, read_at, waiting, goodix_any_contact_down()));
 	}
 }
 

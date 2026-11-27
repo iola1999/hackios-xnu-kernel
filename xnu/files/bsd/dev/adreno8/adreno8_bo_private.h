@@ -13,6 +13,7 @@ bool adreno8_bo_ready(void);
 bool adreno8_bo_enabled(void);
 /* Close all BO admission without releasing pages or IOVAs. */
 void adreno8_bo_stop(void);
+bool adreno8_bo_reset_for_recovery(void);
 /* Why a reservation was refused, written through adreno8_bo_reserve's `refusal` when it returns
  * 0, so the user client can answer with a return code that says which shortage it was instead of
  * one kIOReturnNoMemory for all of them. iokit/Kernel/AnnibaleGPU.cpp repeats these values (the

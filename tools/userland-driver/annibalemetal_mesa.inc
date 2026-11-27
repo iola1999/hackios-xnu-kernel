@@ -22,6 +22,8 @@ static struct {
 	__typeof__(&rwa_buffer_textures_writeback) buffer_textures_writeback;
 	__typeof__(&rwa_texture_view) texture_view;
 	__typeof__(&rwa_texture_set_swizzle) texture_set_swizzle;
+	unsigned (*texture_set_purgeable)(struct rwa_texture *, unsigned, char *, size_t);
+	bool (*texture_is_purgeable)(const struct rwa_texture *);
 	__typeof__(&rwa_texture_thumbnail) texture_thumbnail;
 	__typeof__(&rwa_buffer_set_mirror) buffer_set_mirror;
 	__typeof__(&rwa_buffer_from_memory) buffer_from_memory;
@@ -137,6 +139,8 @@ mesa_available(void)
 	*(void **)&mesa.texture_rgb2p_pass = dlsym(mesa.handle, "rwa_texture_rgb2p_pass");
 	*(void **)&mesa.texture_view = dlsym(mesa.handle, "rwa_texture_view");
 	*(void **)&mesa.texture_set_swizzle = dlsym(mesa.handle, "rwa_texture_set_swizzle");
+	*(void **)&mesa.texture_set_purgeable = dlsym(mesa.handle, "rwa_texture_set_purgeable");
+	*(void **)&mesa.texture_is_purgeable = dlsym(mesa.handle, "rwa_texture_is_purgeable");
 	*(void **)&mesa.texture_thumbnail = dlsym(mesa.handle, "rwa_texture_thumbnail");
 	*(void **)&mesa.buffer_set_mirror = dlsym(mesa.handle, "rwa_buffer_set_mirror");
 	*(void **)&mesa.buffer_from_memory = dlsym(mesa.handle, "rwa_buffer_from_memory");

@@ -24,7 +24,7 @@ extern struct adreno8_block adreno8_smmu;
 enum gpu_state { GPU_COLD, GPU_PREPARED, GPU_CP_READY, GPU_UNSECURE, GPU_TESTED, GPU_FAILED };
 static enum gpu_state gpu_state;
 static struct adreno8_memory *sqe, *aqe, *powerup, *scratch, *ring;
-static bool oob_requested, oob_acked, oob_held;
+static bool oob_requested, oob_acked, oob_held, gpu_hang_dumped;
 
 static bool
 gpu_fail(const char *what)
@@ -562,12 +562,10 @@ adreno8_gpu_hang_dump(void)
 	static const char *const uche_clients[] = { "BR_VFD", "BR_SP", "BR_VSC", "BR_VPC", "BR_HLSQ",
 		"BR_PC", "BR_LRZ", "BR_TP", "BV_VFD", "BV_SP", "BV_VSC", "BV_VPC", "BV_HLSQ",
 		"BV_PC", "BV_LRZ", "BV_TP", "STCHE" };
-	static bool dumped;
-
 	/* Both the HFI 150 handler and the timeout report ask; the first one reads. */
-	if (dumped)
+	if (gpu_hang_dumped)
 		return;
-	dumped = true;
+	gpu_hang_dumped = true;
 
 	if (gpu_state != GPU_FAILED && !oob_held && adreno8_gpu8_ifpc)
 		(void)adreno8_gpu_oob_acquire();
@@ -910,4 +908,20 @@ adreno8_gpu_wait_idle(const char *what)
 		return gpu_fail(what);
 	}
 	return gpu_wait_idle(what);
+}
+
+void
+adreno8_gpu_reset_for_recovery(void)
+{
+	gpu_hang_dumped = false;
+	oob_requested = false;
+	oob_acked = false;
+	oob_held = false;
+	if (gpu_state != GPU_COLD) {
+		gpu_state = GPU_PREPARED;
+	}
+	if (scratch != NULL && scratch->memory != 0) {
+		memset((void *)scratch->memory, 0, scratch->size);
+		(void)adreno8_memory_publish(scratch, 0, scratch->size);
+	}
 }

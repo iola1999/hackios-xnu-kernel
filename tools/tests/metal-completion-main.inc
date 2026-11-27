@@ -68,7 +68,7 @@ static void asynchronous(BOOL fails, BOOL timeout, BOOL legacy) {
     if (timeout && !fails) require([[buffer error] code] == 3, "GPU timeout supplies an error");
     require(callback_count == 1 && scheduled_count == 1, "each initial handler delivered once");
     require(queue->returned == 1, "queue slot returned exactly once");
-    require(writebacks == (fails || timeout ? 0 : 1), "failed work skips writeback");
+    require(writebacks == (fails || timeout ? 1 : 2), "failed work skips completion writeback");
     [buffer commit]; require(submitted == 1, "duplicate commit makes no submission");
     [original release]; [buffer release]; require(queue->returned == 1, "dealloc preserves paid queue slot");
     pending_release();

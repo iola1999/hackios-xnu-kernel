@@ -163,6 +163,106 @@ static void run_integer_alias_case(unsigned fourcc, unsigned plane, unsigned for
         fourcc,plane,format,view_width,height);
 }
 
+static IOSurfaceRef make_custom_planar(unsigned fourcc, unsigned w0, unsigned h0,
+                                       unsigned e0, unsigned r0, unsigned o0,
+                                       unsigned w1, unsigned h1,
+                                       unsigned e1, unsigned r1, unsigned o1,
+                                       unsigned alloc_size)
+{
+    NSDictionary *properties = @{
+        (id)kIOSurfaceWidth:@(w0), (id)kIOSurfaceHeight:@(h0),
+        (id)kIOSurfaceBytesPerElement:@(e0),
+        (id)kIOSurfaceBytesPerRow:@(r0), (id)kIOSurfacePixelFormat:@(fourcc),
+        (id)kIOSurfaceAllocSize:@(alloc_size),
+        (id)kIOSurfacePlaneInfo:@[
+            @{(id)kIOSurfacePlaneWidth:@(w0), (id)kIOSurfacePlaneHeight:@(h0),
+              (id)kIOSurfacePlaneBytesPerElement:@(e0),
+              (id)kIOSurfacePlaneBytesPerRow:@(r0), (id)kIOSurfacePlaneOffset:@(o0),
+              (id)kIOSurfacePlaneSize:@(r0 * h0)},
+            @{(id)kIOSurfacePlaneWidth:@(w1), (id)kIOSurfacePlaneHeight:@(h1),
+              (id)kIOSurfacePlaneBytesPerElement:@(e1),
+              (id)kIOSurfacePlaneBytesPerRow:@(r1), (id)kIOSurfacePlaneOffset:@(o1),
+              (id)kIOSurfacePlaneSize:@(r1 * h1)}
+        ]
+    };
+    return IOSurfaceCreate((CFDictionaryRef)properties);
+}
+
+static void run_m5_boundary_cases(id<MTLDevice> device)
+{
+    /* 1. Odd dimensions (65x9 / 33x5) + distinct 64B-aligned plane strides (NV12 and P010). */
+    const struct {
+        unsigned fourcc, e0, e1, r0, r1, fmt0, fmt1;
+    } odd_cases[] = {
+        { '420v', 1, 2, 192, 256, 10, 30 },
+        { 'x420', 2, 4, 192, 256, 20, 60 },
+    };
+    for (unsigned i = 0; i < 2; i++) {
+        IOSurfaceRef sf = make_custom_planar(odd_cases[i].fourcc, 65, 9,
+            odd_cases[i].e0, odd_cases[i].r0, 128,
+            33, 5, odd_cases[i].e1, odd_cases[i].r1, 4096, 8192);
+        assert(sf);
+        for (unsigned plane = 0; plane < 2; plane++) {
+            unsigned w = plane ? 33 : 65;
+            unsigned h = plane ? 5 : 9;
+            unsigned fmt = plane ? odd_cases[i].fmt1 : odd_cases[i].fmt0;
+            struct ann_texture_shape shape = {fmt, 2, w, h, 1, 1, 1, 1, 5};
+            struct ann_surface sel = {};
+            char why[768] = {};
+            void *base = NULL;
+            if (ann_surface_plane(sf, plane, &shape, &sel, &base, why, sizeof(why)) != 0) {
+                fprintf(stderr, "M5 odd planar rejected %08x plane %u: %s\n",
+                        odd_cases[i].fourcc, plane, why);
+                exit(2);
+            }
+            assert(sel.width == w && sel.height == h);
+            assert(sel.rowBytes == (plane ? odd_cases[i].r1 : odd_cases[i].r0));
+        }
+        /* In-flight CB lifetime: release caller IOSurface ref before waitUntilCompleted. */
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(MTLPixelFormat)odd_cases[i].fmt0
+                                                                                      width:65 height:9 mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+        td.storageMode = MTLStorageModeShared;
+        id<MTLTexture> tex = [device newTextureWithDescriptor:td iosurface:sf plane:0];
+        assert(tex);
+        id<MTLRenderPipelineState> state = pipeline(device, odd_cases[i].fmt0, 4);
+        id<MTLCommandQueue> queue = [device newCommandQueue];
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = tex;
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+        [enc setRenderPipelineState:state];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [enc endEncoding];
+        [cb commit];
+        CFRelease(sf);
+        [cb waitUntilCompleted];
+        assert(cb.status == MTLCommandBufferStatusCompleted);
+        [queue release]; [state release]; [tex release];
+    }
+
+    /* 2. Non-64B-aligned plane stride (row=72): ann_surface_plane accepts whole-pixel native views
+     * (preserving rowBytes=72 for backend wrapped fallback) and rejects view_bpp not dividing stride. */
+    IOSurfaceRef unaligned = make_custom_planar('420v', 65, 9, 1, 72, 0, 33, 5, 2, 72, 1024, 4096);
+    if (unaligned) {
+        struct ann_texture_shape shape = {10, 2, 65, 9, 1, 1, 1, 1, 5};
+        struct ann_surface sel = {};
+        char why[768] = {};
+        assert(ann_surface_plane(unaligned, 0, &shape, &sel, NULL, why, sizeof(why)) == 0);
+        assert(sel.rowBytes == 72 && sel.width == 65 && sel.height == 9);
+        struct ann_texture_shape shape1 = {30, 2, 33, 5, 1, 1, 1, 1, 5};
+        assert(ann_surface_plane(unaligned, 1, &shape1, &sel, NULL, why, sizeof(why)) == 0);
+        assert(sel.rowBytes == 72 && sel.width == 33 && sel.height == 5);
+        /* Packed RGBA32Uint view (view_bpp=16) does not divide row=72 -> must reject. */
+        struct ann_texture_shape bad_view = {123, 2, 4, 9, 1, 1, 1, 1, 5};
+        assert(ann_surface_plane(unaligned, 0, &bad_view, &sel, NULL, why, sizeof(why)) != 0);
+        CFRelease(unaligned);
+    }
+    puts("M5 boundary cases: odd dims (65x9/33x5), distinct plane strides (192/256), non-64B stride (72) handling and in-flight IOSurface release passed");
+}
+
 int main(void) { @autoreleasepool {
     setvbuf(stdout,NULL,_IOLBF,0);
     id<MTLDevice> device = MTLCreateSystemDefaultDevice(); assert(device);
@@ -189,6 +289,7 @@ int main(void) { @autoreleasepool {
             printf("native surface rejected FourCC=%08x with incompatible element sizes\n",fourcc);
         }
     }
+    run_m5_boundary_cases(device);
     [device release];
     puts("native packed views: 14 GPU plane writes, 5 NV12 integer alias descriptors, byte order, physical geometry, guards and rejection passed");
 } }

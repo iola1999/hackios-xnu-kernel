@@ -157,7 +157,7 @@ bool iris_dma_alloc_map(struct iris_dma_buf *buf, uint32_t iova, uint32_t size, 
 {
 	(void)cached; alloc_calls++; size = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 	if (alloc_calls == alloc_fail_at && !alloc_retained) return false;
-	assert(size > 0 && size <= IRIS_IOVA_RAW_SESSION_STRIDE);
+	assert(size > 0 && size <= (iova >= IRIS_IOVA_RAW_BASE ? IRIS_IOVA_RAW_SESSION_STRIDE : IRIS_IOVA_SESSION_STRIDE));
 	buf->kva = (uintptr_t)calloc(1, size); assert(buf->kva); buf->iova = iova; buf->size = size;
 	return alloc_calls != alloc_fail_at;
 }
@@ -565,7 +565,7 @@ static void raw_count_check(struct iris_session *s, const char *name)
     const char *number = strrchr(name, '-');
     if (strstr(name, "negotiated")) minimum = (unsigned)strtoul(number + 1, NULL, 10);
     if (strstr(name, "unallocated")) minimum = 1;
-    if (strstr(name, "capacity-isolated")) minimum = 7;
+    if (strstr(name, "capacity-isolated")) minimum = IRIS_RAW_POOL_MAX + 1u;
     if (strstr(name, "slot4")) s->session_id = 4;
     if (strstr(name, "cd21-actual")) { s->width = 320; s->height = 192; }
     assert(iris_hfi_session_open(s) == 0);
@@ -577,7 +577,7 @@ static void raw_count_check(struct iris_session *s, const char *name)
     if (strstr(name, "range-wrap")) s->raw_frame_size = 0x80000000u;
     if (strstr(name, "zero-frame")) s->raw_frame_size = 0;
     if (strstr(name, "dpb-short")) s->intern_dpb.size = 5 * s->dpb_frame_size;
-    if (strstr(name, "capacity-isolated")) s->intern_dpb.size = 8 * s->dpb_frame_size;
+    if (strstr(name, "capacity-isolated")) s->intern_dpb.size = (IRIS_RAW_POOL_MAX + 2u) * s->dpb_frame_size;
     if (strstr(name, "closing")) s->closing = true;
     bool failing_alloc = strstr(name, "alloc-fail") != NULL;
     unsigned fail_index = strstr(name, "second") ? 5 : 4;
@@ -589,7 +589,7 @@ static void raw_count_check(struct iris_session *s, const char *name)
     size_t before = tx_size;
     push_psc(s->wire_session_id);
     int result = iris_receive(s, NULL);
-    bool invalid = minimum == 0 || minimum > 6 || strstr(name, "range-over") ||
+    bool invalid = minimum == 0 || minimum > IRIS_RAW_POOL_MAX || strstr(name, "range-over") ||
         strstr(name, "range-wrap") || strstr(name, "zero-frame") || strstr(name, "dpb-short") || strstr(name, "closing");
     if (invalid || failing_alloc) {
         assert(result < 0 && s->error == (failing_alloc ? ENOMEM : EOPNOTSUPP));
@@ -614,8 +614,9 @@ static void raw_count_check(struct iris_session *s, const char *name)
         return;
     }
     unsigned actual = minimum < 4 ? 4 : minimum;
+    unsigned dpb_realloc = minimum > IRIS_DPB_POOL_COUNT ? 1u : 0u;
     assert(result == 1 && !s->error && s->started_ports == 6 && s->dpb_count == minimum);
-    assert(s->raw_count == actual && alloc_calls == 7 + actual && free_calls == 0);
+    assert(s->raw_count == actual && alloc_calls == 7 + actual + dpb_realloc && free_calls == dpb_realloc);
     assert(buffer_count(2) == actual && buffer_count(6) == minimum);
     for (unsigned i = 0; i < actual; i++) {
         if (i < 4) assert(s->raw[i].kva == initial[i]);
@@ -663,7 +664,7 @@ static void raw_count_check(struct iris_session *s, const char *name)
         stop_mode = 0;
     }
     s->input_queued = false;
-    assert(iris_hfi_session_close(s) == 0 && free_calls == 7 + actual);
+    assert(iris_hfi_session_close(s) == 0 && free_calls == 7 + actual + dpb_realloc);
     for (unsigned i = 0; i < IRIS_RAW_POOL_MAX; i++) assert(!s->raw[i].kva);
 }
 
@@ -765,23 +766,27 @@ int main(int argc, char **argv)
 	else if (strncmp(name, "psc-", 4) == 0) {
 		if (strstr(name, "coded")) s->height = 474;
 		if (strstr(name, "1080p")) { s->width = 1920; s->height = 1080; }
+		if (strstr(name, "320x240")) { s->width = 320; s->height = 240; }
 		assert(iris_hfi_session_open(s) == 0); size_t before = tx_size;
 		s->input_queued = true; s->next_input_idx = 1;
 		push_psc(s->wire_session_id); int r = iris_receive(s, NULL);
 		if (strncmp(name, "psc-valid", 9) == 0) {
-			assert(r == 1 && s->error == 0 && s->started_ports == 6 && s->dpb_count == 2);
-			assert(count_type(0x01000009u, 2) == 6);
+			unsigned exp_dpb = strstr(name, "min7") ? 7u : strstr(name, "min8") ? 8u : 2u;
+			unsigned exp_raw = exp_dpb < 4u ? 4u : exp_dpb;
+			assert(r == 1 && s->error == 0 && s->started_ports == 6 && s->dpb_count == exp_dpb);
+			assert(s->raw_count == exp_raw && s->intern_dpb.size >= exp_dpb * s->dpb_frame_size);
+			assert(count_type(0x01000009u, 2) == exp_dpb + exp_raw);
 			if (strstr(name, "hevc10")) {
-				uint32_t exp_stride = s->width == 1920 ? 3840u : 1280u;
-				uint32_t exp_y_scan = s->height == 1080 ? 1088u : 480u;
-				uint32_t exp_uv_scan = s->height == 1080 ? 544u : 240u;
+				uint32_t exp_stride = s->width == 1920 ? 3840u : s->width == 320 ? 768u : 1280u;
+				uint32_t exp_y_scan = s->height == 1080 ? 1088u : s->height == 240 ? 256u : 480u;
+				uint32_t exp_uv_scan = s->height == 1080 ? 544u : s->height == 240 ? 128u : 240u;
 				assert(s->is_10bit && s->y_stride == exp_stride && s->uv_stride == exp_stride);
 				assert(s->raw_frame_size == ((exp_stride * exp_y_scan + exp_stride * exp_uv_scan + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u)));
 				bool saw_p010 = false, saw_stride = false;
 				for (size_t pos = before; pos < tx_size; pos += get32(tx + pos)) {
 					for (uint32_t off = 32; off < get32(tx + pos); off += get32(tx + pos + off)) {
 						const uint8_t *p = tx + pos + off;
-						if (get32(p + 4) == 0x03000101u && get32(p + 16) == 2 && get32(p + 32) == 4u) saw_p010 = true;
+						if (get32(p + 4) == 0x03000101u && get32(p + 16) == 2 && get32(p + 32) == 3u) saw_p010 = true;
 						if (get32(p + 4) == HFI_PROP_LINEAR_STRIDE_SCANLINE && get32(p + 16) == 2 &&
 						    get32(p + 32) == ((exp_stride << 16) | exp_y_scan) &&
 						    get32(p + 36) == ((exp_stride << 16) | exp_uv_scan)) saw_stride = true;

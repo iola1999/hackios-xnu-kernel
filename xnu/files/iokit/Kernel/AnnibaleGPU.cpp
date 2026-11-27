@@ -355,7 +355,7 @@ static bool
 gpuWait(uint32_t fence, uint64_t milliseconds)
 {
 	uint64_t began = mach_absolute_time(), patience;
-
+	bool wasReady = !gGPUReported && annibale_gpu_ready();
 	nanoseconds_to_absolutetime(milliseconds * NSEC_PER_MSEC, &patience);
 	for (bool waited = false;; waited = true) {
 		uint32_t seen = annibale_gpu_irqs();
@@ -375,21 +375,16 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 		IOLockLock(gGPULock);
 	}
 	/*
-	 * A wait of a second or more that came to nothing says only that the submission is not done:
-	 * one of the camera's still-image passes runs for seconds. The core has stopped answering
-	 * when the timestamp it retired last has stood still for GPU_STALL_MS across such waits.
-	 * What it and its SMMU context say is put down then, and, with boot-arg gpu_recover=1, the
-	 * core is reset and started again, which gives up the submission that hung and leaves later
-	 * ones the core's own. Without that -- or if it does not work -- nothing is waited for again
-	 * in this run: a GPU that may yet write memory of ours is given nothing more. Either way
-	 * this wait has failed, and says so: the submission did not finish.
+	 * A faulted wait or a multi-second wait whose retired timestamp stood still for GPU_STALL_MS
+	 * triggers diagnostics and, with boot-arg gpu_recover=1, resets the core for later work.
 	 */
-	if (milliseconds >= 1000 && !gGPUReported && annibale_gpu_ready()) {
+	if (wasReady && !gGPUReported && !annibale_gpu_ready()) {
+		annibale_gpu_report("faulted");
+		gGPUReported = !annibale_gpu_recover();
+	} else if (milliseconds >= 1000 && !gGPUReported && annibale_gpu_ready()) {
 		static uint32_t stalledAt;
-		static uint64_t stalledSince;
+		static uint64_t stalledSince, stalled;
 		uint32_t retired = annibale_gpu_retired_for(fence);
-		uint64_t stalled;
-
 		if (stalledSince == 0 || retired != stalledAt) {
 			stalledAt = retired;
 			stalledSince = began;
@@ -398,6 +393,7 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 		if (stalled >= (uint64_t) GPU_STALL_MS * NSEC_PER_MSEC) {
 			annibale_gpu_report("no answer");
 			gGPUReported = !annibale_gpu_recover();
+			stalledAt = 0; stalledSince = 0;
 		}
 	}
 	return false;

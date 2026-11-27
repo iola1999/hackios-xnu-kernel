@@ -41,6 +41,8 @@ bool adreno8_hfi_poll(void);
 void adreno8_hfi_worked(uint64_t *microseconds, uint32_t *count, uint32_t by[7]);
 /* Waits for the GPU between two looks: on the GMU's message interrupt (boot-arg gpu_irq). */
 void adreno8_hfi_irq_attach(void);
+void adreno8_hfi_irq_resume(void);
+void adreno8_hfi_reset_for_recovery(void);
 uint32_t adreno8_hfi_irq_count(void);
 void adreno8_hfi_irq_pause(uint32_t seen, uint32_t poll_us, uint32_t longest_us);
 
@@ -48,6 +50,7 @@ void adreno8_hfi_irq_pause(uint32_t seen, uint32_t poll_us, uint32_t longest_us)
 bool adreno8_hwsched_request(const uint32_t *request, uint32_t words,
     uint32_t *reply, uint32_t *reply_words);
 bool adreno8_hwsched_start(void);
+void adreno8_hwsched_reset_for_recovery(void);
 bool adreno8_hwsched_ready(void);
 /* The caller holds OOB_GPU and validates CP idle after the firmware ACK. */
 bool adreno8_hwsched_raw(const uint32_t *pm4, uint32_t dwords, const char *name);

@@ -427,6 +427,22 @@
 	_owner = [device retain];
 	_render = render;
 	_info = *info;
+	for (unsigned i = 0; i < 8; i++) {
+		MTLRenderPipelineColorAttachmentDescriptor *att = descriptor != nil ?
+		    [[descriptor colorAttachments] objectAtIndexedSubscript:i] : nil;
+		if (att == nil) {
+			_colorBlend[i].write_mask = 0xf;
+			continue;
+		}
+		_colorBlend[i].blending_enabled = [att isBlendingEnabled] ? 1u : 0u;
+		_colorBlend[i].rgb_blend_operation = (unsigned)[att rgbBlendOperation];
+		_colorBlend[i].alpha_blend_operation = (unsigned)[att alphaBlendOperation];
+		_colorBlend[i].source_rgb_blend_factor = (unsigned)[att sourceRGBBlendFactor];
+		_colorBlend[i].destination_rgb_blend_factor = (unsigned)[att destinationRGBBlendFactor];
+		_colorBlend[i].source_alpha_blend_factor = (unsigned)[att sourceAlphaBlendFactor];
+		_colorBlend[i].destination_alpha_blend_factor = (unsigned)[att destinationAlphaBlendFactor];
+		_colorBlend[i].write_mask = (unsigned)[att writeMask];
+	}
 	if (info->generated_vertex_stage) {
 		rw_print("this pipeline's vertex stage was generated, so what it "
 		         "draws is the fragment shader over the whole attachment\n");
@@ -456,6 +472,10 @@
 }
 
 - (struct rwa_render *)render { return _render; }
+- (const struct rwa_color_blend *)colorBlendAtIndex:(unsigned)index
+{
+	return index < 8 ? &_colorBlend[index] : NULL;
+}
 - (BOOL)writesDepth           { return _info.fragment_writes_depth != 0; }
 - (unsigned)vertexStreamMask  { return _info.vertex_stream_mask; }
 - (unsigned)vertexStreamCount { return _info.vertex_streams; }

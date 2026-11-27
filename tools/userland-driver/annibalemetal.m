@@ -971,8 +971,10 @@ struct gem_close { uint32_t handle, pad; };
 	AnnibaleMetalDevice *_owner;
 	struct rwa_render *_render;
 	struct rwa_render_info _info;
+	struct rwa_color_blend _colorBlend[8];
 }
 - (struct rwa_render *)render;
+- (const struct rwa_color_blend *)colorBlendAtIndex:(unsigned)index;
 /* Not part of any Metal protocol: whether this pipeline's fragment shader stores to
  * [[depth]], which only whoever read the shader knows. A pass without a depth attachment
  * drops those writes -- Metal's own behaviour -- and a draw that says so is the difference
@@ -1100,6 +1102,7 @@ struct gem_close { uint32_t handle, pad; };
 #include "annibalemetal_device_caps.inc"
 #include "annibalemetal_heap.inc"   /* -newHeapWithDescriptor: and the two size answers */
 #include "annibalemetal_residency.inc"
+static volatile unsigned commit_in_flight;   /* defined in annibalemetal_commandbuffer.inc */
 #include "annibalemetal_buffer_pipeline.inc"
 #include "annibalemetal_work.inc"
 #include "annibalemetal_blit.inc"

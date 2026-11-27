@@ -170,6 +170,13 @@ adreno8_hwsched_start(void)
 	return true;
 }
 
+void
+adreno8_hwsched_reset_for_recovery(void)
+{
+	adreno8_hwsched_attempted = false;
+	adreno8_hwsched_started = false;
+}
+
 bool
 adreno8_hwsched_raw(const uint32_t *pm4, uint32_t dwords, const char *name)
 {

@@ -253,7 +253,7 @@ struct adreno8_gpu_space adreno8_gmu_space = { "gmu", GMU_CONTEXT };
 struct adreno8_gpu_space adreno8_gpu_space = { "gpu", 0 };
 struct adreno8_gpu_space adreno8_secure_space = { "secure", SECURE_CONTEXT };
 
-static bool adreno8_space_sync(struct adreno8_gpu_space *space);
+bool adreno8_space_sync(struct adreno8_gpu_space *space);
 
 /* A level-2 table is remembered by its index (leaf_slot) and checked again before it is trusted. */
 static struct adreno8_space_table *
@@ -576,7 +576,7 @@ adreno8_space_map_block(struct adreno8_gpu_space *space, const struct adreno8_gp
 	return true;
 }
 
-static bool
+bool
 adreno8_space_sync(struct adreno8_gpu_space *space)
 {
 	uint32_t cb = (adreno8_smmu_pages + space->context) * adreno8_smmu_page;

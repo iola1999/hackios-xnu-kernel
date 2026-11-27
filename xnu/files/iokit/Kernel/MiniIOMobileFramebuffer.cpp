@@ -66,6 +66,7 @@ enum {
 	kFBMethodGetID                  = 7,
 	kFBMethodGetDisplaySize         = 8,
 	kFBMethodRequestPowerChange     = 12,
+	kFBMethodIsMainDisplay          = 18,
 	kFBMethodSwapSignal             = 20,
 	kFBMethodGetDigitalOutState     = 25,
 	kFBMethodGetDotPitch            = 28,
@@ -76,9 +77,11 @@ enum {
 	kFBMethodChangeFrameInfo        = 73,
 	kFBMethodSupportedFrameInfo     = 74,
 	kFBMethodGetCurrentAbsoluteTime = 77,
+	kFBMethodSetBlock               = 78,
 	kFBMethodGetBlock               = 79,
 	kFBMethodSwapCancelAll          = 81,
 	kFBMethodGetProtectionOptions   = 82,
+	kFBMethodSetDisplayType         = 88,
 };
 
 #define kFBNotifyVSync          5
@@ -633,16 +636,10 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	cx1 = (uint32_t) px1 > fPanelWidth ? (int32_t) fPanelWidth : px1;
 	job.pixels = s->pixels();
 	job.stride = s->info.bytesPerRow;
-	job.sx = sx;
-	job.sy = sy;
-	job.sw = sw;
-	job.sh = sh;
-	job.px0 = px0;
-	job.py0 = py0;
-	job.px1 = px1;
-	job.py1 = py1;
-	job.cx0 = cx0;
-	job.cx1 = cx1;
+	job.pixelFormat = s->info.pixelFormat;
+	job.sx = sx; job.sy = sy; job.sw = sw; job.sh = sh;
+	job.px0 = px0; job.py0 = py0; job.px1 = px1; job.py1 = py1;
+	job.cx0 = cx0; job.cx1 = cx1;
 	job.bufferSeq = fBufferSeq[targetBuf];
 	job.filter = filter;
 	job.unscaled = px1 - px0 == sw && py1 - py0 == sh && px0 >= 0 && (uint32_t) px1 <= fPanelWidth;
@@ -1230,6 +1227,7 @@ class IOMobileFramebufferUserClient : public IOUserClient
 	uint64_t                fVSyncTime;             /* when the refresh being waited for is due */
 	bool                    fVSyncRunning;
 	bool                    fClosed;
+	uint32_t                fDisplayType;
 
 	static void vsyncFired(thread_call_param_t self, thread_call_param_t unused);
 	void vsync(void);

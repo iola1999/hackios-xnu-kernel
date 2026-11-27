@@ -248,7 +248,7 @@ extern int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t ar
 #define HFI_CODEC_DECODE_AVC             1u
 #define HFI_CODEC_DECODE_HEVC            3u
 #define HFI_COLOR_FMT_NV12               1u
-#define HFI_COLOR_FMT_P010               4u
+#define HFI_COLOR_FMT_P010               3u /* HFI Gen2: 2=NV12_UBWC, 3=P010, 4=TP10_UBWC */
 
 #define HFI_PORT_NONE                   0u
 #define HFI_PORT_BITSTREAM              1u
@@ -275,8 +275,8 @@ extern int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t ar
 #define IRIS_MAX_SESSIONS               4u
 #define IRIS_RAW_POOL_COUNT             4u
 #define IRIS_DPB_POOL_COUNT             6u
-/* Linear AVC/HEVC output uses the firmware minimum for both RAW and DPB. */
-#define IRIS_RAW_POOL_MAX               IRIS_DPB_POOL_COUNT
+/* Initial DPB pool count at session open; PSC may negotiate up to IRIS_RAW_POOL_MAX within IOVA bounds. */
+#define IRIS_RAW_POOL_MAX               16u
 #define IRIS_MAX_BITSTREAM_BYTES        (4u * 1024u * 1024u)
 #define IRIS_MAX_WIDTH                  4096u
 #define IRIS_MAX_HEIGHT                 4096u

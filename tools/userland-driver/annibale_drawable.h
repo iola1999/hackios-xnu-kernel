@@ -174,7 +174,7 @@ int ann_import_available(void);
 static inline unsigned
 ann_canonical_pixel_format(unsigned fmt)
 {
-	if (fmt == 94 || (fmt >= 550 && fmt <= 555)) {
+	if (fmt >= 550 && fmt <= 555) {
 		return (fmt == 551 || fmt == 553 || fmt == 555) ? 81u : 80u;
 	}
 	return fmt;

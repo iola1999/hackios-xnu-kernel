@@ -34,6 +34,8 @@ uint32_t adreno8_context_retired_for(uint32_t timestamp);
 uint32_t adreno8_context_depth(void);
 void adreno8_context_describe_inflight(void);
 bool adreno8_context_close(void);
+void adreno8_context_reset_for_recovery(void);
+bool adreno8_context_rebind_for_recovery(void);
 bool adreno8_context_test(void);
 /* Require the completed stage-22 self-test, latest EOP and GPU idle. The caller
  * keeps submissions serialized until its page-table operation has finished. */

@@ -186,10 +186,21 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 - (NSUInteger)resourceOptions      { return 0; }
 - (NSUInteger)hazardTrackingMode   { return 0; }
 - (NSUInteger)allocatedSize        { return 0; }   /* not accounted for yet, and says so */
-/* MTLPurgeableStateNonVolatile, for the reason written over the buffer's own: a texture of
- * the compiler library's is held until it is destroyed, so there is no volatile state to
- * report and zero was not a state at all. */
-- (NSUInteger)setPurgeableState:(NSUInteger)state { (void)state; return 2; }
+- (NSUInteger)setPurgeableState:(NSUInteger)state
+{
+	char why[256] = { 0 };
+
+	if (_texture == NULL || mesa.texture_set_purgeable == NULL) {
+		return 2;   /* MTLPurgeableStateNonVolatile */
+	}
+	if (state != 1 && state != 2) {
+		if (_iosurface != NULL || _parentTexture != NULL || _buffer != NULL ||
+		    __atomic_load_n(&commit_in_flight, __ATOMIC_ACQUIRE) != 0) {
+			return mesa.texture_set_purgeable(_texture, 1, NULL, 0);
+		}
+	}
+	return mesa.texture_set_purgeable(_texture, (unsigned)state, why, sizeof(why));
+}
 - (id)heap                         { return rw_resource_heap(self); }
 - (NSUInteger)heapOffset           { return rw_resource_heap_offset(self); }
 - (BOOL)isAliasable                { return NO; }
@@ -476,7 +487,13 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 - (BOOL)isDrawable               { return NO; }
 - (BOOL)isComplete               { return YES; }
 - (void)waitUntilComplete        { }
-- (BOOL)isPurgeable              { return NO; }
+- (BOOL)isPurgeable
+{
+	if (_texture != NULL && mesa.texture_is_purgeable != NULL) {
+		return mesa.texture_is_purgeable(_texture) ? YES : NO;
+	}
+	return NO;
+}
 - (NSUInteger)protectionOptions  { return 0; }
 - (NSUInteger)unfilteredResourceOptions { return [self resourceOptions]; }
 /* Zero is "not rotated": this texture is not a rotated view of a display surface, which is

@@ -41,6 +41,8 @@ bool adreno8_gpu_memory_verify(void);
 bool adreno8_gpu_memory_ready(void);
 bool adreno8_gpu_faulted(void);
 bool adreno8_memory_retained(void);
+void adreno8_memory_set_recover_armed(bool armed);
+bool adreno8_memory_reset_for_recovery(void);
 /* CPU writes require publish before device access. Acquire requires clean CPU lines;
  * the CPU and device must not write the same cache line concurrently. */
 bool adreno8_memory_publish(const struct adreno8_memory *, uint32_t offset, uint32_t size);

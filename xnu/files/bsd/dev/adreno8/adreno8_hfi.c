@@ -893,3 +893,27 @@ adreno8_ordinary_ready(void)
 {
 	return adreno8_direct_ring && adreno8_ordinary_started;
 }
+
+void
+adreno8_hfi_reset_for_recovery(void)
+{
+	adreno8_gmu_talks = false;
+	adreno8_hfi_tables_sent = false;
+	adreno8_hfi_seq = 0;
+	adreno8_speed_now = 1;
+	adreno8_speed_limit = 0;
+	adreno8_speed_cool_ticks = 0;
+	adreno8_speed_ticked = 0;
+	adreno8_speed_busy_seen = adreno8_retired_total;
+	adreno8_speed_light_since = 0;
+}
+
+void
+adreno8_hfi_irq_resume(void)
+{
+	if (!hfi_irq_on || adreno8_gmu.base == 0) {
+		return;
+	}
+	hfi_irq_in_window = 0;
+	adreno8_wr(adreno8_gmu.base + GMU_GMU2HOST_MASK, ~1u);
+}

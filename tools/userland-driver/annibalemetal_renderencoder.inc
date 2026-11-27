@@ -1,8 +1,171 @@
+/*
+ * G31 env-gated RenderPass trace probe (ANNIBALE_G31_TRACE=1 or =<max_lines>, off by default).
+ * Zero overhead when unset: rw_g31_trace_limit() caches the parsed cap on first call.
+ */
+static unsigned
+rw_g31_trace_limit(void)
+{
+	static int limit = -1;
+
+	if (__builtin_expect(limit < 0, 0)) {
+		const char *val = getenv("ANNIBALE_G31_TRACE");
+		if (val == NULL || val[0] == '\0' || strcmp(val, "0") == 0) {
+			limit = 0;
+		} else {
+			long n = strtol(val, NULL, 10);
+			limit = (n > 1 && n <= 4096) ? (int)n : 256;
+		}
+	}
+	return (unsigned)limit;
+}
+
+static uint32_t
+rw_g31_surface_id(id texture)
+{
+	if (texture == nil || ![texture respondsToSelector:sel_registerName("iosurface")]) {
+		return 0;
+	}
+	void *sf = ((void *(*)(id, SEL))objc_msgSend)(texture, sel_registerName("iosurface"));
+	return sf != NULL ? ann_surface_id(sf) : 0;
+}
+
+static BOOL
+rw_g31_tex_matches(id texture, BOOL is_attachment)
+{
+	if (texture == nil) {
+		return NO;
+	}
+	unsigned w = (unsigned)[texture width];
+	unsigned h = (unsigned)[texture height];
+	unsigned fmt = (unsigned)[texture pixelFormat];
+	if (w > 0 && h > 0 && w < 160u && h < 160u) {
+		return YES;
+	}
+	if (fmt == 1u) {   /* MTLPixelFormatA8Unorm */
+		return YES;
+	}
+	if (is_attachment) {
+		if (fmt == 10u) {   /* MTLPixelFormatR8Unorm */
+			return YES;
+		}
+		if (rw_g31_surface_id(texture) != 0 &&
+		    (fmt == 80u || fmt == 81u)) {   /* BGRA8Unorm / BGRA8Unorm_sRGB IOSurface */
+			return YES;
+		}
+	}
+	return NO;
+}
+
+static const char *
+rw_g31_load_name(uint8_t load_action)
+{
+	if (load_action == MTLLoadActionClear) {
+		return "clear";
+	}
+	if (load_action == MTLLoadActionLoad) {
+		return "load";
+	}
+	return "dontcare";
+}
+
+static void
+rw_g31_trace_draw(AnnibaleMetalRenderPipeline *pipeline, id const *color, unsigned color_count,
+                  const uint8_t *load_action, id const *ftex, unsigned ftex_count,
+                  id const *vtex, unsigned vtex_count, const unsigned *scissor)
+{
+	static unsigned emitted;
+	unsigned limit = rw_g31_trace_limit();
+	if (limit == 0 || __atomic_load_n(&emitted, __ATOMIC_RELAXED) >= limit) {
+		return;
+	}
+	int att_idx = -1;
+	BOOL matched = NO;
+	for (unsigned i = 0; i < color_count && i < 8u; i++) {
+		if (color[i] == nil) {
+			continue;
+		}
+		if (att_idx < 0) {
+			att_idx = (int)i;
+		}
+		if (rw_g31_tex_matches(color[i], YES)) {
+			att_idx = (int)i;
+			matched = YES;
+			break;
+		}
+	}
+	const char *tex_stage = NULL;
+	unsigned tex_idx = 0;
+	id matched_tex = nil;
+	for (unsigned i = 0; i < ftex_count; i++) {
+		if (rw_g31_tex_matches(ftex[i], NO)) {
+			tex_stage = "ftex";
+			tex_idx = i;
+			matched_tex = ftex[i];
+			matched = YES;
+			break;
+		}
+	}
+	if (matched_tex == nil) {
+		for (unsigned i = 0; i < vtex_count; i++) {
+			if (rw_g31_tex_matches(vtex[i], NO)) {
+				tex_stage = "vtex";
+				tex_idx = i;
+				matched_tex = vtex[i];
+				matched = YES;
+				break;
+			}
+		}
+	}
+	if (!matched || att_idx < 0) {
+		return;
+	}
+	unsigned seq = __atomic_fetch_add(&emitted, 1u, __ATOMIC_RELAXED);
+	if (seq >= limit) {
+		return;
+	}
+	id target = color[att_idx];
+	const struct rwa_color_blend *b = pipeline != nil ?
+	    [pipeline colorBlendAtIndex:(unsigned)att_idx] : NULL;
+	NSString *label = pipeline != nil ? [pipeline label] : nil;
+	const char *pipe_name = label != nil ? [label UTF8String] : "(none)";
+	char tex_buf[96];
+	if (matched_tex != nil) {
+		snprintf(tex_buf, sizeof(tex_buf), "%s[%u]=%ux%u/fmt=%u/sf=%u",
+		         tex_stage, tex_idx, (unsigned)[matched_tex width],
+		         (unsigned)[matched_tex height], (unsigned)[matched_tex pixelFormat],
+		         rw_g31_surface_id(matched_tex));
+	} else {
+		snprintf(tex_buf, sizeof(tex_buf), "none");
+	}
+	char sc_buf[64];
+	if (scissor != NULL) {
+		snprintf(sc_buf, sizeof(sc_buf), "%u,%u,%u,%u",
+		         scissor[0], scissor[1], scissor[2], scissor[3]);
+	} else {
+		snprintf(sc_buf, sizeof(sc_buf), "none");
+	}
+	rw_print("g31-trace #%u c%d=%ux%u fmt=%u sf=%u load=%s mask=%#x blend=%u "
+	         "rgb=%u/%u/%u a=%u/%u/%u tex=%s sc=%s pipe=%s\n",
+	         seq, att_idx, (unsigned)[target width], (unsigned)[target height],
+	         (unsigned)[target pixelFormat], rw_g31_surface_id(target),
+	         rw_g31_load_name(load_action[att_idx]),
+	         b != NULL ? b->write_mask : 0xfu,
+	         b != NULL ? b->blending_enabled : 0u,
+	         b != NULL ? b->source_rgb_blend_factor : 1u,
+	         b != NULL ? b->destination_rgb_blend_factor : 0u,
+	         b != NULL ? b->rgb_blend_operation : 0u,
+	         b != NULL ? b->source_alpha_blend_factor : 1u,
+	         b != NULL ? b->destination_alpha_blend_factor : 0u,
+	         b != NULL ? b->alpha_blend_operation : 0u,
+	         tex_buf, sc_buf, pipe_name != NULL ? pipe_name : "(none)");
+}
+
 @implementation AnnibaleMetalRenderEncoder {
 	AnnibaleMetalCommandBuffer *_commandBuffer;   /* not retained: it owns the encoder */
 	AnnibaleMetalRenderPipeline *_pipeline;
 	id _color[8];
 	unsigned _colorCount;
+	uint8_t _loadAction[8];
 	id _resolve[8];   /* the resolveTexture of each colour attachment, or nil */
 	id _resolveTo[8];
 	unsigned _resolveLevel[8], _resolveSlice[8];
@@ -91,6 +254,7 @@
 		}
 		[_color[i] retain];
 		[_resolve[i] retain];
+		_loadAction[i] = (uint8_t)[attachment loadAction];
 		if ([attachment loadAction] == MTLLoadActionDontCare) _discards |= 1u << i;
 		if ([attachment loadAction] == MTLLoadActionClear) {
 			_discards |= 1u << (8 + i);
@@ -449,6 +613,12 @@ rw_bind_slot(id *slots, unsigned *count, id object, NSUInteger index)
 	                 firstColor != nil ? (unsigned)[firstColor width] : 0u,
 	                 firstColor != nil ? (unsigned)[firstColor height] : 0u,
 	                 firstColor != nil ? (unsigned)[firstColor sampleCount] : 0u);
+	if (__builtin_expect(rw_g31_trace_limit() != 0, 0)) {
+		rw_g31_trace_draw(_pipeline, _color, _colorCount, _loadAction,
+		                  _fragmentTextures, _fragmentTextureCount,
+		                  _vertexTextures, _vertexTextureCount,
+		                  _hasScissorRect ? _scissorRect : NULL);
+	}
 	[_commandBuffer recordWork:work];
 	[work release];
 }

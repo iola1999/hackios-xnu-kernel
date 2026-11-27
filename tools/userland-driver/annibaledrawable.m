@@ -402,7 +402,7 @@ static const struct ann_format ann_formats[] = {
 	{  80, 'BGRA', 4, 0, "MTLPixelFormatBGRA8Unorm" },
 	{  81, 'BGRA', 4, 0, "MTLPixelFormatBGRA8Unorm_sRGB" },
 	{  90, 'R10k', 4, 0, "a ten-bit RGB format" },
-	{  94, 'BGRA', 4, 0, "a ten-bit RGB format" },
+	{  94, 'l10r', 4, 0, "MTLPixelFormatBGR10A2Unorm" },
 	{ 110, 'RGhA', 8, 0, "MTLPixelFormatRGBA16Unorm" },
 	{ 112, 'RGhA', 8, 0, "MTLPixelFormatRGBA16Snorm" },
 	{ 113, 'RGhA', 8, 0, "MTLPixelFormatRGBA16Uint" },
@@ -733,8 +733,7 @@ ann_texture_for_surface(struct rwa_device *mesa_device, const struct ann_surface
 	 * release.
 	 */
 	struct ann_texture_shape import_shape = *want;
-	if (import_shape.pixel_format == 94 ||
-	    (import_shape.pixel_format >= 550 && import_shape.pixel_format <= 555)) {
+	if (import_shape.pixel_format >= 550 && import_shape.pixel_format <= 555) {
 		import_shape.pixel_format = (import_shape.pixel_format == 551 ||
 		    import_shape.pixel_format == 553 || import_shape.pixel_format == 555) ? 81 : 80;
 	}

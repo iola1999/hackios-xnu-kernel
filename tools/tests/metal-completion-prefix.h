@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <objc/message.h>
 #import <objc/runtime.h>
 #include <mach/mach_time.h>
 #include <assert.h>
@@ -152,6 +153,9 @@ static struct {
     __typeof__(&rwa_texture_rgb2p_pass) texture_rgb2p_pass;
     __typeof__(&rwa_texture_destroy) texture_destroy;
     __typeof__(&rwa_dispatch_nowait) dispatch_nowait;
+    int (*dispatch_split)(struct rwa_compute *, const struct rwa_bindings *,
+        const struct rwa_buffer_bind *, unsigned, const unsigned *, const unsigned *,
+        unsigned, const unsigned *, const unsigned *, bool, char *, size_t);
     int (*dispatch_nowait_imageblock)(struct rwa_compute *, const struct rwa_bindings *,
         const struct rwa_buffer_bind *, unsigned, const unsigned *, const unsigned *,
         unsigned, const unsigned *, char *, size_t);
@@ -161,6 +165,13 @@ static struct {
 } mesa = {.flush = rwa_flush, .fence_take = take, .fence_wait = rwa_fence_wait,
           .fence_release = rwa_fence_release, .finish = legacy_finish,
           .buffer_textures_writeback = writeback, .texture_rgb2p_pass = pass, .texture_destroy = destroy_texture};
+
+#define RW_YIELD_THREADS 16
+static bool rw_gpu_yield(void) { return false; }
+static uint32_t ann_surface_id(void *sf) { return (uint32_t)(uintptr_t)sf; }
+static void rw_capture_vertex(id work, struct rwa_render *render, unsigned commit, unsigned index) {
+    (void)work; (void)render; (void)commit; (void)index;
+}
 
 #define RW_TRACE_COMMITS 0
 #define RW_COMMIT_SLOW_US 1000000000ull

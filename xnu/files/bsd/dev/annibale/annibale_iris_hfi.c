@@ -670,6 +670,7 @@ iris_psc_geometry_ok(const struct iris_session *s)
 	return true;
 }
 
+static int iris_reallocate_dpb(struct iris_session *s, uint32_t dpb_count);
 static int iris_reconfigure_p010(struct iris_session *s, uint32_t raw_target);
 
 static int
@@ -690,7 +691,7 @@ iris_start_output(struct iris_session *s)
 	    !depth_ok || count == 0 ||
 	    count > IRIS_RAW_POOL_MAX || s->raw_frame_size == 0 ||
 	    (uint64_t)s->raw_frame_size * count > IRIS_IOVA_RAW_SESSION_STRIDE ||
-	    s->dpb_frame_size == 0 || count > s->intern_dpb.size / s->dpb_frame_size ||
+	    s->dpb_frame_size == 0 ||
 	    (s->codec_type == IRIS_CODEC_H264 && (s->psc_values[PSC_CODED] & 1u) == 0)) {
 		s->psc_rejected = true;
 		return EOPNOTSUPP;
@@ -699,6 +700,14 @@ iris_start_output(struct iris_session *s)
 	if (is_10bit) {
 		int p010_err = iris_reconfigure_p010(s, raw_target);
 		if (p010_err != 0) return p010_err;
+	} else if (count > IRIS_DPB_POOL_COUNT &&
+	    s->intern_dpb.size / s->dpb_frame_size >= IRIS_DPB_POOL_COUNT) {
+		int dpb_err = iris_reallocate_dpb(s, count);
+		if (dpb_err != 0) return dpb_err;
+	}
+	if (count > s->intern_dpb.size / s->dpb_frame_size || s->dpb_frame_size == 0) {
+		s->psc_rejected = true;
+		return EOPNOTSUPP;
 	}
 	/* Keep the initial RAW allocations and add the buffers required by input PSC. */
 	while (s->raw_count < raw_target) {

@@ -588,3 +588,36 @@ adreno8_context_test(void)
 	printf("adreno8: standard context reused for non-privileged IBs and unregistered; resources retained until cold reset\n");
 	return true;
 }
+
+void
+adreno8_context_reset_for_recovery(void)
+{
+	context_failed = false;
+	for (uint32_t i = 0; i < context_slot_count(); i++) {
+		struct adreno8_context_slot *s = &context_slots[i];
+
+		if (s->state == CONTEXT_COLD)
+			continue;
+		s->state = CONTEXT_PREPARED;
+		s->checked = 0;
+		if (s->queue_view) {
+			adreno8_wr(s->queue_view + 20, 0);
+			adreno8_wr(s->queue_view + 24, 0);
+		}
+		if (s->timestamp_view) {
+			adreno8_wr(s->timestamp_view + CONTEXT_SOP, s->last);
+			adreno8_wr(s->timestamp_view + CONTEXT_EOP, s->last);
+		}
+		adreno8_settle();
+	}
+}
+
+bool
+adreno8_context_rebind_for_recovery(void)
+{
+	for (uint32_t i = 0; i < context_slot_count(); i++) {
+		if (!context_register_slot(i))
+			return false;
+	}
+	return true;
+}

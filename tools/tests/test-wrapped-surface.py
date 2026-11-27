@@ -27,10 +27,15 @@ PREFIX = r'''
 #define MIN2(a,b) ((a)<(b)?(a):(b))
 #define DIV_ROUND_UP(a,b) (((a)+(b)-1)/(b))
 #define RWA_LOCKED
+struct pipe_context { int unused; };
+struct pipe_transfer { int unused; };
+#define PIPE_MAP_READ 1
 struct rwa_buffer_texture;
-struct rwa_device { struct rwa_buffer_texture *buffer_textures; unsigned written_buffer_textures, buffer_textures_count; };
-struct rwa_buffer { struct rwa_device *device; void *map,*mirror; size_t size; uint64_t mirror_hash; bool mirror_hashed; };
+struct rwa_device { struct pipe_context *pipe; struct rwa_buffer_texture *buffer_textures; unsigned written_buffer_textures, buffer_textures_count; };
 struct pipe_resource { unsigned height0,width0; };
+struct rwa_buffer { struct rwa_device *device; struct pipe_resource *res; void *map,*mirror; size_t size; uint64_t mirror_hash; bool mirror_hashed; };
+static inline void *pipe_buffer_map_range(struct pipe_context *p, struct pipe_resource *r, size_t off, size_t len, unsigned usage, struct pipe_transfer **t) { (void)p;(void)r;(void)off;(void)len;(void)usage;(void)t; return NULL; }
+static inline void pipe_buffer_unmap(struct pipe_context *p, struct pipe_transfer *t) { (void)p;(void)t; }
 struct rwa_texture { struct rwa_device *device; struct pipe_resource *res; struct rwa_buffer_texture *backing; char *pixels; const char *format_name; };
 struct rwa_buffer_texture { struct rwa_texture *texture; struct rwa_buffer *source; size_t offset; unsigned row_bytes; uint64_t hash; bool hashed,written; struct rwa_buffer_texture *next; };
 static inline void buffer_texture_clear_written(struct rwa_device *device, struct rwa_buffer_texture *backing) {

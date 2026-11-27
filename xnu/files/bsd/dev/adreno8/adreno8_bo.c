@@ -88,6 +88,16 @@ adreno8_bo_enable(void)
 	return adreno8_bo_ready();
 }
 
+bool
+adreno8_bo_reset_for_recovery(void)
+{
+	if (bo_guard == 0)
+		return false;
+	bo_checked = 0;
+	bo_state = BO_ENABLED;
+	return adreno8_bo_ready();
+}
+
 static bool
 bo_range(uint64_t address, uint64_t size)
 {

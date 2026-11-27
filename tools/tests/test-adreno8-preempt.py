@@ -66,8 +66,8 @@ struct adreno8_gpu_space {
 static struct adreno8_block adreno8_gmu;
 static struct adreno8_block adreno8_smmu = { .name = "smmu", .phys = 0x3da0000, .size = 0x40000 };
 static uint32_t adreno8_smmu_page = 0x1000, adreno8_smmu_pages = 32;
-struct adreno8_gpu_space adreno8_gpu_space;
-static bool adreno8_gpu8_keep = true, adreno8_gpu8_ifpc, adreno8_gpu8_preempt, adreno8_gpu8_return;
+struct adreno8_gpu_space adreno8_gpu_space, adreno8_gmu_space, adreno8_secure_space;
+static bool adreno8_gpu8_keep = true, adreno8_gpu8_ifpc, adreno8_gpu8_preempt, adreno8_gpu8_return, adreno8_gpu_recover_enabled;
 static bool adreno8_reset_required;
 static uint32_t adreno8_inflight = 4;
 static uint32_t adreno8_gx_hz[17] = {0, 160000000, 222000000, 342000000};
@@ -207,6 +207,30 @@ void adreno8_hfi_worked(uint64_t *u, uint32_t *s, uint32_t by[7]) { *u = 0; *s =
 void adreno8_hfi_irq_attach(void) {}
 uint32_t adreno8_hfi_irq_count(void) { return 0; }
 void adreno8_hfi_irq_pause(uint32_t seen, uint32_t pu, uint32_t lu) { (void)seen; (void)pu; (void)lu; }
+void adreno8_hfi_irq_resume(void) {}
+void adreno8_hfi_reset_for_recovery(void) {}
+void adreno8_gmu_reset_for_recovery(void) {}
+void adreno8_hwsched_reset_for_recovery(void) {}
+bool adreno8_hwsched_start(void) { return true; }
+void adreno8_gpu_reset_for_recovery(void) {}
+bool adreno8_memory_reset_for_recovery(void) { return true; }
+void adreno8_memory_set_recover_armed(bool armed) { (void)armed; }
+bool adreno8_gpu_memory_verify(void) { return true; }
+bool adreno8_gpu_cp_init(void) { return true; }
+bool adreno8_gpu_secure_exit(void) { return true; }
+bool adreno8_gpu_scratch_test(void) { return true; }
+static bool adreno8_step_firmware(void) { return true; }
+static bool adreno8_step_gmu_start(void) { return true; }
+static bool adreno8_step_queues(void) { return true; }
+static bool adreno8_step_tables(void) { return true; }
+static bool adreno8_step_gx_power(void) { return true; }
+static bool adreno8_cx_ready(void) { return true; }
+static bool adreno8_secure_lost(void) { return false; }
+static bool adreno8_zap_ready(void) { return true; }
+static bool adreno8_space_faulted(struct adreno8_gpu_space *s) { (void)s; return false; }
+bool adreno8_space_clear_fault(struct adreno8_gpu_space *s);
+bool adreno8_space_sync(struct adreno8_gpu_space *s) { (void)s; return true; }
+bool adreno8_bo_reset_for_recovery(void) { g_bo_ready = true; return true; }
 static bool AnnibaleGPUStart(void) { return true; }
 """
 
@@ -395,7 +419,8 @@ def main() -> int:
         (tdir / "adreno8_private.h").write_text("")
         (tdir / "sys/annibale_input.h").write_text("")
         for hdr in ("adreno8_wire_private.h", "adreno8_memory_private.h", "adreno8_hwsched_private.h",
-                    "adreno8_context_private.h", "adreno8_bo_private.h", "adreno8_gpu_private.h"):
+                    "adreno8_context_private.h", "adreno8_bo_private.h", "adreno8_gpu_private.h",
+                    "adreno8_zap_private.h"):
             (tdir / hdr).write_text((DEV / hdr).read_text())
         cfile = tdir / "check.c"
         binfile = tdir / "check"
