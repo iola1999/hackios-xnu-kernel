@@ -8,6 +8,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 WRITE_INC = ROOT / "xnu/files/bsd/miscfs/apfs/apfs_vnops_write.inc"
 DIR_INC = ROOT / "xnu/files/bsd/miscfs/apfs/apfs_vnops_dir.inc"
+VNOPS_C = ROOT / "xnu/files/bsd/miscfs/apfs/apfs_vnops.c"
 
 STUBS = r"""
 #include <assert.h>
@@ -32,15 +33,17 @@ enum {
 };
 
 struct apfs_mount { int dummy; };
-struct apfs_inode { uint32_t pclass; };
+struct apfs_inode { uint32_t pclass; uint32_t nchildren; };
 struct apfs_node {
     struct apfs_mount *an_mount;
     uint64_t an_id;
     uint64_t an_size;
+    bool an_orphan;
     struct apfs_inode an_ino;
 };
 typedef struct vnode {
     off_t ubc_size;
+    bool is_dir;
     struct apfs_node node;
 } *vnode_t;
 
@@ -48,10 +51,13 @@ struct vnode_attr {
     bool active_pclass;
     bool supported_pclass;
     uint32_t va_dataprotect_class;
+    uint64_t va_nlink;
 };
 struct apfs_wattr { uint32_t set; uint32_t pclass; };
 struct apfs_wnew { uint32_t pclass; };
 
+#define vnode_isdir(vp) ((vp)->is_dir)
+#define VATTR_RETURN(vap, field, val) ((vap)->field = (val))
 #define VATTR_IS_ACTIVE(vap, field) ((vap)->active_pclass)
 #define VATTR_SET_SUPPORTED(vap, field) ((vap)->supported_pclass = true)
 #define APFS_WCALL(am, an, other, call) ((void)(am), (void)(an), (void)(other), (call))
@@ -140,6 +146,16 @@ int main(void) {
     struct vnode_attr set_d = { .active_pclass = true, .va_dataprotect_class = PROTECTION_CLASS_D };
     assert(harness_setattr_pclass(&cur_pclass, &set_default) == PROTECTION_CLASS_B && set_default.supported_pclass);
     assert(harness_setattr_pclass(&cur_pclass, &set_d) == PROTECTION_CLASS_D && set_d.supported_pclass);
+
+    /* 7. S12: unlinked open file (an_orphan) reports st_nlink == 0 via getattr. */
+    struct vnode link_file = { .is_dir = false, .node = { .an_orphan = false, .an_ino = { .nchildren = 0 } } };
+    assert(harness_getattr_nlink(&link_file) == 1);
+    link_file.node.an_ino.nchildren = 3;
+    assert(harness_getattr_nlink(&link_file) == 3);
+    link_file.node.an_orphan = true;
+    assert(harness_getattr_nlink(&link_file) == 0);
+    struct vnode link_dir = { .is_dir = true, .node = { .an_orphan = true, .an_ino = { .nchildren = 0 } } };
+    assert(harness_getattr_nlink(&link_dir) == 2);
     return 0;
 }
 """
@@ -148,6 +164,7 @@ int main(void) {
 def main():
     write_src = WRITE_INC.read_text()
     dir_src = DIR_INC.read_text()
+    vnops_src = VNOPS_C.read_text()
 
     wresize_start = write_src.index("static int\napfs_wresize(")
     wresize_end = write_src.index("\n}\n", wresize_start) + 3
@@ -161,6 +178,10 @@ def main():
     create_blk_end = dir_src.index("\n\tif (VATTR_IS_ACTIVE(vap, va_flags))", create_blk_start)
     create_blk = dir_src[create_blk_start:create_blk_end]
 
+    nlink_start = vnops_src.index("\tVATTR_RETURN(vap, va_nlink,", vnops_src.index("apfs_vnop_getattr("))
+    nlink_end = vnops_src.index("\n", nlink_start)
+    nlink_stmt = vnops_src[nlink_start:nlink_end]
+
     helpers = f"""
 static uint32_t harness_create_pclass(struct apfs_node *dn, struct vnode_attr *vap) {{
     struct apfs_wnew a = {{ 0 }};
@@ -173,6 +194,15 @@ static uint32_t harness_setattr_pclass(uint32_t *cur, struct vnode_attr *vap) {{
 {setattr_blk}
     if (a.set & APFS_WA_PCLASS) *cur = a.pclass;
     return *cur;
+}}
+
+static uint64_t harness_getattr_nlink(vnode_t vp) {{
+    struct vnode_attr va = {{ 0 }};
+    struct vnode_attr *vap = &va;
+    struct apfs_node *an = &vp->node;
+    struct apfs_inode ino = an->an_ino;
+{nlink_stmt}
+    return va.va_nlink;
 }}
 """
 

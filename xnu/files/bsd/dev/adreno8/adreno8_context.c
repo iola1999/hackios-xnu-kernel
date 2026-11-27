@@ -480,14 +480,14 @@ adreno8_context_retired_for(uint32_t timestamp)
 	return eop ? context_encode_fence(slot, eop) : 0u;
 }
 
+static bool context_inflight_described;
+
 void
 adreno8_context_describe_inflight(void)
 {
-	static bool described;
-
-	if (described)
+	if (context_inflight_described)
 		return;
-	described = true;
+	context_inflight_described = true;
 	for (uint32_t i = 0; i < context_slot_count(); i++) {
 		const struct adreno8_context_slot *s = &context_slots[i];
 		uint32_t sop = s->timestamp_view ? adreno8_rd(s->timestamp_view + CONTEXT_SOP) : 0;
@@ -593,6 +593,7 @@ void
 adreno8_context_reset_for_recovery(void)
 {
 	context_failed = false;
+	context_inflight_described = false;
 	for (uint32_t i = 0; i < context_slot_count(); i++) {
 		struct adreno8_context_slot *s = &context_slots[i];
 

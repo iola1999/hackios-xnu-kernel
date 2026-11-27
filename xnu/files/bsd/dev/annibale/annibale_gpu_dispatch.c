@@ -193,6 +193,12 @@ annibale_gpu_retired_for(uint32_t fence)
 	return annibale_platform_is_annibale() ? adreno8_context_retired_for(fence) : 0;
 }
 
+bool
+annibale_gpu_progress(uint64_t *sig)
+{
+	return annibale_platform_is_annibale() && sig != NULL && adreno8_gpu_cp_progress(sig);
+}
+
 uint32_t
 annibale_gpu_last(void)
 {

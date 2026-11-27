@@ -183,6 +183,7 @@ struct adreno8_gpu_space {
 #define GMU_AO_INTERRUPT_MASK   GMU(0x23b06)
 #define GMU_RSCC_CONTROL_REQ    GMU(0x23b07)    /* bit 1: ours, for the RSC to wake */
 #define GMU_RSCC_CONTROL_ACK    GMU(0x23b08)
+#define GMU_CX_BUSY_STATUS      GMU(0x23b0c)    /* bit 23: GX/CX busy */
 #define GMU_AHB_FENCE_CTRL      GMU(0x23b10)    /* 0: a forbidden access is answered, 1: it fences the bus */
 #define GMU_AHB_FENCE_RANGE_0   GMU(0x23b11)    /* the GMU is forbidden the 3D core's registers until it has them right */
 #define GMU_AHB_FENCE_STATUS    GMU(0x23b13)
@@ -381,6 +382,10 @@ vm_offset_t
 adreno8_seen_at(uint32_t address);
 void
 adreno8_gmu_post_mortem(void);
+void
+adreno8_hfi_dump_queues(const char *prefix);
+void
+adreno8_hfi_hang_dump(void);
 bool
 adreno8_step_first_words(void);
 bool

@@ -489,6 +489,7 @@ annibale_ipa_init(void)
 #define SCM_MP_ASSIGN_ARGINFO   0x1117ULL
 #define QCOM_VMID_HLOS          3u
 #define QCOM_PERM_RW            6u
+#define QCOM_PERM_RWX           7u
 
 struct ipa_elf32_phdr {
 	uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align;
@@ -937,38 +938,29 @@ struct tz_assign_perm {
 };
 
 int64_t
-annibale_tz_assign_mem(uint64_t region_pa, uint64_t region_sz, uint32_t peer_vmid, bool shared, uint64_t *res1_out)
+annibale_tz_assign_mem_perms(uint64_t region_pa, uint64_t region_sz,
+    const uint32_t *dst_vmids, const uint32_t *dst_perms, uint32_t dst_cnt, uint64_t *res1_out)
 {
 	if (res1_out != NULL) {
 		*res1_out = 0;
 	}
-	if (region_sz == 0 || !ipa_ensure_tz_hdr_pages()) {
+	if (region_sz == 0 || dst_vmids == NULL || dst_perms == NULL ||
+	    dst_cnt == 0u || dst_cnt > 4u || !ipa_ensure_tz_hdr_pages()) {
 		return -1;
 	}
 
 	lck_mtx_lock(&ipa_lock);
 	vm_offset_t va = ipa_tz_hdr_va[2];
 	uint64_t pa = ipa_tz_hdr_pa[2];
-	uint64_t src_pa = pa + 0x000ULL;
-	uint64_t mem_pa = pa + 0x040ULL;
-	uint64_t dst_pa = pa + 0x080ULL;
-	uint64_t ext_pa = pa + 0x100ULL;
-
+	uint64_t src_pa = pa + 0x000ULL, mem_pa = pa + 0x040ULL;
+	uint64_t dst_pa = pa + 0x080ULL, ext_pa = pa + 0x100ULL;
 	uint32_t src_vmid = QCOM_VMID_HLOS;
 	struct tz_assign_mem mem = { .addr = region_pa, .size = region_sz };
-	struct tz_assign_perm dst[2] = { 0 };
-	uint64_t dst_sz;
-	if (shared) {
-		dst[0].vmid = QCOM_VMID_HLOS;
-		dst[0].perm = QCOM_PERM_RW;
-		dst[1].vmid = peer_vmid;
-		dst[1].perm = QCOM_PERM_RW;
-		dst_sz = 2ULL * sizeof(struct tz_assign_perm);
-	} else {
-		/* Match qcom_q6v5_pas.ko sun_mpss_resource (region_assign_shared=0): exclusive peer ownership. */
-		dst[0].vmid = peer_vmid;
-		dst[0].perm = QCOM_PERM_RW;
-		dst_sz = sizeof(struct tz_assign_perm);
+	struct tz_assign_perm dst[4] = { 0 };
+	uint64_t dst_sz = (uint64_t)dst_cnt * sizeof(struct tz_assign_perm);
+	for (uint32_t i = 0; i < dst_cnt; i++) {
+		dst[i].vmid = dst_vmids[i];
+		dst[i].perm = dst_perms[i];
 	}
 	uint64_t ext[7] = { 4ULL, dst_pa, dst_sz, 0ULL, 0ULL, 0ULL, 0ULL };
 
@@ -977,7 +969,6 @@ annibale_tz_assign_mem(uint64_t region_pa, uint64_t region_sz, uint32_t peer_vmi
 	memcpy((void *)(va + 0x040u), &mem, sizeof(mem));
 	memcpy((void *)(va + 0x080u), dst, (size_t)dst_sz);
 	memcpy((void *)(va + 0x100u), ext, sizeof(ext));
-
 	for (uint32_t off = 0; off < 0x200u; off += 64u) {
 		uintptr_t line = (uintptr_t)va + off;
 		__asm__ volatile("dc civac, %0" :: "r"(line) : "memory");
@@ -987,6 +978,15 @@ annibale_tz_assign_mem(uint64_t region_pa, uint64_t region_sz, uint32_t peer_vmi
 	int64_t rc = annibale_tz_smc(SCM_MP_ASSIGN, SCM_MP_ASSIGN_ARGINFO, mem_pa, 16ULL, src_pa, ext_pa, res1_out);
 	lck_mtx_unlock(&ipa_lock);
 	return rc;
+}
+
+int64_t
+annibale_tz_assign_mem(uint64_t region_pa, uint64_t region_sz, uint32_t peer_vmid, bool shared, uint64_t *res1_out)
+{
+	/* Match qcom_q6v5_pas.ko sun_mpss_resource (region_assign_shared=0): exclusive peer or HLOS+peer. */
+	uint32_t vmids[2] = { shared ? QCOM_VMID_HLOS : peer_vmid, peer_vmid };
+	uint32_t perms[2] = { QCOM_PERM_RW, QCOM_PERM_RW };
+	return annibale_tz_assign_mem_perms(region_pa, region_sz, vmids, perms, shared ? 2u : 1u, res1_out);
 }
 
 bool

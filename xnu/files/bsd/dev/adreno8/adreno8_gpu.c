@@ -567,11 +567,13 @@ adreno8_gpu_hang_dump(void)
 		return;
 	gpu_hang_dumped = true;
 
+	/* Read always-on GMU and HFI queue state before OOB acquire alters GMU2HOST or power status. */
+	adreno8_hfi_hang_dump();
 	if (gpu_state != GPU_FAILED && !oob_held && adreno8_gpu8_ifpc)
 		(void)adreno8_gpu_oob_acquire();
 	if (gpu_state == GPU_FAILED || !GMU_PWR_GX_UP(gpu_gmu_read(GMU_PWR_CLK_STATUS))) {
 		printf("adreno8: hang dump: GX is off, no CP registers\n");
-		return;
+		goto tail_summary;
 	}
 	/* Dump BR's command tree first so the compact register/pipe summary sits at the ring tail. */
 	uint64_t br_ib1_base = 0;
@@ -652,6 +654,7 @@ adreno8_gpu_hang_dump(void)
 		snprintf(what, sizeof(what), "tree 0 of %u", br_ib1_init);
 		adreno8_bo_dump_words(what, br_ib1_base, br_ib1_init < 2048u ? br_ib1_init : 2048u);
 	}
+tail_summary:
 	if (adreno8_gpu_space.is_on)
 		(void)adreno8_space_faulted(&adreno8_gpu_space);
 	adreno8_context_describe_inflight();
@@ -908,6 +911,61 @@ adreno8_gpu_wait_idle(const char *what)
 		return gpu_fail(what);
 	}
 	return gpu_wait_idle(what);
+}
+
+/* Sample CP RB RPTR and BR/BV IB1/IB2 REM_SIZE without triggering gpu_fail() on collapsed GX. */
+bool
+adreno8_gpu_cp_progress(uint64_t *sig)
+{
+	static const uint32_t pipes[] = { A8_PIPE_BR, A8_PIPE_BV };
+	uint64_t acc = 0x9e3779b97f4a7c15ULL;
+	bool temp_oob = false;
+
+	if (sig == NULL || gpu_state != GPU_TESTED || !adreno8_gpu.base ||
+	    !adreno8_hwsched_ready() || !adreno8_gpu_memory_ready() || adreno8_gpu_faulted())
+		return false;
+	if (!GMU_PWR_GX_UP(gpu_gmu_read(GMU_PWR_CLK_STATUS)))
+		return false;
+	if (!oob_held && adreno8_gpu8_ifpc) {
+		if (!adreno8_gpu_oob_acquire())
+			return false;
+		temp_oob = true;
+	}
+	if (!GMU_PWR_GX_UP(gpu_gmu_read(GMU_PWR_CLK_STATUS))) {
+		if (temp_oob)
+			adreno8_gpu_oob_release();
+		return false;
+	}
+	uint32_t rptr_br = adreno8_rd(adreno8_gpu.base + 4u * GEN8_CP_RB_RPTR_BR);
+	adreno8_settle();
+	uint32_t rptr_bv = adreno8_rd(adreno8_gpu.base + 4u * GEN8_CP_RB_RPTR_BV);
+	adreno8_settle();
+	acc ^= ((uint64_t)rptr_bv << 32) | rptr_br;
+	for (unsigned i = 0; i < A8_COUNT(pipes); i++) {
+		adreno8_settle();
+		adreno8_wr(adreno8_gpu.base + 4u * GEN8_CP_APERTURE_CNTL_HOST, pipes[i] << 12);
+		adreno8_settle();
+		if (adreno8_rd(adreno8_gpu.base + 4u * GEN8_CP_APERTURE_CNTL_HOST) != (pipes[i] << 12)) {
+			adreno8_settle();
+			adreno8_wr(adreno8_gpu.base + 4u * GEN8_CP_APERTURE_CNTL_HOST, 0);
+			adreno8_settle();
+			if (temp_oob)
+				adreno8_gpu_oob_release();
+			return false;
+		}
+		adreno8_settle();
+		uint32_t ib1_rem = adreno8_rd(adreno8_gpu.base + 4u * (GEN8_CP_IB1_BASE_PIPE + 2));
+		adreno8_settle();
+		uint32_t ib2_rem = adreno8_rd(adreno8_gpu.base + 4u * (GEN8_CP_IB2_BASE_PIPE + 2));
+		adreno8_settle();
+		acc = (acc * 0xbf58476d1ce4e5b9ULL) ^ (((uint64_t)ib1_rem << 32) | ib2_rem);
+	}
+	adreno8_wr(adreno8_gpu.base + 4u * GEN8_CP_APERTURE_CNTL_HOST, 0);
+	adreno8_settle();
+	if (temp_oob)
+		adreno8_gpu_oob_release();
+	*sig = acc;
+	return true;
 }
 
 void

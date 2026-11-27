@@ -76,6 +76,7 @@ extern uint32_t gpu_log;
 bool annibale_gpu_done(uint32_t fence);
 uint32_t annibale_gpu_retired(void);
 uint32_t annibale_gpu_retired_for(uint32_t fence);
+bool annibale_gpu_progress(uint64_t * sig);
 uint32_t annibale_gpu_irqs(void);
 void annibale_gpu_pause(uint32_t seen, uint32_t poll_us, uint32_t longest_us);
 uint32_t annibale_gpu_last(void);
@@ -350,54 +351,7 @@ static struct {
 } gGPUStat;
 static uint32_t gGPUIrqsSeen;                   /* annibale_gpu_irqs() at the last statistics */
 
-/* Wait for the 3D core to be done with submission `fence`; with the lock held, which is let go of while waiting. */
-static bool
-gpuWait(uint32_t fence, uint64_t milliseconds)
-{
-	uint64_t began = mach_absolute_time(), patience;
-	bool wasReady = !gGPUReported && annibale_gpu_ready();
-	nanoseconds_to_absolutetime(milliseconds * NSEC_PER_MSEC, &patience);
-	for (bool waited = false;; waited = true) {
-		uint32_t seen = annibale_gpu_irqs();
-
-		if (!gGPUReported && annibale_gpu_ready() && annibale_gpu_done(fence)) {
-			if (waited) {
-				gGPUStat.waits++;
-				gGPUStat.waiting += mach_absolute_time() - began;
-			}
-			return true;
-		}
-		if (mach_absolute_time() - began >= patience || gGPUReported || !annibale_gpu_ready()) {
-			break;                  /* (a GPU that has stopped answering is not waited for again) */
-		}
-		IOLockUnlock(gGPULock);
-		annibale_gpu_pause(seen, GPU_ASK_AGAIN_US, GPU_ASK_LONGEST_US);
-		IOLockLock(gGPULock);
-	}
-	/*
-	 * A faulted wait or a multi-second wait whose retired timestamp stood still for GPU_STALL_MS
-	 * triggers diagnostics and, with boot-arg gpu_recover=1, resets the core for later work.
-	 */
-	if (wasReady && !gGPUReported && !annibale_gpu_ready()) {
-		annibale_gpu_report("faulted");
-		gGPUReported = !annibale_gpu_recover();
-	} else if (milliseconds >= 1000 && !gGPUReported && annibale_gpu_ready()) {
-		static uint32_t stalledAt;
-		static uint64_t stalledSince, stalled;
-		uint32_t retired = annibale_gpu_retired_for(fence);
-		if (stalledSince == 0 || retired != stalledAt) {
-			stalledAt = retired;
-			stalledSince = began;
-		}
-		absolutetime_to_nanoseconds(mach_absolute_time() - stalledSince, &stalled);
-		if (stalled >= (uint64_t) GPU_STALL_MS * NSEC_PER_MSEC) {
-			annibale_gpu_report("no answer");
-			gGPUReported = !annibale_gpu_recover();
-			stalledAt = 0; stalledSince = 0;
-		}
-	}
-	return false;
-}
+#include "AnnibaleGPUWait.inc"
 
 bool
 MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds)

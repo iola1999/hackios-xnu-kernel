@@ -780,6 +780,7 @@ int main(int argc, char **argv)
 				uint32_t exp_stride = s->width == 1920 ? 3840u : s->width == 320 ? 768u : 1280u;
 				uint32_t exp_y_scan = s->height == 1080 ? 1088u : s->height == 240 ? 256u : 480u;
 				uint32_t exp_uv_scan = s->height == 1080 ? 544u : s->height == 240 ? 128u : 240u;
+				uint32_t exp_hfi_stride = exp_stride / 2u;
 				assert(s->is_10bit && s->y_stride == exp_stride && s->uv_stride == exp_stride);
 				assert(s->raw_frame_size == ((exp_stride * exp_y_scan + exp_stride * exp_uv_scan + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u)));
 				bool saw_p010 = false, saw_stride = false;
@@ -788,8 +789,8 @@ int main(int argc, char **argv)
 						const uint8_t *p = tx + pos + off;
 						if (get32(p + 4) == 0x03000101u && get32(p + 16) == 2 && get32(p + 32) == 3u) saw_p010 = true;
 						if (get32(p + 4) == HFI_PROP_LINEAR_STRIDE_SCANLINE && get32(p + 16) == 2 &&
-						    get32(p + 32) == ((exp_stride << 16) | exp_y_scan) &&
-						    get32(p + 36) == ((exp_stride << 16) | exp_uv_scan)) saw_stride = true;
+						    get32(p + 32) == ((exp_hfi_stride << 16) | exp_y_scan) &&
+						    get32(p + 36) == ((exp_hfi_stride << 16) | exp_uv_scan)) saw_stride = true;
 					}
 				}
 				assert(saw_p010 && saw_stride);

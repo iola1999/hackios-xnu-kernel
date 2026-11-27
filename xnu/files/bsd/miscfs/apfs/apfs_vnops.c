@@ -404,7 +404,7 @@ apfs_vnop_getattr(struct vnop_getattr_args *ap)
 	ino = an->an_ino;
 
 	VATTR_RETURN(vap, va_rdev, (dev_t)ino.rdev);
-	VATTR_RETURN(vap, va_nlink, vnode_isdir(vp) ? 2 : (uint32_t)(ino.nchildren > 0 ? ino.nchildren : 1));
+	VATTR_RETURN(vap, va_nlink, vnode_isdir(vp) ? 2 : (an->an_orphan ? 0u : (uint32_t)(ino.nchildren > 0 ? ino.nchildren : 1)));
 	VATTR_RETURN(vap, va_data_size, size);
 	VATTR_RETURN(vap, va_total_size, size);
 	VATTR_RETURN(vap, va_total_alloc, ino.alloced_size);

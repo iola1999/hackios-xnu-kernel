@@ -830,10 +830,54 @@ adreno8_speed_tick(void)
 
 /* ---- step 16: the last look ------------------------------------------------------------------------------------ */
 
+void
+adreno8_hfi_dump_queues(const char *prefix)
+{
+	if (adreno8_hfi_view_table == 0) {
+		return;
+	}
+	printf("%s: command %u/%u, response %u/%u, debug %u/%u\n", prefix,
+	    adreno8_rd(adreno8_hfi_view_table + (ADRENO8_HFI_HEADER(0) + 10) * 4),
+	    adreno8_rd(adreno8_hfi_view_table + (ADRENO8_HFI_HEADER(0) + 11) * 4),
+	    adreno8_rd(adreno8_hfi_view_table + (ADRENO8_HFI_HEADER(1) + 10) * 4),
+	    adreno8_rd(adreno8_hfi_view_table + (ADRENO8_HFI_HEADER(1) + 11) * 4),
+	    adreno8_rd(adreno8_hfi_view_table + (ADRENO8_HFI_HEADER(2) + 10) * 4),
+	    adreno8_rd(adreno8_hfi_view_table + (ADRENO8_HFI_HEADER(2) + 11) * 4));
+}
+
+void
+adreno8_hfi_hang_dump(void)
+{
+	static const struct { const char *name; uint32_t off; } gmu_regs[] = {
+		{ "GMU_PWR_CLK_STATUS", GMU_PWR_CLK_STATUS },
+		{ "GMU_RPMH_POWER_STATE", GMU_RPMH_POWER_STATE },
+		{ "GMU_FW_INIT_RESULT", GMU_FW_INIT_RESULT },
+		{ "GMU_GMU2HOST_INFO", GMU_GMU2HOST_INFO },
+		{ "GMU_GMU2HOST_MASK", GMU_GMU2HOST_MASK },
+		{ "GMU_CX_BUSY_STATUS", GMU_CX_BUSY_STATUS },
+		{ "GMU_AO_INTERRUPT_STATUS", GMU_AO_INTERRUPT_STATUS },
+		{ "GMU_AHB_FENCE_STATUS", GMU_AHB_FENCE_STATUS },
+		{ "GMU_HFI_CTRL_STATUS", GMU_HFI_CTRL_STATUS },
+	};
+
+	if (adreno8_gmu.base != 0) {
+		for (unsigned i = 0; i < sizeof(gmu_regs) / sizeof(gmu_regs[0]); i++) {
+			printf("adreno8: hang GMU %s = %#x\n",
+			    gmu_regs[i].name, adreno8_rd(adreno8_gmu.base + gmu_regs[i].off));
+			adreno8_settle();
+		}
+	}
+	if (adreno8_gmu_space.is_on) {
+		(void)adreno8_space_faulted(&adreno8_gmu_space);
+	}
+	adreno8_hfi_dump_queues("adreno8: hang HFI queues");
+}
+
 bool
 adreno8_step_last_look(void)
 {
 	uint32_t ao, fence, power;
+	char prefix[48];
 
 	adreno8_announce("read GMU fault, interrupt, power, counter and queue status");
 	if (adreno8_space_faulted(&adreno8_gmu_space)) {
@@ -851,12 +895,8 @@ adreno8_step_last_look(void)
 	power = adreno8_get(&adreno8_gmu, "power clock status", GMU_PWR_CLK_STATUS);
 	adreno8_get(&adreno8_gmu, "always on counter, high", GMU_ALWAYS_ON_HI);
 	adreno8_get(&adreno8_gmu, "always on counter, low", GMU_ALWAYS_ON_LO);
-	if (adreno8_hfi_view_table != 0) {
-		printf("adreno8: %u: the queues at the end: command %u/%u, response %u/%u, debug %u/%u\n", adreno8_step,
-		    adreno8_rd(adreno8_hfi_view_table + (ADRENO8_HFI_HEADER(0) + 10) * 4), adreno8_rd(adreno8_hfi_view_table + (ADRENO8_HFI_HEADER(0) + 11) * 4),
-		    adreno8_rd(adreno8_hfi_view_table + (ADRENO8_HFI_HEADER(1) + 10) * 4), adreno8_rd(adreno8_hfi_view_table + (ADRENO8_HFI_HEADER(1) + 11) * 4), adreno8_rd(adreno8_hfi_view_table + (ADRENO8_HFI_HEADER(2) + 10) * 4),
-		    adreno8_rd(adreno8_hfi_view_table + (ADRENO8_HFI_HEADER(2) + 11) * 4));
-	}
+	snprintf(prefix, sizeof(prefix), "adreno8: %u: the queues at the end", adreno8_step);
+	adreno8_hfi_dump_queues(prefix);
 	printf("adreno8: %u: GMU diagnostics complete; log %#x, GX power/clock status %#x\n",
 	    adreno8_step, adreno8_gmu_log.address, power);
 	return true;

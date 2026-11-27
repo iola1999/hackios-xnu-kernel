@@ -203,6 +203,7 @@ void adreno8_gpu_hang_dump(void) { if (!g_gpu_dumped) { g_gpu_dumped = true; g_h
 bool adreno8_gpu_cp_init(void) { g_cp_calls++; return g_cp_ok; }
 bool adreno8_gpu_secure_exit(void) { return g_sec_exit_ok; }
 bool adreno8_gpu_scratch_test(void) { g_scratch_calls++; return g_scratch_ok; }
+bool adreno8_gpu_cp_progress(uint64_t *sig) { (void)sig; return false; }
 void adreno8_gpu_reset_for_recovery(void) { g_gpu_dumped = false; g_gpu_cmds_ok = true; }
 bool AnnibaleGPUStart(void) { return true; }
 '''

@@ -116,6 +116,7 @@ static bool adreno8_translation_walk(struct adreno8_space *sp, uint32_t va, vm_o
 static const uint8_t *annibale_image_file(const char *d, const char *n, uint64_t *s, int *k) { (void)d; (void)n; (void)s; (void)k; return NULL; }
 static bool adreno8_space_faulted(struct adreno8_space *sp) { (void)sp; return false; }
 void adreno8_context_describe_inflight(void) {}
+void adreno8_hfi_hang_dump(void) {}
 void adreno8_bo_dump_tree(uint64_t b, uint32_t i) { (void)b; (void)i; }
 void adreno8_bo_describe_owner(const char *n, uint32_t a) { (void)n; (void)a; }
 void adreno8_bo_dump_words(const char *w, uint64_t a, uint32_t c) { (void)w; (void)a; (void)c; }

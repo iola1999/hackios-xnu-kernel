@@ -1,16 +1,18 @@
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
-index 0554aa8021cb..b92910a1fb48 100644
+index 0554aa8021cb..000000000000 100644
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
-@@ -141,6 +141,7 @@ _Static_assert(ARM64_KDBG_CODE_GUEST <= KDBG_CODE_MAX, "arm64 KDBG trace codes o
+@@ -141,6 +141,9 @@
  _Static_assert(ARM64_KDBG_CODE_GUEST <= UINT16_MAX, "arm64 KDBG trace codes out of range");
  
  void panic_with_thread_kernel_state(const char *msg, arm_saved_state_t *ss) __abortlike;
 +extern void loader_fault_log(const char *, uint64_t, uint64_t, uint32_t, uint64_t);
++extern char *proc_name_address(void *p);
++extern int proc_selfpid(void);
  
  void sleh_synchronous_sp1(arm_context_t *, uint64_t, vm_offset_t) __abortlike;
  void sleh_synchronous(arm_context_t *, uint64_t, vm_offset_t, bool);
-@@ -550,6 +551,9 @@ __dead2 __unused
+@@ -550,8 +553,11 @@
  static void
  arm64_implementation_specific_error(arm_saved_state_t *state, uint64_t esr, vm_offset_t far)
  {
@@ -22,7 +24,9 @@ index 0554aa8021cb..b92910a1fb48 100644
 +	panic_plain("Unhandled implementation specific error (pc=0x%llx lr=0x%llx esr=0x%llx far=0x%lx)\n",
 +	    (unsigned long long)pc, (unsigned long long)lr, (unsigned long long)esr, (unsigned long)far);
  }
-@@ -624,7 +628,7 @@ panic_with_thread_kernel_state(const char *msg, arm_saved_state_t *ss)
+ 
+ #if CONFIG_KERNEL_INTEGRITY
+@@ -624,7 +630,7 @@
  
  	ss_valid = is_saved_state64(ss);
  	arm_saved_state64_t *state = saved_state64(ss);
@@ -31,3 +35,75 @@ index 0554aa8021cb..b92910a1fb48 100644
  	os_atomic_cmpxchg(&original_faulting_state, NULL, state, seq_cst);
  
  	// rdar://80659177
+@@ -2539,6 +2545,53 @@
+ }
+ 
+ static void
++copyio_fault_trace(
++	const char                     *kind,
++	arm_saved_state_t              *state,
++	uint64_t                        esr,
++	vm_offset_t                     fault_addr,
++	fault_status_t                  fault_code,
++	vm_prot_t                       fault_type,
++	int                             result,
++	thread_t                        thread,
++	struct copyio_recovery_entry   *recover)
++{
++	static uint32_t loc_said, other_said;
++	task_t task = (thread != THREAD_NULL) ? current_task() : TASK_NULL;
++	void *bsd = (task != TASK_NULL) ? get_bsdtask_info(task) : NULL;
++	const char *pname = bsd ? proc_name_address(bsd) : "?";
++	bool is_loc = (bsd != NULL && strncmp(pname, "locationd", 9) == 0);
++	uint32_t *counter = is_loc ? &loc_said : &other_said;
++
++	if (os_atomic_load(counter, relaxed) >= 8 ||
++	    os_atomic_inc(counter, relaxed) > 8) {
++		return;
++	}
++
++	int pid = bsd ? proc_selfpid() : 0;
++	int irqs_on = SPSR_INTERRUPTS_ENABLED(get_saved_state_cpsr(state)) ? 1 : 0;
++	uint64_t pc = get_saved_state_pc(state);
++	uint64_t lr = is_saved_state64(state) ? saved_state64(state)->lr : 0;
++	uint64_t rec_start = (uint64_t)((uintptr_t)copyio_recover_table + (uintptr_t)recover->cre_start);
++	uint64_t rec_target = (uint64_t)((uintptr_t)copyio_recover_table + (uintptr_t)recover->cre_recovery);
++	int trec = (thread != THREAD_NULL) ? (int)thread->recover : -1;
++	char msg[256];
++
++	snprintf(msg, sizeof(msg),
++	    "copyio_abort(%s): %s[%d] far=0x%llx pc=0x%llx lr=0x%llx res=%d fc=0x%x ft=0x%x esr=0x%llx irqs_on=%d rec=0x%llx->0x%llx trec=%d",
++	    kind, pname, pid, (unsigned long long)fault_addr,
++	    (unsigned long long)pc, (unsigned long long)lr,
++	    result, (unsigned)fault_code, (unsigned)fault_type,
++	    (unsigned long long)esr, irqs_on,
++	    (unsigned long long)rec_start, (unsigned long long)rec_target, trec);
++	if (irqs_on) {
++		printf("%s\n", msg);
++	} else {
++		kprintf("%s\n", msg);
++	}
++}
++
++static void
+ handle_kernel_abort(arm_saved_state_t *state, uint64_t esr, vm_offset_t fault_addr,
+     fault_status_t fault_code, vm_prot_t fault_type, expected_fault_handler_t expected_fault_handler)
+ {
+@@ -2711,6 +2764,8 @@
+ 			/*
+ 			 *  If we have a recover handler, invoke it now.
+ 			 */
++			copyio_fault_trace("vm", state, esr, fault_addr, fault_code, fault_type,
++			    (int)result, thread, recover);
+ 			handle_kernel_abort_recover(state, esr, fault_addr, thread, recover);
+ 			return;
+ 		}
+@@ -2718,6 +2773,8 @@
+ 		panic_fault_address = fault_addr;
+ 	} else if (is_alignment_fault(fault_code)) {
+ 		if (recover) {
++			copyio_fault_trace("align", state, esr, fault_addr, fault_code, fault_type,
++			    -1, thread, recover);
+ 			handle_kernel_abort_recover(state, esr, fault_addr, thread, recover);
+ 			return;
+ 		}

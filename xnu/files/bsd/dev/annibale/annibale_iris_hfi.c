@@ -719,8 +719,10 @@ iris_start_output(struct iris_session *s)
 	}
 	struct iris_pkt_buf b;
 	pkt_begin(&b, s->wire_session_id);
-	uint32_t stride_scan[2] = { (s->y_stride << 16) | s->y_scanlines,
-		(s->uv_stride << 16) | s->uv_scanlines };
+	uint32_t hfi_y_stride = s->is_10bit ? (s->y_stride / 2u) : s->y_stride;
+	uint32_t hfi_uv_stride = s->is_10bit ? (s->uv_stride / 2u) : s->uv_stride;
+	uint32_t stride_scan[2] = { (hfi_y_stride << 16) | s->y_scanlines,
+		(hfi_uv_stride << 16) | s->uv_scanlines };
 	if (!pkt_add_u32(&b, HFI_PROP_OPB_ENABLE, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32, HFI_PORT_RAW, 1u) ||
 	    !pkt_add_u32(&b, HFI_PROP_COLOR_FORMAT, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32_ENUM,
 	    HFI_PORT_RAW, s->is_10bit ? HFI_COLOR_FMT_P010 : HFI_COLOR_FMT_NV12) ||

@@ -125,11 +125,27 @@ static uint64_t g_now_us_val = 0;
 static uint64_t host_now_us(void) { return g_now_us_val; }
 static void adsp_fastrpc_cache_clean(uint64_t va, uint32_t size) { (void)va; (void)size; }
 static void adsp_fastrpc_free_buf(void);
+static bool adsp_fastrpc_assign_heap(uint64_t pa);
 static bool adsp_fastrpc_ensure_mem(void);
-static int64_t annibale_tz_assign_mem(uint64_t pa, uint64_t sz, uint32_t vmid, bool shared, uint64_t *r1) {
-    (void)pa; (void)sz; (void)vmid; (void)shared;
-    if (r1) *r1 = 0;
-    return 0;
+static struct { uint32_t cnt, v0, v1, perm; } g_tz_calls[4];
+static uint32_t g_tz_call_count = 0;
+static uint32_t g_tz_succeed_on_idx = 0u;
+static int64_t annibale_tz_assign_mem_perms(uint64_t pa, uint64_t sz, const uint32_t *vmids,
+    const uint32_t *perms, uint32_t cnt, uint64_t *r1) {
+    assert(pa != 0 && sz == 0x00c00000u && vmids != NULL && perms != NULL && cnt >= 1u && cnt <= 2u);
+    if (g_tz_call_count < 4u) {
+        g_tz_calls[g_tz_call_count].cnt = cnt;
+        g_tz_calls[g_tz_call_count].v0 = vmids[0];
+        g_tz_calls[g_tz_call_count].v1 = cnt > 1u ? vmids[1] : 0u;
+        g_tz_calls[g_tz_call_count].perm = perms[0];
+    }
+    uint32_t idx = g_tz_call_count++;
+    if (idx == g_tz_succeed_on_idx) {
+        if (r1) *r1 = 0;
+        return 0;
+    }
+    if (r1) *r1 = 0x56u;
+    return -2;
 }
 
 struct mock_file { const char *path; const char *data; size_t size; bool vfs_only; };
@@ -204,7 +220,7 @@ static bool smem_peek(uint32_t off, void *dst, uint32_t len) {
 #include "annibale_adsp_fastrpc.inc"
 
 static bool adsp_fastrpc_ensure_mem(void) {
-    (void)g_heap_mem; (void)annibale_tz_assign_mem; (void)adsp_hw_up;
+    (void)g_heap_mem; (void)annibale_tz_assign_mem_perms; (void)adsp_hw_up;
     adsp_fastrpc_heap_va = (uint64_t)(uintptr_t)g_heap_mem;
     adsp_fastrpc_heap_pa = g_fake_heap_pa;
     adsp_fastrpc_heap_ready = true;
@@ -548,6 +564,42 @@ int main(void) {
     assert(g_cmd2_req_count == ADSP_FASTRPC_INTENT_REQ_RETRIES);
     assert(adsp_fastrpc_stage == FASTRPC_STAGE_FAILED);
     adsp_fastrpc_reset();
+
+    /* 9. lowdma heap/staging picker respects WiFi ceiling, modem ceiling, 4 MiB alignment, and bounds. */
+    uint64_t heap_pa = 0, buf_pa = 0;
+    assert(adsp_fastrpc_lowdma_pick(0xc772d000ULL, 128ULL, &heap_pa, &buf_pa));
+    assert((heap_pa & 0x3fffffULL) == 0ULL);
+    assert(heap_pa >= ((0xc772d000ULL + 0x06000000ULL + 0xfffffULL) & ~0xfffffULL));
+    assert(buf_pa >= ((0xc772d000ULL + 0x06000000ULL + 0xfffffULL) & ~0xfffffULL));
+    assert(heap_pa + ADSP_FASTRPC_HEAP_SIZE <= 0xcf72d000ULL - 0x0012c000ULL);
+    assert(buf_pa + ADSP_FASTRPC_INVOKE_BUF_SZ <= 0xcf72d000ULL - 0x0012c000ULL);
+    assert(buf_pa + ADSP_FASTRPC_INVOKE_BUF_SZ <= heap_pa || heap_pa + ADSP_FASTRPC_HEAP_SIZE <= buf_pa);
+    assert(!adsp_fastrpc_lowdma_pick(0ULL, 128ULL, &heap_pa, &buf_pa));
+    assert(!adsp_fastrpc_lowdma_pick(0xc772d000ULL, 95ULL, &heap_pa, &buf_pa));
+    assert(!adsp_fastrpc_lowdma_pick(0xc772d000ULL, 1025ULL, &heap_pa, &buf_pa));
+    assert(!adsp_fastrpc_lowdma_pick(0xf9000000ULL, 128ULL, &heap_pa, &buf_pa));
+
+    /* 10. adsp_fastrpc_assign_heap tries dual-VMID {0x16,0x25} RWX(7), then RW(6), then single-VMID 0x25/0x16 RWX(7). */
+    g_tz_call_count = 0;
+    g_tz_succeed_on_idx = 0u;
+    assert(adsp_fastrpc_assign_heap(0xcdc00000ULL));
+    assert(g_tz_call_count == 1u && g_tz_calls[0].cnt == 2u &&
+        g_tz_calls[0].v0 == 0x16u && g_tz_calls[0].v1 == 0x25u && g_tz_calls[0].perm == 7u);
+
+    g_tz_call_count = 0;
+    g_tz_succeed_on_idx = 3u;
+    assert(adsp_fastrpc_assign_heap(0xcdc00000ULL));
+    assert(g_tz_call_count == 4u);
+    assert(g_tz_calls[0].cnt == 2u && g_tz_calls[0].v0 == 0x16u && g_tz_calls[0].v1 == 0x25u && g_tz_calls[0].perm == 7u);
+    assert(g_tz_calls[1].cnt == 2u && g_tz_calls[1].v0 == 0x16u && g_tz_calls[1].v1 == 0x25u && g_tz_calls[1].perm == 6u);
+    assert(g_tz_calls[2].cnt == 1u && g_tz_calls[2].v0 == 0x25u && g_tz_calls[2].perm == 7u);
+    assert(g_tz_calls[3].cnt == 1u && g_tz_calls[3].v0 == 0x16u && g_tz_calls[3].perm == 7u);
+
+    g_tz_call_count = 0;
+    g_tz_succeed_on_idx = 0xffffffffu;
+    assert(!adsp_fastrpc_assign_heap(0xcdc00000ULL));
+    assert(g_tz_call_count == 4u);
+
     puts("PASS: annibale_adsp_fastrpc Stage 2 (SMMU, GLINK, INIT_CREATE, apps_std, ASan+UBSan)");
     return 0;
 }

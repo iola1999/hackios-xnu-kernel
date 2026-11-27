@@ -97,6 +97,7 @@ bool adreno8_gpu_memory_verify(void) { return true; }
 bool adreno8_gpu_cp_init(void) { return true; }
 bool adreno8_gpu_secure_exit(void) { return true; }
 bool adreno8_gpu_scratch_test(void) { return true; }
+bool adreno8_gpu_cp_progress(uint64_t *sig) { (void)sig; return false; }
 bool adreno8_step_firmware(void) { return true; }
 bool adreno8_step_gmu_start(void) { return true; }
 bool adreno8_step_queues(void) { return true; }
@@ -352,7 +353,8 @@ def main():
     fixture=runpy.run_path(str(ROOT/"tools/tests/test-annibale-gpu-lifetime.py"))
     function=fixture["function"]
     original=(IOKIT/"AnnibaleGPU.cpp").read_text()
-    source=original.replace('#include "AnnibaleGPUSubmit.inc"',(IOKIT/"AnnibaleGPUSubmit.inc").read_text())
+    source=(original.replace('#include "AnnibaleGPUSubmit.inc"',(IOKIT/"AnnibaleGPUSubmit.inc").read_text())
+            .replace('#include "AnnibaleGPUWait.inc"',(IOKIT/"AnnibaleGPUWait.inc").read_text()))
     dispatch=(DEV/"annibale/annibale_gpu_dispatch.c").read_text().replace('#include "../adreno8/','#include "')
     publisher=(function(source,"AnnibaleGPU::start")+"\nstatic AnnibaleGPU *gGPUService;\n"
                +function(source,"AnnibaleGPUStart")+function(source,"AnnibaleGPUStop"))

@@ -1150,6 +1150,10 @@ int main(void) {{
         assert(res1 == 0x1234ULL);
         mock_assign_rc = 0; mock_assign_res1 = 0; res1 = 0x5555ULL;
         assert(annibale_tz_assign_mem(0x84a00000ULL, 0ULL, 15u, false, &res1) == -1 && res1 == 0);
+        const uint32_t av[2] = {{ 0x16u, 0x25u }}, ap[2] = {{ 7u, 7u }}; struct tz_assign_perm dv[2]; uint64_t ev[7];
+        assert(annibale_tz_assign_mem_perms(0xcdc00000ULL, 0x00c00000ULL, av, ap, 2u, &res1) == 0 && res1 == 0);
+        memcpy(dv, slot2 + 0x080u, sizeof(dv)); memcpy(ev, slot2 + 0x100u, sizeof(ev));
+        assert(dv[0].vmid == 0x16u && dv[0].perm == 7u && dv[1].vmid == 0x25u && dv[1].perm == 7u && ev[2] == 48ULL);
     }}
     lowdma_enabled = false;
 

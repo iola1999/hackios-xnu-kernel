@@ -38,7 +38,10 @@
 #define ADSP_FASTRPC_HEAP_SIZE      0x00c00000u /* 12 MiB, annibale.dts adsp_mem_heap */
 #define ADSP_FASTRPC_INVOKE_BUF_SZ  0x00010000u /* 64 KiB invoke + reverse-RPC staging */
 #define ADSP_FASTRPC_IO_MAX_BYTES   (ADSP_FASTRPC_INVOKE_BUF_SZ / 2u)
-#define ADSP_FASTRPC_VMID_ADSP      0x16u
+#define ADSP_FASTRPC_VMID_LPASS     0x16u
+#define ADSP_FASTRPC_VMID_ADSP_HEAP 0x25u
+#define ADSP_FASTRPC_PERM_RW        6u
+#define ADSP_FASTRPC_PERM_RWX       7u
 
 #define ADSP_FASTRPC_SCALARS(method, in, out) \
 	((((uint32_t)(method) & 0x1fu) << 24) | (((uint32_t)(in) & 0xffu) << 16) | (((uint32_t)(out) & 0xffu) << 8))
@@ -161,10 +164,57 @@ static bool adsp_fastrpc_heap_ready;
 static uint64_t adsp_fastrpc_buf_va;
 static uint64_t adsp_fastrpc_buf_pa;
 static bool adsp_fastrpc_buf_ready;
+static bool adsp_fastrpc_buf_from_lowdma;
+
+/*
+ * Carve adsp_mem_heap (12 MiB, 4 MiB-aligned) and invoke staging buffer (64 KiB)
+ * from the <4 GiB loader lowdma window, strictly above ath12k/MHI (80 MiB lx +
+ * firmware/rings) and strictly below modem_svc (rmtfs + memshare), audio, and IPA.
+ */
+static bool
+adsp_fastrpc_lowdma_pick(uint64_t low, uint64_t mb,
+    uint64_t *heap_pa_out, uint64_t *buf_pa_out)
+{
+	if (low == 0 || mb < 96 || mb > 1024) {
+		return false;
+	}
+	uint64_t low_end = low + (mb << 20);
+	if (low_end > 0x100000000ULL || low_end < low + 0x06d00000ULL) {
+		return false;
+	}
+	uint64_t wifi_ceiling = (low + 0x06000000ULL + 0xfffffULL) & ~0xfffffULL;
+	uint64_t top_limit = (low_end - 0x0012c000ULL) & ~0xfffffULL;
+	uint64_t modem_safe = (low + 0x070c0000ULL + 0xfffffULL) & ~0xfffffULL;
+	uint64_t modem_min = top_limit > 0x00e00000ULL ? (top_limit - 0x00e00000ULL) : 0ULL;
+
+	if (modem_safe < modem_min) {
+		modem_safe = modem_min;
+	}
+	if (modem_safe < top_limit) {
+		top_limit = modem_safe;
+	}
+	if (top_limit < ADSP_FASTRPC_HEAP_SIZE + ADSP_FASTRPC_INVOKE_BUF_SZ) {
+		return false;
+	}
+	uint64_t heap_pa = (top_limit - ADSP_FASTRPC_HEAP_SIZE) & ~0x3fffffULL;
+	uint64_t buf_pa = (heap_pa + ADSP_FASTRPC_HEAP_SIZE + ADSP_FASTRPC_INVOKE_BUF_SZ <= top_limit)
+	    ? (heap_pa + ADSP_FASTRPC_HEAP_SIZE)
+	    : (heap_pa - ADSP_FASTRPC_INVOKE_BUF_SZ);
+	uint64_t region_min = buf_pa < heap_pa ? buf_pa : heap_pa;
+
+	if (heap_pa < wifi_ceiling || region_min < wifi_ceiling ||
+	    heap_pa + ADSP_FASTRPC_HEAP_SIZE > top_limit ||
+	    buf_pa + ADSP_FASTRPC_INVOKE_BUF_SZ > top_limit) {
+		return false;
+	}
+	*heap_pa_out = heap_pa;
+	*buf_pa_out = buf_pa;
+	return true;
+}
 
 #ifndef ADSP_FASTRPC_HOST_TEST
-extern int64_t annibale_tz_assign_mem(uint64_t region_pa, uint64_t region_sz,
-    uint32_t peer_vmid, bool shared, uint64_t *res1_out);
+extern int64_t annibale_tz_assign_mem_perms(uint64_t region_pa, uint64_t region_sz,
+    const uint32_t *dst_vmids, const uint32_t *dst_perms, uint32_t dst_cnt, uint64_t *res1_out);
 
 static void
 adsp_fastrpc_cache_clean(uint64_t va, uint32_t size)
@@ -207,31 +257,61 @@ adsp_fastrpc_alloc_contig_low4g(uint32_t size, uint32_t align_mask, uint64_t *va
 	return true;
 }
 
+static bool adsp_fastrpc_assign_heap(uint64_t pa);
+
 static bool
 adsp_fastrpc_ensure_mem(void)
 {
+	uint64_t low = 0, mb = 0;
+	uint64_t low_heap_pa = 0, low_buf_pa = 0;
+	bool has_lowdma = PE_parse_boot_argn("lowdma", &low, sizeof(low)) &&
+	    PE_parse_boot_argn("lowdma_mb", &mb, sizeof(mb)) &&
+	    adsp_fastrpc_lowdma_pick(low, mb, &low_heap_pa, &low_buf_pa);
+
 	if (!adsp_fastrpc_heap_ready) {
-		uint64_t va = 0, pa = 0, res1 = 0;
-		if (!adsp_fastrpc_alloc_contig_low4g(ADSP_FASTRPC_HEAP_SIZE, 0x3fffffULL, &va, &pa)) {
+		uint64_t va = 0, pa = 0;
+		if (has_lowdma) {
+			vm_offset_t kva = ml_io_map_unmappable((vm_offset_t)low_heap_pa,
+			    ADSP_FASTRPC_HEAP_SIZE, VM_WIMG_DEFAULT);
+			if (kva != 0) {
+				bzero((void *)kva, ADSP_FASTRPC_HEAP_SIZE);
+				adsp_fastrpc_cache_clean((uint64_t)kva, ADSP_FASTRPC_HEAP_SIZE);
+				ml_io_unmap(kva, ADSP_FASTRPC_HEAP_SIZE);
+				pa = low_heap_pa;
+			}
+		}
+		if (pa == 0 &&
+		    !adsp_fastrpc_alloc_contig_low4g(ADSP_FASTRPC_HEAP_SIZE, 0x3fffffULL, &va, &pa)) {
 			say("fastrpc: adsp_mem_heap 12 MiB <4G allocation failed\n");
 			return false;
 		}
-		int64_t rc = annibale_tz_assign_mem(pa, ADSP_FASTRPC_HEAP_SIZE,
-		    ADSP_FASTRPC_VMID_ADSP, true, &res1);
-		say("fastrpc: adsp_mem_heap pa=%#llx sz=%#x hyp_assign=(%lld,%#llx)\n",
-		    pa, ADSP_FASTRPC_HEAP_SIZE, rc, res1);
+		(void)adsp_fastrpc_assign_heap(pa);
 		adsp_fastrpc_heap_va = va;
 		adsp_fastrpc_heap_pa = pa;
 		adsp_fastrpc_heap_ready = true;
 	}
 	if (!adsp_fastrpc_buf_ready) {
 		uint64_t va = 0, pa = 0;
-		if (!adsp_fastrpc_alloc_contig_low4g(ADSP_FASTRPC_INVOKE_BUF_SZ, PAGE_MASK, &va, &pa)) {
+		bool from_lowdma = false;
+		if (has_lowdma) {
+			vm_offset_t kva = ml_io_map_unmappable((vm_offset_t)low_buf_pa,
+			    ADSP_FASTRPC_INVOKE_BUF_SZ, VM_WIMG_DEFAULT);
+			if (kva != 0) {
+				bzero((void *)kva, ADSP_FASTRPC_INVOKE_BUF_SZ);
+				adsp_fastrpc_cache_clean((uint64_t)kva, ADSP_FASTRPC_INVOKE_BUF_SZ);
+				va = (uint64_t)kva;
+				pa = low_buf_pa;
+				from_lowdma = true;
+			}
+		}
+		if (!from_lowdma &&
+		    !adsp_fastrpc_alloc_contig_low4g(ADSP_FASTRPC_INVOKE_BUF_SZ, PAGE_MASK, &va, &pa)) {
 			say("fastrpc: invoke buffer %u B allocation failed\n", ADSP_FASTRPC_INVOKE_BUF_SZ);
 			return false;
 		}
 		adsp_fastrpc_buf_va = va;
 		adsp_fastrpc_buf_pa = pa;
+		adsp_fastrpc_buf_from_lowdma = from_lowdma;
 		adsp_fastrpc_buf_ready = true;
 	}
 	return true;
@@ -241,10 +321,15 @@ static void
 adsp_fastrpc_free_buf(void)
 {
 	if (adsp_fastrpc_buf_ready && adsp_fastrpc_buf_va != 0) {
-		kmem_free(kernel_map, (vm_offset_t)adsp_fastrpc_buf_va, ADSP_FASTRPC_INVOKE_BUF_SZ);
+		if (adsp_fastrpc_buf_from_lowdma) {
+			ml_io_unmap((vm_offset_t)adsp_fastrpc_buf_va, ADSP_FASTRPC_INVOKE_BUF_SZ);
+		} else {
+			kmem_free(kernel_map, (vm_offset_t)adsp_fastrpc_buf_va, ADSP_FASTRPC_INVOKE_BUF_SZ);
+		}
 	}
 	adsp_fastrpc_buf_va = 0;
 	adsp_fastrpc_buf_pa = 0;
+	adsp_fastrpc_buf_from_lowdma = false;
 	adsp_fastrpc_buf_ready = false;
 }
 
@@ -314,6 +399,34 @@ adsp_fastrpc_free_fd_data(struct adsp_fastrpc_fd *slot)
 	}
 }
 #endif
+
+static bool
+adsp_fastrpc_assign_heap(uint64_t pa)
+{
+	/* Match annibale DTS adsp_heap_region (qcom,vmids = <0x16 0x25>) and upstream Linux fastrpc (RWX=7). */
+	static const struct {
+		uint32_t vmids[2];
+		uint32_t perms[2];
+		uint32_t cnt;
+	} candidates[] = {
+		{ { ADSP_FASTRPC_VMID_LPASS, ADSP_FASTRPC_VMID_ADSP_HEAP }, { ADSP_FASTRPC_PERM_RWX, ADSP_FASTRPC_PERM_RWX }, 2u },
+		{ { ADSP_FASTRPC_VMID_LPASS, ADSP_FASTRPC_VMID_ADSP_HEAP }, { ADSP_FASTRPC_PERM_RW, ADSP_FASTRPC_PERM_RW }, 2u },
+		{ { ADSP_FASTRPC_VMID_ADSP_HEAP, 0u }, { ADSP_FASTRPC_PERM_RWX, 0u }, 1u },
+		{ { ADSP_FASTRPC_VMID_LPASS, 0u }, { ADSP_FASTRPC_PERM_RWX, 0u }, 1u },
+	};
+	for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+		uint64_t res1 = 0;
+		int64_t rc = annibale_tz_assign_mem_perms(pa, ADSP_FASTRPC_HEAP_SIZE,
+		    candidates[i].vmids, candidates[i].perms, candidates[i].cnt, &res1);
+		say("fastrpc: adsp_mem_heap pa=%#llx sz=%#x cnt=%u vmids=%#x,%#x perm=%u hyp_assign=(%lld,%#llx)\n",
+		    pa, ADSP_FASTRPC_HEAP_SIZE, candidates[i].cnt, candidates[i].vmids[0],
+		    candidates[i].vmids[1], candidates[i].perms[0], rc, res1);
+		if (rc == 0 && res1 == 0) {
+			return true;
+		}
+	}
+	return false;
+}
 
 static uint32_t
 adsp_fastrpc_align_up(uint32_t v, uint32_t align)

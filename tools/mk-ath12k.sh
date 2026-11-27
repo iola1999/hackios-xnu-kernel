@@ -108,7 +108,7 @@ CFLAGS="-mkernel -mgeneral-regs-only -fno-builtin -fno-common -ffreestanding -fn
 # the kernel's two headers come from this repository's copy of them (xnu/files, which both kernels share)
 K=$ROOT/xnu/files/bsd/sys
 DFLAGS="-Isrc/ath12k -Isrc -include $W/include/lx_prelude.h -include $W/ath12k/lx_ath12k.h -DCONFIG_ATH12K_DEBUG
-	-DLX_POOL_MB=96u -DLX_RINGS_MB=64u -DLX_ALIGN_NATURAL
+	-DLX_POOL_MB=80u -DLX_RINGS_MB=48u -DLX_ALIGN_NATURAL
 	-DKBUILD_MODNAME=\"ath12k\"
 	-DLX_ANNIBALE_LX_H=\"$K/annibale_lx.h\" -DLX_ANNIBALE_QMI_H=\"$K/annibale_qmi.h\""
 # Timestamp-based incremental skip: if out/ath12k.o exists and is newer than all inputs, return early

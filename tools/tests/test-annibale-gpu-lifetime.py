@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "xnu/files/iokit/Kernel/AnnibaleGPU.cpp"
 MEMORY = SOURCE.with_name("AnnibaleGPUMemory.inc")
 SUBMIT = SOURCE.with_name("AnnibaleGPUSubmit.inc")
+WAIT = SOURCE.with_name("AnnibaleGPUWait.inc")
 
 
 def function(source, name):
@@ -195,6 +196,13 @@ static uint32_t annibale_gpu_last() { return 7; }
 static uint32_t retired_now, retired_slot1;
 static uint32_t annibale_gpu_retired() { return retired_now; }
 static uint32_t annibale_gpu_retired_for(uint32_t f) { return (f & 0x80000000u) ? retired_slot1 : retired_now; }
+static bool cp_progress_ok;
+static uint64_t cp_progress_sig;
+static uint64_t (*cp_progress_hook)(bool *ok);
+static bool annibale_gpu_progress(uint64_t *sig) {
+    if (cp_progress_hook) { bool ok = false; *sig = cp_progress_hook(&ok); return ok; }
+    *sig = cp_progress_sig; return cp_progress_ok;
+}
 static uint32_t context_depth = 4;
 static uint32_t adreno8_context_depth() { return context_depth; }
 static uint32_t annibale_gpu_submit(const uint64_t *, const uint32_t *, uint32_t count) {
@@ -233,6 +241,7 @@ static void reset() {
     releases_in_lock = drops_in_lock = 0;
     wrong_pages = busy_for = 0; context_depth = 4; done_hook = nullptr;
     retired_now = retired_slot1 = 0;
+    cp_progress_ok = false; cp_progress_sig = 0; cp_progress_hook = nullptr;
     submit_answer = 17; next_address = 0x40000000; now = 0;
     gGPUReported = gGPUCached = gGPUCoherent = false; gGPUKeep = 0;
     flush_calls = 0; last_flush_ptr = nullptr; last_flush_size = 0;
@@ -620,12 +629,32 @@ static void cross_slot_last_use_and_stall() {
     MiniIOSurfaceDrop(&s);
     assert(root->freed); c.clientClose(); c.free();
 }
+static uint64_t g11_advancing_cp(bool *ok) {
+    *ok = true;
+    return 0x1000u + (now / (5000ULL * NSEC_PER_MSEC));
+}
+static void g11_long_submission_progress() {
+    reset(); fence_done = false; retired_now = 200u;
+    cp_progress_hook = g11_advancing_cp;
+    IOLockLock(gGPULock);
+    /* Single 35 s wait (> GPU_STALL_MS) with advancing IB1/IB2 rem must NOT report a stall. */
+    assert(!gpuWait(205u, 35000));
+    assert(!gGPUReported);
+    /* Once CP freezes at a fixed signature, GPU_STALL_MS reports "no answer" after 30 s frozen. */
+    cp_progress_hook = nullptr; cp_progress_ok = true; cp_progress_sig = 0xdeadbeefULL;
+    for (int i = 0; i < 8; i++) {
+        (void)gpuWait(205u, 5000);
+        if (gGPUReported) { assert(i == 6); break; }
+    }
+    assert(gGPUReported);
+    IOLockUnlock(gGPULock);
+}
 int main() {
     healthy(); stopped(); failed_reap(); completed_reap(); failed_free(); partial_map(); segments(); kept();
     failed_surface(); surface_ownership(); full_pending(); long_pass(); failed_submit(); queue_room(); display();
     out_of_lock_teardown(); keep_evict_bounded(); surface_fail_retain_not_pooled(); full_fleft_reap_before_wait();
-    cross_slot_last_use_and_stall(); reset();
-    printf("AnnibaleGPU production lifecycle: 36 scenarios at %llu-byte pages passed\n", (unsigned long long)PAGE_SIZE);
+    cross_slot_last_use_and_stall(); g11_long_submission_progress(); reset();
+    printf("AnnibaleGPU production lifecycle: 37 scenarios at %llu-byte pages passed\n", (unsigned long long)PAGE_SIZE);
 }
 '''
 
@@ -639,7 +668,7 @@ def unit(source, memory):
             "static bool gGPUReported, gGPUCached, gGPUCoherent;\n" + stats + "\nstatic uint32_t gGPUIrqsSeen;\n" + records
             + "\nstruct AnnibaleGPUUserClient : IOUserClient {\n" + fields
             + "\nIOReturn clientClose(); void free();\n};\n"
-            + function(source, "gpuWait") + function(source, "MiniIOSurfaceDrawn")
+            + function(source, "gpuProgressSample") + function(source, "gpuWait") + function(source, "MiniIOSurfaceDrawn")
             + function(source, "MiniIOSurfaceGPUStopped")
             + memory + function(source, "AnnibaleGPUUserClient::submit") + CASES)
 
@@ -700,7 +729,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mutations", action="store_true")
     args = parser.parse_args()
-    source = SOURCE.read_text().replace('#include "AnnibaleGPUSubmit.inc"', SUBMIT.read_text())
+    source = (SOURCE.read_text()
+              .replace('#include "AnnibaleGPUSubmit.inc"', SUBMIT.read_text())
+              .replace('#include "AnnibaleGPUWait.inc"', WAIT.read_text()))
     memory = MEMORY.read_text()
     with tempfile.TemporaryDirectory(prefix="annibale-gpu-lifetime-") as temporary:
         folder = Path(temporary)
