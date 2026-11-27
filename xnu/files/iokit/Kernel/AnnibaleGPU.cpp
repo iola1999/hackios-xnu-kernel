@@ -342,6 +342,10 @@ static struct {
 	uint32_t made_by_size[4];               /* ... how many of them under 64 KB, 1 MB, 8 MB, and larger */
 	uint64_t locking;                       /* ... and waiting for gGPULock to enter them */
 	uint64_t submitting, rooming;           /* time in submit() from its start, and in it waiting for room in the A830's queue */
+	uint32_t hit_by_size[4];                /* kept ones given again, in the size classes of made_by_size */
+	uint32_t miss_size, miss_flags;         /* a gemNew the pool had nothing the size of; the size there, the flags not */
+	uint32_t evict_entrycap, evict_bytecap; /* keep() drops: no free place of GPU_KEPT; over GPU_KEPT_BYTES */
+	uint32_t expire_drop;                   /* pool entries gemNew's scan let go for being kept GPU_KEPT_SECONDS */
 } gGPUStat;
 static uint32_t gGPUIrqsSeen;                   /* annibale_gpu_irqs() at the last statistics */
 

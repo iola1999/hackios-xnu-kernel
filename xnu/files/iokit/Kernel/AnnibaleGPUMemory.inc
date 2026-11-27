@@ -375,6 +375,9 @@ AnnibaleGPUUserClient::keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint6
 		if (!dropKept(oldest)) {
 			return false;
 		}
+		/* no free place: the entry cap is what makes room; a free place and the bytes over: the byte cap */
+		gGPUStat.evict_entrycap += place == NULL;
+		gGPUStat.evict_bytecap += place != NULL;
 	}
 	place->memory = memory;
 	place->kernel = kernel != NULL ? kernel : (uint8_t *) OSDynamicCast(IOBufferMemoryDescriptor, memory)->getBytesNoCopy();
@@ -430,18 +433,30 @@ AnnibaleGPUUserClient::gemNew(struct msm_gem_new * request, uint64_t * iova, str
 	uint64_t old;
 
 	nanoseconds_to_absolutetime(GPU_KEPT_SECONDS * NSEC_PER_SEC, &old);
+	bool size_seen = false;         /* the pool has an entry of the size asked, whatever its flags: a miss is for the flags */
+
 	for (uint32_t i = 0; i < GPU_KEPT; i++) {
 		struct gpu_kept * k = &fKept[i];
 
-		if (k->memory != NULL && began - k->since > old && !dropKept(k)) {
-			ioUnlock(io, acq);
-			return kIOReturnNotReady;
+		if (k->memory != NULL && began - k->since > old) {
+			if (!dropKept(k)) {
+				ioUnlock(io, acq);
+				return kIOReturnNotReady;
+			}
+			gGPUStat.expire_drop++;
 		}
 
-		if (k->memory != NULL && k->size >= size && k->size - size <= size / 4 && k->flags == request->flags &&
-		    (found == NULL || k->size < found->size || (k->size == found->size && k->since > found->since))) {
-			found = k;
+		if (k->memory != NULL && k->size >= size && k->size - size <= size / 4) {
+			size_seen = true;
+			if (k->flags == request->flags &&
+			    (found == NULL || k->size < found->size || (k->size == found->size && k->since > found->since))) {
+				found = k;
+			}
 		}
+	}
+	if (found == NULL) {
+		gGPUStat.miss_size += !size_seen;
+		gGPUStat.miss_flags += size_seen;
 	}
 	for (uint32_t n = 0; found != NULL && n < GPU_BUFFERS; n++) {
 		uint32_t h = (fNextBuffer + n) % GPU_BUFFERS;
@@ -463,6 +478,7 @@ AnnibaleGPUUserClient::gemNew(struct msm_gem_new * request, uint64_t * iova, str
 			found->memory = NULL;
 			fKeptBytes -= found->size;
 			gGPUStat.given_again++;
+			gGPUStat.hit_by_size[b->size < (64u << 10) ? 0 : b->size < (1u << 20) ? 1 : b->size < (8u << 20) ? 2 : 3]++;
 			ioUnlock(io, acq);
 			if (gGPUKeep == 2) {
 				bzero(b->kernel, (size_t) b->size);

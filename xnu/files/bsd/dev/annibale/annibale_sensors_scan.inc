@@ -63,6 +63,24 @@ scan_now_us(void)
 	return ns / 1000;
 }
 
+/*
+ * A fatal-phase marker: the scan of the 36/37 and 48/49 pairs kills the kernel one or two
+ * seconds into the boot (kernel-12377-flipwd14-b5r25 RESULTS section 3) and nothing after the
+ * reset can say where it died, so the scan's phases and every first pin write are written with
+ * loader_log_line_sync, which pushes them to the point of coherence at once. Each one costs a
+ * clean of the log so far; the scan is a one-shot boot diagnostic of a handful of groups, so
+ * the total is tens of milliseconds, and the bitbang waveform itself is never interrupted --
+ * the marks bracket it, they do not interrupt it.
+ */
+static void
+scan_mark(const char *what, uint32_t sda, uint32_t scl)
+{
+	char line[96];
+
+	snprintf(line, sizeof(line), "sensors-scan: mark %s gpio%u/%u t=%lluus\n", what, sda, scl, scan_now_us());
+	loader_log_line_sync(line);
+}
+
 /* The activity-mask bit of the engine a known pin pair belongs to, from the Android dts pinmux
  * groups: qupv3_se13 = gpio20/21 (qup2_se5), qupv3_se11 = gpio12/13 (qup2_se3), qupv3_se10 =
  * gpio8/9 (qup2_se2) on wrapper 2; qupv3_1 SE1 = gpio36/37, SE4 = gpio48/49 on wrapper 1
@@ -221,7 +239,7 @@ scan_group_clocked(uint32_t gi, uint32_t active)
  * a low line there means the bus has no working pull-up and the nack says nothing about the chip.
  */
 static uint32_t
-scan_probe_pass(const char *tag, uint32_t active, uint32_t found)
+scan_probe_pass(const char *tag, uint32_t active, uint32_t found, bool marks)
 {
 	static const uint8_t addrs[SNS_SCAN_ADDR_COUNT] = {
 		ANNIBALE_GLS6151_I2C_ADDR, ANNIBALE_STK6A2X_I2C_ADDR, 0x2c,
@@ -232,12 +250,26 @@ scan_probe_pass(const char *tag, uint32_t active, uint32_t found)
 			continue;
 		}
 		uint32_t sda = scan_groups[gi].sda, scl = scan_groups[gi].scl;
+		if (marks) {
+			scan_mark("busidle-pre", sda, scl);
+		}
 		sns_bus_idle(sda, scl);
+		if (marks) {
+			scan_mark("busidle-post", sda, scl);
+		}
 		for (uint32_t ai = 0; ai < SNS_SCAN_ADDR_COUNT; ai++) {
 			uint32_t sda_in = sns_tlmm_get_in(sda) ? 1u : 0u;
 			uint32_t scl_in = sns_tlmm_get_in(scl) ? 1u : 0u;
 			uint64_t t = scan_now_us();
-			bool ack = od_i2c_ack_probe(sda, scl, addrs[ai]);
+			bool ack;
+
+			if (marks && ai == 0) {
+				scan_mark("probe-pre", sda, scl);
+			}
+			ack = od_i2c_ack_probe(sda, scl, addrs[ai]);
+			if (marks && ai == 0) {
+				scan_mark("probe-post", sda, scl);
+			}
 
 			say("sensors-scan: %s gpio%u/%u 0x%02x %s t=%lluus sda=%u scl=%u\n",
 			    tag, sda, scl, addrs[ai], ack ? "ack" : "nack", t, sda_in, scl_in);
@@ -262,6 +294,7 @@ sensors_scan_run(void)
 	uint32_t active, found = 0, full_mask;
 
 	say("sensors-scan: starting, %u group(s), 0x31/0x47/0x2c probed per group\n", scan_group_count);
+	scan_mark("start", 0, 0);
 	if (tlmm_base == 0) {
 		say("sensors-scan: no TLMM mapping, scan aborted\n");
 		return;
@@ -284,7 +317,9 @@ sensors_scan_run(void)
 			    sda, scl);
 		}
 	}
+	scan_mark("clocksample-pre", 0, 0);
 	active = scan_clock_sample();
+	scan_mark("clocksample-post", 0, 0);
 	for (uint32_t gi = 0; gi < scan_group_count; gi++) {
 		if (scan_group_clocked(gi, active)) {
 			say("sensors-scan: gpio%u/%u skipped, its SE clock is active\n",
@@ -301,7 +336,7 @@ sensors_scan_run(void)
 	for (uint32_t rep = 1; rep <= 3; rep++) {
 		char tag[8];
 		snprintf(tag, sizeof(tag), "r%u", rep);
-		found = scan_probe_pass(tag, active, found);
+		found = scan_probe_pass(tag, active, found, rep == 1);
 		delay_for_interval(10, NSEC_PER_MSEC);
 	}
 
@@ -320,7 +355,7 @@ sensors_scan_run(void)
 			sns_rail_vote(probe_rails[i].name, probe_rails[i].mv);
 			delay_for_interval(20, NSEC_PER_MSEC);
 			snprintf(tag, sizeof(tag), "rail-%.8s", probe_rails[i].name);
-			found = scan_probe_pass(tag, active, found);
+			found = scan_probe_pass(tag, active, found, true);
 		}
 	}
 
@@ -328,8 +363,10 @@ sensors_scan_run(void)
 		/* The scan leaves every pin output-disabled, so the output value bit goes back first
 		 * and the cfg (which may re-enable the output) second: no driven glitch in between.
 		 * Bit0 of the in_out readback is the read-only input sense, writes to it are ignored. */
+		scan_mark("restore-pre", snap_pins[i], 0);
 		sns_reg_wr(tlmm_base, snap_pins[i] * 0x1000u + 0x04u, snap_io[i]);
 		sns_reg_wr(tlmm_base, snap_pins[i] * 0x1000u, snap_cfg[i]);
+		scan_mark("restore-post", snap_pins[i], 0);
 	}
 	for (uint32_t gi = 0; gi < scan_group_count; gi++) {
 		say("sensors-scan: summary gpio%u/%u: %s ack %u/%u, %s ack %u/%u, %s ack %u/%u\n",
@@ -339,4 +376,5 @@ sensors_scan_run(void)
 		    addr_names[2], scan_acks[gi][2], scan_tries[gi][2]);
 	}
 	say("sensors-scan: done, pin mux snapshot restored\n");
+	scan_mark("done", 0, 0);
 }

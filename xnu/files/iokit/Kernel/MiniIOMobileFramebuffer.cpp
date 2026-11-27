@@ -215,6 +215,40 @@ swapWord(const uint8_t * swap, unsigned offset)
 	return value;
 }
 
+/*
+ * A sparse probe of a surface's pixels: some sixty machine words spread evenly over the rows.
+ * Batch 8's black windows are zero in every pixel of the full panel, status bar included, so a
+ * probe this sparse settles what only a full scan could prove -- which is what it is for: a hint
+ * of the presenter log, cheap enough to take on every frame, not a proof about every pixel.
+ */
+static bool
+surfacePixelsZero(MiniIOSurface * s)
+{
+	size_t rows = s->info.height, rowBytes = s->info.bytesPerRow, width = s->info.width;
+
+	if (rows == 0 || width == 0 || rowBytes == 0) {
+		return false;
+	}
+	size_t span = (rows - 1) * rowBytes + width * 4;
+	size_t count = span / 8;
+
+	if (count == 0) {
+		return false;
+	}
+	size_t step = count / 64 + 1;
+	const uint8_t * base = s->pixels();
+
+	for (size_t i = 0; i < count; i += step) {
+		uint64_t word;
+
+		memcpy(&word, base + i * 8, sizeof(word));
+		if (word != 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
 struct RowJob;
@@ -324,6 +358,7 @@ public:
 	bool            fSettling, fDrewNearest;
 	uint32_t        fStatSettled;           /* frames drawn again filtered, and how long that took together */
 	uint64_t        fStatSettleTime;
+	uint64_t        fZeroSwapSilentUntil;   /* show(): a zero-swap line was written, nothing more of it until then */
 
 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
 	/* CoreBrightness's IOMFBBrightnessLevel goes to the backlight; anything else is refused, as without this */
@@ -974,6 +1009,30 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	drew_panel = flip.ready ? flip.drew : (layers != 0 || cleared_black);
 	flip_present(swapWord(swap, SWAP_ID));
 	drawn = mach_absolute_time();
+	/*
+	 * What a black window is made of, for the batch 8 evidence gap: a surface is on the panel
+	 * whose pixels are all zero, or that no submission has ever named (drawn == 0). One line at
+	 * most in five seconds -- a black window is seconds of the same surfaces in turn. ZERO is the
+	 * sparse probe's answer: with it the surface holds zeros whatever drawn says, without it the
+	 * line is for drawn == 0 alone. The empty-layer clear-black path and the no-swap case are told
+	 * apart from this by the "tl: s" lines and this line's absence, the masks are in the line for
+	 * the same telling. The probe runs with fLock held; it is some sixty words of the surface.
+	 */
+	if (gTouchLat && drawn >= fZeroSwapSilentUntil && surfaces[0] != NULL &&
+	    surfaces[0]->info.bytesPerElement == 4 && surfaces[0]->info.planeCount == 0) {
+		MiniIOSurface * s0 = surfaces[0];
+		bool zero = surfacePixelsZero(s0);
+
+		if (zero || s0->drawn == 0) {
+			uint64_t silence;
+
+			nanoseconds_to_absolutetime(5 * NSEC_PER_SEC, &silence);
+			fZeroSwapSilentUntil = drawn + silence;
+			annibale_tl("mfb: zero-swap surface %u drawn %u layers 0x%x/0x%x zero %u at %llu\n",
+			    swapWord(swap, SWAP_SURFACE(0)), s0->drawn, set, swapWord(swap, SWAP_LAYERS_CLEARED),
+			    zero ? 1u : 0u, (unsigned long long) micros(drawn));
+		}
+	}
 	if (fGraphics) {
 		recordFrame(swap, recorded, cleared_black, drew_panel, drawn);
 	}

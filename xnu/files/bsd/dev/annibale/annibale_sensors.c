@@ -52,6 +52,7 @@ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
 extern void loader_log_putc(char c);
 extern void loader_log_line(const char *line);
+extern void loader_log_line_sync(const char *line);
 extern bool disable_serial_output;
 extern bool disable_kprintf_output;
 

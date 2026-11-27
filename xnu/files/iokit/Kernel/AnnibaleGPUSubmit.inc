@@ -7,6 +7,14 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request, struct gpu_io_sta
 	uint64_t addresses[GPU_SUBMIT_CMDS];
 	uint32_t words[GPU_SUBMIT_CMDS], count = 0;
 	uint64_t entered = mach_absolute_time(), began, nanos, again, roomed, acq;
+	/*
+	 * Segment boundaries inside the lock, for "tl: is" when the whole span is slow: after the
+	 * depth wait, the validation, the cache maintenance, the backend's own submit, the "tl: Q"
+	 * line's making, the per-buffer fence bookkeeping, reap(), and the statistics. The tail of
+	 * a submit -- everything after "tl: Q" -- reached 16 ms in batch 8 (tlL-strict-comparison
+	 * §7) without any line saying which part of it that was; these say it.
+	 */
+	uint64_t seg_room, seg_val, seg_flush, seg_sub, seg_qlog, seg_book, seg_reap, seg_end;
 	IOReturn ret = kIOReturnBadArgument;
 	const bool a830 = annibale_platform_is_annibale();
 
@@ -72,6 +80,7 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request, struct gpu_io_sta
 		}
 	}
 	gGPUStat.rooming += mach_absolute_time() - roomed;
+	seg_room = mach_absolute_time();
 	if (gGPUReported || !annibale_gpu_ready()) {
 		ioUnlock(io, acq);
 		ret = kIOReturnNotReady;
@@ -101,6 +110,7 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request, struct gpu_io_sta
 		ioUnlock(io, acq);
 		goto out;
 	}
+	seg_val = mach_absolute_time();
 	/*
 	 * The GPU reads memory and writes memory. What this processor's cache holds of an IOSurface
 	 * (somebody has written it, or has read it, as the display's driver does, and the GPU is to
@@ -137,6 +147,7 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request, struct gpu_io_sta
 	}
 	annibale_gpu_to_memory(NULL, 0);                 /* (and what was written last is in memory: a barrier) */
 	gGPUStat.flushing += mach_absolute_time() - began;
+	seg_flush = mach_absolute_time();
 	gGPUStat.buffers += request->nr_bos;
 	request->fence = annibale_gpu_submit(addresses, words, count);
 	if (request->fence != 0) {
@@ -163,6 +174,7 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request, struct gpu_io_sta
 		 * descriptor, including buffers still carrying their previous fence. */
 		gGPUReported = true;
 	}
+	seg_sub = mach_absolute_time();
 	if (gpu_log && request->fence != 0) {
 		/* "tl: Q FENCE WHO at US: N buffers, B of 4 MB or more, W words of commands": what was given
 		 * (tl: q: what it took). WHO is the process that gave it, because several share the GPU and
@@ -184,6 +196,7 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request, struct gpu_io_sta
 		annibale_tl("tl: Q %u %s at %llu: %u buffers, %u big, %u words\n", request->fence, who, ns / 1000,
 		    request->nr_bos, big, all_words);
 	}
+	seg_qlog = mach_absolute_time();
 	if (request->flags & MSM_SUBMIT_FENCE_FD_OUT) {
 		request->fence_fd = -1;
 	}
@@ -203,7 +216,9 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request, struct gpu_io_sta
 			}
 		}
 	}
+	seg_book = mach_absolute_time();
 	reap();
+	seg_reap = mach_absolute_time();
 	if (fSubmits++ < 4) {
 		IOLog("AnnibaleGPU: submission %u: %u command buffers, the first at %#llx, %u words\n", request->fence, count,
 		    addresses[0], words[0]);
@@ -232,12 +247,20 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request, struct gpu_io_sta
 		absolutetime_to_nanoseconds(gGPUStat.making, &making);
 		absolutetime_to_nanoseconds(gGPUStat.allocating, &allocating);
 		absolutetime_to_nanoseconds(gGPUStat.locking, &locking);
+		uint32_t kept_count = 0;
+
+		for (uint32_t i = 0; i < GPU_KEPT; i++) {
+			kept_count += fKept[i].memory != NULL;
+		}
 		IOLog("AnnibaleGPU: buffers: %u made in %llu us each (%llu getting the memory, %llu waiting for the GPU lock; %u under "
-		    "64 KB, %u under 1 MB, %u under 8 MB, %u larger), %u kept ones given again (%llu MB kept)\n",
+		    "64 KB, %u under 1 MB, %u under 8 MB, %u larger), %u kept ones given again (%llu MB kept), hits by size %u/%u/%u/%u, "
+		    "%u in the pool; misses %u for size, %u for flags; evicted %u entry-cap, %u byte-cap, %u expired\n",
 		    gGPUStat.made, gGPUStat.made ? making / NSEC_PER_USEC / gGPUStat.made : 0,
 		    gGPUStat.made ? allocating / NSEC_PER_USEC / gGPUStat.made : 0,
 		    gGPUStat.made ? locking / NSEC_PER_USEC / gGPUStat.made : 0, gGPUStat.made_by_size[0], gGPUStat.made_by_size[1],
-		    gGPUStat.made_by_size[2], gGPUStat.made_by_size[3], gGPUStat.given_again, fKeptBytes >> 20);
+		    gGPUStat.made_by_size[2], gGPUStat.made_by_size[3], gGPUStat.given_again, fKeptBytes >> 20,
+		    gGPUStat.hit_by_size[0], gGPUStat.hit_by_size[1], gGPUStat.hit_by_size[2], gGPUStat.hit_by_size[3], kept_count,
+		    gGPUStat.miss_size, gGPUStat.miss_flags, gGPUStat.evict_entrycap, gGPUStat.evict_bytecap, gGPUStat.expire_drop);
 		/* Three messages, one record each: what a window's submissions cost here, what the GPU did
 		 * with them, and what they named. */
 		IOLog("AnnibaleGPU: %u submissions in %llu ms: %llu us each in the kernel, %llu of them waiting for room in the queue; "
@@ -291,7 +314,38 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request, struct gpu_io_sta
 		}
 		bzero(&gGPUStat, sizeof(gGPUStat));
 	}
+	seg_end = mach_absolute_time();
 	ioUnlock(io, acq);
+	/*
+	 * The whole span in the lock, with what it was spent on, when it passed the notice
+	 * threshold: room is the depth wait for space in the queue, val the command buffers'
+	 * validation, flush the cache maintenance (nothing with gpu_coherent=1), sub the backend's
+	 * own submit including a recovery retry, qlog the counting and printing of "tl: Q", book
+	 * the per-buffer fence bookkeeping, reap the freeing of what the GPU is done with, stat
+	 * the five-second statistics. After ioUnlock so the line itself holds nothing.
+	 */
+	if (gGPUIoLog) {
+		uint64_t span_ns, at;
+
+		absolutetime_to_nanoseconds(seg_end - roomed, &span_ns);
+		if (span_ns >= (uint64_t) GPU_LOCK_NOTICE_US * NSEC_PER_USEC) {
+			uint64_t us[8];
+
+			absolutetime_to_nanoseconds(seg_room - roomed, &us[0]);
+			absolutetime_to_nanoseconds(seg_val - seg_room, &us[1]);
+			absolutetime_to_nanoseconds(seg_flush - seg_val, &us[2]);
+			absolutetime_to_nanoseconds(seg_sub - seg_flush, &us[3]);
+			absolutetime_to_nanoseconds(seg_qlog - seg_sub, &us[4]);
+			absolutetime_to_nanoseconds(seg_book - seg_qlog, &us[5]);
+			absolutetime_to_nanoseconds(seg_reap - seg_book, &us[6]);
+			absolutetime_to_nanoseconds(seg_end - seg_reap, &us[7]);
+			absolutetime_to_nanoseconds(roomed, &at);
+			annibale_tl("tl: is %d %llu fence %u room %llu val %llu flush %llu sub %llu qlog %llu book %llu reap %llu stat %llu at %llu\n",
+			    proc_pid(current_proc()), (unsigned long long)thread_tid(current_thread()), request->fence,
+			    us[0] / 1000, us[1] / 1000, us[2] / 1000, us[3] / 1000, us[4] / 1000, us[5] / 1000, us[6] / 1000,
+			    us[7] / 1000, at / 1000);
+		}
+	}
 	ret = request->fence != 0 ? kIOReturnSuccess : kIOReturnTimeout;
 out:
 	if (bos != NULL) {

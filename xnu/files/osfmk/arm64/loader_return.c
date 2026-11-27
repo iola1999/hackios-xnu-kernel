@@ -188,6 +188,68 @@ loader_log_line(const char *line)
 	__builtin_arm_wsr64("DAIF", daif);
 }
 
+static void
+loader_cache_clean_range(uintptr_t start, uintptr_t end)
+{
+	for (uintptr_t p = start & ~63UL; p < end; p += 64) {
+		__asm__ volatile ("dc cvac, %0" : : "r" (p) : "memory");
+	}
+}
+
+/*
+ * A line whose evidence value is in a kernel that may die before it can return:
+ * append it atomically like loader_log_line(), then clean the log and its length
+ * metadata to the point of coherence. Ordinary cacheable stores can die with the core
+ * on a sudden reset; loader_log_line_sync() is for sparse fatal-phase markers, not
+ * high-frequency telemetry.
+ *
+ * The clean covers the log as far as it was written when the line went in, so the
+ * lines before it -- written without any such need -- come along for nothing. It runs
+ * after the lock is let go of: the bytes it cleans are written by then and never move,
+ * and a writer during the clean only appends beyond them. Holding the lock for the
+ * clean instead would stop every other processor's logging for its hundreds of
+ * microseconds a line, in the middle of the very phase the markers are about.
+ *
+ * Boundaries a reader after a reset is inside, either way: the clean reaches the point
+ * of coherence, which is DRAM or the system cache of it, and no further promise exists
+ * -- whether any of it survives a warm reset of the chip, and whether anything reads
+ * it before the next kernel load writes over the window, is for the loader and the
+ * host flow to answer, not for this line.
+ */
+void loader_log_line_sync(const char *line);
+
+void
+loader_log_line_sync(const char *line)
+{
+	uint64_t daif;
+	bool locked = false;
+
+	daif = __builtin_arm_rsr64("DAIF");
+	__builtin_arm_wsr("DAIFSet", DAIFSC_IRQF | DAIFSC_FIQF);
+	for (uint32_t tries = 0; !locked && tries < 10000000; tries++) {
+		locked = os_atomic_cmpxchg(&loader_log_lock, 0, 1, acquire);
+	}
+	for (; *line != 0; line++) {
+		if (*line != '\r') {
+			loader_log_put_locked(*line);
+		}
+	}
+	uint32_t len = loader_log_len;
+	if (len > LOADER_LOG_SIZE) {
+		len = LOADER_LOG_SIZE;
+	}
+	if (locked) {
+		os_atomic_store(&loader_log_lock, 0, release);
+	}
+	loader_cache_clean_range((uintptr_t)loader_log, (uintptr_t)loader_log + len);
+	loader_cache_clean_range((uintptr_t)&loader_log_len, (uintptr_t)&loader_log_len + sizeof(loader_log_len));
+	loader_cache_clean_range((uintptr_t)&loader_log_ring_at, (uintptr_t)&loader_log_ring_at + sizeof(loader_log_ring_at));
+	loader_cache_clean_range((uintptr_t)&loader_log_wrapped, (uintptr_t)&loader_log_wrapped + sizeof(loader_log_wrapped));
+	loader_cache_clean_range((uintptr_t)&loader_log_linear, (uintptr_t)&loader_log_linear + sizeof(loader_log_linear));
+	__asm__ volatile ("dsb sy" : : : "memory");
+	__builtin_arm_wsr64("DAIF", daif);
+}
+
 /* Record the initial trap without acquiring the video console lock. */
 void loader_fault_log(const char *message, uint64_t pc, uint64_t lr, uint32_t esr, uint64_t far);
 
