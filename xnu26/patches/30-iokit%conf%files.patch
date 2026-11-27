@@ -2,7 +2,7 @@ diff --git a/iokit/conf/files b/iokit/conf/files
 index c72c690d7c74..b91083851d1b 100644
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
-@@ -80,12 +80,25 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
+@@ -80,12 +80,26 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
  iokit/Kernel/IOGuardPageMemoryDescriptor.cpp		optional iokitcpp
  
  iokit/Kernel/IOPlatformExpert.cpp			optional iokitcpp
