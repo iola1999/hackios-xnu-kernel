@@ -1036,9 +1036,15 @@ iris_finish_drain(struct iris_session *s)
 		    s->raw[i].iova, s->raw[i].size, 0, 0)) return EIO;
 		s->raw_state[i] = IRIS_RAW_QUEUED;
 	}
-	if (!iris_send_command(s, HFI_CMD_RESUME, HFI_PORT_BITSTREAM, flags, HFI_CMD_DRAIN, NULL)) return EIO;
-	if ((s->started_ports & (1u << HFI_PORT_RAW)) != 0 &&
-	    !iris_send_command(s, HFI_CMD_RESUME, HFI_PORT_RAW, flags, HFI_CMD_DRAIN, NULL)) return EIO;
+	uint32_t bs_id = 0, raw_id = 0;
+	if (!iris_send_command(s, HFI_CMD_RESUME, HFI_PORT_BITSTREAM, flags, HFI_CMD_DRAIN, &bs_id)) return EIO;
+	int err = iris_wait_reply(s, HFI_CMD_RESUME, bs_id, HFI_PORT_BITSTREAM, 500u);
+	if (err != 0) return err;
+	if ((s->started_ports & (1u << HFI_PORT_RAW)) != 0) {
+		if (!iris_send_command(s, HFI_CMD_RESUME, HFI_PORT_RAW, flags, HFI_CMD_DRAIN, &raw_id)) return EIO;
+		err = iris_wait_reply(s, HFI_CMD_RESUME, raw_id, HFI_PORT_RAW, 500u);
+		if (err != 0) return err;
+	}
 	s->draining = false;
 	s->drain_ack = false;
 	s->drain_last = false;

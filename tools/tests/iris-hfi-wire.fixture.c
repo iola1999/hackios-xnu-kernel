@@ -118,6 +118,7 @@ static void firmware_packet(uint32_t sid, const uint8_t *p)
 	if (type == 0x01000006u) reply(sid, type, id, port, port == stop_port ? stop_mode : 0);
 	if (type == 0x01000004u) reply(sid, type, id, port, close_mode);
 	if (type == 0x01000007u && drain_auto_ack) reply(sid, type, id, port, 0);
+	if (type == 0x01000008u && get32(p) >= 36u && get32(p + 32) == 0x01000007u) reply(sid, type, id, port, 0);
 #ifdef IRIS_LEGACY_WIRE
 	if (type == 0x01000003u || type == 0x01000005u) reply(sid, type, id, port, 0);
 #endif

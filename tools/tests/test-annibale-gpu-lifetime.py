@@ -38,7 +38,9 @@ using IOReturn = int;
 struct IOExternalMethodArguments;
 enum { kIOReturnSuccess, kIOReturnBadArgument, kIOReturnNoMemory,
        kIOReturnNotReady, kIOReturnNotFound, kIOReturnUnsupported,
-       kIOReturnVMError, kIOReturnTimeout };
+       kIOReturnVMError, kIOReturnTimeout, kIOReturnNoResources, kIOReturnNoSpace };
+enum { GPU_REFUSE_NOT_READY = 1, GPU_REFUSE_NO_RANGE = 2, GPU_REFUSE_NO_TABLE = 3 };
+#define GPU_KEEP_FROM (256u << 10)
 enum { kIOMemoryMapperNone, kIODirectionInOut = 1,
        kIOMemoryKernelUserShared = 2, kIOMapWriteCombineCache = 4, kIODirectionOut = 8 };
 constexpr IOReturn KERN_PROTECTION_FAILURE = 100;
@@ -67,8 +69,22 @@ static int copyin(user_addr_t from, void *to, size_t size) {
 #define OSDynamicCast(type, ptr) dynamic_cast<type *>(ptr)
 #define OSSafeReleaseNULL(ptr) do { if (ptr) { (ptr)->release(); (ptr) = nullptr; } } while (0)
 struct IOLock { unsigned depth = 0; };
+static IOLock lock; static IOLock *gGPULock = &lock;
+static unsigned releases_in_lock, drops_in_lock;
 static void IOLockLock(IOLock *l) { assert(l && l->depth++ == 0); }
 static void IOLockUnlock(IOLock *l) { assert(l && l->depth-- == 1); }
+struct gpu_io_stat { uint64_t queueing, span; };
+static void gpuLockIoctl(uint32_t) { IOLockLock(gGPULock); }
+static uint64_t ioLock(struct gpu_io_stat *, uint32_t selector) { gpuLockIoctl(selector); return 0; }
+static void ioUnlock(struct gpu_io_stat *, uint64_t) { IOLockUnlock(gGPULock); }
+static void depthWaitEntry(uint32_t, uint32_t) {}
+static void depthWaitExit(uint32_t, uint64_t) {}
+static void *current_proc() { return nullptr; }
+static int proc_pid(void *) { return 1; }
+static void *current_thread() { return nullptr; }
+static uint64_t thread_tid(void *) { return 1; }
+#define GPU_LOCK_NOTICE_US 2000
+#define GPU_IMPORT_NOTICE_US 2000
 static void gpuNoteSubmit(pid_t) {}
 
 class IOMemoryDescriptor {
@@ -86,6 +102,7 @@ public:
     void retain() { assert(!freed && refs); ++refs; }
     void release() {
         assert(!freed && refs);
+        if (gGPULock->depth != 0) ++releases_in_lock;
         if (--refs == 0) { freed = true; if (parent) parent->release(); }
     }
     uint64_t getLength() const { assert(!freed); return size; }
@@ -120,7 +137,10 @@ public:
 };
 struct MiniIOSurface {
     IOMemoryDescriptor *memory;
+    IOMemoryDescriptor *backing = nullptr;
+    uint64_t backingOffset = 0;
     uint8_t *kbase;
+    uint8_t *kpixels = nullptr;
     unsigned held = 1;
     uint32_t drawn = 0;
     uint32_t cpuSyncedFence = 0;
@@ -135,6 +155,7 @@ static MiniIOSurface *MiniIOSurfaceCopy(uint32_t) {
     return surface_lookup;
 }
 static void MiniIOSurfaceDrop(MiniIOSurface *s) {
+    if (gGPULock->depth != 0) ++drops_in_lock;
     assert(s->held); if (--s->held == 0) s->memory->release();
 }
 struct IOUserClient {
@@ -150,8 +171,12 @@ static unsigned map_calls, unmap_calls, freed_addresses, done_calls, submit_call
 static uint32_t submit_answer;
 static uint64_t next_address, last_base, base_phys, wrong_pages;
 static uint32_t gpu_log, gpu_va;
+static bool gGPUSaidSetIova, gWaitLines, gGPUIoLog;
+static uint32_t annibale_gpu_last();
+static bool gpuWait(uint32_t fence, uint64_t milliseconds);
 static bool annibale_gpu_ready() { return ready; }
-static uint64_t annibale_gpu_address(uint64_t size) {
+static uint64_t annibale_gpu_address(uint64_t size, uint32_t *refusal) {
+    if (!ready) { if (refusal) *refusal = GPU_REFUSE_NOT_READY; return 0; }
     uint64_t result = next_address; next_address += size; last_base = result; return result;
 }
 static void annibale_gpu_address_free(uint64_t, uint64_t) { ++freed_addresses; }
@@ -203,6 +228,7 @@ static void reset() {
     a830 = false; ready = mapped_ok = unmap_ok = fence_done = true;
     recover_ok = false;
     map_calls = unmap_calls = freed_addresses = done_calls = submit_calls = map_fail_at = 0;
+    releases_in_lock = drops_in_lock = 0;
     wrong_pages = busy_for = 0; context_depth = 4;
     submit_answer = 17; next_address = 0x40000000; now = 0;
     gGPUReported = gGPUCached = gGPUCoherent = false; gGPUKeep = 0;
@@ -211,11 +237,11 @@ static void reset() {
     surface_lookup = nullptr; memset(&gGPUStat, 0, sizeof(gGPUStat));
 }
 static AnnibaleGPUUserClient client() {
-    AnnibaleGPUUserClient c{}; c.fBuffers = new gpu_buffer[GPU_BUFFERS]{}; return c;
+    AnnibaleGPUUserClient c{}; c.fBuffers = new gpu_buffer[GPU_BUFFERS]{}; c.fKept = new gpu_kept[GPU_KEPT]{}; return c;
 }
 static gpu_buffer *allocate(AnnibaleGPUUserClient &c, uint64_t size = PAGE_SIZE) {
-    msm_gem_new request{size, 0, 0};
-    assert(c.gemNew(&request) == kIOReturnSuccess);
+    msm_gem_new request{size, 0, 0}; struct gpu_io_stat io{};
+    assert(c.gemNew(&request, nullptr, &io) == kIOReturnSuccess);
     return &c.fBuffers[request.handle - 1];
 }
 static void healthy() {
@@ -252,27 +278,28 @@ static void failed_free() {
     unmap_ok = false; c.freeBuffer(b);
     assert(!m->freed && m->refs == 1 && b->memory == m && c.fBufferCount == 1);
     assert(gGPUReported && freed_addresses == 0);
-    msm_gem_new request{PAGE_SIZE, 0, 0}; assert(c.gemNew(&request) == kIOReturnNotReady); c.free();
+    msm_gem_new request{PAGE_SIZE, 0, 0}; struct gpu_io_stat io{}; assert(c.gemNew(&request, nullptr, &io) == kIOReturnNotReady); c.free();
 }
 static void partial_map() {
     for (bool commit_failure : {false, true}) for (bool cleanup : {false, true}) {
         reset(); auto c = client(); map_fail_at = commit_failure ? 0 : 2;
         mapped_ok = !commit_failure; unmap_ok = cleanup;
-        msm_gem_new request{2 * PAGE_SIZE, 0, 0};
-        assert(c.gemNew(&request) == kIOReturnNoMemory);
+        msm_gem_new request{2 * PAGE_SIZE, 0, 0}; struct gpu_io_stat io{};
+        assert(c.gemNew(&request, nullptr, &io) == kIOReturnNotReady);
         auto *m = IOMemoryDescriptor::allocated.back();
         assert(m->freed == cleanup && freed_addresses == unsigned(cleanup));
         assert(unmap_calls == 1 && (cleanup || (m->refs == 1 && gGPUReported))); c.free();
     }
     reset(); auto c = client(); IOBufferMemoryDescriptor::next_segment_limit = 1024;
-    msm_gem_new request{PAGE_SIZE, 0, 0}; assert(c.gemNew(&request) == kIOReturnNoMemory);
+    msm_gem_new request{PAGE_SIZE, 0, 0}; struct gpu_io_stat io{};
+    assert(c.gemNew(&request, nullptr, &io) == kIOReturnNotReady);
     assert(map_calls == 0 && IOMemoryDescriptor::allocated.back()->freed); c.free();
 }
 static void segments() {
     for (uint64_t limit : {uint64_t(4096), uint64_t(8192), uint64_t(PAGE_SIZE), UINT64_MAX}) {
         reset(); auto c = client(); IOBufferMemoryDescriptor::next_segment_limit = limit;
         allocate(c, 3 * PAGE_SIZE);
-        assert(map_calls == 3 * PAGE_SIZE / 4096 && wrong_pages == 0); c.free();
+        assert(map_calls == 4 * PAGE_SIZE / 4096 && wrong_pages == 0); c.free();
     }
 }
 static void kept() {
@@ -295,23 +322,24 @@ static void kept() {
     c.freeBuffer(b); assert(c.dropKept(&c.fKept[0]) && m->freed); c.free();
     reset(); c = client(); gGPUKeep = 1; b = allocate(c, GPU_KEEP_FROM); m = b->memory;
     c.freeBuffer(b); unmap_ok = false; now = (GPU_KEPT_SECONDS + 1ull) * NSEC_PER_SEC;
-    msm_gem_new request{GPU_KEEP_FROM, 0, 0};
-    assert(c.gemNew(&request) == kIOReturnNotReady && !m->freed && c.fKept[0].memory == m); c.free();
+    msm_gem_new request{GPU_KEEP_FROM, 0, 0}; struct gpu_io_stat io{};
+    assert(c.gemNew(&request, nullptr, &io) == kIOReturnNotReady && !m->freed && c.fKept[0].memory == m); c.free();
 }
 static void failed_surface() {
     reset(); auto c = client(); auto *root = new IOBufferMemoryDescriptor(3 * PAGE_SIZE);
     MiniIOSurface s{}; s.memory = root; s.kbase = root->bytes; s.info.allocSize = 2 * PAGE_SIZE;
     surface_lookup = &s; map_fail_at = 2; unmap_ok = false;
-    annibale_surface request{}; assert(c.surfaceBuffer(&request) == kIOReturnNoMemory);
-    assert(c.fBufferCount == 1 && c.fBuffers[request.handle - 1].memory == root);
+    annibale_surface request{}; struct gpu_io_stat io{};
+    assert(c.surfaceBuffer(&request, &io) == kIOReturnNotReady);
+    assert(c.fBufferCount == 1 && c.fBuffers[request.handle - 1].memory == root && !c.fBuffers[request.handle - 1].pooled);
     MiniIOSurfaceDrop(&s); assert(!root->freed && root->refs == 1); c.free();
 }
 static void surface_ownership() {
     for (bool cleanup : {false, true}) {
         reset(); auto c = client(); auto *root = new IOBufferMemoryDescriptor(2 * PAGE_SIZE);
         MiniIOSurface s{}; s.memory = root; s.kbase = root->bytes; s.info.allocSize = PAGE_SIZE;
-        surface_lookup = &s; annibale_surface request{};
-        assert(c.surfaceBuffer(&request) == kIOReturnSuccess && s.held == 2);
+        surface_lookup = &s; annibale_surface request{}; struct gpu_io_stat io{};
+        assert(c.surfaceBuffer(&request, &io) == kIOReturnSuccess && s.held == 2);
         auto *b = &c.fBuffers[request.handle - 1]; auto *sub = b->memory;
         unmap_ok = cleanup; c.freeBuffer(b); MiniIOSurfaceDrop(&s);
         assert(root->freed == cleanup && sub->freed == cleanup);
@@ -371,8 +399,8 @@ static void failed_submit() {
         cmd.type = MSM_SUBMIT_CMD_BUF; cmd.size = 4;
         msm_gem_submit request{}; request.nr_cmds = request.nr_bos = 1;
         request.bos = reinterpret_cast<uint64_t>(&bo); request.cmds = reinterpret_cast<uint64_t>(&cmd);
-        submit_answer = 0; recover_ok = recovered;
-        assert(c.submit(&request) == kIOReturnTimeout && gGPUReported && b->fence == 0);
+        submit_answer = 0; recover_ok = recovered; struct gpu_io_stat io{};
+        assert(c.submit(&request, &io) == kIOReturnTimeout && gGPUReported && b->fence == 0);
         assert(submit_calls == (recovered ? 2u : 1u)); c.freeBuffer(b);
         assert(!m->freed && freed_addresses == 0);
         MiniIOSurface surface{}; assert(!MiniIOSurfaceDrawn(&surface, 0)); c.free();
@@ -386,8 +414,8 @@ static void queue_room() {
         cmd.type = MSM_SUBMIT_CMD_BUF; cmd.size = 4;
         msm_gem_submit request{}; request.nr_cmds = request.nr_bos = 1; request.flags = MSM_PIPE_3D0;
         request.bos = reinterpret_cast<uint64_t>(&bo); request.cmds = reinterpret_cast<uint64_t>(&cmd);
-        busy_for = 3; uint64_t before = now;
-        assert(c.submit(&request) == kIOReturnSuccess && submit_calls == 1);
+        busy_for = 3; uint64_t before = now; struct gpu_io_stat io{};
+        assert(c.submit(&request, &io) == kIOReturnSuccess && submit_calls == 1);
         assert(a830_queue ? done_calls >= 4 && now > before && gGPUStat.waits == 1 : done_calls == 0 && now == before);
         c.free();
     }
@@ -396,7 +424,7 @@ static void queue_room() {
     cmd.type = MSM_SUBMIT_CMD_BUF; cmd.size = 4;
     msm_gem_submit request{}; request.nr_cmds = request.nr_bos = 1; request.flags = MSM_PIPE_3D0;
     request.bos = reinterpret_cast<uint64_t>(&bo); request.cmds = reinterpret_cast<uint64_t>(&cmd);
-    busy_for = 3; assert(c.submit(&request) == kIOReturnSuccess && done_calls == 0); c.free();
+    busy_for = 3; struct gpu_io_stat io{}; assert(c.submit(&request, &io) == kIOReturnSuccess && done_calls == 0); c.free();
 }
 static void display() {
     reset(); MiniIOSurface s{}; s.drawn = 7; ready = false;
@@ -416,10 +444,128 @@ static void display() {
     gGPUCoherent = true; s2.drawn = 8;
     assert(MiniIOSurfaceDrawn(&s2, 0) && flush_calls == 1);
 }
+static void out_of_lock_teardown() {
+    reset(); auto c = client(); gGPUKeep = 0;
+    std::vector<IOMemoryDescriptor *> deferred;
+    fence_done = false;
+    for (unsigned i = 0; i < 40; ++i) {
+        auto *b = allocate(c, PAGE_SIZE);
+        deferred.push_back(b->memory);
+        uint32_t handle = (uint32_t)(b - c.fBuffers) + 1;
+        assert(c.gemClose(handle) == kIOReturnSuccess);
+    }
+    assert(c.fLeftCount == 40 && releases_in_lock == 0);
+    auto *live = allocate(c, PAGE_SIZE);
+    uint32_t live_handle = (uint32_t)(live - c.fBuffers) + 1;
+    msm_gem_submit_bo bo{0, live_handle, 0}; msm_gem_submit_cmd cmd{};
+    cmd.type = MSM_SUBMIT_CMD_BUF; cmd.size = 4;
+    msm_gem_submit req{}; req.nr_cmds = req.nr_bos = 1; req.flags = MSM_PIPE_3D0;
+    req.bos = reinterpret_cast<uint64_t>(&bo); req.cmds = reinterpret_cast<uint64_t>(&cmd);
+    fence_done = true;
+    struct gpu_io_stat io{};
+    assert(c.submit(&req, &io) == kIOReturnSuccess);
+    assert(c.fLeftCount == 40 - GPU_REAP_SUBMIT_BUDGET);
+    assert(releases_in_lock == 0);
+    while (c.fLeftCount != 0) {
+        assert(c.submit(&req, &io) == kIOReturnSuccess);
+    }
+    assert(releases_in_lock == 0);
+    for (auto *m : deferred) assert(m->freed);
+    auto *root = new IOBufferMemoryDescriptor(2 * PAGE_SIZE);
+    MiniIOSurface s{}; s.memory = root; s.kbase = root->bytes; s.info.allocSize = PAGE_SIZE;
+    surface_lookup = &s; annibale_surface sreq{};
+    assert(c.surfaceBuffer(&sreq, &io) == kIOReturnSuccess);
+    fence_done = false;
+    assert(c.gemClose(sreq.handle) == kIOReturnSuccess);
+    assert(c.fLeftCount == 1);
+    fence_done = true;
+    assert(c.submit(&req, &io) == kIOReturnSuccess);
+    assert(c.fLeftCount == 0 && releases_in_lock == 0 && drops_in_lock == 0 && s.held == 1);
+    MiniIOSurfaceDrop(&s);
+    assert(root->freed);
+    gGPUKeep = 1;
+    std::vector<uint32_t> keep_handles;
+    for (unsigned i = 0; i < 20; ++i) {
+        auto *b = allocate(c, PAGE_SIZE);
+        keep_handles.push_back((uint32_t)(b - c.fBuffers) + 1);
+    }
+    for (uint32_t h : keep_handles) {
+        assert(c.gemClose(h) == kIOReturnSuccess);
+    }
+    now = (GPU_KEPT_SECONDS + 1ull) * NSEC_PER_SEC;
+    msm_gem_new nreq{2 * PAGE_SIZE, 0, 0};
+    assert(c.gemNew(&nreq, nullptr, &io) == kIOReturnSuccess);
+    assert(gGPUStat.expire_drop == GPU_EXPIRE_BUDGET && releases_in_lock == 0);
+    assert(c.clientClose() == kIOReturnSuccess);
+    assert(releases_in_lock == 0 && drops_in_lock == 0);
+    c.free();
+}
+static void keep_evict_bounded() {
+    reset(); auto c = client(); gGPUKeep = 1;
+    for (unsigned i = 0; i < 32; ++i) {
+        auto *m = new IOBufferMemoryDescriptor(GPU_KEPT_BYTES / 32);
+        assert(c.keep(m, m->bytes, 0x50000000ull + i * (GPU_KEPT_BYTES / 32), GPU_KEPT_BYTES / 32, 0));
+    }
+    assert(c.fKeptBytes == GPU_KEPT_BYTES);
+    struct gpu_garbage garbage{};
+    auto *big = new IOBufferMemoryDescriptor(GPU_KEPT_BYTES / 4);
+    /* Replacing 8 entries needs <= 16 evictions -> succeeds and defers releases to garbage. */
+    assert(c.keep(big, big->bytes, 0x90000000ull, GPU_KEPT_BYTES / 4, 0, &garbage));
+    assert(garbage.memory_count == 8 && releases_in_lock == 0);
+    gpuGarbageFlush(&garbage);
+    /* Fill pool with many tiny entries plus large entries so > GPU_KEEP_EVICT_MAX evictions would be required. */
+    reset(); c = client(); gGPUKeep = 1;
+    for (unsigned i = 0; i < 200; ++i) {
+        auto *m = new IOBufferMemoryDescriptor(PAGE_SIZE);
+        assert(c.keep(m, m->bytes, 0x60000000ull + i * PAGE_SIZE, PAGE_SIZE, 0));
+    }
+    for (unsigned i = 0; i < 3; ++i) {
+        auto *m = new IOBufferMemoryDescriptor(GPU_KEPT_BYTES / 4);
+        assert(c.keep(m, m->bytes, 0x70000000ull + i * (GPU_KEPT_BYTES / 4), GPU_KEPT_BYTES / 4, 0));
+    }
+    auto *giant = new IOBufferMemoryDescriptor(GPU_KEPT_BYTES / 4);
+    assert(!c.keep(giant, giant->bytes, 0x80000000ull, GPU_KEPT_BYTES / 4, 0, &garbage));
+    assert(garbage.memory_count == GPU_KEEP_EVICT_MAX && releases_in_lock == 0);
+    gpuGarbageFlush(&garbage); giant->release();
+    c.clientClose(); c.free();
+}
+static void surface_fail_retain_not_pooled() {
+    reset(); auto c = client();
+    auto *root = new IOBufferMemoryDescriptor(3 * PAGE_SIZE);
+    MiniIOSurface s{}; s.memory = root; s.kbase = root->bytes; s.info.allocSize = 2 * PAGE_SIZE;
+    surface_lookup = &s; map_fail_at = 2; unmap_ok = false;
+    annibale_surface request{}; struct gpu_io_stat io{};
+    assert(c.surfaceBuffer(&request, &io) == kIOReturnNotReady);
+    assert(c.fBufferCount == 1 && !c.fBuffers[request.handle - 1].pooled);
+    /* Even if recovery clears gGPUReported later, retained surface backing must never enter fKept. */
+    ready = true; gGPUReported = false; fence_done = true; unmap_ok = true; gGPUKeep = 1;
+    assert(c.gemClose(request.handle) == kIOReturnSuccess);
+    assert(c.fKeptBytes == 0 && c.fKept[0].memory == nullptr);
+    assert(c.clientClose() == kIOReturnSuccess);
+    MiniIOSurfaceDrop(&s);
+    assert(root->freed); c.free();
+}
+static void full_fleft_reap_before_wait() {
+    reset(); auto c = client();
+    for (unsigned i = 0; i <= GPU_LEFT; ++i) {
+        auto *b = allocate(c); b->fence = 7;
+    }
+    fence_done = false;
+    for (unsigned i = 0; i < GPU_LEFT; ++i) {
+        assert(c.gemClose(i + 1) == kIOReturnSuccess);
+    }
+    assert(c.fLeftCount == GPU_LEFT);
+    fence_done = true;
+    uint64_t before = now;
+    assert(c.gemClose(GPU_LEFT + 1) == kIOReturnSuccess);
+    assert(now == before && c.fLeftCount < GPU_LEFT && releases_in_lock == 0);
+    c.clientClose(); c.free();
+}
 int main() {
     healthy(); stopped(); failed_reap(); completed_reap(); failed_free(); partial_map(); segments(); kept();
-    failed_surface(); surface_ownership(); full_pending(); long_pass(); failed_submit(); queue_room(); display(); reset();
-    printf("AnnibaleGPU production lifecycle: 32 scenarios at %llu-byte pages passed\n", (unsigned long long)PAGE_SIZE);
+    failed_surface(); surface_ownership(); full_pending(); long_pass(); failed_submit(); queue_room(); display();
+    out_of_lock_teardown(); keep_evict_bounded(); surface_fail_retain_not_pooled(); full_fleft_reap_before_wait(); reset();
+    printf("AnnibaleGPU production lifecycle: 36 scenarios at %llu-byte pages passed\n", (unsigned long long)PAGE_SIZE);
 }
 '''
 
@@ -429,7 +575,7 @@ def unit(source, memory):
     stats = re.search(r"static struct \{.*?\} gGPUStat;", source, re.S).group()
     records = source[source.index("struct gpu_buffer {") : source.index("class AnnibaleGPUUserClient :")]
     fields = source[source.index("\ttask_t                  fTask;") : source.index("\npublic:\n\tvirtual bool initWithTask")]
-    return (PRELUDE + uapi + "\nstatic IOLock lock; static IOLock *gGPULock = &lock;\n"
+    return (PRELUDE + uapi + "\n"
             "static bool gGPUReported, gGPUCached, gGPUCoherent;\n" + stats + "\nstatic uint32_t gGPUIrqsSeen;\n" + records
             + "\nstruct AnnibaleGPUUserClient : IOUserClient {\n" + fields
             + "\nIOReturn clientClose(); void free();\n};\n"
@@ -508,11 +654,13 @@ def main():
                 ("reuse_failed_kept", memory, "if (!gpuReleaseMapping(k->address, k->size))", "if ((gpuReleaseMapping(k->address, k->size), false))", False),
                 ("short_segment", memory, " && length >= 4096;", ";", False),
                 ("one_lookup", memory, "phys += 4096, length -= 4096", "length -= 4096", False),
-                ("queue_wait_held", source, "if (!gpuWait(last - depth + 1, GPU_PATIENCE_MS)) {", "if (true) {", True),
-                ("submit_zero", source, "gGPUReported = true;\n\t}\n\tif (gpu_log", "gGPUReported = false;\n\t}\n\tif (gpu_log", True),
+                ("queue_wait_held", source, "if (!gpuWait(target, GPU_PATIENCE_MS)) {", "if (true) {", True),
+                ("submit_zero", source, "gGPUReported = true;\n\t}\n\tseg_sub = mach_absolute_time();\n\tif (gpu_log", "gGPUReported = false;\n\t}\n\tseg_sub = mach_absolute_time();\n\tif (gpu_log", True),
                 ("one_free_wait", memory, "} while (busy && fLeftCount == GPU_LEFT && !gGPUReported && annibale_gpu_ready());", "} while (false);", False),
                 ("stopped_ignores_reported", source, "stopped = stopped || gGPUReported;", "stopped = stopped;", True),
                 ("display_stopped", source, "(annibale_gpu_ready() && gpuWait(fence, milliseconds))", "(!annibale_gpu_ready() || gpuWait(fence, milliseconds))", True),
+                ("surface_pooled_leak", memory, "b->surface == NULL && b->pooled &&", "b->surface == NULL &&", False),
+                ("reap_release_in_lock", source, "gpuGarbageFlush(&garbage);", "/* leaked or in-lock */", True),
             ]
             for name, original, old, new, in_source in changes:
                 assert old in original, name

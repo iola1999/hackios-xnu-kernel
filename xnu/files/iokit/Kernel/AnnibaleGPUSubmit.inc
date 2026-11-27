@@ -15,6 +15,7 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request, struct gpu_io_sta
 	 * §7) without any line saying which part of it that was; these say it.
 	 */
 	uint64_t seg_room, seg_val, seg_flush, seg_sub, seg_qlog, seg_book, seg_reap, seg_end;
+	struct gpu_garbage garbage = {};
 	IOReturn ret = kIOReturnBadArgument;
 	const bool a830 = annibale_platform_is_annibale();
 
@@ -217,7 +218,7 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request, struct gpu_io_sta
 		}
 	}
 	seg_book = mach_absolute_time();
-	reap();
+	reap(&garbage, GPU_REAP_SUBMIT_BUDGET);
 	seg_reap = mach_absolute_time();
 	if (fSubmits++ < 4) {
 		IOLog("AnnibaleGPU: submission %u: %u command buffers, the first at %#llx, %u words\n", request->fence, count,
@@ -322,6 +323,7 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request, struct gpu_io_sta
 	}
 	seg_end = mach_absolute_time();
 	ioUnlock(io, acq);
+	gpuGarbageFlush(&garbage);
 	/*
 	 * The whole span in the lock, with what it was spent on, when it passed the notice
 	 * threshold: room is the depth wait for space in the queue, val the command buffers'

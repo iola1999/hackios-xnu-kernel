@@ -99,6 +99,10 @@
 			_clearColor[i][2] = (float)c.blue; _clearColor[i][3] = (float)c.alpha;
 			_clears = YES;
 		}
+		if (__builtin_expect(rw_damage_probe_enabled(), 0) && i == 0 &&
+		    rw_damage_is_display_surface(texture, NULL, NULL)) {
+			rw_damage_note_pass(_commandBuffer, [attachment loadAction]);
+		}
 	}
 	/*
 	 * The depth/stencil attachment, which is two descriptors over one texture: for

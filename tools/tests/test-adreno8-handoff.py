@@ -75,7 +75,7 @@ static uint32_t table[1024], commands[1024], responses[1024], debug[1024], gmu_r
 static bool adreno8_direct_ring;
 static vm_offset_t adreno8_hfi_view_table, adreno8_hfi_view_cmd;
 static vm_offset_t adreno8_hfi_view_resp, adreno8_hfi_view_debug;
-static bool adreno8_gmu_talks, adreno8_gpu8_keep, adreno8_gpu8_return, adreno8_reset_required;
+static bool adreno8_gmu_talks, adreno8_gpu8_keep, adreno8_gpu8_ifpc, adreno8_gpu8_return, adreno8_reset_required;
 static unsigned hmode, sent_count, fail_at, resource_replies, sleeps;
 static uint32_t captured[32][255], lengths[32], start_header;
 static bool adreno8_clock_started(void) { return true; }

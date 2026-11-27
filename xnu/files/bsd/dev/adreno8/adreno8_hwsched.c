@@ -136,7 +136,7 @@ adreno8_hwsched_ready(void)
 bool
 adreno8_hwsched_start(void)
 {
-	const uint32_t features[][3] = {{9, 0, 0}, {1, 1, 0}, {16, 1, 0}};
+	const uint32_t features[][3] = {{9, adreno8_gpu8_ifpc ? 1u : 0u, 0}, {1, 1, 0}, {16, 1, 0}};
 	const uint32_t handle = 0, preemption[] = {2, 0, 0}, aqe[] = {29, 1, 0};
 
 	if (adreno8_direct_ring || adreno8_hwsched_attempted || !adreno8_cx_ready() || !adreno8_gmu_talks ||
@@ -164,7 +164,8 @@ adreno8_hwsched_start(void)
 		return false;
 	}
 	adreno8_hwsched_started = true;
-	printf("adreno8: HWSCHED START acknowledged; GPU execution initialization is pending\n");
+	printf("adreno8: HWSCHED START acknowledged (ifpc=%u); GPU execution initialization is pending\n",
+	    adreno8_gpu8_ifpc ? 1u : 0u);
 	return true;
 }
 

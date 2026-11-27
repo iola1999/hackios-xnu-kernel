@@ -769,7 +769,7 @@ struct gpu_buffer {
 	uint32_t                        flags;
 	uint32_t                        seed;           /* the surface's when it was last pushed out of the cache, */
 	uint64_t                        pushed;         /* ... and when that was */
-	bool                            seen;           /* by the program: mapped, and from then on written by it */
+	bool                            seen, pooled;   /* seen: mapped by program; pooled: came from gemNew and not shared */
 	uint32_t                        fence;          /* the last submission that names it (0: none has) */
 };
 
@@ -785,8 +785,10 @@ struct gpu_left {
 	MiniIOSurface *                 surface;
 	uint64_t                        address, size;
 	uint32_t                        fence, flags;
+	bool                            pooled;
 };
 #define GPU_LEFT                256     /* given back while the GPU is busy: about a frame of an animation's worth */
+struct gpu_garbage;
 
 /*
  * A buffer of the program's own given back, and done with: kept, memory and place in the GPU's
@@ -842,10 +844,11 @@ class AnnibaleGPUUserClient : public IOUserClient
 	struct gpu_buffer * buffer(uint32_t handle);
 	uint32_t lastUse(uint32_t handle);
 	struct gpu_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle, IOReturn * error);
-	void freeBuffer(struct gpu_buffer * b);
-	bool keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags);
-	bool dropKept(struct gpu_kept * k);
-	void reap(void);
+	void freeBuffer(struct gpu_buffer * b, struct gpu_garbage * garbage = NULL);
+	bool keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags, struct gpu_garbage * garbage = NULL);
+	bool dropKept(struct gpu_kept * k, struct gpu_garbage * garbage = NULL);
+	void reap(struct gpu_garbage * garbage = NULL, uint32_t budget = 0);
+	IOReturn gemClose(uint32_t handle);
 	IOReturn gemNew(struct msm_gem_new * request, uint64_t * iova, struct gpu_io_stat * io);
 	IOReturn surfaceBuffer(struct annibale_surface * request, struct gpu_io_stat * io);
 	IOReturn memoryBuffer(struct annibale_memory * request, struct gpu_io_stat * io);
@@ -1037,7 +1040,6 @@ AnnibaleGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 		struct annibale_worked worked;
 	} r;
 	size_t size = args->structureInputSize;
-	struct gpu_buffer * b;
 	IOReturn ret = kIOReturnSuccess;
 	uint64_t zero = 0, patience, waitBegan;
 	uint32_t fence;
@@ -1144,15 +1146,7 @@ AnnibaleGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 		}
 		break;
 	case kDrmGemClose:
-		gpuLockIoctl(kDrmGemClose);
-		b = buffer(r.close.handle);
-		if (b == NULL) {
-			ret = kIOReturnBadArgument;
-		} else {
-			freeBuffer(b);
-			reap();
-		}
-		IOLockUnlock(gGPULock);
+		ret = gemClose(r.close.handle);
 		break;
 	case kAnnibaleGPUWorked:
 		if (annibale_platform_is_annibale()) {

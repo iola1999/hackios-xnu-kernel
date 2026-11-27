@@ -29,10 +29,11 @@ FB_HARNESS = r"""
 #define THREAD_UNINT 0
 typedef int wait_result_t;
 typedef int IOLock;
+static uint32_t gHelperWakeups = 0;
 static inline void IOLockLock(IOLock *l) { (void)l; }
 static inline void IOLockUnlock(IOLock *l) { (void)l; }
 static inline void IOLockSleep(IOLock *l, void *e, int m) { (void)l; (void)e; (void)m; }
-static inline void IOLockWakeup(IOLock *l, void *e, bool o) { (void)l; (void)e; (void)o; }
+static inline void IOLockWakeup(IOLock *l, void *e, bool o) { (void)l; (void)e; (void)o; gHelperWakeups++; }
 #define IONew(type, count) ((type *)calloc((count), sizeof(type)))
 #define IODelete(ptr, type, count) free(ptr)
 #define bzero(p, n) memset((p), 0, (n))
@@ -102,7 +103,7 @@ public:
     uint32_t fRowSeq = 0, fAllChangedSeq = 0, fBufferSeq[2] = { 0, 0 };
     int32_t fRowHashGeometry[8] = { 0 };
     uint64_t fBandAt = 0;
-    uint32_t fWholeFrames = 0, fUnhashed = 0, fStatUnhashed = 0, fStatUnchanged = 0;
+    uint32_t fWholeFrames = 0, fUnhashed = 0, fStatUnhashed = 0, fStatUnchanged = 0, fLastChangedRows = 0;
     uint64_t fStatBandRows = 0;
     uint64_t fStatChangedRows = 0;
     int32_t fStatRowsFrom = -1, fStatRowsTo = -1;
@@ -300,6 +301,51 @@ int main(void) {
     assert(fb.fWholeFrames == 0);
     assert(fb.fStatUnhashed == 0);
 
+    /* 6. Idle 10 Hz small-band updates (>= ROWS_SOON_NS, < DRAW_MIN_PARALLEL_ROWS) must run inline
+     * without waking helper threads, while keeping exact double-buffered pixel parity. */
+    fb.fThreads = 1;
+    fb.fHelpersStarted = 0;
+    fb.fWholeFrames = 0; fb.fUnhashed = 0; fb.fStatUnhashed = 0;
+    fill_band(&surf, 0, sh, 0xff102030u);
+    step(fullSrc, fullDst, 100, "idle-prep-1");
+    fill_band(&surf, 0, sh, 0xff102031u);
+    step(fullSrc, fullDst, 100, "idle-prep-2");
+    fill_band(&surf, 70, 82, 0xff501000u);
+    step(fullSrc, fullDst, 100, "idle-prep-3");
+    fb.fThreads = 3;
+    fb.fHelpersStarted = 2;
+    gHelperWakeups = 0;
+    for (int i = 0; i < 4; i++) {
+        fill_band(&surf, 70, 82, 0xff501010u + (uint32_t)i * 0x040404u);
+        step(fullSrc, fullDst, 100, "idle-10hz-clock");
+    }
+    assert(gHelperWakeups == 0);
+    /* Verify shouldParallelDraw flips to true once work reaches DRAW_MIN_PARALLEL_ROWS. */
+    {
+        RowJob bigJob = {};
+        bigJob.by0 = 0; bigJob.by1 = 160; bigJob.drawWork = 128; bigJob.allDirty = false;
+        assert(shouldParallelDraw(&bigJob));
+        bigJob.drawWork = 127;
+        assert(!shouldParallelDraw(&bigJob));
+        bigJob.allDirty = true;
+        assert(shouldParallelDraw(&bigJob));
+    }
+
+    /* 7. Post-animation settle: ROWS_UNHASHED is bounded to 4, so static frames after a whole-screen
+     * burst re-hash within 4 frames and detect unchanged pixels. */
+    fb.fThreads = 1;
+    fb.fHelpersStarted = 0;
+    fb.fWholeFrames = 0; fb.fUnhashed = 0; fb.fStatUnhashed = 0; fb.fStatUnchanged = 0;
+    for (int i = 0; i < 3; i++) {
+        fill_band(&surf, 0, sh, 0xff600000u + (uint32_t)i * 0x070707u);
+        step(fullSrc, fullDst, 8, "settle-burst");
+    }
+    for (int i = 0; i < 6; i++) {
+        step(fullSrc, fullDst, 8, "settle-static");
+    }
+    assert(fb.fStatUnhashed <= ROWS_UNHASHED);
+    assert(fb.fStatUnchanged >= 1);
+
     free(surf.buf);
     free(bufA);
     free(bufB);
@@ -324,6 +370,7 @@ struct rwa_compute_info { int dummy; };
 struct rwa_render_shape { uint32_t color_format[8]; uint32_t depth_format; };
 static void stub_render_destroy(struct rwa_render *r) { (void)r; }
 static void stub_compute_destroy(struct rwa_compute *c) { (void)c; }
+static void rw_print(const char *fmt, ...) { (void)fmt; }
 static struct {
     void (*render_destroy)(struct rwa_render *);
     void (*compute_destroy)(struct rwa_compute *);
@@ -407,6 +454,9 @@ typedef size_t vm_size_t;
 #define ADRENO8_MEM_EXEC 4u
 #define ADRENO8_GPU_IOVA_START 0x10000000u
 #define ADRENO8_GPU_IOVA_END   0xe0000000u
+#define ADRENO8_BO_REFUSE_NOT_READY 1u
+#define ADRENO8_BO_REFUSE_NO_RANGE  2u
+#define ADRENO8_BO_REFUSE_NO_TABLE  3u
 #define KERN_SUCCESS 0
 #define KMA_KOBJECT 0
 #define KMA_ZERO 0
@@ -486,8 +536,8 @@ int main(void) {
     adreno8_gpu_space.is_on = true;
 
     /* 1. Verify leaf-skipping adreno8_space_find_range matches 4 KB reference walk across partial leaves. */
-    uint64_t a1 = adreno8_bo_reserve(12 * 4096);
-    uint64_t a2 = adreno8_bo_reserve(600 * 4096);
+    uint64_t a1 = adreno8_bo_reserve(12 * 4096, NULL);
+    uint64_t a2 = adreno8_bo_reserve(600 * 4096, NULL);
     assert(a1 != 0 && a2 != 0);
     assert(adreno8_bo_release(a1, 12 * 4096));
     for (uint32_t sz_pages : (uint32_t[]){ 1, 12, 13, 512, 513, 1025 }) {
@@ -505,8 +555,8 @@ int main(void) {
      * and allocate 16 full-screen 28 MiB RGBA16Float textures in backboardd. */
     uint64_t pads[960];
     for (int i = 0; i < 960; i++) {
-        pads[i] = adreno8_bo_reserve(509 * 4096);
-        uint64_t pin = adreno8_bo_reserve(4096);
+        pads[i] = adreno8_bo_reserve(509 * 4096, NULL);
+        uint64_t pin = adreno8_bo_reserve(4096, NULL);
         assert(pads[i] != 0 && pin != 0);
     }
     for (int i = 0; i < 960; i++) {
@@ -514,7 +564,7 @@ int main(void) {
     }
     uint64_t big[16];
     for (int i = 0; i < 16; i++) {
-        big[i] = adreno8_bo_reserve(28u << 20);
+        big[i] = adreno8_bo_reserve(28u << 20, NULL);
         if (big[i] == 0) {
             fprintf(stderr, "FAILED 28 MiB allocation #%d\n", i);
             return 1;

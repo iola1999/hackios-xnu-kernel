@@ -124,7 +124,9 @@ scan_add_group(uint32_t sda, uint32_t scl)
 static bool
 scan_pin_forbidden(uint32_t pin)
 {
-	return pin >= 16 && pin <= 19;  /* wlan-en, sw-ctrl and the retired assignment's SCL */
+	/* WCN7850 connectivity (gpio16-19) and DTB qcom,gpios-reserved TZ/HYP XPU pins (36-39, 48-51, 74). */
+	return (pin >= 16u && pin <= 19u) || (pin >= 36u && pin <= 39u) ||
+	    (pin >= 48u && pin <= 51u) || pin == 74u;
 }
 static void
 parse_scan_boot_arg(void)

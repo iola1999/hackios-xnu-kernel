@@ -267,7 +267,7 @@ adreno8_wait_for(struct adreno8_block *b, uint32_t offset, uint32_t mask, uint32
 
 /* ---- leaving --------------------------------------------------------------------------------------------- */
 
-bool adreno8_gpu8_keep, adreno8_gpu8_return;
+bool adreno8_gpu8_keep, adreno8_gpu8_ifpc, adreno8_gpu8_return;
 bool adreno8_init_done;
 uint32_t adreno8_gpu8_secure_mode;
 bool adreno8_reset_required;
@@ -391,6 +391,8 @@ adreno8_init(void)
 	PE_parse_boot_argn("adreno8_inflight", &adreno8_inflight, sizeof(adreno8_inflight));
 	PE_parse_boot_argn("adreno8_gmuclk", &adreno8_gmu_from_pll, sizeof(adreno8_gmu_from_pll));
 	adreno8_gpu8_keep = PE_parse_boot_argn("adreno8_keep", &one, sizeof(one)) && one != 0;
+	one = 0;
+	adreno8_gpu8_ifpc = PE_parse_boot_argn("adreno8_ifpc", &one, sizeof(one)) && one != 0;
 	one = 0;
 	adreno8_gpu8_return = PE_parse_boot_argn("adreno8_return", &one, sizeof(one)) && one != 0;
 	one = 0;

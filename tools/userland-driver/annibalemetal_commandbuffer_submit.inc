@@ -2,6 +2,234 @@
 static void rw_surface_commit_mark(id texture, unsigned commit);   /* annibalemetal_completion.inc */
 
 /*
+ * S7 Stage 2 low-frequency display-surface damage probe (off by default, zero overhead when
+ * ANNIBALE_DAMAGE_PROBE is unset or "0"). When enabled, records per-pass color0 loadAction
+ * counts from annibalemetal_renderencoder.inc and per-draw scissor y-bounds on display-sized
+ * IOSurface commits, printing one summary line every 30 display-surface commits.
+ */
+#define RW_DAMAGE_RING 32u
+#define RW_DAMAGE_SURFACES 16u
+#define RW_DAMAGE_WINDOW 30u
+
+static pthread_mutex_t rw_damage_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static struct {
+	uintptr_t cb_key;
+	uint32_t clear_cnt;
+	uint32_t load_cnt;
+	uint32_t dontcare_cnt;
+} rw_damage_cb_ring[RW_DAMAGE_RING];
+
+static unsigned rw_damage_ring_next;
+
+static struct {
+	uint32_t reports;
+	uint32_t frames;
+	uint32_t clear_cnt;
+	uint32_t load_cnt;
+	uint32_t dontcare_cnt;
+	uint32_t draw_cnt;
+	uint32_t all_scissored_frames;
+	uint32_t union_y0;
+	uint32_t union_y1;
+	uint32_t last_sf_id;
+	uint32_t sf_ids[RW_DAMAGE_SURFACES];
+	uint32_t sf_distinct;
+	bool has_y;
+} rw_damage_win;
+
+static bool
+rw_damage_probe_enabled(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *val = getenv("ANNIBALE_DAMAGE_PROBE");
+		on = (val != NULL && val[0] != '\0' && strcmp(val, "0") != 0) ? 1 : 0;
+	}
+	return on != 0;
+}
+
+static bool
+rw_damage_is_display_surface(id texture, uint32_t *sf_id_out, unsigned *height_out)
+{
+	if (texture == nil || ![texture respondsToSelector:sel_registerName("iosurface")]) {
+		return false;
+	}
+	void *sf = ((void *(*)(id, SEL))objc_msgSend)(texture, sel_registerName("iosurface"));
+	if (sf == NULL) {
+		return false;
+	}
+	unsigned w = (unsigned)[texture width];
+	unsigned h = (unsigned)[texture height];
+	if (w < 1000u || h < 2000u) {
+		return false;
+	}
+	if (sf_id_out != NULL) {
+		*sf_id_out = ann_surface_id(sf);
+	}
+	if (height_out != NULL) {
+		*height_out = h;
+	}
+	return true;
+}
+
+static void
+rw_damage_note_pass(const void *cb, NSUInteger load_action)
+{
+	uintptr_t key = (uintptr_t)cb;
+	unsigned slot = RW_DAMAGE_RING;
+
+	pthread_mutex_lock(&rw_damage_lock);
+	for (unsigned i = 0; i < RW_DAMAGE_RING; i++) {
+		if (rw_damage_cb_ring[i].cb_key == key) {
+			slot = i;
+			break;
+		}
+		if (slot == RW_DAMAGE_RING && rw_damage_cb_ring[i].cb_key == 0) {
+			slot = i;
+		}
+	}
+	if (slot == RW_DAMAGE_RING) {
+		slot = rw_damage_ring_next++ % RW_DAMAGE_RING;
+		rw_damage_cb_ring[slot].cb_key = 0;
+	}
+	if (rw_damage_cb_ring[slot].cb_key != key) {
+		rw_damage_cb_ring[slot].cb_key = key;
+		rw_damage_cb_ring[slot].clear_cnt = 0;
+		rw_damage_cb_ring[slot].load_cnt = 0;
+		rw_damage_cb_ring[slot].dontcare_cnt = 0;
+	}
+	if (load_action == MTLLoadActionClear) {
+		rw_damage_cb_ring[slot].clear_cnt++;
+	} else if (load_action == MTLLoadActionDontCare) {
+		rw_damage_cb_ring[slot].dontcare_cnt++;
+	} else {
+		rw_damage_cb_ring[slot].load_cnt++;
+	}
+	pthread_mutex_unlock(&rw_damage_lock);
+}
+
+static void
+rw_damage_commit_sample(const void *cb, NSArray *works)
+{
+	uintptr_t key = (uintptr_t)cb;
+	uint32_t clear_cnt = 0, load_cnt = 0, dontcare_cnt = 0;
+	uint32_t draw_cnt = 0, sf_id = 0;
+	bool saw_display = false, all_scissored = true, has_y = false;
+	uint32_t y0 = UINT32_MAX, y1 = 0;
+
+	for (AnnibaleMetalWork *work in works) {
+		if (work->colorCount == 0 || work->color[0] == nil) {
+			continue;
+		}
+		uint32_t cur_sf = 0;
+		unsigned tex_h = 0;
+		if (!rw_damage_is_display_surface(work->color[0], &cur_sf, &tex_h)) {
+			continue;
+		}
+		if (work->copyKind == RW_COPY_CLEAR) {
+			saw_display = true;
+			sf_id = cur_sf;
+			continue;
+		}
+		if (work->copyKind != RW_COPY_NONE || work->render == nil) {
+			continue;
+		}
+		saw_display = true;
+		sf_id = cur_sf;
+		draw_cnt++;
+		if (!work->hasScissorRect) {
+			all_scissored = false;
+			continue;
+		}
+		uint32_t sy0 = work->scissorRect[1] > tex_h ? tex_h : work->scissorRect[1];
+		uint64_t sy1_64 = (uint64_t)work->scissorRect[1] + (uint64_t)work->scissorRect[3];
+		uint32_t sy1 = sy1_64 > tex_h ? tex_h : (uint32_t)sy1_64;
+		if (sy0 < y0) y0 = sy0;
+		if (sy1 > y1) y1 = sy1;
+		has_y = true;
+	}
+
+	pthread_mutex_lock(&rw_damage_lock);
+	for (unsigned i = 0; i < RW_DAMAGE_RING; i++) {
+		if (rw_damage_cb_ring[i].cb_key == key) {
+			clear_cnt = rw_damage_cb_ring[i].clear_cnt;
+			load_cnt = rw_damage_cb_ring[i].load_cnt;
+			dontcare_cnt = rw_damage_cb_ring[i].dontcare_cnt;
+			rw_damage_cb_ring[i].cb_key = 0;
+			break;
+		}
+	}
+	if (!saw_display && clear_cnt == 0 && load_cnt == 0 && dontcare_cnt == 0) {
+		pthread_mutex_unlock(&rw_damage_lock);
+		return;
+	}
+	rw_damage_win.frames++;
+	rw_damage_win.clear_cnt += clear_cnt;
+	rw_damage_win.load_cnt += load_cnt;
+	rw_damage_win.dontcare_cnt += dontcare_cnt;
+	rw_damage_win.draw_cnt += draw_cnt;
+	if (draw_cnt > 0 && all_scissored) {
+		rw_damage_win.all_scissored_frames++;
+		if (has_y) {
+			if (!rw_damage_win.has_y || y0 < rw_damage_win.union_y0) {
+				rw_damage_win.union_y0 = y0;
+			}
+			if (!rw_damage_win.has_y || y1 > rw_damage_win.union_y1) {
+				rw_damage_win.union_y1 = y1;
+			}
+			rw_damage_win.has_y = true;
+		}
+	}
+	if (sf_id != 0) {
+		rw_damage_win.last_sf_id = sf_id;
+		bool seen = false;
+		for (uint32_t i = 0; i < rw_damage_win.sf_distinct; i++) {
+			if (rw_damage_win.sf_ids[i] == sf_id) {
+				seen = true;
+				break;
+			}
+		}
+		if (!seen && rw_damage_win.sf_distinct < RW_DAMAGE_SURFACES) {
+			rw_damage_win.sf_ids[rw_damage_win.sf_distinct++] = sf_id;
+		}
+	}
+	if (rw_damage_win.frames >= RW_DAMAGE_WINDOW) {
+		uint32_t rep = ++rw_damage_win.reports;
+		uint32_t frames = rw_damage_win.frames;
+		uint32_t c_cnt = rw_damage_win.clear_cnt;
+		uint32_t l_cnt = rw_damage_win.load_cnt;
+		uint32_t d_cnt = rw_damage_win.dontcare_cnt;
+		uint32_t dr_cnt = rw_damage_win.draw_cnt;
+		uint32_t sc_cnt = rw_damage_win.all_scissored_frames;
+		uint32_t uy0 = rw_damage_win.has_y ? rw_damage_win.union_y0 : 0u;
+		uint32_t uy1 = rw_damage_win.has_y ? rw_damage_win.union_y1 : 0u;
+		uint32_t last_sf = rw_damage_win.last_sf_id;
+		uint32_t distinct_sf = rw_damage_win.sf_distinct;
+
+		rw_damage_win.frames = 0;
+		rw_damage_win.clear_cnt = 0;
+		rw_damage_win.load_cnt = 0;
+		rw_damage_win.dontcare_cnt = 0;
+		rw_damage_win.draw_cnt = 0;
+		rw_damage_win.all_scissored_frames = 0;
+		rw_damage_win.union_y0 = 0;
+		rw_damage_win.union_y1 = 0;
+		rw_damage_win.sf_distinct = 0;
+		rw_damage_win.has_y = false;
+		pthread_mutex_unlock(&rw_damage_lock);
+
+		rw_print("damage_probe[%u]: clear=%u load=%u dontcare=%u draws=%u "
+		         "all_scissored=%u/%u union_y=%u..%u iosurface_id=%u sf_distinct=%u\n",
+		         rep, c_cnt, l_cnt, d_cnt, dr_cnt, sc_cnt, frames, uy0, uy1,
+		         last_sf, distinct_sf);
+		return;
+	}
+	pthread_mutex_unlock(&rw_damage_lock);
+}
+
+/*
  * GPU YIELDING, the submission half (the grid cutting is the encoder's half,
  * annibalemetal_compute_argencoder.inc; rw_gpu_yield in annibalemetal_diag.inc says what
  * the pair is for, with the measurements). The kernel's context queue is first-in
@@ -489,6 +717,9 @@ done:
 		}
 	}
 	rw_audit_commit_end(commit_count);
+	if (__builtin_expect(rw_damage_probe_enabled(), 0)) {
+		rw_damage_commit_sample(self, _work);
+	}
 	/* The draws this buffer recorded are all in the library's batch by now -- a draw no
 	 * longer waits for the GPU (rwa_render_draw) -- and this hands them over.
 	 *

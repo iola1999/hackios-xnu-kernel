@@ -550,9 +550,15 @@ def mutations():
         'stage_missing': (HFI, 'int\niris_hfi_session_open', 'static int\niris_copy_decoded', '\t    !pkt_add_u32(&b, HFI_PROP_STAGE, HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32,\n\t    HFI_PORT_NONE, 1u) ||\n', '', ['wire-h264', 'stage-wire']),
     })
     resume = (
-        '\tif (!iris_send_command(s, HFI_CMD_RESUME, HFI_PORT_BITSTREAM, flags, HFI_CMD_DRAIN, NULL)) return EIO;\n'
-        '\tif ((s->started_ports & (1u << HFI_PORT_RAW)) != 0 &&\n'
-        '\t    !iris_send_command(s, HFI_CMD_RESUME, HFI_PORT_RAW, flags, HFI_CMD_DRAIN, NULL)) return EIO;\n')
+        '\tuint32_t bs_id = 0, raw_id = 0;\n'
+        '\tif (!iris_send_command(s, HFI_CMD_RESUME, HFI_PORT_BITSTREAM, flags, HFI_CMD_DRAIN, &bs_id)) return EIO;\n'
+        '\tint err = iris_wait_reply(s, HFI_CMD_RESUME, bs_id, HFI_PORT_BITSTREAM, 500u);\n'
+        '\tif (err != 0) return err;\n'
+        '\tif ((s->started_ports & (1u << HFI_PORT_RAW)) != 0) {\n'
+        '\t\tif (!iris_send_command(s, HFI_CMD_RESUME, HFI_PORT_RAW, flags, HFI_CMD_DRAIN, &raw_id)) return EIO;\n'
+        '\t\terr = iris_wait_reply(s, HFI_CMD_RESUME, raw_id, HFI_PORT_RAW, 500u);\n'
+        '\t\tif (err != 0) return err;\n'
+        '\t}\n')
     requeue = (
         '\t/* Publish host-owned output buffers before firmware resumes decoding. */\n'
         '\tfor (uint32_t i = 0; i < s->raw_count; i++) {\n'

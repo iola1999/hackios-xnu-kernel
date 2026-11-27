@@ -172,7 +172,9 @@ extern bool annibale_aoss_send_msg(const char *msg);
 #define QMI_VOICE_END_CALL              0x0021u
 #define QMI_VOICE_ANSWER_CALL           0x0022u
 #define QMI_VOICE_ALL_CALL_STATUS_IND   0x002eu
+#define QMI_UIM_EVENT_REG               0x002eu
 #define QMI_UIM_GET_CARD_STATUS         0x002fu
+#define QMI_UIM_GET_SLOTS_STATUS        0x0047u
 
 /* ---- Public ioctl / character device structures for /dev/annibale-modem ----------------------------- */
 
@@ -672,9 +674,13 @@ modem_rat_to_string(uint8_t rat_code)
 static void
 modem_qmi_poll_services(void)
 {
-	if (qmi_slots[SLOT_UIM].online && !qmi_slots[SLOT_UIM].queried &&
-	    modem_qmi_send(SLOT_UIM, QMI_UIM_GET_CARD_STATUS, NULL, 0) == 0) {
-		qmi_slots[SLOT_UIM].queried = true;
+	if (qmi_slots[SLOT_UIM].online && !qmi_slots[SLOT_UIM].queried) {
+		static const uint8_t uim_ev_tlvs[] = { 0x01, 0x04, 0x00, 0x11, 0x00, 0x00, 0x00 };
+		(void)modem_qmi_send(SLOT_UIM, QMI_UIM_EVENT_REG, uim_ev_tlvs, sizeof(uim_ev_tlvs));
+		(void)modem_qmi_send(SLOT_UIM, QMI_UIM_GET_SLOTS_STATUS, NULL, 0);
+		if (modem_qmi_send(SLOT_UIM, QMI_UIM_GET_CARD_STATUS, NULL, 0) == 0) {
+			qmi_slots[SLOT_UIM].queried = true;
+		}
 	}
 	if (qmi_slots[SLOT_DMS].online && !qmi_slots[SLOT_DMS].queried &&
 	    modem_tick >= dms_retry_at_tick &&
@@ -750,9 +756,15 @@ modem_qmi_rx_cb(void *context, uint32_t from_node, uint32_t from_port, const voi
 		modem_uim_handle_rx(qmi_flags, msg_id, tlvs, tlv_len, &modem_status.sim_state);
 		break;
 	case SLOT_DMS: {
+		static bool uim_requeried_online;
 		uint8_t mode = 0;
 		bool want_online = false, requery = false;
 		modem_dms_handle_rx(qmi_flags, msg_id, tlvs, tlv_len, &mode, &want_online, &requery);
+		if (msg_id == QMI_DMS_GET_OPERATING_MODE && !want_online && mode == 0 &&
+		    !uim_requeried_online && qmi_slots[SLOT_UIM].online) {
+			uim_requeried_online = true;
+			qmi_slots[SLOT_UIM].queried = false;
+		}
 		if (want_online && dms_retry_count < 4u) {
 			static const uint8_t online_tlv[] = { 0x01, 0x01, 0x00, 0x00 };
 			if (modem_qmi_send(SLOT_DMS, QMI_DMS_SET_OPERATING_MODE, online_tlv, sizeof(online_tlv)) == 0) {

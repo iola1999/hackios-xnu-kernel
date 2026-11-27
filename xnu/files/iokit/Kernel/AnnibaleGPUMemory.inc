@@ -1,3 +1,59 @@
+#define GPU_GARBAGE_CAP         32
+#define GPU_REAP_SUBMIT_BUDGET  16
+#define GPU_REAP_CLOSE_BUDGET   16
+#define GPU_KEEP_EVICT_MAX      16
+#define GPU_EXPIRE_BUDGET       16
+
+/*
+ * Detached backing descriptors and surfaces whose GPU SMMU mappings are already unmapped and
+ * invalidated: released outside gGPULock so VM page teardown never stalls concurrent callers.
+ */
+struct gpu_garbage {
+	IOMemoryDescriptor *    memory[GPU_GARBAGE_CAP];
+	MiniIOSurface *         surface[GPU_GARBAGE_CAP];
+	uint32_t                memory_count;
+	uint32_t                surface_count;
+};
+
+static void
+gpuGarbageReleaseMemory(struct gpu_garbage * garbage, IOMemoryDescriptor * memory)
+{
+	if (memory == NULL) {
+		return;
+	}
+	if (garbage != NULL && garbage->memory_count < GPU_GARBAGE_CAP) {
+		garbage->memory[garbage->memory_count++] = memory;
+		return;
+	}
+	memory->release();
+}
+
+static void
+gpuGarbageDropSurface(struct gpu_garbage * garbage, MiniIOSurface * surface)
+{
+	if (surface == NULL) {
+		return;
+	}
+	if (garbage != NULL && garbage->surface_count < GPU_GARBAGE_CAP) {
+		garbage->surface[garbage->surface_count++] = surface;
+		return;
+	}
+	MiniIOSurfaceDrop(surface);
+}
+
+static void
+gpuGarbageFlush(struct gpu_garbage * garbage)
+{
+	for (uint32_t i = 0; i < garbage->memory_count; i++) {
+		garbage->memory[i]->release();
+	}
+	garbage->memory_count = 0;
+	for (uint32_t i = 0; i < garbage->surface_count; i++) {
+		MiniIOSurfaceDrop(garbage->surface[i]);
+	}
+	garbage->surface_count = 0;
+}
+
 /* The descriptor and IOVA remain owned until unmap and TLB invalidation succeed.
  * A failed backend may still DMA into any submitted buffer, even with no returned fence. */
 static bool
@@ -20,11 +76,14 @@ gpuReleaseMapping(uint64_t address, uint64_t size)
  * retains its existing record.
  */
 void
-AnnibaleGPUUserClient::freeBuffer(struct gpu_buffer * b)
+AnnibaleGPUUserClient::freeBuffer(struct gpu_buffer * b, struct gpu_garbage * garbage)
 {
 	uint32_t last = annibale_gpu_ready() ? annibale_gpu_last() : 0;
 	bool busy = gGPUReported || !annibale_gpu_ready() || (last != 0 && !annibale_gpu_done(last));
 
+	if (busy && fLeftCount == GPU_LEFT && !gGPUReported && annibale_gpu_ready()) {
+		reap(garbage, GPU_REAP_CLOSE_BUDGET);
+	}
 	/*
 	 * Nowhere to keep it: wait until `last` retires. One of the camera's still-image passes runs
 	 * for seconds, so a wait that runs out here is tried again; gpuWait() reports a core whose
@@ -50,57 +109,85 @@ AnnibaleGPUUserClient::freeBuffer(struct gpu_buffer * b)
 		left->size = b->size;
 		left->fence = last;
 		left->flags = b->flags;
+		left->pooled = b->pooled;
 	} else {
-		if (!busy && b->surface == NULL && keep(b->memory, b->kernel, b->address, b->size, b->flags)) {
+		if (!busy && b->surface == NULL && b->pooled &&
+		    keep(b->memory, b->kernel, b->address, b->size, b->flags, garbage)) {
 			b->memory = NULL;
 		} else if (busy || !gpuReleaseMapping(b->address, b->size)) {
 			gGPUReported = true;
 			IOLog("AnnibaleGPU: retaining %llu bytes until reset after unconfirmed completion or unmap\n", b->size);
 			return;
 		}
-		if (b->memory != NULL) {
-			b->memory->release();
-		}
-		if (b->surface != NULL) {
-			MiniIOSurfaceDrop(b->surface);
-		}
+		gpuGarbageReleaseMemory(garbage, b->memory);
+		gpuGarbageDropSurface(garbage, b->surface);
 	}
-	b->memory = NULL;
 	b->surface = NULL;
+	b->pooled = false;
+	__atomic_store_n(&b->memory, NULL, __ATOMIC_RELEASE);
 	fBufferCount--;
 	fBufferBytes -= b->size;
 }
 
-/* The buffers that were given back early and that the GPU is done with now: freed. With the lock held. */
+/*
+ * Reap retired buffers from fLeft under gGPULock, bounding per-call work when `budget` is non-zero
+ * and deferring memory/surface teardown into `garbage` so callers release pages outside gGPULock.
+ */
 void
-AnnibaleGPUUserClient::reap(void)
+AnnibaleGPUUserClient::reap(struct gpu_garbage * garbage, uint32_t budget)
 {
+	uint32_t reaped = 0;
+
 	for (uint32_t i = 0; i < fLeftCount;) {
 		struct gpu_left * left = &fLeft[i];
 
+		if (budget != 0 && (reaped >= budget || (garbage != NULL &&
+		    (garbage->memory_count >= budget || garbage->surface_count >= budget)))) {
+			break;
+		}
 		if (gGPUReported || !annibale_gpu_ready() || !annibale_gpu_done(left->fence)) {
 			i++;
 			continue;
 		}
-		if (left->surface == NULL && keep(left->memory, NULL, left->address, left->size, left->flags)) {
+		if (left->surface == NULL && left->pooled &&
+		    keep(left->memory, NULL, left->address, left->size, left->flags, garbage)) {
 			left->memory = NULL;
 		} else if (!gpuReleaseMapping(left->address, left->size)) {
 			i++;
 			continue;
 		}
-		if (left->memory != NULL) {
-			left->memory->release();
-		}
-		if (left->surface != NULL) {
-			MiniIOSurfaceDrop(left->surface);
-		}
+		gpuGarbageReleaseMemory(garbage, left->memory);
+		gpuGarbageDropSurface(garbage, left->surface);
 		*left = fLeft[--fLeftCount];
+		reaped++;
 	}
+}
+
+IOReturn
+AnnibaleGPUUserClient::gemClose(uint32_t handle)
+{
+	struct gpu_garbage garbage = {};
+	IOReturn ret = kIOReturnSuccess;
+
+	gpuLockIoctl(kDrmGemClose);
+	struct gpu_buffer * b = buffer(handle);
+
+	if (b == NULL) {
+		ret = kIOReturnBadArgument;
+	} else {
+		freeBuffer(b, &garbage);
+		reap(&garbage, GPU_REAP_CLOSE_BUDGET);
+	}
+	IOLockUnlock(gGPULock);
+	gpuGarbageFlush(&garbage);
+	return ret;
 }
 
 IOReturn
 AnnibaleGPUUserClient::clientClose(void)
 {
+	struct gpu_garbage garbage = {};
+
 	if (fBuffers != NULL) {
 		IOLockLock(gGPULock);
 		/* what the client had the GPU do last may still be going on, in these buffers */
@@ -109,17 +196,18 @@ AnnibaleGPUUserClient::clientClose(void)
 		}
 		for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
 			if (fBuffers[i].memory != NULL) {
-				freeBuffer(&fBuffers[i]);
+				freeBuffer(&fBuffers[i], &garbage);
 			}
 		}
-		reap();
+		reap(&garbage, 0);
 		for (uint32_t i = 0; i < GPU_KEPT; i++) {
-			dropKept(&fKept[i]);
+			dropKept(&fKept[i], &garbage);
 		}
 		if (fLeftCount != 0) {
 			IOLog("AnnibaleGPU: the GPU is not done with %u buffers of a program that is gone: they stay its own\n", fLeftCount);
 		}
 		IOLockUnlock(gGPULock);
+		gpuGarbageFlush(&garbage);
 	}
 	if (!isInactive()) {
 		terminate();
@@ -306,9 +394,14 @@ AnnibaleGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uin
 		if (!gpuReleaseMapping(b->address, size)) {
 			/* The caller releases its reference on failure; this record retains the backing pages. */
 			memory->retain();
+			b->kernel = NULL;
 			b->surface = NULL;
 			b->size = size;
 			b->flags = flags;
+			b->seed = 0;
+			b->pushed = 0;
+			b->seen = false;
+			b->pooled = false;
 			b->fence = 0;
 			/* the memory reference is the slot's validity, published last for gemInfo's lock-free read */
 			__atomic_store_n(&b->memory, memory, __ATOMIC_RELEASE);
@@ -334,7 +427,7 @@ AnnibaleGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uin
 
 /* With the lock held. */
 bool
-AnnibaleGPUUserClient::dropKept(struct gpu_kept * k)
+AnnibaleGPUUserClient::dropKept(struct gpu_kept * k, struct gpu_garbage * garbage)
 {
 	if (k->memory == NULL) {
 		return true;
@@ -342,7 +435,7 @@ AnnibaleGPUUserClient::dropKept(struct gpu_kept * k)
 	if (!gpuReleaseMapping(k->address, k->size)) {
 		return false;
 	}
-	k->memory->release();
+	gpuGarbageReleaseMemory(garbage, k->memory);
 	k->memory = NULL;
 	fKeptBytes -= k->size;
 	return true;
@@ -364,7 +457,8 @@ static const uint32_t gGPUKeptTarget[4] = {
 
 /* With the lock held, the GPU done with the buffer: kept if it is worth it. */
 bool
-AnnibaleGPUUserClient::keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags)
+AnnibaleGPUUserClient::keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags,
+    struct gpu_garbage * garbage)
 {
 	struct gpu_kept * place = NULL;
 
@@ -372,7 +466,7 @@ AnnibaleGPUUserClient::keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint6
 	    (kernel == NULL && OSDynamicCast(IOBufferMemoryDescriptor, memory) == NULL)) {
 		return false;
 	}
-	for (;;) {
+	for (uint32_t evicts = 0;; evicts++) {
 		struct gpu_kept * oldest = NULL;
 		struct gpu_kept * oldest_by_class[4] = { NULL, NULL, NULL, NULL };
 		uint32_t count[4] = { 0, 0, 0, 0 };
@@ -396,6 +490,9 @@ AnnibaleGPUUserClient::keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint6
 		if (place != NULL && fKeptBytes + size <= GPU_KEPT_BYTES) {
 			break;
 		}
+		if (garbage != NULL && evicts >= GPU_KEEP_EVICT_MAX) {
+			return false;
+		}
 		struct gpu_kept * victim = oldest;
 
 		if (place == NULL) {
@@ -417,7 +514,7 @@ AnnibaleGPUUserClient::keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint6
 			}
 			victim = victim != NULL ? victim : oldest;
 		}
-		if (!dropKept(victim)) {
+		if (!dropKept(victim, garbage)) {
 			return false;
 		}
 		/* no free place: the entry cap is what makes room; a free place and the bytes over: the byte cap */
@@ -468,6 +565,7 @@ AnnibaleGPUUserClient::gemNew(struct msm_gem_new * request, uint64_t * iova, str
 	 * backboardd made 218 buffers of 8 MB or more. The program sees the size it asked for; the rest
 	 * is mapped and unused.
 	 */
+	struct gpu_garbage garbage = {};
 	uint64_t acq = ioLock(io, kMsmGemNew);
 
 	if (gGPUReported || !annibale_gpu_ready()) {
@@ -479,16 +577,19 @@ AnnibaleGPUUserClient::gemNew(struct msm_gem_new * request, uint64_t * iova, str
 
 	nanoseconds_to_absolutetime(GPU_KEPT_SECONDS * NSEC_PER_SEC, &old);
 	bool size_seen = false;         /* the pool has an entry of the size asked, whatever its flags: a miss is for the flags */
+	uint32_t expired = 0;
 
 	for (uint32_t i = 0; i < GPU_KEPT; i++) {
 		struct gpu_kept * k = &fKept[i];
 
-		if (k->memory != NULL && began - k->since > old) {
-			if (!dropKept(k)) {
+		if (k->memory != NULL && began - k->since > old && expired < GPU_EXPIRE_BUDGET) {
+			if (!dropKept(k, &garbage)) {
 				ioUnlock(io, acq);
+				gpuGarbageFlush(&garbage);
 				return kIOReturnNotReady;
 			}
 			gGPUStat.expire_drop++;
+			expired++;
 		}
 
 		if (k->memory != NULL && k->size >= size && k->size - size <= size / 4) {
@@ -513,6 +614,7 @@ AnnibaleGPUUserClient::gemNew(struct msm_gem_new * request, uint64_t * iova, str
 			b->address = found->address;
 			b->size = found->size;
 			b->flags = found->flags;
+			b->pooled = true;
 			/* the memory reference is the slot's validity, published last for gemInfo's lock-free read */
 			__atomic_store_n(&b->memory, found->memory, __ATOMIC_RELEASE);
 			fNextBuffer = h + 1;
@@ -525,6 +627,7 @@ AnnibaleGPUUserClient::gemNew(struct msm_gem_new * request, uint64_t * iova, str
 			gGPUStat.given_again++;
 			gGPUStat.hit_by_size[b->size < (64u << 10) ? 0 : b->size < (1u << 20) ? 1 : b->size < (8u << 20) ? 2 : 3]++;
 			ioUnlock(io, acq);
+			gpuGarbageFlush(&garbage);
 			if (gGPUKeep == 2) {
 				bzero(b->kernel, (size_t) b->size);
 			}
@@ -532,6 +635,7 @@ AnnibaleGPUUserClient::gemNew(struct msm_gem_new * request, uint64_t * iova, str
 		}
 	}
 	ioUnlock(io, acq);
+	gpuGarbageFlush(&garbage);
 	/* (the memory comes zeroed, and making it write-combined pushes the zeroes out of the cache) */
 	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
 	    (gGPUCached ? 0 : kIOMapWriteCombineCache), (vm_size_t) size, PAGE_SIZE);
@@ -552,6 +656,7 @@ AnnibaleGPUUserClient::gemNew(struct msm_gem_new * request, uint64_t * iova, str
 	b = newBuffer(memory, 0, size, request->flags, &request->handle, &error);
 	if (b != NULL) {
 		b->kernel = (uint8_t *) memory->getBytesNoCopy();
+		b->pooled = true;
 		if (iova) *iova = b->address;
 		gGPUStat.made++;
 		gGPUStat.making += mach_absolute_time() - began;
@@ -638,6 +743,7 @@ AnnibaleGPUUserClient::surfaceBuffer(struct annibale_surface * request, struct g
 	} else if ((b = newBuffer(pixelsMemory, pixelsOffset, size, 0, &request->handle, &error)) != NULL) {
 		b->kernel = s->kpixels;
 		b->surface = s;
+		b->pooled = false;
 		gGPUStat.surfaces++;
 		/* the memory reference is the slot's validity, published last for gemInfo's lock-free read */
 		__atomic_store_n(&b->memory, memory, __ATOMIC_RELEASE);
@@ -713,6 +819,7 @@ AnnibaleGPUUserClient::memoryBuffer(struct annibale_memory * request, struct gpu
 		error = kIOReturnNotReady;
 	} else if ((b = newBuffer(memory, 0, request->size, flags, &request->handle, &error)) != NULL) {
 		b->kernel = NULL;
+		b->pooled = false;
 		/* the memory reference is the slot's validity, published last for gemInfo's lock-free read */
 		__atomic_store_n(&b->memory, memory, __ATOMIC_RELEASE);
 	}

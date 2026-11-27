@@ -444,6 +444,9 @@ annibale_sta_ask_leave(void)
 	asked_leave = true;
 	asked_join = false;
 	bzero(&asked_join_what, sizeof(asked_join_what));
+	if (standing.ssid_length == 0 && fallback.ssid_length != 0) {
+		standing = fallback;
+	}
 	bzero(&fallback, sizeof(fallback));
 	bool flush_power = power_report_pending;
 	power_report_pending = false;

@@ -982,32 +982,7 @@ modem_dms_handle_rx(uint8_t qmi_flags, uint16_t msg_id, const uint8_t *tlvs, uin
 	}
 }
 
-static void
-modem_uim_handle_rx(uint8_t qmi_flags, uint16_t msg_id, const uint8_t *tlvs, uint16_t tlv_len,
-    uint32_t *sim_state_out)
-{
-	uint16_t res = 0, err = 0, clen = 0;
-	const uint8_t *cv;
-
-	if (msg_id != 0x002fu /* GET_CARD_STATUS */ && msg_id != 0x0032u /* CARD_STATUS_IND */) {
-		return;
-	}
-	if (qmi_flags == 0x02u && svc_qmi_read_result(tlvs, tlv_len, &res, &err) && res != 0) {
-		printf("annibale-modem: QMI UIM GET_CARD_STATUS failed res=%u err=%u\n", res, err);
-		return;
-	}
-	cv = annibale_qmi_find_tlv(tlvs, tlv_len, 0x10u, &clen);
-	if (cv == NULL || clen < 15u || cv[8] == 0) {
-		return;
-	}
-	uint8_t num_slots = cv[8], card = cv[9], upin = cv[10], uim_err = cv[13], apps = cv[14];
-	uint8_t app_state = (clen >= 17u && apps > 0) ? cv[16] : 0u;
-	modem_loc_diag.uim_card = card;
-	modem_loc_diag.uim_err = uim_err;
-	*sim_state_out = (card == 1u) ? (app_state == 7u ? 2u : 1u) : 0u;
-	printf("annibale-modem: QMI UIM slots=%u slot0=(card=%u upin=%u err=%u apps=%u app_st=%u) sim=%u (subscriber_id=***)\n",
-	    num_slots, card, upin, uim_err, apps, app_state, *sim_state_out);
-}
+#include "annibale_modem_uim.inc"
 
 static void
 modem_wms_handle_rx(uint8_t qmi_flags, uint16_t msg_id, const uint8_t *tlvs, uint16_t tlv_len,

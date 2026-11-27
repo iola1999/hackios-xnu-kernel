@@ -35,6 +35,7 @@ source = r'''
 #include <string.h>
 #define Z_WAITOK 1
 #define Z_ZERO 2
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define printf(...) ((void)0)
 
 typedef uint64_t clock_sec_t;
@@ -45,18 +46,23 @@ static void clock_get_system_microtime(clock_sec_t *sec, clock_usec_t *usec) {
 }
 
 enum annibale_sta_event { ANNIBALE_STA_POWER, ANNIBALE_STA_SCAN_DONE, ANNIBALE_STA_JOIN_DONE, ANNIBALE_STA_LINK };
-struct annibale_sta_state { struct { int16_t rssi; } bss; };
+struct annibale_sta_state { struct { int16_t rssi; uint8_t ssid_length, ssid[32], bssid[6]; } bss; };
 static int current_rssi;
 static struct annibale_sta_state station;
 static void *kalloc_data(size_t size, int flags) {
     assert(size == sizeof(station) && flags == (Z_WAITOK | Z_ZERO)); return &station;
 }
 static void kfree_data(void *data, size_t size) { assert(data == &station && size == sizeof(station)); }
-static void annibale_sta_state(struct annibale_sta_state *state) { state->bss.rssi = current_rssi; }
+static void annibale_sta_state(struct annibale_sta_state *state) {
+    state->bss.rssi = current_rssi;
+    state->bss.ssid_length = 4;
+    memcpy(state->bss.ssid, "TEST", 4);
+    memcpy(state->bss.bssid, "\x02\x11\x22\x33\x44\x55", 6);
+}
 static int apple80211_lock;
 static void lck_mtx_lock(int *lock) { assert(lock == &apple80211_lock); }
 static void lck_mtx_unlock(int *lock) { assert(lock == &apple80211_lock); }
-static unsigned result_next;
+static struct { uint64_t data; unsigned next; } result_readers[16];
 static uint32_t join_result;
 
 struct captured { uint32_t code, length; uint8_t data[0x1d8]; };
@@ -70,6 +76,9 @@ static void post(uint32_t code, const void *data, uint32_t length) {
     if (length) memcpy(event->data, data, length);
 }
 ''' + "\n".join(declaration(name) for name in (
+    "struct apple80211_ssid_changed {",
+    "struct apple80211_bssid_changed {",
+    "struct apple80211_power_changed {",
     "struct apple80211_link_changed {",
     "struct apple80211_lqm_changed {",
     "struct apple80211_assoc_done {",

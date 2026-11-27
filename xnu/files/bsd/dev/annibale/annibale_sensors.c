@@ -158,6 +158,7 @@ rd(vm_offset_t address)
 #include "annibale_sensors_i2c.inc"
 #include "annibale_sensors_probe.inc"
 #include "annibale_sensors_scan.inc"
+#include "annibale_sensors_ssc.inc"
 
 /* ---- bitbang hardware driver ------------------------------------------------------------------------ */
 
@@ -668,9 +669,12 @@ sensors_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 	if (hw_i2c_mode > 0) {
 		sensors_hw_init();
+	} else if (scan_group_count == 0 && probe_mode == 0) {
+		sensors_ssc_init();
 	}
 
 	for (;;) {
+		sensors_ssc_tick();
 		poll_hardware_sensors();
 		delay_for_interval(250, NSEC_PER_MSEC);
 	}

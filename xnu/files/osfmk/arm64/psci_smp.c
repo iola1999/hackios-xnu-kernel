@@ -50,9 +50,12 @@
 
 #if defined(GENERIC_PSCI_SMP)
 
+#define PSCI_VERSION            0x84000000u
 #define PSCI_CPU_OFF            0x84000002u
 #define PSCI_CPU_ON             0xC4000003u
 #define PSCI_AFFINITY_INFO      0xC4000004u
+#define PSCI_FEATURES           0x8400000Au
+#define PSCI_CPU_SUSPEND        0xC4000001u
 #define PSCI_AFFINITY_OFF       1
 
 #define PSCI_SMP_START_SECONDS  5       /* how long a started core is waited for */
@@ -118,11 +121,37 @@ psci_smp_init(void)
 	DTEntry chosen;
 	void const *prop;
 	unsigned int size;
+	int64_t ver, feat;
 
 	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
 	    SecureDTGetProperty(chosen, "psci-method", &prop, &size) == kSuccess &&
 	    size >= 3 && strncmp((const char *)prop, "hvc", 3) == 0) {
 		psci_smp_hvc = 1;
+	}
+
+	ver = psci_call(PSCI_VERSION, 0, 0, 0);
+	if ((int32_t)ver < 0) {
+		printf("psci: method=%s version=err(%lld:%s)\n",
+		    psci_smp_hvc ? "hvc" : "smc", (long long)(int32_t)ver,
+		    psci_error((int32_t)ver));
+		return;
+	}
+	uint32_t major = ((uint32_t)ver >> 16) & 0x7fffu;
+	uint32_t minor = (uint32_t)ver & 0xffffu;
+	if (major >= 1) {
+		feat = psci_call(PSCI_FEATURES, PSCI_CPU_SUSPEND, 0, 0);
+		if ((int32_t)feat < 0) {
+			printf("psci: method=%s version=%u.%u cpu_suspend=err(%lld:%s)\n",
+			    psci_smp_hvc ? "hvc" : "smc", major, minor,
+			    (long long)(int32_t)feat, psci_error((int32_t)feat));
+		} else {
+			uint32_t f = (uint32_t)feat;
+			printf("psci: method=%s version=%u.%u cpu_suspend=0x%x (osi=%u ext_stateid=%u)\n",
+			    psci_smp_hvc ? "hvc" : "smc", major, minor, f, f & 1u, (f >> 1) & 1u);
+		}
+	} else {
+		printf("psci: method=%s version=%u.%u cpu_suspend=n/a\n",
+		    psci_smp_hvc ? "hvc" : "smc", major, minor);
 	}
 }
 

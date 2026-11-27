@@ -27,6 +27,7 @@ struct RowJob {
 	int32_t         sx, sy, sw, sh, px0, py0, px1, py1, cx0, cx1;
 	int32_t         by0, by1;       /* the panel rows this frame draws (dirtyBand), within py0..py1 */
 	uint32_t        bufferSeq;      /* fRowSeq when the target panel buffer was last updated */
+	uint32_t        drawWork;       /* upper bound on rows needing pixel work in drawRows() */
 	bool            filter, unscaled, allDirty, hashPhase, hashKnown;
 	int32_t         hashFirst[8], hashLast[8], hashCount[8];
 };
@@ -174,8 +175,18 @@ IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
  * rows again (it draws whole, the hashes being old) and one to see whether the frames still change
  * whole. A pause of ROWS_SOON_NS or more goes back to hashing every frame.
  */
-#define ROWS_SOON_NS    (25 * NSEC_PER_MSEC)
-#define ROWS_UNHASHED   16
+#define ROWS_SOON_NS            (25 * NSEC_PER_MSEC)
+#define ROWS_UNHASHED           4
+#define DRAW_MIN_PARALLEL_ROWS  128
+
+static inline bool
+shouldParallelDraw(const RowJob * job)
+{
+	uint32_t span = (uint32_t) (job->by1 - job->by0);
+	uint32_t work = job->allDirty || span < job->drawWork ? span : job->drawWork;
+
+	return work >= DRAW_MIN_PARALLEL_ROWS;
+}
 
 void
 IOMobileFramebuffer::hashRows(RowJob * job, unsigned share, unsigned shares)
@@ -259,12 +270,14 @@ IOMobileFramebuffer::dirtyBand(RowJob * job)
 
 	job->by0 = job->py0;
 	job->by1 = job->py1;
+	job->drawWork = (uint32_t) (job->py1 - job->py0);
 	job->allDirty = true;
 	job->hashPhase = false;
 	fRowSeq++;
 	if (!gRows || !fSingleLayer || fDiff || (job->sx & 1) != 0 || (job->stride & 7) != 0) {
 		fRowHashRows = 0;
 		fAllChangedSeq = fRowSeq;
+		fLastChangedRows = (uint32_t) job->sh;
 		return true;
 	}
 	absolutetime_to_nanoseconds(now - fBandAt, &gap);
@@ -277,6 +290,7 @@ IOMobileFramebuffer::dirtyBand(RowJob * job)
 		fStatUnhashed++;
 		fRowHashRows = 0;
 		fAllChangedSeq = fRowSeq;
+		fLastChangedRows = (uint32_t) job->sh;
 		return true;
 	}
 	if (fRowHashSize != (uint32_t) job->sh) {
@@ -310,7 +324,8 @@ IOMobileFramebuffer::dirtyBand(RowJob * job)
 	}
 	known = fRowHashRows == (uint32_t) job->sh && memcmp(geometry, fRowHashGeometry, sizeof(geometry)) == 0;
 	job->hashKnown = known;
-	if (fThreads > 1 && fHelpersStarted + 1 == fThreads) {
+	/* Idle/post-pause frames (>= ROWS_SOON_NS) hash inline (~0.35 ms) instead of waking idle helper cores. */
+	if (gap < ROWS_SOON_NS && fThreads > 1 && fHelpersStarted + 1 == fThreads) {
 		job->hashPhase = true;
 		IOLockLock(fHelperLock);
 		fHelperJob = job;
@@ -364,6 +379,10 @@ IOMobileFramebuffer::dirtyBand(RowJob * job)
 	if (job->allDirty) {
 		job->by0 = job->py0;
 		job->by1 = job->py1;
+		job->drawWork = (uint32_t) (job->py1 - job->py0);
+	} else {
+		job->drawWork = (uint32_t) changed + (flip.ready ? fLastChangedRows : 0u);
 	}
+	fLastChangedRows = (uint32_t) changed;
 	return true;
 }

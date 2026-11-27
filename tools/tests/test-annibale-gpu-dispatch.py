@@ -42,8 +42,13 @@ static void adreno8_sleep_us(uint32_t us) { (void)us; }
 BACKENDS = r'''
 bool adreno8_bo_enable(void) { enable_calls++; bo_open = self_test; return bo_open; }
 bool adreno8_bo_ready(void) { ready_checks++; return bo_open; }
+bool adreno8_bo_enabled(void) { return bo_open; }
 void adreno8_bo_stop(void) { stop_calls++; bo_open = false; }
-uint64_t adreno8_bo_reserve(uint64_t size) { assert(size == 4096); return bo_open ? 0x10001000 : 0; }
+uint64_t adreno8_bo_reserve(uint64_t size, uint32_t *refusal) {
+    assert(size == 4096 && refusal);
+    if (!bo_open) *refusal = ADRENO8_BO_REFUSE_NOT_READY;
+    return bo_open ? 0x10001000 : 0;
+}
 bool adreno8_bo_map(uint64_t address, uint64_t pa, bool ro) {
     assert(address == 0x10001000 && pa == 0x50000000 && ro); return bo_open;
 }
@@ -93,8 +98,10 @@ static void exercise(bool platform) {
     uint64_t value, used=9, largest=9, lost=9, address=0x10001000;
     uint32_t live=9, refused=9, words=6, by[7], timed; unsigned holes=9, most=9;
     assert(annibale_gpu_ready() == platform);
+    assert(annibale_gpu_accepting() == platform);
     if (!platform) {
-        assert(!annibale_gpu_parameter(1, &value) && !annibale_gpu_address(4096));
+        uint32_t refusal = 0;
+        assert(!annibale_gpu_parameter(1, &value) && !annibale_gpu_address(4096, &refusal) && refusal == ADRENO8_BO_REFUSE_NOT_READY);
         annibale_gpu_address_free(address, 4096);
         annibale_gpu_space(&used, &live, &largest, &holes, &most, &lost, &refused);
         assert(!used && !live && !largest && !holes && !most && !lost && !refused);
@@ -110,7 +117,8 @@ static void exercise(bool platform) {
         return;
     }
     assert(annibale_gpu_parameter(1, &value) && value == 830u);
-    assert(annibale_gpu_address(4096) == 0x10001000u);
+    uint32_t refusal = 0;
+    assert(annibale_gpu_address(4096, &refusal) == 0x10001000u && refusal == 0);
     annibale_gpu_address_free(address, 4096);
     annibale_gpu_space(&used, &live, &largest, &holes, &most, &lost, &refused);
     assert(!used && !live && !largest && !holes && !most && !lost && !refused);
@@ -131,7 +139,8 @@ int main(void) {
     exercise(false); exercise(true);
     bo_open = true; annibale_gpu_stop(); assert(!bo_open && close_calls == 1 && !legacy_calls);
     uint64_t value=9, address=0x10001000; uint32_t words=6;
-    assert(!annibale_gpu_ready() && !annibale_gpu_parameter(1, &value) && !annibale_gpu_address(4096));
+    uint32_t refusal = 0;
+    assert(!annibale_gpu_ready() && !annibale_gpu_accepting() && !annibale_gpu_parameter(1, &value) && !annibale_gpu_address(4096, &refusal) && refusal == ADRENO8_BO_REFUSE_NOT_READY);
     assert(!annibale_gpu_map(address, 0x50000000, true) && !annibale_gpu_mapped() && !annibale_gpu_unmap(address, 4096));
     assert(!annibale_gpu_submit(&address, &words, 1) && !annibale_gpu_done(17));
     unsigned checked = ready_checks;
@@ -252,8 +261,8 @@ static void a830_boundaries() {
         if(mode==23) request.syncobj_stride=8;
         if(mode==24) request.flags=1;
         if(mode==25) request.flags|=0x100;
-        uint64_t original_address=b->address; cache_pushes=0;
-        assert(c.submit(&request)==(valid ? kIOReturnSuccess : kIOReturnBadArgument));
+        uint64_t original_address=b->address; cache_pushes=0; struct gpu_io_stat io{};
+        assert(c.submit(&request, &io)==(valid ? kIOReturnSuccess : kIOReturnBadArgument));
         assert(!gGPUReported && submit_calls==(valid?1u:0u) && cache_pushes==(valid?1u:0u));
         assert(b->address==original_address); c.clientClose(); c.free();
     }
@@ -316,7 +325,7 @@ def main():
         enum { kMsmSubmitQueueNew, kAnnibaleGPUWorked, kMsmSetParam, kIOReturnSuccess, kIOReturnBadArgument, kIOReturnUnsupported };
         #define MSM_PARAM_COMM 0x0c
         #define MSM_PARAM_CMDLINE 0x0d
-        static unsigned depth; static void IOLockLock(void*){depth++;} static void IOLockUnlock(void*){depth--;}
+        static unsigned depth; static void IOLockLock(void*){depth++;} static void gpuLockIoctl(uint32_t){depth++;} static void IOLockUnlock(void*){depth--;}
         static void *gGPULock; static void annibale_gpu_worked(uint64_t*,uint32_t*,uint32_t*){assert(!a830);}
         int call(unsigned selector,unsigned flags,unsigned prio) {
         struct { struct{unsigned flags,prio,id;} queue; struct{uint64_t microseconds;uint32_t submissions,by[7];}worked; struct{unsigned param;} param;}r{};
@@ -341,17 +350,20 @@ def main():
         for label,old,new in variants:
             assert old in source
             run(boundaries(source.replace(old,new,1),fixture),target,label,success=False)
-        ready_block=source[source.index('\tif (selector != kAnnibaleShow) {'):source.index('\tbzero(&r, sizeof(r));')]
+        ready_block=source[source.index('\tif (selector != kAnnibaleShow &&'):source.index('\tbzero(&r, sizeof(r));')]
         param_block=source[source.index('\tcase kMsmGetParam:'):source.index('\tcase kMsmSetParam:')]
         locked=PUBLISHER+r'''
         enum { kAnnibaleShow=1,kMsmGetParam=2,kIOReturnSuccess=0,kIOReturnNotReady=3,kIOReturnBadArgument=4 };
         static bool gGPUReported, backend_ready;
+        static void gpuLockIoctl(uint32_t){IOLockLock(gGPULock);}
+        static bool annibale_gpu_accepting(){return backend_ready;}
         static bool annibale_gpu_ready(){assert(gGPULock && gGPULock->depth==1);return backend_ready;}
         static bool annibale_gpu_parameter(uint32_t,uint64_t *v){assert(gGPULock->depth==1);*v=830;return backend_ready;}
-        struct gpu_buffer{}; const unsigned GPU_BUFFERS=3;
+        struct gpu_buffer{}; struct gpu_kept{}; const unsigned GPU_BUFFERS=3, GPU_KEPT=3;
         #define IONewZero(type,n) new type[n]{}
+        #define IODelete(p,type,n) delete[] (p)
         struct IOUserClient:IOService{};
-        struct AnnibaleGPUUserClient:IOUserClient{uint32_t fClientType=0;gpu_buffer *fBuffers=nullptr;bool start(IOService*) override;};
+        struct AnnibaleGPUUserClient:IOUserClient{uint32_t fClientType=0;gpu_buffer *fBuffers=nullptr;gpu_kept *fKept=nullptr;bool start(IOService*) override;};
         '''+function(source,"AnnibaleGPUUserClient::start")+'''
         static int entry(unsigned selector){'''+ready_block+'''return kIOReturnSuccess;}
         static int parameter(){int ret=kIOReturnSuccess;struct{struct{uint32_t param;uint64_t value;}param;}r{};
@@ -360,7 +372,7 @@ def main():
         assert(!c.start(&provider) && entry(kAnnibaleShow)==kIOReturnSuccess && entry(0)==kIOReturnNotReady);
         gGPULock=IOLockAlloc();assert(!c.start(&provider) && entry(0)==kIOReturnNotReady);
         backend_ready=true;assert(c.start(&provider) && entry(0)==kIOReturnSuccess && parameter()==kIOReturnSuccess);
-        assert(!gGPULock->depth);delete[] c.fBuffers;c.fBuffers=nullptr;
+        assert(!gGPULock->depth);delete[] c.fBuffers;c.fBuffers=nullptr;delete[] c.fKept;c.fKept=nullptr;
         gGPUReported=true;assert(!c.start(&provider) && entry(0)==kIOReturnNotReady);
         gGPUReported=false;backend_ready=false;assert(parameter()==kIOReturnBadArgument);
         IOLockFree(gGPULock);gGPULock=nullptr;}

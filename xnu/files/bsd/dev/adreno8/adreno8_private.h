@@ -295,6 +295,7 @@ extern vm_offset_t adreno8_hfi_view_debug;
 extern struct adreno8_gpu_space adreno8_gmu_space;
 extern struct adreno8_gpu_space adreno8_secure_space;
 extern bool adreno8_gpu8_keep;
+extern bool adreno8_gpu8_ifpc;
 extern bool adreno8_reset_required;
 extern bool adreno8_gpu8_return;
 extern uint32_t adreno8_gpu8_secure_mode; /* boot-args adreno8_secure_preflight=N; unknown values parse to 0 */

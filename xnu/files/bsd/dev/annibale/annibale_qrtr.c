@@ -292,8 +292,8 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
 			}
 		}
 		lck_mtx_unlock(&qrtr_lock);
-		/* MPSS (node 0) sends QRTR_NEW_LOOKUP during bringup and expects matching servers plus the zero terminator. */
-		should_answer = (answer != 0 || header->from_node == 0 || nmatch > 0);
+		/* MPSS (node 0) and ADSP (node 5) send QRTR_NEW_LOOKUP during bringup and expect matching servers plus the zero terminator. */
+		should_answer = (answer != 0 || header->from_node == 0 || header->from_node == 5 || nmatch > 0);
 		error = 0;
 		if (should_answer) {
 			for (unsigned i = 0; i < nmatch && error == 0; i++) {
@@ -315,8 +315,16 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
 		    error == 0 ? "answered" : "the answer was not sent");
 		break;
 	}
-	default:
-		break;                                  /* (a client's going, and what else there is: nothing here wants it) */
+	default: {
+		static uint32_t unhandled_ctrl_logs;
+		if (unhandled_ctrl_logs < 32u) {
+			unhandled_ctrl_logs++;
+			printf("qrtr: node %u port %u ctrl cmd=%u w0=%#x w1=%#x\n",
+			    header->from_node, header->from_port, control->command,
+			    control->words[0], control->words[1]);
+		}
+		break;
+	}
 	}
 }
 

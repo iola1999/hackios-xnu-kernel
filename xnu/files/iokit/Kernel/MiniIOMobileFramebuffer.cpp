@@ -320,7 +320,7 @@ public:
 	uint32_t        fRowSeq, fAllChangedSeq, fBufferSeq[2];
 	int32_t         fRowHashGeometry[8];
 	uint64_t        fBandAt;                /* when the frame before came; frames in a row that changed whole, frames unhashed since */
-	uint32_t        fWholeFrames, fUnhashed, fStatUnhashed;
+	uint32_t        fWholeFrames, fUnhashed, fStatUnhashed, fLastChangedRows;
 	bool            fSingleLayer;           /* this frame is one surface, in the bottom layer */
 	uint32_t        fStatUnchanged;         /* frames with no row changed, not drawn */
 	uint64_t        fStatBandRows;          /* panel rows drawn */
@@ -695,7 +695,7 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	fLastBy1 = job.by1;
 	fLastAllDirty = job.allDirty;
 	fStatBandRows += (uint64_t) (job.by1 - job.by0);
-	if (fThreads <= 1 || fDiff || fHelpersStarted + 1 < fThreads) {
+	if (fThreads <= 1 || fDiff || fHelpersStarted + 1 < fThreads || !shouldParallelDraw(&job)) {
 		drawRows(&job, job.by0, job.by1, fBlendRow);
 		fBufferSeq[targetBuf] = fRowSeq;
 		fLastBufSeqAfter = fRowSeq;
