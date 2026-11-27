@@ -63,6 +63,8 @@ enum RWCopyKind { RW_COPY_NONE, RW_COPY_BUFFER, RW_COPY_TEXTURE, RW_COPY_MIPMAP,
 	 * whether the encoder was given one; without one the draw does not clip. */
 	unsigned scissorRect[4];
 	BOOL hasScissorRect;
+	float blendColor[4];
+	BOOL hasBlendColor;
 	unsigned primitive, vertexStart, vertexCount;
 	/* the index buffer of an indexed draw and the three numbers that come with it in
 	 * the same Metal call; indexBuffer nil is -drawPrimitives:, and then vertexCount

@@ -363,8 +363,19 @@ cam_native_sensor_power(bool up)
 			    back && power[i].value != 0 ? ANNIBALE_RPMH_MODE_HPM : ANNIBALE_RPMH_MODE_NONE);
 			break;
 		case 4:
-			ok = back && annibale_rpmh_regulator("ldob8", 3104u, power[i].value != 0,
+			if (!back) {
+				ok = false;
+				break;
+			}
+			if (power[i].value == 0 && !cam_vaf_powered) {
+				ok = true;
+				break;
+			}
+			ok = annibale_rpmh_regulator("ldob8", 3104u, power[i].value != 0,
 			    power[i].value != 0 ? ANNIBALE_RPMH_MODE_HPM : ANNIBALE_RPMH_MODE_NONE);
+			if (ok) {
+				cam_vaf_powered = power[i].value != 0;
+			}
 			break;
 		case 14:
 			ok = back && (power[i].value == 0 || power[i].value == 3296000u) &&
@@ -475,18 +486,31 @@ cam_native_apply_exposure_regs(bool force)
  * search. Position 0 is where it rests without current; it is walked there before its supply
  * goes off.
  */
-#define OVX8000_LENS_STEP       64u
+#define OVX8000_LENS_STEP       32u
+#define OVX8000_LENS_SOFT_ZONE  64u
+#define OVX8000_LENS_SOFT_STEP  16u
 #define OVX8000_LENS_STEP_US    10800u  /* GT9764V AAC3: 9.8 ms with 0x06=0x40, 0x07=7, plus 1 ms settling margin. */
 
 static bool cam_native_lens_ready;
 
-/* The lens from `from` to `to`, OVX8000_LENS_STEP at a time; false when a write failed. */
+static uint32_t
+cam_native_lens_next_step(uint32_t from, uint32_t to)
+{
+	uint32_t step = (from > to && from <= OVX8000_LENS_SOFT_ZONE) ?
+	    OVX8000_LENS_SOFT_STEP : OVX8000_LENS_STEP;
+
+	if (from < to) {
+		return MIN(from + step, to);
+	}
+	return (from - to > step) ? (from - step) : to;
+}
+
+/* The lens from `from` to `to`, with finer steps when descending into the rest stop; false on I2C error. */
 static bool
 cam_native_lens_walk(uint32_t from, uint32_t to)
 {
 	while (from != to) {
-		uint32_t next = from < to ? MIN(from + OVX8000_LENS_STEP, to) :
-		    (from - to > OVX8000_LENS_STEP ? from - OVX8000_LENS_STEP : to);
+		uint32_t next = cam_native_lens_next_step(from, to);
 
 		if (!wide_bus_write(OVX8000_LENS_SLAVE, 0x03u, (uint8_t)(next >> 8), (uint8_t)next, 3u)) {
 			return false;
@@ -527,6 +551,12 @@ cam_native_lens_up(void)
 	cam_native_lens_ready = true;
 	for (size_t i = 0; cam_native_lens_ready && i < sizeof(setup) / sizeof(setup[0]); i++) {
 		cam_native_lens_ready = wide_bus_write(OVX8000_LENS_SLAVE, setup[i][0], setup[i][1], 0, 2u);
+	}
+	if (cam_native_lens_ready) {
+		cam_native_lens_ready = wide_bus_write(OVX8000_LENS_SLAVE, 0x03u, 0u, 0u, 3u);
+		if (cam_native_lens_ready) {
+			cam_native_applied_focus = 0u;
+		}
 	}
 	if (!cam_native_lens_ready) {
 		say("lens set-up failed\n");

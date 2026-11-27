@@ -127,7 +127,11 @@ rw_g31_trace_draw(AnnibaleMetalRenderPipeline *pipeline, id const *color, unsign
 	const struct rwa_color_blend *b = pipeline != nil ?
 	    [pipeline colorBlendAtIndex:(unsigned)att_idx] : NULL;
 	NSString *label = pipeline != nil ? [pipeline label] : nil;
-	const char *pipe_name = label != nil ? [label UTF8String] : "(none)";
+	if ((label == nil || [label length] == 0) && pipeline != nil &&
+	    [pipeline respondsToSelector:@selector(fragmentFunctionName)]) {
+		label = [pipeline fragmentFunctionName];
+	}
+	const char *pipe_name = (label != nil && [label length] > 0) ? [label UTF8String] : "(none)";
 	char tex_buf[96];
 	if (matched_tex != nil) {
 		snprintf(tex_buf, sizeof(tex_buf), "%s[%u]=%ux%u/fmt=%u/sf=%u",
@@ -185,6 +189,8 @@ rw_g31_trace_draw(AnnibaleMetalRenderPipeline *pipeline, id const *color, unsign
 	BOOL _hasViewportRect;
 	unsigned _scissorRect[4];
 	BOOL _hasScissorRect;
+	float _blendColor[4];
+	BOOL _hasBlendColor;
 	id _vertexBuffers[RW_MAX_BUFFERS];
 	NSUInteger _vertexBufferOffsets[RW_MAX_BUFFERS];
 	id _fragmentBuffers[RW_MAX_BUFFERS];
@@ -217,16 +223,18 @@ rw_g31_trace_draw(AnnibaleMetalRenderPipeline *pipeline, id const *color, unsign
 		 * surf= field can be told written-from-unwritten apart (A1 first-shot dark).
 		 * Internal textures are named by pointer too, so a render pass's output can be
 		 * matched to the fusion dispatch's tex= inputs. */
-		void *sf = [texture respondsToSelector:sel_registerName("iosurface")] ?
-		    ((void *(*)(id, SEL))objc_msgSend)(texture, sel_registerName("iosurface")) : NULL;
-		static unsigned said_target;
-		if (said_target++ < 160) {
-			rw_print("render targets %s%u plane %lu %ux%u as colour %u\n",
-				 sf != NULL ? "surface " : "texture ",
-				 sf != NULL ? ann_surface_id(sf) : (unsigned)(uintptr_t)texture,
-				 sf != NULL ? (unsigned long)((NSUInteger(*)(id, SEL))objc_msgSend)(
-				     texture, sel_registerName("iosurfacePlane")) : 0ul,
-				 (unsigned)[texture width], (unsigned)[texture height], i);
+		if (rw_log_verbose) {
+			static unsigned said_target;
+			if (said_target++ < 160) {
+				void *sf = [texture respondsToSelector:sel_registerName("iosurface")] ?
+				    ((void *(*)(id, SEL))objc_msgSend)(texture, sel_registerName("iosurface")) : NULL;
+				rw_print("render targets %s%u plane %lu %ux%u as colour %u\n",
+					 sf != NULL ? "surface " : "texture ",
+					 sf != NULL ? ann_surface_id(sf) : (unsigned)(uintptr_t)texture,
+					 sf != NULL ? (unsigned long)((NSUInteger(*)(id, SEL))objc_msgSend)(
+					     texture, sel_registerName("iosurfacePlane")) : 0ul,
+					 (unsigned)[texture width], (unsigned)[texture height], i);
+			}
 		}
 		_color[i] = rw_attachment_level(texture, [attachment level]);
 		_colorCount = i + 1;
@@ -456,7 +464,11 @@ rw_bind_slot(id *slots, unsigned *count, id object, NSUInteger index)
 }
 - (void)setBlendColorRed:(float)r green:(float)g blue:(float)b alpha:(float)a
 {
-	(void)r; (void)g; (void)b; (void)a;
+	_blendColor[0] = r;
+	_blendColor[1] = g;
+	_blendColor[2] = b;
+	_blendColor[3] = a;
+	_hasBlendColor = YES;
 }
 
 - (void)recordRGB2PPass:(BOOL)begin
@@ -575,6 +587,10 @@ rw_bind_slot(id *slots, unsigned *count, id object, NSUInteger index)
 		work->scissorRect[i] = _scissorRect[i];
 	}
 	work->hasScissorRect = _hasScissorRect;
+	for (unsigned i = 0; i < 4; i++) {
+		work->blendColor[i] = _blendColor[i];
+	}
+	work->hasBlendColor = _hasBlendColor;
 	work->primitive = (unsigned)primitive;
 	work->vertexStart = (unsigned)start;
 	work->vertexCount = (unsigned)count;

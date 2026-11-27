@@ -759,6 +759,7 @@ rw_pixel_probe(AnnibaleMetalWork *work, unsigned commit, unsigned index)
 		 * one loop over its attachments and nothing else. */
 		.resolve = resolve,
 		.discard = work->discards,
+		.blend_color = work->hasBlendColor ? work->blendColor : NULL,
 	};
 
 	if (work->indexBuffer != nil && draw.index_buffer == NULL) {

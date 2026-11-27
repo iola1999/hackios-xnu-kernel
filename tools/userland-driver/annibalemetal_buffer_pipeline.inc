@@ -427,6 +427,8 @@
 	_owner = [device retain];
 	_render = render;
 	_info = *info;
+	id frag = descriptor != nil ? [descriptor fragmentFunction] : nil;
+	_fragmentName = frag != nil ? [[frag name] copy] : nil;
 	for (unsigned i = 0; i < 8; i++) {
 		MTLRenderPipelineColorAttachmentDescriptor *att = descriptor != nil ?
 		    [[descriptor colorAttachments] objectAtIndexedSubscript:i] : nil;
@@ -467,6 +469,7 @@
 	if (_render != NULL) {
 		rw_pipe_release(_render);
 	}
+	[_fragmentName release];
 	[_owner release];
 	[super dealloc];
 }
@@ -476,6 +479,7 @@
 {
 	return index < 8 ? &_colorBlend[index] : NULL;
 }
+- (NSString *)fragmentFunctionName { return _fragmentName; }
 - (BOOL)writesDepth           { return _info.fragment_writes_depth != 0; }
 - (unsigned)vertexStreamMask  { return _info.vertex_stream_mask; }
 - (unsigned)vertexStreamCount { return _info.vertex_streams; }

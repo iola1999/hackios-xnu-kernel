@@ -31,8 +31,9 @@
 #define OVX8000_M24_GAIN_UNITY  256u
 #define OVX8000_M24_GAIN_MAX    4096u
 #define OVX8000_M24_BLACK_10BIT 64u
-#define OVX8000_FOCUS_DEFAULT   512u
-#define OVX8000_FOCUS_MAX       1023u
+/* Matches actuatorDriver initialCode (0x0113 = 275) and calibrated upper bound (700). */
+#define OVX8000_FOCUS_DEFAULT   275u
+#define OVX8000_FOCUS_MAX       700u
 
 static uint32_t cam_native_exposure_lines;
 static uint32_t cam_native_gain;
@@ -97,6 +98,7 @@ cam_native_exposure_reset(void)
 	cam_native_exposure_lines = 0;
 	cam_native_gain = 0;
 	cam_native_frame_lines = 0;
+	cam_native_focus = OVX8000_FOCUS_DEFAULT;
 	cam_native_exposure_invalidate();
 }
 
@@ -111,6 +113,7 @@ cam_native_exposure_defaults(const struct annibale_camera_profile *p)
 		cam_native_frame_lines = OVX8000_M24_FLL_MIN;
 		cam_native_exposure_lines = OVX8000_M24_FLL_MIN - OVX8000_M24_MARGIN;
 		cam_native_gain = OVX8000_M24_GAIN_UNITY;
+		cam_native_focus = OVX8000_FOCUS_DEFAULT;
 	} else {
 		cam_native_exposure_reset();
 	}

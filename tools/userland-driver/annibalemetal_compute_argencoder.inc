@@ -751,16 +751,26 @@
 		}
 		return NO;
 	}
-	if (index >= _layout.member_count) {
+	NSUInteger maxSlots = _layout.encoded_length / 8u;
+	for (unsigned i = 0; i < _layout.member_count; i++) {
+		if ((NSUInteger)_layout.members[i].id + 1u > maxSlots) {
+			maxSlots = (NSUInteger)_layout.members[i].id + 1u;
+		}
+	}
+	if (maxSlots > RWA_MAX_ARGBUF_MEMBERS) {
+		maxSlots = RWA_MAX_ARGBUF_MEMBERS;
+	}
+	if (index >= maxSlots) {
 		/* Which of the two layouts this is matters to whoever reads the line: a
 		 * shader's set is the shader's business and an application cannot change
 		 * it, while a set described with MTLArgumentDescriptors is the
 		 * application's own and the id it just used is one it did not describe. */
-		rw_print("%s was encoded at id %lu of %s that declares %u member%s\n", what,
+		rw_print("%s was encoded at id %lu of %s that declares %u member%s (slots %lu)\n", what,
 		         (unsigned long)index,
 		         _fromModule ? "a set a shader declares" : "an encoder this "
 		                       "application described",
-		         _layout.member_count, _layout.member_count == 1 ? "" : "s");
+		         _layout.member_count, _layout.member_count == 1 ? "" : "s",
+		         (unsigned long)maxSlots);
 		return NO;
 	}
 	return YES;

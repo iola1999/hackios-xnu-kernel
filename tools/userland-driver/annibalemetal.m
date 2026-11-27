@@ -318,6 +318,7 @@ struct rwa_draw {
 	 * Appended with the two above: air_metal.h says what the library does with one. */
 	struct rwa_texture *const *resolve;
 	unsigned discard;   /* colour attachments the pass does not load (bit i) */
+	const float *blend_color;   /* { r, g, b, a } or NULL for {0, 0, 0, 0} */
 };
 
 /*
@@ -461,23 +462,24 @@ _Static_assert(sizeof(struct rwa_render_info) == 116 &&
  * not flushed dies with the process. One flush per sentence costs nothing next to the draw
  * that provoked it.
  */
-/* Instrumentation for the frozen-desktop round: the buffer teardown order below is unchanged, these
- * lines only record it, so a later analysis can match a bad access address against the memory of a
- * buffer this process already destroyed. Bounded to the first 32 buffers of a process and then every
- * 256th, because the log ring holds about 13,500 lines. */
-static uint64_t rw_dealloc_count;
-static bool
-rw_dealloc_print(void)
-{
-	return ++rw_dealloc_count <= 32 || (rw_dealloc_count % 256) == 0;
-}
-
 static void rw_print(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 /* and the one method this driver installs into Metal's own function class, whose reason
  * is a measurement and is written where it is done (the end of this file) */
 static void ensure_function_encoder(void);
 
 #include "annibalemetal_console.inc"
+
+/* Buffer teardown instrumentation, gated on ANNIBALE_METAL_LOG_VERBOSE=1. When enabled, records
+ * the first 32 buffers of a process and then every 256th. */
+static uint64_t rw_dealloc_count;
+static bool
+rw_dealloc_print(void)
+{
+	if (!rw_log_verbose) {
+		return false;
+	}
+	return ++rw_dealloc_count <= 32 || (rw_dealloc_count % 256) == 0;
+}
 
 static void
 rw_print(const char *fmt, ...)
@@ -557,8 +559,10 @@ rw_pipeline_note(const void *pipeline, unsigned color_count, unsigned depth,
 	/* Said once, when the shape is first drawn: a handle and the attachment it went into,
 	 * which is the pair the reader needs and the one thing that cannot be recovered later
 	 * from a count. Bounded by RW_PIPELINE_ROWS lines for the life of the process. */
-	rw_print("pipeline seen: %p attachment %ux%u colour %u depth %u samples %u\n", pipeline,
-	         width, height, color_count, depth, sample_count);
+	if (rw_log_verbose) {
+		rw_print("pipeline seen: %p attachment %ux%u colour %u depth %u samples %u\n", pipeline,
+		         width, height, color_count, depth, sample_count);
+	}
 }
 
 static void
@@ -972,9 +976,11 @@ struct gem_close { uint32_t handle, pad; };
 	struct rwa_render *_render;
 	struct rwa_render_info _info;
 	struct rwa_color_blend _colorBlend[8];
+	NSString *_fragmentName;
 }
 - (struct rwa_render *)render;
 - (const struct rwa_color_blend *)colorBlendAtIndex:(unsigned)index;
+- (NSString *)fragmentFunctionName;
 /* Not part of any Metal protocol: whether this pipeline's fragment shader stores to
  * [[depth]], which only whoever read the shader knows. A pass without a depth attachment
  * drops those writes -- Metal's own behaviour -- and a draw that says so is the difference

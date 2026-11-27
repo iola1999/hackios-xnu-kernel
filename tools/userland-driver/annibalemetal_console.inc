@@ -8,12 +8,28 @@
 #include <sys/stat.h>
 
 static FILE *rw_console;
+static bool rw_log_verbose;
+static bool rw_say_pace;
+
+static bool
+rw_env_flag_enabled(const char *name)
+{
+	const char *value = getenv(name);
+	return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static void
+rw_console_refresh_env(void)
+{
+	rw_log_verbose = rw_env_flag_enabled("ANNIBALE_METAL_LOG_VERBOSE");
+	rw_say_pace = rw_env_flag_enabled("ANNIBALE_THUMBS") || rw_env_flag_enabled("ANNIBALE_AIR_DUMP");
+}
 
 /* A line written here goes into the kernel log through kern.annibale.say. It replaces the console
  * in a process whose standard output is /dev/null, an ExtensionKit extension such as
  * MercuryPosterExtension, where every line of this driver and of the library was lost. The kernel
  * keeps at most 200 said lines a second, and a ANNIBALE_THUMBS sample prints 33 lines at once, so
- * each line waits 5 ms. */
+ * pacing waits 5 ms per line only when ANNIBALE_THUMBS or ANNIBALE_AIR_DUMP is enabled. */
 static int
 rw_is_noisy_line(const char *line, size_t length)
 {
@@ -25,6 +41,8 @@ rw_is_noisy_line(const char *line, size_t length)
 	    !memcmp(line, "ir3q job:", 9)))
 		return 1;
 	if (length >= 13 && (!memcmp(line, "fd draw calls", 13) || !memcmp(line, "fd draw vbos ", 13)))
+		return 1;
+	if (!rw_log_verbose && length >= 20 && !memcmp(line, "fd tile ring create:", 20))
 		return 1;
 	return 0;
 }
@@ -42,7 +60,8 @@ rw_say_write(void *cookie, const char *bytes, int count)
 		if (bytes[i] == '\n' || length == sizeof(line) - 1) {
 			if (length > 0 && !rw_is_noisy_line(line, length)) {
 				sysctlbyname("kern.annibale.say", NULL, NULL, line, length);
-				usleep(5000);
+				if (rw_say_pace)
+					usleep(5000);
 			}
 			length = 0;
 		}
@@ -79,6 +98,7 @@ rw_console_write(void *cookie, const char *bytes, int count)
 __attribute__((constructor)) static void
 rw_console_init(void)
 {
+	rw_console_refresh_env();
 	FILE *prefixed = funopen(NULL, NULL, rw_console_write, NULL, NULL);
 
 	if (prefixed == NULL)

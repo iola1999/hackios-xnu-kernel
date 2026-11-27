@@ -96,30 +96,34 @@ ann_surface_id(void *sf)
 @interface AnnibaleMetalRenderPipeline : NSObject {
     struct rwa_color_blend _blend[8];
     NSString *_label;
+    NSString *_fragmentName;
 }
-- (instancetype)initWithLabel:(NSString *)label blend:(struct rwa_color_blend)b;
+- (instancetype)initWithLabel:(NSString *)label fragmentName:(NSString *)frag blend:(struct rwa_color_blend)b;
 - (const struct rwa_color_blend *)colorBlendAtIndex:(unsigned)index;
 - (NSString *)label;
+- (NSString *)fragmentFunctionName;
 @end
 
 @implementation AnnibaleMetalRenderPipeline
-- (instancetype)initWithLabel:(NSString *)label blend:(struct rwa_color_blend)b
+- (instancetype)initWithLabel:(NSString *)label fragmentName:(NSString *)frag blend:(struct rwa_color_blend)b
 {
     self = [super init];
     if (self) {
         _label = [label retain];
+        _fragmentName = [frag retain];
         for (unsigned i = 0; i < 8; i++) {
             _blend[i] = b;
         }
     }
     return self;
 }
-- (void)dealloc { [_label release]; [super dealloc]; }
+- (void)dealloc { [_label release]; [_fragmentName release]; [super dealloc]; }
 - (const struct rwa_color_blend *)colorBlendAtIndex:(unsigned)index
 {
     return index < 8 ? &_blend[index] : NULL;
 }
 - (NSString *)label { return _label; }
+- (NSString *)fragmentFunctionName { return _fragmentName; }
 @end
 
 __G31_HELPERS__
@@ -149,7 +153,9 @@ main(int argc, char **argv)
             .write_mask = 0x7,
         };
         AnnibaleMetalRenderPipeline *pipe =
-            [[AnnibaleMetalRenderPipeline alloc] initWithLabel:@"safari.grid" blend:b];
+            [[AnnibaleMetalRenderPipeline alloc] initWithLabel:@"safari.grid" fragmentName:@"grid_frag" blend:b];
+        AnnibaleMetalRenderPipeline *pipe_nolabel =
+            [[AnnibaleMetalRenderPipeline alloc] initWithLabel:nil fragmentName:@"maps_label_frag" blend:b];
         FakeTex *a8_96 = [[FakeTex alloc] initWithW:96 h:96 fmt:1 sf:0];
         FakeTex *r8_96 = [[FakeTex alloc] initWithW:96 h:96 fmt:10 sf:0];
         FakeTex *surf_bgra = [[FakeTex alloc] initWithW:1206 h:2622 fmt:80 sf:42];
@@ -199,6 +205,12 @@ main(int argc, char **argv)
             check(strstr(log_buf, "c0=1206x2622 fmt=115 sf=0 load=dontcare") != NULL &&
                   strstr(log_buf, "tex=vtex[0]=64x64/fmt=80/sf=0") != NULL,
                   "line 3 format mismatch");
+
+            /* 5. Nil pipeline label falls back to fragmentFunctionName */
+            rw_g31_trace_draw(pipe_nolabel, c1, 1, l1, NULL, 0, NULL, 0, sc1);
+            check(log_lines == 4, "nil-label pipeline must log with fragmentFunctionName fallback");
+            check(strstr(log_buf, "pipe=maps_label_frag") != NULL,
+                  "line 4 fragmentFunctionName fallback mismatch");
         } else if (strcmp(mode, "cap2") == 0) {
             check(rw_g31_trace_limit() == 2, "ANNIBALE_G31_TRACE=2 must parse cap 2");
             id c[1] = { a8_96 };
@@ -215,6 +227,7 @@ main(int argc, char **argv)
         [surf_bgra release];
         [r8_96 release];
         [a8_96 release];
+        [pipe_nolabel release];
         [pipe release];
     }
     return 0;

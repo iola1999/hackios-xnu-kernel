@@ -210,21 +210,23 @@ static bool gcc_cam_hf_axi_ok = false;
 static bool cam_nrt_axi_ok = false;
 static bool cam_hw_dma_verified = false;
 static bool cam_sensor_streaming = false;
+static bool cam_vaf_powered = false;
 
 struct cam_vrm_rail {
 	const char *name;
 	uint32_t mv;
 	uint32_t mode;
+	bool on_demand;
 };
 
 static const struct cam_vrm_rail cam_vrm_rails[] = {
-	{ "bobb2",  3296u, ANNIBALE_RPMH_MODE_AUTO }, /* pm_humu_bob2: rear camera BOB parent */
-	{ "ldom1",  1200u, ANNIBALE_RPMH_MODE_HPM  }, /* pm8010m_l1: front OV20B DVDD (1.056..1.200 V) */
-	{ "ldoi1",  1152u, ANNIBALE_RPMH_MODE_HPM  }, /* pm_v8i_l1: rear wide OV50E DVDD (1.152 V) */
-	{ "ldom5",  1800u, ANNIBALE_RPMH_MODE_NONE }, /* pm8010m_l5: front OV20B DOVDD (1.8 V, no mode reg) */
-	{ "ldob10", 1800u, ANNIBALE_RPMH_MODE_HPM  }, /* pm_humu_l10: rear wide OV50E DOVDD (1.8 V) */
-	{ "ldom3",  2800u, ANNIBALE_RPMH_MODE_NONE }, /* pm8010m_l3: front OV20B AVDD (2.8 V, no mode reg) */
-	{ "ldob8",  3104u, ANNIBALE_RPMH_MODE_HPM  }, /* pm_humu_l8: rear wide VCM AF (3.104 V) */
+	{ "bobb2",  3296u, ANNIBALE_RPMH_MODE_AUTO, false }, /* pm_humu_bob2: rear camera BOB parent */
+	{ "ldom1",  1200u, ANNIBALE_RPMH_MODE_HPM,  false }, /* pm8010m_l1: front OV20B DVDD (1.056..1.200 V) */
+	{ "ldoi1",  1152u, ANNIBALE_RPMH_MODE_HPM,  false }, /* pm_v8i_l1: rear wide OV50E DVDD (1.152 V) */
+	{ "ldom5",  1800u, ANNIBALE_RPMH_MODE_NONE, false }, /* pm8010m_l5: front OV20B DOVDD (1.8 V, no mode reg) */
+	{ "ldob10", 1800u, ANNIBALE_RPMH_MODE_HPM,  false }, /* pm_humu_l10: rear wide OV50E DOVDD (1.8 V) */
+	{ "ldom3",  2800u, ANNIBALE_RPMH_MODE_NONE, false }, /* pm8010m_l3: front OV20B AVDD (2.8 V, no mode reg) */
+	{ "ldob8",  3104u, ANNIBALE_RPMH_MODE_HPM,  true  }, /* pm_humu_l8: rear wide VCM AF (3.104 V, enabled only by back sensor sequence) */
 };
 
 static inline uint32_t
@@ -370,9 +372,17 @@ cam_vote_rpmh_supplies(bool enable)
 	}
 	for (size_t i = 0; i < sizeof(cam_vrm_rails) / sizeof(cam_vrm_rails[0]); i++) {
 		size_t idx = enable ? i : (sizeof(cam_vrm_rails) / sizeof(cam_vrm_rails[0]) - 1u - i);
+		if (cam_vrm_rails[idx].on_demand) {
+			if (enable || !cam_vaf_powered) {
+				continue;
+			}
+		}
 		bool regulator_ok = annibale_rpmh_regulator(cam_vrm_rails[idx].name,
 		    cam_vrm_rails[idx].mv, enable,
 		    enable ? cam_vrm_rails[idx].mode : ANNIBALE_RPMH_MODE_NONE);
+		if (cam_vrm_rails[idx].on_demand && !enable && regulator_ok) {
+			cam_vaf_powered = false;
+		}
 		say("rpmh regulator=%s enable=%u returned=%u\n", cam_vrm_rails[idx].name,
 		    enable ? 1u : 0u, regulator_ok ? 1u : 0u);
 	}

@@ -30,12 +30,12 @@ static struct {
 	uint32_t dontcare_cnt;
 	uint32_t draw_cnt;
 	uint32_t all_scissored_frames;
-	uint32_t union_y0;
-	uint32_t union_y1;
+	uint32_t h_bucket[4];   /* per-frame scissor height fraction: <25%, 25..50%, 50..90%, >90% */
+	uint32_t frame_h[RW_DAMAGE_WINDOW];
+	uint32_t frame_h_cnt;
 	uint32_t last_sf_id;
 	uint32_t sf_ids[RW_DAMAGE_SURFACES];
 	uint32_t sf_distinct;
-	bool has_y;
 } rw_damage_win;
 
 static bool
@@ -115,7 +115,7 @@ rw_damage_commit_sample(const void *cb, NSArray *works)
 {
 	uintptr_t key = (uintptr_t)cb;
 	uint32_t clear_cnt = 0, load_cnt = 0, dontcare_cnt = 0;
-	uint32_t draw_cnt = 0, sf_id = 0;
+	uint32_t draw_cnt = 0, sf_id = 0, frame_tex_h = 0;
 	bool saw_display = false, all_scissored = true, has_y = false;
 	uint32_t y0 = UINT32_MAX, y1 = 0;
 
@@ -148,6 +148,7 @@ rw_damage_commit_sample(const void *cb, NSArray *works)
 		uint32_t sy1 = sy1_64 > tex_h ? tex_h : (uint32_t)sy1_64;
 		if (sy0 < y0) y0 = sy0;
 		if (sy1 > y1) y1 = sy1;
+		if (tex_h > frame_tex_h) frame_tex_h = tex_h;
 		has_y = true;
 	}
 
@@ -172,14 +173,14 @@ rw_damage_commit_sample(const void *cb, NSArray *works)
 	rw_damage_win.draw_cnt += draw_cnt;
 	if (draw_cnt > 0 && all_scissored) {
 		rw_damage_win.all_scissored_frames++;
-		if (has_y) {
-			if (!rw_damage_win.has_y || y0 < rw_damage_win.union_y0) {
-				rw_damage_win.union_y0 = y0;
+		if (has_y && frame_tex_h > 0 && y1 >= y0) {
+			uint32_t fh = y1 - y0;
+			uint32_t pct = (uint32_t)(((uint64_t)fh * 100u) / frame_tex_h);
+			unsigned bi = pct < 25u ? 0u : (pct < 50u ? 1u : (pct <= 90u ? 2u : 3u));
+			rw_damage_win.h_bucket[bi]++;
+			if (rw_damage_win.frame_h_cnt < RW_DAMAGE_WINDOW) {
+				rw_damage_win.frame_h[rw_damage_win.frame_h_cnt++] = fh;
 			}
-			if (!rw_damage_win.has_y || y1 > rw_damage_win.union_y1) {
-				rw_damage_win.union_y1 = y1;
-			}
-			rw_damage_win.has_y = true;
 		}
 	}
 	if (sf_id != 0) {
@@ -203,8 +204,21 @@ rw_damage_commit_sample(const void *cb, NSArray *works)
 		uint32_t d_cnt = rw_damage_win.dontcare_cnt;
 		uint32_t dr_cnt = rw_damage_win.draw_cnt;
 		uint32_t sc_cnt = rw_damage_win.all_scissored_frames;
-		uint32_t uy0 = rw_damage_win.has_y ? rw_damage_win.union_y0 : 0u;
-		uint32_t uy1 = rw_damage_win.has_y ? rw_damage_win.union_y1 : 0u;
+		uint32_t b0 = rw_damage_win.h_bucket[0], b1 = rw_damage_win.h_bucket[1];
+		uint32_t b2 = rw_damage_win.h_bucket[2], b3 = rw_damage_win.h_bucket[3];
+		uint32_t n = rw_damage_win.frame_h_cnt;
+		uint32_t sorted[RW_DAMAGE_WINDOW];
+		for (uint32_t i = 0; i < n; i++) {
+			uint32_t v = rw_damage_win.frame_h[i];
+			uint32_t j = i;
+			while (j > 0 && sorted[j - 1] > v) {
+				sorted[j] = sorted[j - 1];
+				j--;
+			}
+			sorted[j] = v;
+		}
+		uint32_t p50 = n > 0 ? sorted[n / 2u] : 0u;
+		uint32_t p90 = n > 0 ? sorted[((n - 1u) * 9u) / 10u] : 0u;
 		uint32_t last_sf = rw_damage_win.last_sf_id;
 		uint32_t distinct_sf = rw_damage_win.sf_distinct;
 
@@ -214,16 +228,16 @@ rw_damage_commit_sample(const void *cb, NSArray *works)
 		rw_damage_win.dontcare_cnt = 0;
 		rw_damage_win.draw_cnt = 0;
 		rw_damage_win.all_scissored_frames = 0;
-		rw_damage_win.union_y0 = 0;
-		rw_damage_win.union_y1 = 0;
+		memset(rw_damage_win.h_bucket, 0, sizeof(rw_damage_win.h_bucket));
+		rw_damage_win.frame_h_cnt = 0;
 		rw_damage_win.sf_distinct = 0;
-		rw_damage_win.has_y = false;
 		pthread_mutex_unlock(&rw_damage_lock);
 
 		rw_print("damage_probe[%u]: clear=%u load=%u dontcare=%u draws=%u "
-		         "all_scissored=%u/%u union_y=%u..%u iosurface_id=%u sf_distinct=%u\n",
-		         rep, c_cnt, l_cnt, d_cnt, dr_cnt, sc_cnt, frames, uy0, uy1,
-		         last_sf, distinct_sf);
+		         "all_scissored=%u/%u h_buckets=%u/%u/%u/%u h_p50=%u h_p90=%u "
+		         "iosurface_id=%u sf_distinct=%u\n",
+		         rep, c_cnt, l_cnt, d_cnt, dr_cnt, sc_cnt, frames, b0, b1, b2, b3,
+		         p50, p90, last_sf, distinct_sf);
 		return;
 	}
 	pthread_mutex_unlock(&rw_damage_lock);

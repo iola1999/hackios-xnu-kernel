@@ -485,7 +485,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	int camera_requested = 0;
 	/* (the loader stays for run after run: what the last run's arguments said must not hold for this one) */
 	gamut_p3 = 0;
-	front_cam_rotation_isp = 180;   /* K90's measured mounting angle; frontcamrot= overrides */
+	front_cam_rotation_isp = 0;     /* K90's measured mounting angle; frontcamrot= overrides */
 	for (const char *c = pi.cmdline; *c; c++) {
 		if (starts_with(c, "bootcpu=") && (c == pi.cmdline || c[-1] == ' ') && c[8] >= '0' && c[8] <= '7') {
 			kernel_mpidr = PLAT->core_mpidr[c[8] - '0'];

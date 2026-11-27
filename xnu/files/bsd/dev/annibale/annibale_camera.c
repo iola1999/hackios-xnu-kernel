@@ -855,6 +855,63 @@ cam_return_poll(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t expected
 	return false;
 }
 
+static bool
+cam_return_cci0_write(uint8_t slave7, uint8_t b0, uint8_t b1, uint8_t b2, uint32_t len)
+{
+	if (!cci_ready || cci0_base == 0 || len < 2u || len > 3u) {
+		return false;
+	}
+	reg_wr(cci0_base, CCI_IRQ_CLEAR_0, 0xffffffffu);
+	reg_wr(cci0_base, CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
+	uint32_t set_param = 0x01u | ((uint32_t)(slave7 & 0x7fu) << 4) | (1u << 16);
+	uint32_t wr_cmd = 0x09u | (len << 4) | ((uint32_t)b0 << 8) | ((uint32_t)b1 << 16) |
+	    ((uint32_t)b2 << 24);
+	reg_wr(cci0_base, CCI_I2C_M1_Q0_EXEC_WORD_CNT, 3u);
+	reg_wr(cci0_base, CCI_I2C_M1_Q0_LOAD_DATA, set_param);
+	reg_wr(cci0_base, CCI_I2C_M1_Q0_LOAD_DATA, wr_cmd);
+	reg_wr(cci0_base, CCI_I2C_M1_Q0_LOAD_DATA, 0x108u);
+	reg_wr(cci0_base, CCI_I2C_M1_Q0_CTRL, 0u);
+	reg_wr(cci0_base, CCI_QUEUE_START, (1u << 2));
+	for (uint32_t i = 0; i < 250u; i++) {
+		uint32_t irq = reg_rd(cci0_base, CCI_IRQ_STATUS_0);
+		if (irq == UINT32_MAX || (irq & CCI_IRQ_M1_ERROR) != 0) {
+			break;
+		}
+		if ((irq & CCI_IRQ_M1_Q0_REPORT) != 0) {
+			return true;
+		}
+		cam_return_spin_us(10u);
+	}
+	cci_ready = false;
+	return false;
+}
+
+static void
+cam_return_lens_park(void)
+{
+	if (!cam_native_lens_ready) {
+		return;
+	}
+	if (wide_bus_mode == 1u && cci_ready && cci0_base != 0) {
+		uint32_t pos = cam_native_applied_focus;
+		bool walked = true;
+		while (pos != ANNIBALE_CAMERA_NO_FOCUS && pos > 0u) {
+			pos = cam_native_lens_next_step(pos, 0u);
+			if (!cam_return_cci0_write(OVX8000_LENS_SLAVE, 0x03u,
+			    (uint8_t)(pos >> 8), (uint8_t)pos, 3u)) {
+				walked = false;
+				break;
+			}
+			cam_return_spin_us(OVX8000_LENS_STEP_US);
+		}
+		if (walked && cam_return_cci0_write(OVX8000_LENS_SLAVE, 0x02u, 0x01u, 0u, 2u)) {
+			cam_return_spin_us(200u);
+		}
+	}
+	cam_native_lens_ready = false;
+	cam_native_applied_focus = ANNIBALE_CAMERA_NO_FOCUS;
+}
+
 bool annibale_camera_return_quiesce(void);
 
 bool
@@ -938,6 +995,7 @@ annibale_camera_return_quiesce(void)
 			return false;
 		}
 	}
+	cam_return_lens_park();
 	if (tlmm_base != 0) {
 		tlmm_set_out(GPIO_WIDE_RESET, false);
 		tlmm_set_out(GPIO_FRONT_RESET, false);

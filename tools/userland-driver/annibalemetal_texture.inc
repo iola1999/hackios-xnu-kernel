@@ -327,6 +327,10 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 		rw_print("texture view: %s\n", why);
 		return nil;
 	}
+	if (mesa.texture_set_view_slices != NULL) {
+		mesa.texture_set_view_slices(view, (unsigned)type, (unsigned)slices.location,
+					     (unsigned)slices.length);
+	}
 	BOOL identity = swizzle.red == MTLTextureSwizzleRed &&
 			swizzle.green == MTLTextureSwizzleGreen &&
 			swizzle.blue == MTLTextureSwizzleBlue &&
@@ -343,8 +347,9 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 	if (shape.depth)
 		shape.depth = MAX(shape.depth >> first, 1u);
 	shape.mip_levels = num_levels;
-	shape.array_length = (type == MTLTextureType2DArray || type == MTLTextureTypeCubeArray)
-				? (unsigned)slices.length : 1;
+	shape.array_length = (type == MTLTextureType1DArray || type == MTLTextureType2DArray)
+				? (unsigned)slices.length
+				: (type == MTLTextureTypeCubeArray ? MAX((unsigned)slices.length / 6u, 1u) : 1u);
 	texture = [[AnnibaleMetalTexture alloc] initWithAnnibaleDevice:_owner texture:view
 							       shape:&shape iosurface:_iosurface plane:_iosurfacePlane];
 	if (texture != nil) {
@@ -386,6 +391,8 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 				? 6 * MAX(_shape.array_length, 1) : MAX(_shape.array_length, 1);
 
 	BOOL type_ok = (type == _shape.type) ||
+		(type == MTLTextureType1D && _shape.type == MTLTextureType1DArray) ||
+		(type == MTLTextureType1DArray && _shape.type == MTLTextureType1D) ||
 		(type == MTLTextureType2D && _shape.type == MTLTextureType2DArray) ||
 		(type == MTLTextureType2DArray && _shape.type == MTLTextureType2D) ||
 		(type == MTLTextureTypeCube && _shape.type == MTLTextureTypeCubeArray) ||

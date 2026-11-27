@@ -19,15 +19,15 @@ index fb0b67c..7746afa 100644
  
 +/*
 + * Processes named here are told they run on a hypervisor even when the machine
-+ * does not. Espresso (the neural network runtime behind Vision and the camera
-+ * pipelines) rewrites any engine it is asked for to its CPU engine inside a VM,
-+ * and this machine has no Apple Neural Engine for the ANE engine it is asked
-+ * for: the inference the callers want exists either way, the VM answer only
-+ * selects the backend that can actually run it. Every other process keeps the
-+ * true answer -- bluetoothd picks its transport on it, the haptic server waits
-+ * for firmware on it. Boot-arg ane_vmm_procs replaces the default list.
++ * does not. Espresso (the neural network runtime behind Vision) rewrites any
++ * engine it is asked for to its CPU engine inside a VM, and this machine has
++ * no Apple Neural Engine: mediaanalysisd's Vision models run on CPU. Every
++ * other process keeps the true answer -- cameracaptured strips all rear
++ * cameras (PortTypeBack*) when kern.hv_vmm_present == 1 and its ANE models
++ * use tunneled_ane_op; bluetoothd and audiomxd also branch on it. Boot-arg
++ * ane_vmm_procs replaces the default list.
 + */
-+static char vmm_spoof_procs[128] = "cameracaptured,mediaanalysisd";
++static char vmm_spoof_procs[128] = "mediaanalysisd";
 +
 +static bool
 +vmm_spoof_listed(const char *name)
