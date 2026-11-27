@@ -154,15 +154,18 @@ apfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
 
 /* sync(2) and the like: every file's dirty pages, then a commit, which ends with a flush. */
 static int
-apfs_sync(mount_t mp, __unused int waitfor, __unused vfs_context_t ctx)
+apfs_sync(mount_t mp, int waitfor, __unused vfs_context_t ctx)
 {
 	struct apfs_mount *am = mp != NULL ? APFS_MP(mp) : NULL;
+	struct apfs_wpush_ctx pctx = { .wait = waitfor == MNT_WAIT };
+	int error;
 
 	if (am == NULL || am->am_w == NULL) {
 		return 0;
 	}
-	vnode_iterate(mp, 0, apfs_wpush_vnode, NULL);
-	return apfs_wcommit(am, false, 0, APFS_WHY_SYNC);
+	vnode_iterate(mp, 0, apfs_wpush_vnode, &pctx);
+	error = apfs_wcommit(am, false, 0, APFS_WHY_SYNC);
+	return error != 0 ? error : pctx.error;
 }
 
 static int

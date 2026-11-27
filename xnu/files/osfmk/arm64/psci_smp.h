@@ -23,6 +23,7 @@ extern void             psci_smp_cpu_off(void) __dead2;
 
 extern void             psci_smp_stop_others(void);
 extern void             psci_smp_stop_here(void);
+extern void             psci_smp_cpu_idle(void);
 extern int              psci_smp_report(char *buf, size_t size);
 
 /* osfmk/arm64/gic_v3_irq.c */

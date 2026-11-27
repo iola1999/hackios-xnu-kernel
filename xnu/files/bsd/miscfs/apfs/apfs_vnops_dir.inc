@@ -80,8 +80,11 @@ apfs_wmake(vnode_t dvp, vnode_t *vpp, struct componentname *cnp, struct vnode_at
 		a.target = target;
 		a.target_len = strlen(target);
 	}
-	if (VATTR_IS_ACTIVE(vap, va_dataprotect_class)) {
+	if (VATTR_IS_ACTIVE(vap, va_dataprotect_class) &&
+	    vap->va_dataprotect_class != PROTECTION_CLASS_DEFAULT) {
 		a.pclass = vap->va_dataprotect_class;
+	} else if (dn->an_ino.pclass != 0) {
+		a.pclass = dn->an_ino.pclass;
 	}
 	if (VATTR_IS_ACTIVE(vap, va_flags)) {
 		t.set |= APFS_WA_FLAGS;
@@ -359,10 +362,17 @@ apfs_vnop_clonefile(struct vnop_clonefile_args *ap)
 	if (error) {
 		return error;
 	}
-	if (vnode_isdir(fvp)) {
-		vnode_iterate(am->am_mp, 0, apfs_wpush_vnode, am);
-	} else {
-		(void)apfs_wpush_vnode(fvp, am);
+	{
+		struct apfs_wpush_ctx pctx = { .wait = true };
+
+		if (vnode_isdir(fvp)) {
+			vnode_iterate(am->am_mp, 0, apfs_wpush_vnode, &pctx);
+		} else {
+			(void)apfs_wpush_vnode(fvp, &pctx);
+		}
+		if (pctx.error != 0) {
+			return pctx.error;
+		}
 	}
 	if (VATTR_IS_ACTIVE(vap, va_mode)) {
 		top.set |= APFS_WA_MODE;

@@ -29,6 +29,9 @@ adreno8_step_service(void)
 		adreno8_bo_stop();
 		return false;
 	}
+	if (adreno8_gpu8_ifpc) {
+		adreno8_gpu_oob_release();
+	}
 	adreno8_say("adreno8: AnnibaleGPU registered with A830 BOs and standard HWSCHED submission\n");
 	return true;
 }

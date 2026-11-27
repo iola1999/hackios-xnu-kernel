@@ -38,6 +38,7 @@ struct apfs_wmount {
 	thread_call_t      wm_tick;
 	bool               wm_armed;            /* wm_tick is entered; under am_lock */
 	bool               wm_closing;          /* unmount: wm_tick is not entered again */
+	bool               wm_data_dirty;       /* data blocks mapped since last flush; under wm_spin */
 	uint64_t           wm_base;             /* the container's first byte on the device */
 	uint32_t           wm_devblock;
 	uint32_t           wm_bs;
@@ -169,7 +170,23 @@ apfs_wmap_add(struct apfs_mount *am, uint64_t addr, uint64_t blocks, uint64_t id
 	wm->wm_map[wm->wm_nmap].id = id;
 	wm->wm_map[wm->wm_nmap].off = off;
 	wm->wm_nmap++;
+	wm->wm_data_dirty = true;
 	lck_spin_unlock(&wm->wm_spin);
+}
+
+bool
+apfs_wdata_dirty(struct apfs_mount *am)
+{
+	struct apfs_wmount *wm = am->am_w;
+	bool dirty;
+
+	if (wm == NULL) {
+		return false;
+	}
+	lck_spin_lock(&wm->wm_spin);
+	dirty = wm->wm_nmap > 0 || wm->wm_io > 0 || wm->wm_data_dirty;
+	lck_spin_unlock(&wm->wm_spin);
+	return dirty;
 }
 
 /* A data write done: its count goes, then the cluster layer's own completion, if any. */
@@ -301,7 +318,21 @@ apfs_wcommit_locked(struct apfs_mount *am, enum apfs_wwhy why)
 
 	wm->wm_armed = false;
 	if (!apfs_wtx_dirty(wm->wm_wtx)) {
-		return apfs_wtx_broken(wm->wm_wtx) ? EIO : 0;
+		if (apfs_wtx_broken(wm->wm_wtx)) {
+			return EIO;
+		}
+		if (!apfs_wdata_dirty(am)) {
+			return 0;
+		}
+		/* MAP_SHARED in-place writes leave metadata untouched, so drain I/O and flush cache. */
+		(void)apfs_wio_drain(am);
+		error = am->am_nx.dev.flush != NULL ? am->am_nx.dev.flush(am->am_nx.dev.ctx) : 0;
+		if (error == 0) {
+			lck_spin_lock(&wm->wm_spin);
+			wm->wm_data_dirty = wm->wm_nmap > 0 || wm->wm_io > 0;
+			lck_spin_unlock(&wm->wm_spin);
+		}
+		return error;
 	}
 	t0 = mach_absolute_time();
 	free = apfs_wio_drain(am);
@@ -324,16 +355,27 @@ apfs_wcommit_locked(struct apfs_mount *am, enum apfs_wwhy why)
 		vfs_setflags(am->am_mp, MNT_RDONLY);
 	} else {
 		wm->wm_commits++;
+		lck_spin_lock(&wm->wm_spin);
+		wm->wm_data_dirty = wm->wm_nmap > 0 || wm->wm_io > 0;
+		lck_spin_unlock(&wm->wm_spin);
 	}
 	return error;
 }
 
-/* A file's dirty pages to the device; `wait` non-NULL: until they are there.  No lock held. */
+/* A file's dirty pages to the device; `ctx` may wait and record the first error across vnodes. */
 int
-apfs_wpush_vnode(vnode_t vp, void *wait)
+apfs_wpush_vnode(vnode_t vp, void *arg)
 {
+	struct apfs_wpush_ctx *ctx = arg;
+	bool wait = ctx != NULL && ctx->wait;
+
 	if (vnode_isreg(vp) && ubc_getsize(vp) > 0) {
-		(void)ubc_msync(vp, 0, ubc_getsize(vp), NULL, UBC_PUSHDIRTY | (wait != NULL ? UBC_SYNC : 0));
+		int err = ubc_msync(vp, 0, ubc_getsize(vp), NULL,
+		    UBC_PUSHDIRTY | (wait ? UBC_SYNC : 0));
+
+		if (err != 0 && ctx != NULL && ctx->error == 0) {
+			ctx->error = err;
+		}
 	}
 	return VNODE_RETURNED;
 }
@@ -416,8 +458,15 @@ apfs_wflush(struct apfs_mount *am)
 	if (apfs_wtx_dirty(am->am_w->wm_wtx)) {
 		error = apfs_wcommit_locked(am, APFS_WHY_FULLFSYNC);
 	} else {
+		struct apfs_wmount *wm = am->am_w;
+
 		(void)apfs_wio_drain(am);
 		error = am->am_nx.dev.flush != NULL ? am->am_nx.dev.flush(am->am_nx.dev.ctx) : 0;
+		if (error == 0) {
+			lck_spin_lock(&wm->wm_spin);
+			wm->wm_data_dirty = wm->wm_nmap > 0 || wm->wm_io > 0;
+			lck_spin_unlock(&wm->wm_spin);
+		}
 	}
 	apfs_unlock_exclusive(am);
 	return error;
@@ -599,9 +648,13 @@ apfs_data_flush(void)
 	lck_mtx_unlock(&apfs_pool_lock);
 	if (mp != NULL) {
 		struct apfs_mount *am = vfs_fsprivate(mp);
+		struct apfs_wpush_ctx ctx = { .wait = true };
 
-		vnode_iterate(mp, 0, apfs_wpush_vnode, am);
+		vnode_iterate(mp, 0, apfs_wpush_vnode, &ctx);
 		error = apfs_wcommit(am, false, 0, APFS_WHY_OTHER);
+		if (error == 0) {
+			error = ctx.error;
+		}
 		vfs_unbusy(mp);
 	}
 	return error;

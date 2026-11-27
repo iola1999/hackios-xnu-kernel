@@ -49,6 +49,7 @@ struct tftp_session {
 };
 
 static struct annibale_qrtr_port *svc_tftp_port;
+static LCK_MTX_DECLARE(tftp_lock, &modem_lck_grp);
 static struct tftp_file tftp_files[TFTP_FILES];
 static struct tftp_file tftp_firmware[TFTP_FIRMWARE];
 static struct tftp_session tftp_sessions[TFTP_SESSIONS];
@@ -227,14 +228,24 @@ tftp_pending(void)
 static void
 modem_tftp_poll(void)
 {
-	for (unsigned turn = 0; turn < 20u && tftp_pending(); turn++) {
+	for (unsigned turn = 0; turn < 20u; turn++) {
+		bool more;
+
+		lck_mtx_lock(&tftp_lock);
+		if (!tftp_pending()) {
+			lck_mtx_unlock(&tftp_lock);
+			break;
+		}
 		for (unsigned i = 0; i < TFTP_SESSIONS; i++) {
 			tftp_pump(&tftp_sessions[i]);
 		}
-		if (tftp_pending()) {
-			modem_sleep_ms(1);
-			mpss_glink_poll_rx();                   /* the intent, or the one in use given back */
+		more = tftp_pending();
+		lck_mtx_unlock(&tftp_lock);
+		if (!more) {
+			break;
 		}
+		modem_sleep_ms(1);
+		mpss_glink_poll_rx();                   /* the intent, or the one in use given back */
 	}
 }
 
@@ -370,13 +381,12 @@ tftp_request(uint32_t opcode, uint32_t node, uint32_t port, const uint8_t *buf, 
 }
 
 static void
-svc_tftp_rx(void *context, uint32_t from_node, uint32_t from_port, const void *data, size_t size)
+svc_tftp_rx_locked(uint32_t from_node, uint32_t from_port, const void *data, size_t size)
 {
 	const uint8_t *buf = data;
 	struct tftp_session *s;
 	uint32_t opcode, block;
 
-	(void)context;
 	if (size < 4u) {
 		return;
 	}
@@ -427,6 +437,15 @@ svc_tftp_rx(void *context, uint32_t from_node, uint32_t from_port, const void *d
 		}
 		s->active = false;
 	}
+}
+
+static void
+svc_tftp_rx(void *context, uint32_t from_node, uint32_t from_port, const void *data, size_t size)
+{
+	(void)context;
+	lck_mtx_lock(&tftp_lock);
+	svc_tftp_rx_locked(from_node, from_port, data, size);
+	lck_mtx_unlock(&tftp_lock);
 }
 
 static void

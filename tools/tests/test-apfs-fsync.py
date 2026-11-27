@@ -21,7 +21,7 @@ struct vnop_fsync_args { vnode_t a_vp; int a_waitfor; };
 enum { MNT_WAIT = 1, UBC_SYNC = 2, UBC_PUSHDIRTY = 4, APFS_WHY_FSYNC = 8, F_FULLFSYNC = 10, F_BARRIERFSYNC = 11 };
 #define APFS_VP(vp) (&(vp)->node)
 
-static bool writable = true;
+static bool writable = true, data_dirty = false;
 static int page_error, commit_error, pushes, flushes, flags;
 static int vnode_isreg(vnode_t vp) { return vp->regular; }
 static off_t ubc_getsize(vnode_t vp) { return vp->size; }
@@ -33,7 +33,8 @@ static int ubc_msync(vnode_t vp, off_t start, off_t end, void *resid, int reques
 }
 static void *apfs_wtx_of(struct apfs_mount *am) { return writable ? am : NULL; }
 static int apfs_wcommits(struct apfs_mount *am) { return am->commits; }
-static int apfs_wflush(struct apfs_mount *am) { (void)am; flushes++; return commit_error; }
+static bool apfs_wdata_dirty(struct apfs_mount *am) { (void)am; return data_dirty; }
+static int apfs_wflush(struct apfs_mount *am) { (void)am; flushes++; if (commit_error == 0) data_dirty = false; return commit_error; }
 static int apfs_wcommit(struct apfs_mount *am, bool push, int seq, int why) {
     assert(!push && seq > am->commits && why == APFS_WHY_FSYNC);
     return apfs_wflush(am);
@@ -80,6 +81,17 @@ int main(void) {
     vnode.regular = true;
     vnode.size = 0;
     assert(ioctl_sync(F_BARRIERFSYNC, &vnode) == 0 && pushes == 0 && flushes == 1);
+
+    /* MAP_SHARED in-place overwrite with an_wseq == commits still drains & flushes device. */
+    vnode.size = 4096;
+    page_error = 0;
+    commit_error = 0;
+    flushes = pushes = 0;
+    mount.commits = vnode.node.an_wseq;
+    data_dirty = true;
+    args.a_waitfor = MNT_WAIT;
+    assert(apfs_vnop_fsync(&args) == 0 && pushes == 1 && flushes == 1 && !data_dirty);
+    assert(apfs_vnop_fsync(&args) == 0 && pushes == 2 && flushes == 1);
 }
 """
 

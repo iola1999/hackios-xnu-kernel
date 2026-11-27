@@ -304,11 +304,17 @@ enum apfs_wwhy {
 	APFS_WHY_OTHER,                 /* mount, unmount, the end of a run */
 	APFS_WHY_N
 };
+struct apfs_wpush_ctx {
+	bool wait;
+	int  error;
+};
+
 int  apfs_wcommit_locked(struct apfs_mount *am, enum apfs_wwhy why);
 int  apfs_wcommit(struct apfs_mount *am, bool push, uint64_t upto, enum apfs_wwhy why);
 int  apfs_wflush(struct apfs_mount *am);         /* F_FULLFSYNC: a commit, or a flush */
+bool apfs_wdata_dirty(struct apfs_mount *am);    /* data blocks mapped or sent since last flush */
 uint64_t apfs_wcommits(struct apfs_mount *am);  /* commits made since the mount */
-int  apfs_wpush_vnode(vnode_t vp, void *wait);   /* a vnode_iterate callback as well */
+int  apfs_wpush_vnode(vnode_t vp, void *arg);    /* a vnode_iterate callback as well */
 
 /* apfs_vnops.c */
 extern const struct vnodeopv_desc apfs_vnodeop_opv_desc;

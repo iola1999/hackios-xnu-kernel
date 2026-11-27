@@ -2,7 +2,17 @@ diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
 index 53f9ce51946f..6a1e1641eca3 100644
 --- a/osfmk/arm64/cpu.c
 +++ b/osfmk/arm64/cpu.c
-@@ -586,7 +586,12 @@ cpu_idle(void)
+@@ -75,6 +75,9 @@
+ 
+ extern boolean_t        idle_enable;
+ extern uint64_t         wake_abstime;
++#if defined(GENERIC_PSCI_SMP)
++extern void             psci_smp_cpu_idle(void);
++#endif
+ 
+ #if WITH_CLASSIC_S2R
+ void sleep_token_buffer_init(void);
+@@ -586,7 +589,12 @@ cpu_idle(void)
  #endif /* CONFIG_CPU_COUNTERS */
  
  	if (wfi) {
@@ -16,3 +26,12 @@ index 53f9ce51946f..6a1e1641eca3 100644
  		platform_cache_idle_enter();
  #endif
  
+@@ -612,6 +620,8 @@ cpu_idle(void)
+ 		__builtin_arm_dsb(DSB_SY);
+ #if HAS_RETENTION_STATE
+ 		arm64_retention_wfi();
++#elif defined(GENERIC_PSCI_SMP)
++		psci_smp_cpu_idle();
+ #else
+ 		__builtin_arm_wfi();
+ #endif

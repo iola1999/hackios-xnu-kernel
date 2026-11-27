@@ -111,11 +111,12 @@ apfs_wresize(vnode_t vp, struct apfs_node *an, uint64_t size, int ioflag)
 	if (size > old) {
 		off_t limit = MIN((off_t)round_page_64(old), (off_t)size);
 
+		/* Update UBC size before cluster_write so newEOF <= ubc_getsize(vp) holds for [old, limit). */
+		ubc_setsize(vp, (off_t)size);
 		if (limit > (off_t)old) {
 			error = cluster_write(vp, NULL, (off_t)old, limit, (off_t)old, 0,
 			    IO_HEADZEROFILL | IO_NOZERODIRTY | (ioflag & IO_SYNC));
 		}
-		ubc_setsize(vp, (off_t)size);
 	}
 	return error;
 }
@@ -349,7 +350,13 @@ apfs_vnop_fsync(struct vnop_fsync_args *ap)
 	if (error != 0) {
 		return error;
 	}
-	return wait && an->an_wseq > apfs_wcommits(am) ? apfs_wcommit(am, false, an->an_wseq, APFS_WHY_FSYNC) : 0;
+	if (!wait) {
+		return 0;
+	}
+	if (an->an_wseq > apfs_wcommits(am)) {
+		return apfs_wcommit(am, false, an->an_wseq, APFS_WHY_FSYNC);
+	}
+	return apfs_wdata_dirty(am) ? apfs_wflush(am) : 0;
 }
 
 /* The nearest proper ancestor of an_id's directory that is a sync root, 0 if none (shared lock). */
@@ -543,8 +550,10 @@ apfs_vnop_setattr(struct vnop_setattr_args *ap)
 		VATTR_SET_SUPPORTED(vap, va_create_time);
 	}
 	if (VATTR_IS_ACTIVE(vap, va_dataprotect_class)) {
-		a.set |= APFS_WA_PCLASS;
-		a.pclass = vap->va_dataprotect_class;
+		if (vap->va_dataprotect_class != PROTECTION_CLASS_DEFAULT) {
+			a.set |= APFS_WA_PCLASS;
+			a.pclass = vap->va_dataprotect_class;
+		}
 		VATTR_SET_SUPPORTED(vap, va_dataprotect_class);
 	}
 	/* kept nowhere, as on APFS */

@@ -69,3 +69,23 @@ static bool glink_take_their_intent(struct glink_intent_pool *pool, uint16_t our
 		sleep_us(200);
 	}
 }
+
+/* Non-blocking variant for QRTR TX (adsp_qrtr_send): requests an intent and returns false
+ * immediately without calling glink_poll_rx(), preventing qrtr_calling re-entry deadlocks. */
+static bool glink_try_take_their_intent(struct glink_intent_pool *pool, uint16_t our_cid, uint32_t need, uint32_t *id_out)
+{
+	lck_mtx_lock(&glink_intent_lock);
+	for (struct glink_remote_intent *intent = pool->head; intent != NULL; intent = intent->next) {
+		if (intent->free && intent->size >= need) {
+			intent->free = false;
+			*id_out = intent->id;
+			lck_mtx_unlock(&glink_intent_lock);
+			return true;
+		}
+	}
+	lck_mtx_unlock(&glink_intent_lock);
+	if (our_cid != 0) {
+		glink_send_cmd2(GLINK_RX_INTENT_REQ, our_cid, need);
+	}
+	return false;
+}

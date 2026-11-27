@@ -96,7 +96,7 @@ adsp_qrtr_send(const void *data, uint32_t length)
 	if (16u + length >= glink_our_q_size - 16u) {
 		return EMSGSIZE;
 	}
-	if (!glink_take_their_intent(&adsp_ipcrtr_intents, adsp_ipcrtr_our_cid, length, &iid)) {
+	if (!glink_try_take_their_intent(&adsp_ipcrtr_intents, adsp_ipcrtr_our_cid, length, &iid)) {
 		return EAGAIN;
 	}
 	tx = (uint8_t *)kalloc_data(16u + length, Z_WAITOK);

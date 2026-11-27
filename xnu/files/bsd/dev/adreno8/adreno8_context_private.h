@@ -7,6 +7,8 @@
 /* OOB and command initialization stay owned by adreno8_gpu.c. */
 bool adreno8_gpu_commands_ready(void);
 bool adreno8_gpu_wait_idle(const char *what);
+void adreno8_gpu_oob_release(void);
+bool adreno8_gpu_oob_acquire(void);
 /* After a reported hang: the RBBM and CP status, and for each pipe the IB levels the CP is in
  * with the command words around its position. Reads only, once per boot; prints one line when GX
  * is off. */

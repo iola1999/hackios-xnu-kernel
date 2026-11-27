@@ -6,6 +6,7 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
+INTENTS_INC = ROOT / "xnu/files/bsd/dev/annibale/annibale_adsp_intents.inc"
 IPCRTR_INC = ROOT / "xnu/files/bsd/dev/annibale/annibale_adsp_ipcrtr.inc"
 SCAN_INC = ROOT / "xnu/files/bsd/dev/annibale/annibale_sensors_scan.inc"
 SSC_INC = ROOT / "xnu/files/bsd/dev/annibale/annibale_sensors_ssc.inc"
@@ -20,9 +21,13 @@ HARNESS = r"""
 #include <string.h>
 
 #define GLINK_INTENT        5u
+#define GLINK_RX_INTENT_REQ 7u
 #define GLINK_TX_DATA       9u
 #define GLINK_TX_DATA_CONT  12u
 #define Z_WAITOK            0
+#define Z_ZERO              1
+#define kalloc_type(T, fl)  ((T *)calloc(1, sizeof(T)))
+#define kfree_type(T, p)    free(p)
 #define bzero(p, n)         memset((p), 0, (n))
 #ifndef __unused
 #define __unused            __attribute__((unused))
@@ -92,17 +97,25 @@ static int mock_lookup(struct annibale_qrtr_port *p, uint32_t svc, uint32_t ver,
 static void mock_close(struct annibale_qrtr_port *p) { (void)p; }
 static const struct annibale_qrtr_ops annibale_qrtr = { mock_open, mock_send, mock_lookup, mock_close };
 
-/* ---- annibale_adsp_ipcrtr.inc mocks ---- */
-struct glink_intent_pool { int dummy; };
+/* ---- annibale_adsp_intents.inc + annibale_adsp_ipcrtr.inc mocks ---- */
+static lck_mtx_t glink_intent_lock;
+struct glink_remote_intent {
+    struct glink_remote_intent *next;
+    uint32_t id, size;
+    bool free;
+};
+struct glink_intent_pool {
+    struct glink_remote_intent *head;
+};
 static bool adsp_hw_up = true;
 static uint32_t glink_our_q = 0x1000u;
 static uint32_t glink_our_q_size = 0x4000u;
 static uint32_t glink_tx_write_pos = 0;
-static uint32_t g_open_calls = 0;
+static uint32_t g_open_calls = 0, g_poll_rx_calls = 0, g_intent_req_calls = 0;
 static uint32_t g_intent_sizes[16], g_intent_count = 0;
 static uint8_t g_last_tx[256];
-static uint32_t g_last_tx_len = 0, g_completed_iid = 0;
-static bool g_q_write_ok = true, g_take_intent_ok = true;
+static uint32_t g_last_tx_len = 0;
+static bool g_q_write_ok = true;
 
 static bool glink_q_write(uint32_t q_off, uint32_t q_sz, uint32_t *write_at, const void *buf, uint32_t len) {
     (void)q_off; (void)q_sz; (void)write_at;
@@ -114,20 +127,17 @@ static bool glink_q_write(uint32_t q_off, uint32_t q_sz, uint32_t *write_at, con
     if (len <= sizeof(g_last_tx)) { memcpy(g_last_tx, buf, len); g_last_tx_len = len; }
     return true;
 }
+static void glink_send_cmd2(uint16_t cmd, uint16_t p1, uint32_t p2) {
+    (void)p1; (void)p2;
+    if (cmd == GLINK_RX_INTENT_REQ) g_intent_req_calls++;
+}
 static void glink_send_open(uint16_t cid, const char *name) {
     assert(cid == 4u && strcmp(name, "IPCRTR") == 0);
     g_open_calls++;
 }
-static bool glink_take_their_intent(struct glink_intent_pool *pool, uint16_t our_cid, uint32_t need, uint32_t *id_out) {
-    (void)pool; (void)our_cid; (void)need;
-    if (!g_take_intent_ok) return false;
-    *id_out = 77u;
-    return true;
-}
-static void glink_complete_their_intent(struct glink_intent_pool *pool, uint32_t id, bool reuse) {
-    (void)pool; (void)reuse;
-    g_completed_iid = id;
-}
+static uint64_t now_us(void) { return 0; }
+static void sleep_us(uint32_t us) { (void)us; }
+static void glink_poll_rx(void) { g_poll_rx_calls++; }
 static uint8_t g_smem[0x4000];
 static bool smem_peek(uint32_t off, void *dst, uint32_t len) {
     assert(off + len <= sizeof(g_smem));
@@ -139,6 +149,7 @@ void annibale_qrtr_attach_node(uint32_t peer_node, int (*send)(const void *, uin
 }
 void annibale_qrtr_input(const void *data, uint32_t length) { (void)data; (void)length; }
 
+__INTENTS_INC__
 __IPCRTR_INC__
 __SCAN_FORBIDDEN__
 __SSC_INC__
@@ -186,13 +197,23 @@ int main(void) {
     assert(adsp_ipcrtr_note_ready() && !adsp_ipcrtr_note_ready());
     assert(g_intent_count == 10u && g_intent_sizes[0] == 0x800u && g_intent_sizes[9] == 0x4400u);
 
-    /* 2. TX framing & error paths */
+    /* 2. TX framing & error paths (non-blocking intent path: never re-enters glink_poll_rx) */
+    (void)glink_take_their_intent;
     uint8_t payload[20];
     for (uint32_t i = 0; i < sizeof(payload); i++) payload[i] = (uint8_t)(0xa0u + i);
-    assert(adsp_qrtr_send(payload, sizeof(payload)) == 0 && g_last_tx_len == 36u);
+    g_poll_rx_calls = 0; g_intent_req_calls = 0;
+    assert(adsp_qrtr_send(payload, 20u) == EAGAIN);
+    assert(g_intent_req_calls == 1u && g_poll_rx_calls == 0u);
+    glink_add_their_intent(&adsp_ipcrtr_intents, 77u, 256u);
+    assert(adsp_qrtr_send(payload, sizeof(payload)) == 0 && g_last_tx_len == 36u && g_poll_rx_calls == 0u);
     assert(adsp_qrtr_send(payload, glink_our_q_size) == EMSGSIZE);
-    g_take_intent_ok = false; assert(adsp_qrtr_send(payload, 20u) == EAGAIN); g_take_intent_ok = true;
-    g_q_write_ok = false; g_completed_iid = 0; assert(adsp_qrtr_send(payload, 20u) == EIO && g_completed_iid == 77u); g_q_write_ok = true;
+    /* Intent 77 is now busy -> next send returns EAGAIN without calling glink_poll_rx() */
+    assert(adsp_qrtr_send(payload, 20u) == EAGAIN && g_intent_req_calls == 2u && g_poll_rx_calls == 0u);
+    /* Complete intent 77 with reuse=true -> EIO on glink_q_write returns intent to free */
+    glink_complete_their_intent(&adsp_ipcrtr_intents, 77u, true);
+    g_q_write_ok = false; assert(adsp_qrtr_send(payload, 20u) == EIO && g_poll_rx_calls == 0u); g_q_write_ok = true;
+    assert(adsp_qrtr_send(payload, 20u) == 0 && g_poll_rx_calls == 0u);
+    glink_complete_their_intent(&adsp_ipcrtr_intents, 77u, false);
 
     /* 3. Fragmented RX reassembly across ring wrap + oversize recovery */
     uint8_t expect[120];
@@ -329,7 +350,8 @@ def extract_scan_forbidden(text: str) -> str:
 def main() -> None:
     ssc_text = SSC_INC.read_text().replace("#include <sys/annibale_qrtr.h>", "")
     code = (
-        HARNESS.replace("__IPCRTR_INC__", IPCRTR_INC.read_text())
+        HARNESS.replace("__INTENTS_INC__", INTENTS_INC.read_text())
+        .replace("__IPCRTR_INC__", IPCRTR_INC.read_text())
         .replace("__SCAN_FORBIDDEN__", extract_scan_forbidden(SCAN_INC.read_text()))
         .replace("__SSC_INC__", ssc_text)
     )

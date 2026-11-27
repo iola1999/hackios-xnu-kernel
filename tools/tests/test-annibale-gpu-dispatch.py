@@ -19,10 +19,10 @@ STUB = r'''
 #include <stdio.h>
 #include <string.h>
 typedef uintptr_t vm_offset_t;
-static bool annibale, adreno8_gpu8_keep, adreno8_gpu8_return, bo_open, self_test, publish_ok;
+static bool annibale, adreno8_gpu8_keep, adreno8_gpu8_ifpc, adreno8_gpu8_return, bo_open, self_test, publish_ok;
 static uint32_t adreno8_gx_hz[17] = {0, 160000000, 222000000, 342000000};
 static unsigned adreno8_gx_count = 4;
-static unsigned legacy_calls, enable_calls, close_calls, stop_calls, cache_calls, submit_calls, publish_calls, ready_checks, speed_ticks;
+static unsigned legacy_calls, enable_calls, close_calls, stop_calls, cache_calls, submit_calls, publish_calls, ready_checks, speed_ticks, oob_release_calls;
 static bool annibale_platform_is_annibale(void) { return annibale; }
 static int adreno8_say(const char *format, ...) { (void)format; return 0; }
 static bool PE_parse_boot_argn(const char *key, void *value, unsigned size) {
@@ -62,6 +62,8 @@ bool adreno8_context_done(uint32_t fence) { assert(bo_open && fence == 17); retu
 uint32_t adreno8_context_last(void) { return 17; }
 uint32_t adreno8_context_retired(void) { return 17; }
 void adreno8_gpu_hang_dump(void) {}
+void adreno8_gpu_oob_release(void) { oob_release_calls++; }
+bool adreno8_gpu_oob_acquire(void) { return true; }
 bool adreno8_hfi_poll(void) { return false; }
 void adreno8_hfi_irq_attach(void) {}
 uint32_t adreno8_hfi_irq_count(void) { return 0; }
@@ -153,13 +155,16 @@ int main(void) {
     const uint32_t unsupported[] = {0,5,11,14,15,18,19,21,UINT32_MAX};
     for (unsigned i=0;i<sizeof(unsupported)/sizeof(*unsupported);i++) assert(!annibale_gpu_parameter(unsupported[i],&value));
     for (unsigned platform=0;platform<2;platform++) for (unsigned keep=0;keep<2;keep++)
-    for (unsigned back=0;back<2;back++) for (unsigned tested=0;tested<2;tested++) for (unsigned published=0;published<2;published++) {
-        annibale=platform; adreno8_gpu8_keep=keep; adreno8_gpu8_return=back; self_test=tested; publish_ok=published;
-        bo_open=false; enable_calls=publish_calls=stop_calls=0; gpu_va=2;
+    for (unsigned back=0;back<2;back++) for (unsigned tested=0;tested<2;tested++)
+    for (unsigned published=0;published<2;published++) for (unsigned ifpc=0;ifpc<2;ifpc++) {
+        annibale=platform; adreno8_gpu8_keep=keep; adreno8_gpu8_return=back;
+        adreno8_gpu8_ifpc=ifpc; self_test=tested; publish_ok=published;
+        bo_open=false; enable_calls=publish_calls=stop_calls=oob_release_calls=0; gpu_va=2;
         assert(adreno8_step_service() == (platform && keep && !back && tested && published));
         unsigned admitted=platform && keep && !back;
         assert(enable_calls == admitted && publish_calls == (admitted && tested));
         assert(stop_calls == (admitted && tested && !published));
+        assert(oob_release_calls == (admitted && tested && published && ifpc));
         if (publish_calls) assert(gpu_va == 0 && gpu_log == 1);
     }
     puts("C ABI: 16 fixed-platform entries, A830 retention, parameters and stage23 admission: PASS");

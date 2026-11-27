@@ -24,7 +24,7 @@ extern struct adreno8_block adreno8_smmu;
 enum gpu_state { GPU_COLD, GPU_PREPARED, GPU_CP_READY, GPU_UNSECURE, GPU_TESTED, GPU_FAILED };
 static enum gpu_state gpu_state;
 static struct adreno8_memory *sqe, *aqe, *powerup, *scratch, *ring;
-static bool oob_requested, oob_acked;
+static bool oob_requested, oob_acked, oob_held;
 
 static bool
 gpu_fail(const char *what)
@@ -109,7 +109,7 @@ gpu_pipe_write(uint32_t pipe, uint32_t reg, uint32_t value)
 static bool
 gpu_accessible(void)
 {
-	if (gpu_state == GPU_FAILED || !oob_acked ||
+	if (gpu_state == GPU_FAILED || !oob_acked || !oob_held ||
 	    !(adreno8_direct_ring ? adreno8_ordinary_ready() : adreno8_hwsched_ready()) ||
 	    !adreno8_gpu_memory_ready() || adreno8_gpu_faulted())
 		return false;
@@ -222,9 +222,53 @@ gpu_oob_get(void)
 	}
 	gpu_gmu_write(GMU_GMU2HOST_CLR, 1u << 31);
 	adreno8_settle();
-	if (!oob_acked || !gpu_accessible())
+	if (oob_acked)
+		oob_held = true;
+	if (!oob_acked || !gpu_accessible()) {
+		oob_held = false;
 		return gpu_fail("OOB acknowledgement or GX power");
+	}
 	printf("adreno8: GPU OOB acknowledged and held until cold reset\n");
+	return true;
+}
+
+void
+adreno8_gpu_oob_release(void)
+{
+	if (!adreno8_gpu8_ifpc || !oob_held || gpu_state != GPU_TESTED)
+		return;
+	/* gen8_gmu_oob_clear(oob_gpu): BIT(31 - 0 * 2) on HOST2GMU_SET. */
+	gpu_gmu_write(GMU_HOST2GMU_SET, 1u << 31);
+	adreno8_settle();
+	oob_held = false;
+	printf("adreno8: GPU OOB released for IFPC inter-frame GX collapse\n");
+}
+
+bool
+adreno8_gpu_oob_acquire(void)
+{
+	bool ack = false;
+	if (gpu_state == GPU_FAILED || !adreno8_hwsched_ready() ||
+	    !adreno8_gpu_memory_ready() || adreno8_gpu_faulted())
+		return false;
+	if (oob_held)
+		return GMU_PWR_GX_UP(gpu_gmu_read(GMU_PWR_CLK_STATUS));
+	/* gen8_gmu_oob_set(oob_gpu): request bit 30, response bit 31. */
+	gpu_gmu_write(GMU_HOST2GMU_SET, 1u << 30);
+	adreno8_settle();
+	for (unsigned i = 0; i < 1000; i++) {
+		if (gpu_gmu_read(GMU_GMU2HOST_INFO) & (1u << 31)) {
+			ack = true;
+			break;
+		}
+		adreno8_sleep_us(100);
+	}
+	gpu_gmu_write(GMU_GMU2HOST_CLR, 1u << 31);
+	adreno8_settle();
+	if (!ack || !GMU_PWR_GX_UP(gpu_gmu_read(GMU_PWR_CLK_STATUS)))
+		return false;
+	oob_acked = true;
+	oob_held = true;
 	return true;
 }
 
@@ -525,6 +569,8 @@ adreno8_gpu_hang_dump(void)
 		return;
 	dumped = true;
 
+	if (gpu_state != GPU_FAILED && !oob_held && adreno8_gpu8_ifpc)
+		(void)adreno8_gpu_oob_acquire();
 	if (gpu_state == GPU_FAILED || !GMU_PWR_GX_UP(gpu_gmu_read(GMU_PWR_CLK_STATUS))) {
 		printf("adreno8: hang dump: GX is off, no CP registers\n");
 		return;
@@ -839,7 +885,11 @@ adreno8_gpu_scratch_test(void)
 bool
 adreno8_gpu_commands_ready(void)
 {
-	return gpu_state == GPU_TESTED && gpu_status_ok();
+	if (gpu_state != GPU_TESTED)
+		return false;
+	if (!oob_held && adreno8_gpu8_ifpc)
+		return adreno8_hwsched_ready() && adreno8_gpu_memory_ready() && !adreno8_gpu_faulted();
+	return gpu_status_ok();
 }
 
 bool
@@ -848,6 +898,16 @@ adreno8_gpu_wait_idle(const char *what)
 	if (gpu_state != GPU_TESTED) {
 		printf("adreno8: GPU %s idle wait refused in state %u\n", what, gpu_state);
 		return false;
+	}
+	if (!oob_held && adreno8_gpu8_ifpc) {
+		for (unsigned i = 0; i < 2000; i++) {
+			if (!adreno8_gpu_commands_ready())
+				return gpu_fail(what);
+			if (!(gpu_gmu_read(GMU(GEN8_GMUAO_GPU_CX_BUSY_STATUS)) & (1u << 23)))
+				return adreno8_gpu_commands_ready();
+			adreno8_sleep_us(100);
+		}
+		return gpu_fail(what);
 	}
 	return gpu_wait_idle(what);
 }
