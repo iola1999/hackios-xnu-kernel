@@ -474,7 +474,7 @@ AnnibaleGPUUserClient::dropKept(struct gpu_kept * k, struct gpu_garbage * garbag
 	return true;
 }
 
-#define GPU_KEPT_BYTES          (160ull << 20)
+#define GPU_KEPT_BYTES          (256ull << 20)
 #define GPU_KEPT_SECONDS        60              /* a buffer not asked for again in so long is let go */
 #define GPU_BUCKET_TO           (256u << 10)    /* smaller sizes are made in power-of-two buckets, this one and up exact */
 
@@ -526,27 +526,34 @@ AnnibaleGPUUserClient::keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint6
 		if (garbage != NULL && evicts >= GPU_KEEP_EVICT_MAX) {
 			return false;
 		}
-		struct gpu_kept * victim = oldest;
+		struct gpu_kept * victim = NULL;
 
-		if (place == NULL) {
-			/*
-			 * Entry slots are shared in soft proportions when full. A size class may use spare
-			 * slots beyond its target. Once no slot is free, the victim is the oldest entry of
-			 * a class above target, or of the new entry's class when every class is at target.
-			 * Byte-capacity pressure keeps using the global oldest entry.
-			 */
-			victim = NULL;
-			for (uint32_t keptClass = 0; keptClass < 4; keptClass++) {
-				if (count[keptClass] > gGPUKeptTarget[keptClass] && oldest_by_class[keptClass] != NULL &&
-				    (victim == NULL || oldest_by_class[keptClass]->since < victim->since)) {
-					victim = oldest_by_class[keptClass];
+		/*
+		 * Entry slots are shared in soft proportions when full, and byte-cap pressure protects
+		 * class 3 (>= 8 MiB) from being flushed to zero by smaller allocations. First evict the
+		 * oldest entry from any class above its soft target; if every class is within target,
+		 * entry-cap pressure evicts from the new entry's class and byte-cap pressure for < 8 MiB
+		 * entries restricts eviction to classes 0..2 before falling back to global oldest.
+		 */
+		for (uint32_t keptClass = 0; keptClass < 4; keptClass++) {
+			if (count[keptClass] > gGPUKeptTarget[keptClass] && oldest_by_class[keptClass] != NULL &&
+			    (victim == NULL || oldest_by_class[keptClass]->since < victim->since)) {
+				victim = oldest_by_class[keptClass];
+			}
+		}
+		if (victim == NULL) {
+			if (place == NULL) {
+				victim = oldest_by_class[gpuKeptClass(size)];
+			} else if (gpuKeptClass(size) < 3) {
+				for (uint32_t keptClass = 0; keptClass < 3; keptClass++) {
+					if (oldest_by_class[keptClass] != NULL &&
+					    (victim == NULL || oldest_by_class[keptClass]->since < victim->since)) {
+						victim = oldest_by_class[keptClass];
+					}
 				}
 			}
-			if (victim == NULL) {
-				victim = oldest_by_class[gpuKeptClass(size)];
-			}
-			victim = victim != NULL ? victim : oldest;
 		}
+		victim = victim != NULL ? victim : oldest;
 		if (!dropKept(victim, garbage)) {
 			return false;
 		}

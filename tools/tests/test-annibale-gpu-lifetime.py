@@ -706,12 +706,80 @@ static void g11_long_submission_progress() {
     assert(gGPUReported);
     IOLockUnlock(gGPULock);
 }
+static void protect_huge_from_bytecap_evict() {
+    static_assert(GPU_KEPT_BYTES == (256ull << 20), "GPU_KEPT_BYTES expected 256 MiB");
+    reset(); auto c = client(); gGPUKeep = 1;
+    std::vector<IOMemoryDescriptor *> huge;
+    /* Keep 8 older 28 MiB (class 3, within GPU_KEPT_HUGE_TARGET=16) and 6 newer 4 MiB (class 2). */
+    for (unsigned i = 0; i < 8; ++i) {
+        now = 10 + i;
+        auto *m = new IOBufferMemoryDescriptor(28ull << 20);
+        huge.push_back(m);
+        assert(c.keep(m, m->bytes, 0x10000000ull + i * (28ull << 20), 28ull << 20, 0));
+    }
+    for (unsigned i = 0; i < 6; ++i) {
+        now = 100 + i;
+        auto *m = new IOBufferMemoryDescriptor(4ull << 20);
+        assert(c.keep(m, m->bytes, 0x30000000ull + i * (4ull << 20), 4ull << 20, 0));
+    }
+    assert(c.fKeptBytes == (248ull << 20));
+    gGPUStat.evict_bytecap = gGPUStat.evict_entrycap = 0;
+    struct gpu_garbage garbage{};
+    for (unsigned i = 0; i < 4; ++i) {
+        now = 200 + i;
+        auto *m = new IOBufferMemoryDescriptor(4ull << 20);
+        assert(c.keep(m, m->bytes, 0x40000000ull + i * (4ull << 20), 4ull << 20, 0, &garbage));
+    }
+    gpuGarbageFlush(&garbage);
+    assert(gGPUStat.evict_bytecap >= 2 && gGPUStat.evict_entrycap == 0);
+    for (auto *m : huge) {
+        assert(!m->freed);
+    }
+    c.clientClose(); c.free();
+
+    /* Over-target class 3 (17 > 16) is trimmed first under byte-cap pressure. */
+    reset(); c = client(); gGPUKeep = 1;
+    IOMemoryDescriptor *first_huge = nullptr;
+    for (unsigned i = 0; i < 17; ++i) {
+        now = 10 + i;
+        auto *m = new IOBufferMemoryDescriptor(12ull << 20);
+        if (i == 0) first_huge = m;
+        assert(c.keep(m, m->bytes, 0x50000000ull + i * (12ull << 20), 12ull << 20, 0));
+    }
+    for (unsigned i = 0; i < 12; ++i) {
+        now = 50 + i;
+        auto *m = new IOBufferMemoryDescriptor(4ull << 20);
+        assert(c.keep(m, m->bytes, 0x70000000ull + i * (4ull << 20), 4ull << 20, 0));
+    }
+    now = 100;
+    auto *push = new IOBufferMemoryDescriptor(6ull << 20);
+    assert(c.keep(push, push->bytes, 0x90000000ull, 6ull << 20, 0, &garbage));
+    gpuGarbageFlush(&garbage);
+    assert(first_huge->freed && gGPUStat.evict_bytecap == 1 && gGPUStat.evict_entrycap == 0);
+    c.clientClose(); c.free();
+
+    /* When only class 3 exists, byte-cap pressure for < 8 MiB falls back to global oldest. */
+    reset(); c = client(); gGPUKeep = 1;
+    IOMemoryDescriptor *only_oldest = nullptr;
+    for (unsigned i = 0; i < 8; ++i) {
+        now = 10 + i;
+        auto *m = new IOBufferMemoryDescriptor(32ull << 20);
+        if (i == 0) only_oldest = m;
+        assert(c.keep(m, m->bytes, 0xa0000000ull + i * (32ull << 20), 32ull << 20, 0));
+    }
+    now = 100;
+    auto *small = new IOBufferMemoryDescriptor(4ull << 20);
+    assert(c.keep(small, small->bytes, 0xe0000000ull, 4ull << 20, 0, &garbage));
+    gpuGarbageFlush(&garbage);
+    assert(only_oldest->freed && c.fKeptBytes == (228ull << 20) && gGPUStat.evict_bytecap == 1);
+    c.clientClose(); c.free();
+}
 int main() {
     healthy(); stopped(); failed_reap(); completed_reap(); failed_free(); partial_map(); segments(); kept();
     failed_surface(); surface_ownership(); full_pending(); long_pass(); failed_submit(); queue_room(); display();
     out_of_lock_teardown(); keep_evict_bounded(); surface_fail_retain_not_pooled(); full_fleft_reap_before_wait();
-    cross_slot_last_use_and_stall(); g11_long_submission_progress(); reset();
-    printf("AnnibaleGPU production lifecycle: 37 scenarios at %llu-byte pages passed\n", (unsigned long long)PAGE_SIZE);
+    cross_slot_last_use_and_stall(); g11_long_submission_progress(); protect_huge_from_bytecap_evict(); reset();
+    printf("AnnibaleGPU production lifecycle: 38 scenarios at %llu-byte pages passed\n", (unsigned long long)PAGE_SIZE);
 }
 '''
 
