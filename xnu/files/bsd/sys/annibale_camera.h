@@ -39,10 +39,16 @@ struct annibale_camera_frame {
 	uint32_t        sensor;         /* which: 0 the macro, 1 the wide, 2 the front, 3 the ultra-wide camera */
 	uint32_t        focus;          /* the lens's position it was taken at, 0 (the furthest) to 1023: ANNIBALE_CAMERA_NO_FOCUS where it
 	                                 * has no motor (or it does not answer) */
-	uint32_t        reserved[5];
+	uint32_t        pd_width;       /* VC=1 PD stream width in pixels (0 when absent) */
+	uint32_t        pd_height;      /* VC=1 PD stream height in rows (0 when absent) */
+	uint32_t        pd_stride;      /* VC=1 PD stream bytes per row */
+	uint32_t        pd_bytes;       /* VC=1 PD bytes appended after main frame when ANNIBALE_CAM_PD_VALID */
+	uint32_t        pd_flags;       /* ANNIBALE_CAM_PD_* */
 };
 
 #define ANNIBALE_CAMERA_NO_FOCUS 0xffffffffu
+#define ANNIBALE_CAM_PD_VALID    (1u << 0)
+#define ANNIBALE_CAM_PD_OVERFLOW (1u << 1)
 
 enum {
 	ANNIBALE_CAMERA_EXPOSURE = 1,    /* a: lines, b: gain, c: frame lines (0: the shortest that holds the exposure) */
@@ -145,5 +151,18 @@ struct annibale_camera_capture {
 };
 
 #define CAMIOC_CAPTURE          _IOR('C', 2, struct annibale_camera_capture)
+
+#define ANNIBALE_CAM_EEPROM_CHUNK      2048u
+#define ANNIBALE_CAM_EEPROM_FLAG_VALID (1u << 0)
+
+struct annibale_camera_eeprom {
+	uint32_t offset;        /* in: byte offset into cached EEPROM image */
+	uint32_t length;        /* in: requested bytes (<= ANNIBALE_CAM_EEPROM_CHUNK), out: copied bytes */
+	uint32_t total_bytes;   /* out: total cached EEPROM bytes (0 when unavailable) */
+	uint32_t flags;         /* out: ANNIBALE_CAM_EEPROM_FLAG_* */
+	uint8_t  data[ANNIBALE_CAM_EEPROM_CHUNK];
+};
+
+#define CAMIOC_G_EEPROM         _IOWR('C', 3, struct annibale_camera_eeprom)
 
 #endif /* _SYS_ANNIBALE_CAMERA_H_ */

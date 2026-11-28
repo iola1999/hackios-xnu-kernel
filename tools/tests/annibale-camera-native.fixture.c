@@ -26,6 +26,17 @@
 #endif
 static inline void say(const char *format, ...) { (void)format; }
 #define cam_native_trace(...) ((void)0)
+#ifndef __printflike
+#define __printflike(a, b)
+#endif
+void annibale_tl(const char *format, ...) __printflike(1, 2);
+void annibale_tl(const char *format, ...) { (void)format; }
+static bool PE_parse_boot_argn(const char *name __unused, void *arg __unused, int size __unused) { return false; }
+static void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result) { *result = abstime * 1000u; }
+static void *current_proc(void) { return NULL; }
+static int proc_pid(void *p __unused) { return 0; }
+static void *current_thread(void) { return NULL; }
+static uint64_t thread_tid(void *t __unused) { return 0; }
 
 typedef uintptr_t vm_offset_t;
 typedef int64_t user_ssize_t;
@@ -37,7 +48,7 @@ static struct annibale_camera_capture cam_capture;
 static uint8_t region[CAMERA_REGION_SIZE], output[CAMERA_SLOT_SIZE];
 static vm_offset_t cam_region_vbase, csid_lite_base = 1;
 static vm_offset_t gcc_base = 2, mclkcc_base = 3, camcc_base = 4, tlmm_base = 5;
-static void *kernel_map, *cam_lock;
+static void *cam_lock;
 static uint16_t front_chip_id, wide_chip_id;
 static uint8_t front_slave_addr, wide_slave_addr, wide_bus_mode;
 static uint32_t cached_csid_ver, cached_ife_ver, cam_hw_mmio, current_sensor;
@@ -61,6 +72,11 @@ static bool bus_overflow, sticky_overflow;
 static unsigned buf_polls, deliver_after;
 static uint32_t queued[4], queued_count, taken_address, flushed_slots;
 static bool taken, lose_update;
+static uint32_t wm1_queued[4], wm1_queued_count, wm1_taken_address, pd_flushed_slots, last_rup_aup;
+static bool wm1_taken, stuck_wm1_fifo, wm1_cache_written, fail_eeprom_read;
+static unsigned cci_inits;
+static uint8_t fake_eeprom[0x1840u];
+static uint32_t cam_native_exp_writes, cam_native_focus_steps, cam_native_applied_frame_lines;
 
 static bool cam_capture_resources_held(void);
 static void fake_dma(void);
@@ -73,6 +89,7 @@ static uint32_t reg_rd(vm_offset_t base, uint32_t offset)
         buf_polls++ >= deliver_after) fake_dma();
     if (invalid_status && cam_sensor_streaming && offset == 0x08c) return UINT32_MAX;
     if (stuck_fifo && address_writes && offset == 0x1798) return 1;
+    if (stuck_wm1_fifo && offset == 0x1898) return 1;
     return regs[offset / 4];
 }
 
@@ -109,18 +126,39 @@ static void reg_wr(vm_offset_t base, uint32_t offset, uint32_t value)
         address_writes++;
         regs[0x1798 / 4] = queued_count;
     }
-    if (offset == 0x018 && !taken && queued_count != 0 && !lose_update) {
-        /* The register update hands the writer its next address. */
-        taken_address = queued[0];
-        memmove(queued, queued + 1, sizeof(queued) - sizeof(queued[0]));
-        queued_count--; taken = true; buf_polls = 0;
+    if (offset == 0x1868) wm1_cache_written = true;
+    if (offset == 0x1804) {
+        CHECK(value == (uint32_t)((physical + 0x600000u) >> 8) ||
+              value == (uint32_t)((physical + CAMERA_SLOT_SIZE + 0x600000u) >> 8));
+        CHECK(wm1_queued_count < 4);
+        wm1_queued[wm1_queued_count++] = value;
+        regs[0x1898 / 4] = wm1_queued_count;
+    }
+    if (offset == 0x018) {
+        last_rup_aup = value;
+        if (!taken && queued_count != 0 && !lose_update) {
+            /* The register update hands the writer its next address. */
+            taken_address = queued[0];
+            memmove(queued, queued + 1, sizeof(queued) - sizeof(queued[0]));
+            queued_count--; taken = true; buf_polls = 0;
+        }
+        if ((value & 0x200020u) == 0x200020u && !wm1_taken && wm1_queued_count != 0 && !lose_update) {
+            wm1_taken_address = wm1_queued[0];
+            memmove(wm1_queued, wm1_queued + 1, sizeof(wm1_queued) - sizeof(wm1_queued[0]));
+            wm1_queued_count--; wm1_taken = true;
+        }
     }
     if (offset == 0x010 || (offset == 0x1700 && value == 0)) {
         if (offset == 0x1700 || value == 2) { queued_count = 0; taken = false; }
     }
+    if (offset == 0x010 || (offset == 0x1800 && value == 0)) {
+        if (offset == 0x1800 || value == 2) { wm1_queued_count = 0; wm1_taken = false; }
+    }
     regs[offset / 4] = value;
     if (offset == 0x1704 || offset == 0x018 || offset == 0x010 || offset == 0x1700)
         regs[0x1798 / 4] = stuck_fifo && address_writes ? 1 : queued_count;
+    if (offset == 0x1804 || offset == 0x018 || offset == 0x010 || offset == 0x1800)
+        regs[0x1898 / 4] = stuck_wm1_fifo ? 1 : wm1_queued_count;
 }
 
 static void csid_wr(uint32_t offset, uint32_t value) { reg_wr(csid_lite_base, offset, value); }
@@ -134,6 +172,12 @@ static uint64_t kvtophys(vm_offset_t va)
 }
 void FlushPoC_DcacheRegion(vm_offset_t va, size_t bytes)
 {
+    if (va == cam_region_vbase + 0x600000u || va == cam_region_vbase + CAMERA_SLOT_SIZE + 0x600000u) {
+        CHECK(bytes == 3200u * 480u);
+        pd_flushed_slots |= (va == cam_region_vbase + 0x600000u) ? 1u : 2u;
+        cache_flushes++;
+        return;
+    }
     CHECK((va == cam_region_vbase || va == cam_region_vbase + CAMERA_SLOT_SIZE) &&
           bytes >= profile_data.stride * profile_data.height);
     flushed_slots |= va == cam_region_vbase ? 1u : 2u;
@@ -146,6 +190,34 @@ static bool cci0_m1_read16(uint8_t slave, uint16_t reg, uint16_t *id)
     *id = 0x5650;
     return true;
 }
+
+static bool cci0_m1_init(void)
+{
+    cci_inits++;
+    cci_ready = true;
+    return true;
+}
+
+static bool cci0_m1_read_bytes(uint8_t slave, uint16_t reg, uint8_t *out, uint32_t count)
+{
+    CHECK(slave == 0x51 && count > 0 && count <= 15u);
+    if (fail_eeprom_read || (uint32_t)reg + count > sizeof(fake_eeprom)) {
+        cci_ready = false;
+        return false;
+    }
+    memcpy(out, fake_eeprom + reg, count);
+    return true;
+}
+
+static bool od_i2c_read_bytes(uint32_t sda __unused, uint32_t scl __unused, uint8_t slave, uint16_t reg,
+    uint8_t *out, uint32_t count)
+{
+    return cci0_m1_read_bytes(slave, reg, out, count);
+}
+
+static void cam_native_lens_up(void) { }
+static void cam_native_lens_down(void) { }
+static void cam_native_apply_focus(bool force __unused) { }
 
 static bool od_i2c_read16_reg16(uint32_t sda, uint32_t scl, uint8_t slave, uint16_t reg, uint16_t *id)
 {
@@ -255,6 +327,13 @@ static void fake_dma(void)
     } else {
         regs[0x08c / 4] |= wrong_group ? 1u : 2u;
         regs[0x1790 / 4] = taken_address + (wrong_address ? 1u : 0u);
+        if (wm1_taken && regs[0x1800 / 4] == 1 && regs[0x604 / 4] == 1) {
+            uint32_t pd_slot = wm1_taken_address == (uint32_t)((physical + 0x600000u) >> 8) ? 0 : 1;
+            memset(region + pd_slot * CAMERA_SLOT_SIZE + 0x600000u, (int)(0x70u + completed_frames), 3200u * 480u);
+            regs[0x1890 / 4] = wm1_taken_address;
+            regs[0x08c / 4] |= (1u << 2);
+            wm1_taken = false;
+        }
     }
     if (fatal_frame) regs[0x09c / 4] |= 0x800u;
     taken = false; flushed_slots = 0; delivered = true; completed_frames++;
@@ -281,8 +360,21 @@ static void reset_fixture(void)
     cached_csid_ver = 0x30000004; cached_ife_ver = 0x20050000;
     cam_sensor_streaming = cam_hw_dma_verified = cam_native_phy_configured = false;
     boot_cam_keep_stream = boot_cam_wm_prefetch = 0;
+    boot_cam_pdaf = 1u;
     cam_native_initialized = cam_native_sensor_powered = cam_native_submitted = false;
     cam_native_path_configured = cam_native_reset_failed = false;
+    cam_native_pd_configured = cam_native_pd_diag_logged = false;
+    cam_native_pd_ready_flags = cam_native_pd_frame_flags = 0;
+    cam_eeprom_valid = cam_eeprom_logged = false;
+    wm1_queued_count = wm1_taken_address = pd_flushed_slots = last_rup_aup = 0;
+    wm1_taken = stuck_wm1_fifo = wm1_cache_written = fail_eeprom_read = false;
+    cci_inits = 0; cci_ready = true;
+    memset(fake_eeprom, 0, sizeof(fake_eeprom));
+    fake_eeprom[0x0001u] = 0x10u;
+    fake_eeprom[0x002du] = 0x02u; fake_eeprom[0x002eu] = 0xa4u; /* macro 676 (BE) */
+    fake_eeprom[0x0031u] = 0x01u; fake_eeprom[0x0032u] = 0x45u; /* inf 325 (BE) */
+    fake_eeprom[0x0eefu] = 0x00u; fake_eeprom[0x0ef0u] = 17u;
+    fake_eeprom[0x0ef1u] = 0x00u; fake_eeprom[0x0ef2u] = 13u;
     cam_native_dma_bytes = 0;
     clocks_owned = phy_owned = smmu_owned = delivered = vblank_eof_seen = false;
     address_writes = resets = cache_flushes = completed_frames = vblank_polls = 0;
@@ -334,7 +426,7 @@ static void check_recovered(uint32_t error, unsigned frames_before)
     CHECK(cam_capture.state == ANNIBALE_CAM_CAPTURE_STOPPED && cam_capture.error == 0);
     CHECK(cam_capture.flags == ANNIBALE_CAM_CAPTURE_COMPLETE && cam_hw_dma_verified);
     CHECK(cam_capture.sequence == frames_before + 1 && table_writes[0] == 2 && table_writes[1] == 2);
-    CHECK(annibale_cam_close(0, 0, 0, NULL) == 0 && region_frees == 1);
+    CHECK(annibale_cam_close(0, 0, 0, NULL) == 0 && region_frees == 0);
 }
 
 static void check_success(void)
@@ -387,7 +479,7 @@ int main(void)
     delivered = false; cam_native_capture(); check_success(); cases++;
     CHECK(table_writes[0] == 1 && table_writes[1] == 1 && address_writes == 2 && table_writes[3] == 2);
     CHECK(annibale_cam_close(0, 0, 0, NULL) == 0);
-    CHECK(profile_frees == 1 && region_frees == 1 && power_stops == 2);
+    CHECK(profile_frees == 1 && region_frees == 0 && power_stops == 2);
     CHECK(clock_stops == 1 && phy_stops == 1 && smmu_restores == 1); cases++;
 
     reset_fixture(); cam_capture.state = ANNIBALE_CAM_CAPTURE_READY;
@@ -419,7 +511,7 @@ int main(void)
     /* Close gives up the frame in flight: sensor off, global reset, everything released. */
     CHECK(annibale_cam_close(0, 0, 0, NULL) == 0);
     CHECK(!cam_sensor_streaming && table_writes[3] == 1 && regs[0x200 / 4] == 0 && regs[0x1700 / 4] == 0);
-    CHECK(route_stops == 1 && smmu_restores == 1 && region_frees == 1 && profile_frees == 1 && !clocks_owned); cases++;
+    CHECK(route_stops == 1 && smmu_restores == 1 && region_frees == 0 && profile_frees == 1 && !clocks_owned); cases++;
     /* ... and the camera opens and streams again. */
     cam_region_vbase = (vm_offset_t)region; completed_frames = 0;
     CHECK(annibale_cam_open(0, 0, 0, NULL) == 0);
@@ -441,7 +533,7 @@ int main(void)
         CHECK(cam_capture.state == ANNIBALE_CAM_CAPTURE_STREAMING && ANNIBALE_CAM_CAPTURE_HAS_FRAME(&cam_capture));
         CHECK(cam_capture.dma_address == physical && cam_capture.sequence == 2 && cam_hw_dma_verified);
         CHECK(table_writes[0] == 2 && table_writes[2] == 2);
-        CHECK(annibale_cam_close(0, 0, 0, NULL) == 0 && region_frees == 1); cases++;
+        CHECK(annibale_cam_close(0, 0, 0, NULL) == 0 && region_frees == 0); cases++;
     }
     /* A stream frame done at another address than the queued one keeps everything. */
     reset_fixture(); boot_cam_keep_stream = 1; cam_native_capture(); check_stream(1);
@@ -451,7 +543,7 @@ int main(void)
     lose_update = true; cam_native_capture();
     CHECK(cam_capture.state == ANNIBALE_CAM_CAPTURE_STREAMING); lose_update = false;
     cam_native_capture(); CHECK(cam_capture.state == ANNIBALE_CAM_CAPTURE_FAILED && cam_capture.error == ETIMEDOUT);
-    CHECK(annibale_cam_close(0, 0, 0, NULL) == 0 && region_frees == 1); cases++;
+    CHECK(annibale_cam_close(0, 0, 0, NULL) == 0 && region_frees == 0); cases++;
     /* Close during a stream with the FIFO stuck: held, nothing freed. */
     reset_fixture(); boot_cam_keep_stream = 1; cam_native_capture(); check_stream(1);
     stuck_fifo = true; CHECK(annibale_cam_close(0, 0, 0, NULL) == 0);
@@ -476,12 +568,12 @@ int main(void)
     cam_native_capture(); check_held(); CHECK(address_writes == 0 && resets == 0); cases++;
     reset_fixture(); stale_buf = true; regs[0x08c / 4] = 2;
     cam_native_capture(); CHECK(cam_capture.state == ANNIBALE_CAM_CAPTURE_FAILED && address_writes == 0);
-    CHECK(annibale_cam_close(0, 0, 0, NULL) == 0 && region_frees == 1); cases++;
+    CHECK(annibale_cam_close(0, 0, 0, NULL) == 0 && region_frees == 0); cases++;
 
     reset_fixture(); fail_init = true; cam_native_capture();
     CHECK(cam_capture.state == ANNIBALE_CAM_CAPTURE_FAILED && address_writes == 0);
     CHECK(!clocks_owned && !phy_owned && !cam_native_sensor_powered);
-    CHECK(annibale_cam_close(0, 0, 0, NULL) == 0 && region_frees == 1); cases++;
+    CHECK(annibale_cam_close(0, 0, 0, NULL) == 0 && region_frees == 0); cases++;
     reset_fixture(); bad_contiguity = true; cam_native_capture();
     CHECK(cam_capture.error == EOVERFLOW && address_writes == 0 && clock_starts == 0); cases++;
     reset_fixture(); physical = 1ULL << 36; cam_native_capture();
@@ -508,10 +600,10 @@ int main(void)
     reset_fixture(); fatal_frame = true; cam_native_capture();
     CHECK(cam_capture.state == ANNIBALE_CAM_CAPTURE_FAILED && cam_capture.error == EIO);
     CHECK(!cam_hw_dma_verified && !cam_native_submitted && route_stops == 1);
-    check_no_frame(EIO); CHECK(annibale_cam_close(0, 0, 0, NULL) == 0 && region_frees == 1); cases++;
+    check_no_frame(EIO); CHECK(annibale_cam_close(0, 0, 0, NULL) == 0 && region_frees == 0); cases++;
     reset_fixture(); fail_sensor_off = true; cam_native_capture();
     CHECK(cam_capture.state == ANNIBALE_CAM_CAPTURE_FAILED && !cam_hw_dma_verified);
-    CHECK(annibale_cam_close(0, 0, 0, NULL) == 0 && region_frees == 1); cases++;
+    CHECK(annibale_cam_close(0, 0, 0, NULL) == 0 && region_frees == 0); cases++;
 
     reset_fixture(); cam_native_capture(); fail_smmu_restore = true;
     CHECK(annibale_cam_close(0, 0, 0, NULL) == 0);
@@ -525,7 +617,7 @@ int main(void)
 
     reset_fixture(); CHECK(annibale_cam_open(0, 0, 0, NULL) == EBUSY); cases++;
     reset_fixture(); cam_is_open = false; power_up_ok = false;
-    CHECK(annibale_cam_open(0, 0, 0, NULL) == EIO && region_frees == 1); cases++;
+    CHECK(annibale_cam_open(0, 0, 0, NULL) == EIO && region_frees == 0); cases++;
 
     /* Verify rear wide mode 24 (2560x1920) exposure defaults, clamping, and frame black level. */
     reset_fixture();
@@ -534,6 +626,10 @@ int main(void)
     cam_native_exposure_defaults(&profile_data);
     CHECK(cam_native_frame_lines == 6250u && cam_native_exposure_lines == 6218u && cam_native_gain == 256u);
     CHECK(cam_native_exposure_set(&profile_data, 3000u, 1024u, 6250u));
+    cam_native_applied_exposure_lines = cam_native_exposure_lines;
+    cam_native_applied_gain = cam_native_gain;
+    cam_native_applied_frame_lines = cam_native_frame_lines;
+    cam_native_exposure_shown(true);
     struct annibale_camera_frame back_frame = {0};
     cam_native_frame_exposure(&profile_data, &back_frame);
     CHECK(back_frame.black == 64u && back_frame.exposure_lines == 3000u && back_frame.line_ns == 5333u);
@@ -549,7 +645,7 @@ int main(void)
     profile_data.width = 2560; profile_data.height = 1920; profile_data.stride = 3200;
     for (unsigned frame = 1; frame <= 3; frame++) { cam_native_capture(); check_stream(frame); }
     CHECK(annibale_cam_close(0, 0, 0, NULL) == 0);
-    CHECK(!cam_sensor_streaming && regs[0x200 / 4] == 0 && table_writes[3] == 1 && region_frees == 1);
+    CHECK(!cam_sensor_streaming && regs[0x200 / 4] == 0 && table_writes[3] == 1 && region_frees == 0);
     cases++;
 
     /* Verify cam_wm_prefetch=0 vs 1 writes IFE-lite0 WM0 0x1760/0x1764 accordingly. */
@@ -563,6 +659,59 @@ int main(void)
     cam_native_capture();
     check_success();
     CHECK(regs[0x1760 / 4] == 1u && regs[0x1764 / 4] == UINT32_MAX);
+    CHECK(annibale_cam_close(0, 0, 0, NULL) == 0);
+    cases++;
+
+    /* Verify rear wide Mode 24 PDAF RDI1+WM1 capture, legacy vs PD read, WM1 cache/FIFO guards, and paged EEPROM ioctl. */
+    reset_fixture();
+    boot_cam_keep_stream = 1;
+    wide_chip_id = WIDE_SENSOR_ID_EXPECTED; wide_slave_addr = 0x10; wide_bus_mode = 1;
+    profile_data.sensor = 1; profile_data.mode = 24;
+    profile_data.width = 2560; profile_data.height = 1920; profile_data.stride = 3200;
+    cam_native_capture();
+    CHECK(ANNIBALE_CAM_CAPTURE_HAS_FRAME(&cam_capture));
+    CHECK(last_rup_aup == 0x300030u && !wm1_cache_written);
+    CHECK(regs[0x600 / 4] != 0 && regs[0x1800 / 4] == 1u && cam_eeprom_valid);
+    CHECK((pd_flushed_slots & 1u) != 0);
+    /* Legacy caller reads header + main_bytes only. */
+    size_t main_len = sizeof(struct annibale_camera_frame) + 3200u * 1920u;
+    struct uio u_legacy = { .next = output, .residual = (user_ssize_t)main_len };
+    CHECK(cam_native_read(&u_legacy) == 0 && u_legacy.residual == 0);
+    const struct annibale_camera_frame *pf = (const struct annibale_camera_frame *)output;
+    CHECK((pf->pd_flags & ANNIBALE_CAM_PD_VALID) != 0 && pf->pd_width == 2560u &&
+          pf->pd_height == 480u && pf->pd_stride == 3200u && pf->pd_bytes == 3200u * 480u);
+    /* PD-aware caller reads header + main_bytes + pd_bytes. */
+    uint8_t *big = malloc(main_len + 3200u * 480u);
+    CHECK(big != NULL);
+    struct uio u_pd = { .next = big, .residual = (user_ssize_t)(main_len + 3200u * 480u) };
+    CHECK(cam_native_read(&u_pd) == 0 && u_pd.residual == 0);
+    CHECK(big[main_len] == 0x70u && big[main_len + 3200u * 480u - 1u] == 0x70u);
+    free(big);
+    /* Paged CAMIOC_G_EEPROM ioctl returns cached bytes across pages. */
+    struct annibale_camera_eeprom er = { .offset = 0, .length = ANNIBALE_CAM_EEPROM_CHUNK };
+    CHECK(cam_native_eeprom_ioctl(&er) == 0 && (er.flags & ANNIBALE_CAM_EEPROM_FLAG_VALID) != 0);
+    CHECK(er.total_bytes == CAM_EEPROM_CACHE_BYTES && er.length == ANNIBALE_CAM_EEPROM_CHUNK);
+    CHECK(er.data[0x0001u] == 0x10u && er.data[0x002du] == 0x02u && er.data[0x002eu] == 0xa4u);
+    er.offset = 0x1800u; er.length = ANNIBALE_CAM_EEPROM_CHUNK;
+    CHECK(cam_native_eeprom_ioctl(&er) == 0 && er.length == 0x40u);
+    /* Stuck WM1 FIFO blocks clean close and holds resources. */
+    stuck_wm1_fifo = true;
+    CHECK(annibale_cam_close(0, 0, 0, NULL) == 0);
+    CHECK(cam_capture.state == ANNIBALE_CAM_CAPTURE_HELD);
+    cases++;
+
+    /* EEPROM read failure on CCI0 M1 resets/recovers CCI so main stream still captures cleanly. */
+    reset_fixture();
+    boot_cam_keep_stream = 1;
+    wide_chip_id = WIDE_SENSOR_ID_EXPECTED; wide_slave_addr = 0x10; wide_bus_mode = 1;
+    profile_data.sensor = 1; profile_data.mode = 24;
+    profile_data.width = 2560; profile_data.height = 1920; profile_data.stride = 3200;
+    fail_eeprom_read = true;
+    cam_native_capture();
+    CHECK(ANNIBALE_CAM_CAPTURE_HAS_FRAME(&cam_capture));
+    CHECK(!cam_eeprom_valid && cci_inits == 1u && cci_ready);
+    struct annibale_camera_eeprom er_empty = { .offset = 0, .length = ANNIBALE_CAM_EEPROM_CHUNK };
+    CHECK(cam_native_eeprom_ioctl(&er_empty) == 0 && er_empty.total_bytes == 0 && er_empty.flags == 0);
     CHECK(annibale_cam_close(0, 0, 0, NULL) == 0);
     cases++;
 

@@ -164,6 +164,8 @@ rw_g31_trace_draw(AnnibaleMetalRenderPipeline *pipeline, id const *color, unsign
 	         tex_buf, sc_buf, pipe_name != NULL ? pipe_name : "(none)");
 }
 
+#include "annibalemetal_g32_probe.inc"
+
 @implementation AnnibaleMetalRenderEncoder {
 	AnnibaleMetalCommandBuffer *_commandBuffer;   /* not retained: it owns the encoder */
 	AnnibaleMetalRenderPipeline *_pipeline;
@@ -634,6 +636,9 @@ rw_bind_slot(id *slots, unsigned *count, id object, NSUInteger index)
 		                  _fragmentTextures, _fragmentTextureCount,
 		                  _vertexTextures, _vertexTextureCount,
 		                  _hasScissorRect ? _scissorRect : NULL);
+	}
+	if (__builtin_expect(rw_g32_probe_limit() != 0, 0)) {
+		rw_g32_probe_draw(_pipeline, work);
 	}
 	[_commandBuffer recordWork:work];
 	[work release];

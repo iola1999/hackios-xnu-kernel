@@ -971,16 +971,22 @@ struct gem_close { uint32_t handle, pad; };
       baseInstance:(NSUInteger)baseInstance;
 @end
 
+struct rw_g32_vattr_meta;
+
 @interface AnnibaleMetalRenderPipeline : _MTLRenderPipelineState {
 	AnnibaleMetalDevice *_owner;
 	struct rwa_render *_render;
 	struct rwa_render_info _info;
 	struct rwa_color_blend _colorBlend[8];
+	NSString *_vertexName;
 	NSString *_fragmentName;
+	unsigned _vattrMeta[4][4]; /* [attr 0..3] = { format, offset, buffer_index, stride } */
 }
 - (struct rwa_render *)render;
 - (const struct rwa_color_blend *)colorBlendAtIndex:(unsigned)index;
+- (NSString *)vertexFunctionName;
 - (NSString *)fragmentFunctionName;
+- (const struct rw_g32_vattr_meta *)vertexAttrMeta:(unsigned)index;
 /* Not part of any Metal protocol: whether this pipeline's fragment shader stores to
  * [[depth]], which only whoever read the shader knows. A pass without a depth attachment
  * drops those writes -- Metal's own behaviour -- and a draw that says so is the difference

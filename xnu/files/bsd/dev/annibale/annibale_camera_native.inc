@@ -73,6 +73,8 @@ static uint64_t cam_native_slot_address[2];
 static uint32_t cam_native_sof_ms, cam_native_overflow_ms, cam_native_overflow_stale;
 static uint32_t cam_native_wait_spun;   /* the wait loop's own microseconds where it last looked */
 
+#include "annibale_camera_pdaf.inc"
+
 /*
  * Errors after which no comp_done can arrive. The sensor is stopped and CSID is reset globally;
  * the disabled path and writer and the empty FIFO then end the DMA in place of comp_done.
@@ -174,7 +176,7 @@ cam_native_buffer(void)
 		cam_native_slot_address[slot] = first;
 	}
 	cam_capture.dma_address = cam_native_slot_address[0];
-	return true;
+	return cam_native_pd_buffer_check();
 }
 
 static bool cam_native_finish(bool abandon);
@@ -207,6 +209,7 @@ cam_native_release(void)
 		csid_wr(CAM980_RX_CFG1, 0);
 		csid_wr(CAM980_PATH_CFG0, 0);
 		csid_wr(CAM980_WM_CFG, 0);
+		cam_native_pd_disable_regs();
 		cam_native_path_configured = false;
 	}
 	if (!cam_smmu_release()) {
@@ -274,6 +277,7 @@ cam_native_prepare(void)
 	    !cam_native_register_table(1u, cam_profile->mode_count)) {
 		return EIO;
 	}
+	cam_native_eeprom_load();
 	cam_native_lens_up();
 	cam_native_initialized = true;
 	return 0;
@@ -349,7 +353,8 @@ cam_native_configure(void)
 	return reg_rd(csid_lite_base, CAM980_PATH_CFG0) == (path | (1u << 31)) &&
 	       reg_rd(csid_lite_base, CAM980_WM_IMAGE_CFG0) ==
 	       ((cam_profile->height << 16) | (cam_profile->stride / 16u)) &&
-	       reg_rd(csid_lite_base, CAM980_WM_IMAGE_CFG2) == cam_profile->stride;
+	       reg_rd(csid_lite_base, CAM980_WM_IMAGE_CFG2) == cam_profile->stride &&
+	       cam_native_pd_configure();
 }
 
 static int
@@ -380,6 +385,7 @@ cam_native_wait_frame(void)
 			}
 			cam_capture.flags |= ANNIBALE_CAM_CAPTURE_ADDR_MATCH;
 			cam_capture.time = mach_absolute_time();
+			cam_native_pd_check_done(buf, top);
 			return (cam_capture.rx_irq & CAM980_RX_FATAL) != 0 ||
 			       (cam_capture.path_irq & CAM980_PATH_FATAL) != 0 ? EIO : 0;
 		}
@@ -424,7 +430,8 @@ cam_native_finish(bool abandon)
 	cam_capture.wm_cfg = reg_rd(csid_lite_base, CAM980_WM_CFG);
 	if (reg_rd(csid_lite_base, CAM980_RX_CFG0) != 0 || reg_rd(csid_lite_base, CAM980_RX_CFG1) != 0 ||
 	    reg_rd(csid_lite_base, CAM980_PATH_CFG0) != 0 || cam_capture.wm_cfg != 0 ||
-	    !cam_poll(csid_lite_base, CAM980_WM_FIFO, UINT32_MAX, 0, 100000u)) {
+	    !cam_poll(csid_lite_base, CAM980_WM_FIFO, UINT32_MAX, 0, 100000u) ||
+	    !cam_native_pd_stop_and_drain()) {
 		return false;
 	}
 	cam_capture.fifo_count = reg_rd(csid_lite_base, CAM980_WM_FIFO);
@@ -441,7 +448,7 @@ cam_native_finish(bool abandon)
 	cam_native_submitted = false;
 	cam_native_path_configured = false;
 	csid_wr(CAM980_BUF_MASK, 0);
-	csid_wr(CAM980_BUF_CLEAR, CAM980_RDI0_DONE);
+	csid_wr(CAM980_BUF_CLEAR, CAM980_RDI0_DONE | CAM980_RDI1_DONE);
 	csid_wr(CAM980_RX_MASK, 0);
 	csid_wr(CAM980_PATH_MASK, 0);
 	csid_wr(CAM980_TOP_MASK, 0);
@@ -514,11 +521,13 @@ cam_native_stream_advance(void)
 	uint32_t finished = cam_native_writing;
 
 	cam_native_writing = finished ^ 1u;
-	csid_wr(CAM980_BUF_CLEAR, CAM980_RDI0_DONE);
+	csid_wr(CAM980_BUF_CLEAR, CAM980_RDI0_DONE | (cam_native_pd_configured ? CAM980_RDI1_DONE : 0u));
 	csid_wr(CAM980_IRQ_COMMAND, 1u);
 	csid_wr(CAM980_WM_ADDRESS, (uint32_t)(cam_native_slot_address[cam_native_writing] >> 8));
-	csid_wr(CAM980_RUP_AUP, 0x100010u);
+	cam_native_pd_queue_next(cam_native_writing);
+	csid_wr(CAM980_RUP_AUP, cam_native_pd_rup_aup());
 	FlushPoC_DcacheRegion(cam_native_slot_base(finished), cam_native_dma_bytes);
+	cam_native_pd_finish_slot(finished);
 	cam_native_ready = finished;
 	cam_capture.dma_address = cam_native_slot_address[finished];
 	cam_capture.state = ANNIBALE_CAM_CAPTURE_STREAMING;
@@ -665,6 +674,7 @@ cam_native_capture(void)
 			bzero((void *)cam_native_slot_base(slot), cam_native_dma_bytes);
 			FlushPoC_DcacheRegion(cam_native_slot_base(slot), cam_native_dma_bytes);
 		}
+		cam_native_pd_zero_slots();
 	}
 	if (error == 0 && !cam_native_configure()) {
 		error = EIO;
@@ -691,7 +701,8 @@ cam_native_capture(void)
 #endif
 	csid_wr(CAM980_WM_ADDRESS, (uint32_t)(cam_native_slot_address[0] >> 8));
 	csid_wr(CAM980_WM_CFG, 1u);
-	csid_wr(CAM980_RUP_AUP, 0x100010u);
+	cam_native_pd_arm_first();
+	csid_wr(CAM980_RUP_AUP, cam_native_pd_rup_aup());
 	csid_wr(CAM980_PATH_CONTROL, 1u);
 #ifdef KERNEL
 	ml_set_interrupts_enabled(arm_istate);
@@ -716,6 +727,7 @@ cam_native_capture(void)
 	cam_native_end(error);
 	if (cam_capture.state == ANNIBALE_CAM_CAPTURE_STOPPED) {
 		cam_native_ready = 0;
+		cam_native_pd_ready_flags = cam_native_pd_frame_flags;
 		cam_capture.sequence = sequence + 1u;
 		cam_hw_dma_verified = true;
 	}

@@ -559,6 +559,73 @@ cci0_m1_read16(uint8_t slave7, uint16_t reg, uint16_t *out_val)
 }
 
 static bool
+cci0_m1_read_bytes(uint8_t slave7, uint16_t reg, uint8_t *out, uint32_t count)
+{
+	if (!cci_ready || cci0_base == 0 || out == NULL || count == 0 || count > 15u) {
+		return false;
+	}
+	reg_wr(cci0_base, CCI_IRQ_CLEAR_0, 0xffffffffu);
+	reg_wr(cci0_base, CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
+
+	uint32_t stale = reg_rd(cci0_base, CCI_I2C_M1_READ_BUF_LEVEL);
+	if (stale > 64u) {
+		cci_ready = false;
+		return false;
+	}
+	for (uint32_t i = 0; i < stale; i++) {
+		(void)reg_rd(cci0_base, CCI_I2C_M1_READ_DATA);
+	}
+	if (reg_rd(cci0_base, CCI_I2C_M1_READ_BUF_LEVEL) != 0) {
+		cci_ready = false;
+		return false;
+	}
+
+	uint32_t set_param = 0x01u | ((uint32_t)(slave7 & 0x7fu) << 4) | (1u << 16);
+	uint32_t wr_addr = 0x09u | (2u << 4) | (((uint32_t)(reg >> 8) & 0xffu) << 8) |
+	    (((uint32_t)reg & 0xffu) << 16);
+	uint32_t rd_cmd = 0x0au | (count << 4);
+	uint32_t rep_cmd = 0x108u;
+
+	reg_wr(cci0_base, CCI_I2C_M1_Q0_EXEC_WORD_CNT, 4u);
+	reg_wr(cci0_base, CCI_I2C_M1_Q0_LOAD_DATA, set_param);
+	reg_wr(cci0_base, CCI_I2C_M1_Q0_LOAD_DATA, wr_addr);
+	reg_wr(cci0_base, CCI_I2C_M1_Q0_LOAD_DATA, rd_cmd);
+	reg_wr(cci0_base, CCI_I2C_M1_Q0_LOAD_DATA, rep_cmd);
+	reg_wr(cci0_base, CCI_I2C_M1_Q0_CTRL, 0u);
+	reg_wr(cci0_base, CCI_QUEUE_START, (1u << 2));
+
+	uint32_t expected_words = (count + 1u + 3u) / 4u;
+	bool ok = false;
+	for (uint32_t i = 0; i < 400u; i++) {
+		uint32_t irq = reg_rd(cci0_base, CCI_IRQ_STATUS_0);
+		if (irq == UINT32_MAX || (irq & CCI_IRQ_M1_ERROR) != 0) {
+			break;
+		}
+		if ((irq & (CCI_IRQ_M1_RD_DONE | CCI_IRQ_M1_Q0_REPORT)) ==
+		    (CCI_IRQ_M1_RD_DONE | CCI_IRQ_M1_Q0_REPORT)) {
+			uint32_t level = reg_rd(cci0_base, CCI_I2C_M1_READ_BUF_LEVEL);
+			if (level == expected_words) {
+				uint32_t byte_idx = 0;
+				for (uint32_t w = 0; w < expected_words; w++) {
+					uint32_t raw = reg_rd(cci0_base, CCI_I2C_M1_READ_DATA);
+					uint32_t start_lane = (w == 0) ? 1u : 0u; /* lane 0 of word 0 is SID */
+					for (uint32_t lane = start_lane; lane < 4u && byte_idx < count; lane++) {
+						out[byte_idx++] = (uint8_t)((raw >> (lane * 8u)) & 0xffu);
+					}
+				}
+				ok = (byte_idx == count);
+			}
+			break;
+		}
+		delay_for_interval(10, NSEC_PER_USEC);
+	}
+	if (!ok) {
+		cci_ready = false;
+	}
+	return ok;
+}
+
+static bool
 cci0_m1_write_bytes(uint8_t slave7, uint8_t b0, uint8_t b1, uint8_t b2, uint32_t len)
 {
 	if (!cci_ready || cci0_base == 0 || len < 2 || len > 3) {
@@ -722,6 +789,31 @@ od_i2c_read16_reg16(uint32_t sda_pin, uint32_t scl_pin, uint8_t slave7, uint16_t
 	if (ok) {
 		*out_val = (uint16_t)(((uint16_t)hi << 8) | lo);
 	}
+	return ok;
+}
+
+static bool
+od_i2c_read_bytes(uint32_t sda_pin, uint32_t scl_pin, uint8_t slave7, uint16_t reg, uint8_t *out, uint32_t count)
+{
+	if (out == NULL || count == 0 || !od_i2c_start(sda_pin, scl_pin)) {
+		return false;
+	}
+	if (!od_i2c_tx_byte(sda_pin, scl_pin, (uint8_t)((slave7 << 1) | 0u)) ||
+	    !od_i2c_tx_byte(sda_pin, scl_pin, (uint8_t)(reg >> 8)) ||
+	    !od_i2c_tx_byte(sda_pin, scl_pin, (uint8_t)(reg & 0xffu)) ||
+	    !od_i2c_start(sda_pin, scl_pin) ||
+	    !od_i2c_tx_byte(sda_pin, scl_pin, (uint8_t)((slave7 << 1) | 1u))) {
+		od_i2c_stop(sda_pin, scl_pin);
+		return false;
+	}
+	bool ok = true;
+	for (uint32_t i = 0; i < count; i++) {
+		if (!od_i2c_rx_byte(sda_pin, scl_pin, i + 1u < count, &out[i])) {
+			ok = false;
+			break;
+		}
+	}
+	od_i2c_stop(sda_pin, scl_pin);
 	return ok;
 }
 

@@ -784,6 +784,16 @@ annibale_cam_ioctl(dev_t dev __unused, u_long cmd, caddr_t data, int flags __unu
 		lck_mtx_unlock(cam_lock);
 		return 0;
 	}
+	case CAMIOC_G_EEPROM: {
+		struct annibale_camera_eeprom *req = (struct annibale_camera_eeprom *)data;
+		if (req == NULL) {
+			return EINVAL;
+		}
+		lck_mtx_lock(cam_lock);
+		int err = cam_native_eeprom_ioctl(req);
+		lck_mtx_unlock(cam_lock);
+		return err;
+	}
 	default:
 		return ENOTTY;
 	}
@@ -948,12 +958,18 @@ annibale_camera_return_quiesce(void)
 		csid_wr(CAM980_IRQ_COMMAND, 1u);
 		csid_wr(CAM980_PATH_CFG0, 0);
 		csid_wr(CAM980_WM_CFG, 0);
+		csid_wr(CAM980_RDI1_PATH_CFG0, 0);
+		csid_wr(CAM980_WM1_CFG, 0);
 		if (reg_rd(csid_lite_base, CAM980_RX_CFG0) != 0 ||
 		    reg_rd(csid_lite_base, CAM980_PATH_CFG0) != 0 ||
 		    reg_rd(csid_lite_base, CAM980_WM_CFG) != 0 ||
-		    !cam_return_poll(csid_lite_base, CAM980_WM_FIFO, UINT32_MAX, 0, 50000u)) {
+		    reg_rd(csid_lite_base, CAM980_RDI1_PATH_CFG0) != 0 ||
+		    reg_rd(csid_lite_base, CAM980_WM1_CFG) != 0 ||
+		    !cam_return_poll(csid_lite_base, CAM980_WM_FIFO, UINT32_MAX, 0, 50000u) ||
+		    !cam_return_poll(csid_lite_base, CAM980_WM1_FIFO, UINT32_MAX, 0, 50000u)) {
 			return false;
 		}
+		cam_native_pd_configured = false;
 		cam_native_submitted = false;
 		cam_native_path_configured = false;
 	}
@@ -1035,6 +1051,7 @@ annibale_camera_init(void)
 	(void)PE_parse_boot_argn("cam_rt_mhz", &boot_cam_rt_mhz, sizeof(boot_cam_rt_mhz));
 	(void)PE_parse_boot_argn("cam_probe", &boot_cam_probe, sizeof(boot_cam_probe));
 	(void)PE_parse_boot_argn("cam_keep_stream", &boot_cam_keep_stream, sizeof(boot_cam_keep_stream));
+	(void)PE_parse_boot_argn("cam_pdaf", &boot_cam_pdaf, sizeof(boot_cam_pdaf));
 	(void)PE_parse_boot_argn("cam_wm_prefetch", &boot_cam_wm_prefetch, sizeof(boot_cam_wm_prefetch));
 	if (PE_parse_boot_argn("cam", &cam_arg, sizeof(cam_arg))) {
 		if (cam_arg == 0) {

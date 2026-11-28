@@ -93,7 +93,14 @@ cam_profile_install(struct annibale_camera_profile *profile)
 }
 
 /* The two frame buffers of the region: the slot the writer has, and the one last finished. */
-static uint32_t cam_native_writing, cam_native_ready;
+#define CAM_NATIVE_PD_OFFSET    0x600000u   /* 6 MiB inside 8 MiB CAMERA_SLOT_SIZE */
+#define CAM_NATIVE_PD_WIDTH     2560u
+#define CAM_NATIVE_PD_HEIGHT    480u
+#define CAM_NATIVE_PD_STRIDE    3200u       /* 2560 * 10 / 8 (MIPI RAW10) */
+#define CAM_NATIVE_PD_BYTES     (CAM_NATIVE_PD_STRIDE * CAM_NATIVE_PD_HEIGHT)
+#define CAM_NATIVE_PD_DMA_BYTES ((CAM_NATIVE_PD_BYTES + 511u) & ~511u)
+
+static uint32_t cam_native_writing, cam_native_ready, cam_native_pd_ready_flags;
 
 static vm_offset_t
 cam_native_slot_base(uint32_t slot)
@@ -124,11 +131,23 @@ cam_native_read(struct uio *uio)
 	frame.frame_lines = cam_profile->frame_length;
 	frame.sensor = cam_profile->sensor;
 	frame.focus = ANNIBALE_CAMERA_NO_FOCUS;
+	if ((cam_native_pd_ready_flags & ANNIBALE_CAM_PD_VALID) != 0) {
+		frame.pd_width = CAM_NATIVE_PD_WIDTH;
+		frame.pd_height = CAM_NATIVE_PD_HEIGHT;
+		frame.pd_stride = CAM_NATIVE_PD_STRIDE;
+		frame.pd_bytes = CAM_NATIVE_PD_BYTES;
+	}
+	frame.pd_flags = cam_native_pd_ready_flags;
 	cam_native_frame_exposure(cam_profile, &frame);
 	int error = uiomove((caddr_t)&frame, sizeof(frame), uio);
 	user_ssize_t bytes = MIN(uio_resid(uio), (user_ssize_t)cam_capture.bytes);
 	if (error == 0 && bytes > 0) {
 		error = uiomove((caddr_t)cam_native_slot_base(cam_native_ready), (int)bytes, uio);
+	}
+	if (error == 0 && (cam_native_pd_ready_flags & ANNIBALE_CAM_PD_VALID) != 0 && uio_resid(uio) > 0) {
+		user_ssize_t pd_copy = MIN(uio_resid(uio), (user_ssize_t)CAM_NATIVE_PD_BYTES);
+		error = uiomove((caddr_t)(cam_native_slot_base(cam_native_ready) + CAM_NATIVE_PD_OFFSET),
+		    (int)pd_copy, uio);
 	}
 	return error;
 }

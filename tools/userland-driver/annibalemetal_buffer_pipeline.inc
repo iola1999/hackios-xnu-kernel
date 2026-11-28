@@ -427,8 +427,35 @@
 	_owner = [device retain];
 	_render = render;
 	_info = *info;
+	id vert = descriptor != nil ? [descriptor vertexFunction] : nil;
+	_vertexName = vert != nil ? [[vert name] copy] : nil;
 	id frag = descriptor != nil ? [descriptor fragmentFunction] : nil;
 	_fragmentName = frag != nil ? [[frag name] copy] : nil;
+	id vdesc = descriptor != nil ? [descriptor vertexDescriptor] : nil;
+	if (vdesc != nil) {
+		id attrs = [vdesc attributes];
+		id layouts = [vdesc layouts];
+		for (unsigned i = 0; i < 4; i++) {
+			id a = attrs != nil ? [attrs objectAtIndexedSubscript:i] : nil;
+			if (a == nil) {
+				continue;
+			}
+			unsigned fmt = (unsigned)[a format];
+			unsigned off = (unsigned)[a offset];
+			unsigned bi = (unsigned)[a bufferIndex];
+			unsigned st = 0;
+			if (fmt != 0 && layouts != nil && bi < RW_MAX_BUFFERS) {
+				id l = [layouts objectAtIndexedSubscript:bi];
+				if (l != nil) {
+					st = (unsigned)[l stride];
+				}
+			}
+			_vattrMeta[i][0] = fmt;
+			_vattrMeta[i][1] = off;
+			_vattrMeta[i][2] = bi;
+			_vattrMeta[i][3] = st;
+		}
+	}
 	for (unsigned i = 0; i < 8; i++) {
 		MTLRenderPipelineColorAttachmentDescriptor *att = descriptor != nil ?
 		    [[descriptor colorAttachments] objectAtIndexedSubscript:i] : nil;
@@ -469,6 +496,7 @@
 	if (_render != NULL) {
 		rw_pipe_release(_render);
 	}
+	[_vertexName release];
 	[_fragmentName release];
 	[_owner release];
 	[super dealloc];
@@ -479,7 +507,12 @@
 {
 	return index < 8 ? &_colorBlend[index] : NULL;
 }
+- (NSString *)vertexFunctionName { return _vertexName; }
 - (NSString *)fragmentFunctionName { return _fragmentName; }
+- (const struct rw_g32_vattr_meta *)vertexAttrMeta:(unsigned)index
+{
+	return index < 4 ? (const struct rw_g32_vattr_meta *)_vattrMeta[index] : NULL;
+}
 - (BOOL)writesDepth           { return _info.fragment_writes_depth != 0; }
 - (unsigned)vertexStreamMask  { return _info.vertex_stream_mask; }
 - (unsigned)vertexStreamCount { return _info.vertex_streams; }

@@ -51,6 +51,7 @@ static uint32_t g_psci_idle_arg = 0;
 static uint32_t g_psci_cl5_arg = 0;
 static int64_t g_psci_ver = 0x00010001LL;
 static int64_t g_psci_feat = 0x3LL;
+static int64_t g_psci_mode_feat = 0;
 static int64_t g_psci_set_mode_ret = 0;
 static int64_t g_psci_suspend_ret = 0;
 static int64_t (*g_suspend_hook)(uint64_t power_state);
@@ -91,7 +92,7 @@ static void gic_v3_signal_kinds(int cpu, uint32_t kinds[GIC_SIGNAL_KINDS]) {
 
 #define PSCI_VERSION            0x84000000u
 #define PSCI_FEATURES           0x8400000Au
-#define PSCI_SET_SUSPEND_MODE   0x8400000Eu
+#define PSCI_SET_SUSPEND_MODE   0x8400000Fu
 #define PSCI_SUSPEND_MODE_OSI   1u
 #define PSCI_CPU_SUSPEND        0xC4000001u
 #define PSCI_RET_DENIED         (-3)
@@ -120,6 +121,7 @@ static uint64_t psci_cl5_err_count[MAX_CPUS];
 static int64_t psci_call(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3) {
     if (fn == PSCI_VERSION) return g_psci_ver;
     if (fn == PSCI_FEATURES && a1 == PSCI_CPU_SUSPEND) return g_psci_feat;
+    if (fn == PSCI_FEATURES && a1 == PSCI_SET_SUSPEND_MODE) return g_psci_mode_feat;
     if (fn == PSCI_SET_SUSPEND_MODE) {
         g_set_mode_calls++;
         g_last_suspend_mode = a1;
@@ -166,6 +168,7 @@ static void reset_state(void) {
     g_last_suspend_mode = 999;
     g_psci_ver = 0x00010001LL;
     g_psci_feat = 0x3LL;
+    g_psci_mode_feat = 0;
     g_psci_set_mode_ret = 0;
     g_psci_suspend_ret = 0;
     g_suspend_hook = NULL;
@@ -275,7 +278,7 @@ int main(void) {
     assert(g_set_mode_calls == 0 && psci_idle_enabled && !psci_cl5_enabled);
 
     reset_state();
-    g_psci_idle_arg = 1; g_psci_cl5_arg = 1; g_psci_set_mode_ret = -1;
+    g_psci_idle_arg = 1; g_psci_cl5_arg = 1; g_psci_set_mode_ret = 0xfffffffdLL; /* zero-extended w0 (-3) */
     psci_smp_init();
     assert(g_set_mode_calls == 1 && g_last_suspend_mode == PSCI_SUSPEND_MODE_OSI);
     assert(psci_idle_enabled && !psci_cl5_enabled);
@@ -312,8 +315,8 @@ int main(void) {
     psci_smp_cpu_idle();
     assert(g_last_power_state == PSCI_C4_STATE_ID && psci_c4_count[2] == 1 && psci_cl5_count[2] == 0);
 
-    /* 7. Transient PSCI_DENIED (-3) on CL5 falls back to C4 for this entry without disabling CL5 or C4. */
-    g_hook_stage = 0; g_hook_cpu1_pop_us = 15000ULL; g_hook_cl5_ret = PSCI_RET_DENIED;
+    /* 7. Transient PSCI_DENIED (-3, including zero-extended w0 0xfffffffd) on CL5 falls back to C4 without disabling CL5 or C4. */
+    g_hook_stage = 0; g_hook_cpu1_pop_us = 15000ULL; g_hook_cl5_ret = 0xfffffffdLL;
     g_suspend_hook = peer_enter_hook;
     g_cur_cpu = 0; g_cpus[0].rtcPop = g_now + 20000000ULL;
     psci_smp_cpu_idle();

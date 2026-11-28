@@ -61,19 +61,20 @@ def main():
         "release-immediate-reset": ("if (!cam_native_reset(true)) {", "if (!cam_native_reset(false)) {"),
         "dma-range": ("cam_native_dma_bytes > (1ULL << 36) - first", "false"),
         "contiguity": ("kvtophys(base + offset) != first + offset", "false"),
-        "stream-next-address": ("\tcsid_wr(CAM980_WM_ADDRESS, (uint32_t)(cam_native_slot_address[cam_native_writing] >> 8));\n\tcsid_wr(CAM980_RUP_AUP, 0x100010u);\n\tFlushPoC", "\tcsid_wr(CAM980_RUP_AUP, 0x100010u);\n\tFlushPoC"),
-        "stream-register-update": ("\tcsid_wr(CAM980_RUP_AUP, 0x100010u);\n\tFlushPoC", "\tFlushPoC"),
+        "stream-next-address": ("\tcsid_wr(CAM980_WM_ADDRESS, (uint32_t)(cam_native_slot_address[cam_native_writing] >> 8));\n\tcam_native_pd_queue_next(cam_native_writing);\n\tcsid_wr(CAM980_RUP_AUP, cam_native_pd_rup_aup());\n\tFlushPoC", "\tcam_native_pd_queue_next(cam_native_writing);\n\tcsid_wr(CAM980_RUP_AUP, cam_native_pd_rup_aup());\n\tFlushPoC"),
+        "stream-register-update": ("\tcsid_wr(CAM980_RUP_AUP, cam_native_pd_rup_aup());\n\tFlushPoC", "\tFlushPoC"),
         "stream-other-slot": ("cam_native_writing = finished ^ 1u;", "cam_native_writing = finished;"),
         "stream-flush": ("\tFlushPoC_DcacheRegion(cam_native_slot_base(finished), cam_native_dma_bytes);\n", ""),
-        "stream-done-clear": ("\tcsid_wr(CAM980_BUF_CLEAR, CAM980_RDI0_DONE);\n\tcsid_wr(CAM980_IRQ_COMMAND, 1u);\n\tcsid_wr(CAM980_WM_ADDRESS", "\tcsid_wr(CAM980_WM_ADDRESS"),
+        "stream-done-clear": ("\tcsid_wr(CAM980_BUF_CLEAR, CAM980_RDI0_DONE | (cam_native_pd_configured ? CAM980_RDI1_DONE : 0u));\n\tcsid_wr(CAM980_IRQ_COMMAND, 1u);\n\tcsid_wr(CAM980_WM_ADDRESS", "\tcsid_wr(CAM980_WM_ADDRESS"),
         "abandoned-frame": ("bool stopped = sensor_off && (abandon || cam_native_recoverable(cam_capture.error));", "bool stopped = sensor_off && ((abandon && false) || cam_native_recoverable(cam_capture.error));"),
     }
     with tempfile.TemporaryDirectory(prefix="annibale-camera-native-") as temp:
         directory = Path(temp)
         (directory / "sys").mkdir()
-        (directory / "sys/ioccom.h").write_text("#define _IOR(g, n, t) 0\n")
+        (directory / "sys/ioccom.h").write_text("#define _IOR(g, n, t) 0\n#define _IOWR(g, n, t) 0\n")
         shutil.copyfile(ROOT / "xnu/files/bsd/sys/annibale_camera.h", directory / "annibale_camera.h")
         shutil.copyfile(DRIVER / "annibale_camera_exposure.inc", directory / "annibale_camera_exposure.inc")
+        shutil.copyfile(DRIVER / "annibale_camera_pdaf.inc", directory / "annibale_camera_pdaf.inc")
         (directory / "fixture.c").write_text("#include <errno.h>\n" + constants + "\n" + FIXTURE.read_text())
         (directory / "annibale_camera_clock.inc").write_text(function(clock, "cam_poll"))
         (directory / "annibale_camera_phy.inc").write_text("")

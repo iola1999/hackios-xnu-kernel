@@ -55,7 +55,7 @@
 #define PSCI_CPU_ON             0xC4000003u
 #define PSCI_AFFINITY_INFO      0xC4000004u
 #define PSCI_FEATURES           0x8400000Au
-#define PSCI_SET_SUSPEND_MODE   0x8400000Eu
+#define PSCI_SET_SUSPEND_MODE   0x8400000Fu
 #define PSCI_SUSPEND_MODE_OSI   1u
 #define PSCI_CPU_SUSPEND        0xC4000001u
 #define PSCI_RET_DENIED         (-3)
@@ -123,7 +123,7 @@ psci_call(uint64_t function, uint64_t arg1, uint64_t arg2, uint64_t arg3)
 		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3) : :
                     "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17");
 	}
-	return (int64_t)x0;
+	return (int64_t)(int32_t)(uint32_t)x0;
 }
 
 static const char *
@@ -179,14 +179,18 @@ psci_smp_init(void)
 				    &psci_c4_min_ticks[1]);
 				os_atomic_store(&psci_idle_enabled, true, release);
 				if (want_cl5 && (f & 1u) != 0u && (f & 2u) != 0u) {
-					int64_t mode_ret = psci_call(PSCI_SET_SUSPEND_MODE, PSCI_SUSPEND_MODE_OSI, 0, 0);
+					int64_t mode_feat = (int32_t)psci_call(PSCI_FEATURES, PSCI_SET_SUSPEND_MODE, 0, 0);
+					int64_t mode_ret = (int32_t)psci_call(PSCI_SET_SUSPEND_MODE, PSCI_SUSPEND_MODE_OSI, 0, 0);
+					printf("psci: set_suspend_mode feat=%lld (%s) ret=%lld (%s)\n",
+					    (long long)mode_feat, mode_feat >= 0 ? "supported" : psci_error(mode_feat),
+					    (long long)mode_ret, psci_error(mode_ret));
 					if (mode_ret == 0) {
 						nanoseconds_to_absolutetime((uint64_t)PSCI_CL5_MIN_RES_C1_US * NSEC_PER_USEC,
 						    &psci_cl5_min_ticks);
 						os_atomic_store(&psci_cl5_enabled, true, release);
 					} else {
 						printf("psci: SET_SUSPEND_MODE(OSI) failed: %lld (%s); psci_cl5=0\n",
-						    mode_ret, psci_error(mode_ret));
+						    (long long)mode_ret, psci_error(mode_ret));
 					}
 				}
 			}
@@ -288,7 +292,7 @@ psci_smp_cpu_idle(void)
 		}
 	}
 
-	int64_t status = psci_call(PSCI_CPU_SUSPEND, state_id, 0, 0);
+	int64_t status = (int32_t)psci_call(PSCI_CPU_SUSPEND, state_id, 0, 0);
 	if (try_cl5 && status != 0) {
 		if (status == PSCI_RET_DENIED) {
 			if (cpu >= 0 && cpu < MAX_CPUS) {
@@ -306,7 +310,7 @@ psci_smp_cpu_idle(void)
 		now = mach_absolute_time();
 		if (pop > now && (pop - now) >= psci_c4_min_ticks[cluster]) {
 			try_cl5 = false;
-			status = psci_call(PSCI_CPU_SUSPEND, PSCI_C4_STATE_ID, 0, 0);
+			status = (int32_t)psci_call(PSCI_CPU_SUSPEND, PSCI_C4_STATE_ID, 0, 0);
 		} else {
 			if (c1_tracked) {
 				psci_c1_lock_acquire();
