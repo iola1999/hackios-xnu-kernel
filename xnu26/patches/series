@@ -82,3 +82,6 @@
 80-osfmk%arm64%locore.s.patch
 81-bsd%kern%hvg_sysctl.c.patch
 82-bsd%vfs%vfs_lookup.c.patch
+83-bsd%kern%kern_event.c.patch
+84-osfmk%arm64%loose_ends.c.patch
+85-config%newvers.pl.patch

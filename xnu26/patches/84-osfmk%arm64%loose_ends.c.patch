@@ -1,0 +1,75 @@
+diff --git a/osfmk/arm64/loose_ends.c b/osfmk/arm64/loose_ends.c
+index 2f5845f..218a85e 100644
+--- a/osfmk/arm64/loose_ends.c
++++ b/osfmk/arm64/loose_ends.c
+@@ -134,6 +134,70 @@ bcopy_phys_internal(addr64_t src, addr64_t dst, vm_size_t bytes, int flags)
+ 		char *tmp_src;
+ 		char *tmp_dst;
+ 
++		if (use_copy_window_dst && BCOPY_PHYS_SRC_IS_USER(flags)) {
++			/*
++			 * copyin() may fault on an unmapped user page (e.g. mmap source),
++			 * which vm_fault_internal() rejects with KERN_FAILURE while
++			 * preemption is disabled. Copy into a stack buffer before
++			 * disabling preemption for the per-CPU copy window.
++			 */
++			char bounce[256];
++
++			if (count > count2) {
++				count = count2;
++			}
++			if (count > bytes) {
++				count = bytes;
++			}
++			if (count > sizeof(bounce)) {
++				count = sizeof(bounce);
++			}
++			res = copyin((user_addr_t)src, bounce, count);
++			if (res == KERN_SUCCESS) {
++				mp_disable_preemption();
++				cpu_num = cpu_number();
++				dst_index = pmap_map_cpu_windows_copy(pn_dst, VM_PROT_READ | VM_PROT_WRITE, wimg_bits_dst);
++				tmp_dst = (char *)(pmap_cpu_windows_copy_addr(cpu_num, dst_index) + dst_offset);
++				bcopy(bounce, tmp_dst, count);
++				pmap_unmap_cpu_windows_copy(dst_index);
++				mp_enable_preemption();
++			}
++			src += count;
++			dst += count;
++			bytes -= count;
++			continue;
++		}
++		if (use_copy_window_src && BCOPY_PHYS_DST_IS_USER(flags)) {
++			/*
++			 * Read from the per-CPU copy window under mp_disable_preemption(),
++			 * then copyout() after re-enabling preemption so user write faults
++			 * can be serviced by vm_fault_internal().
++			 */
++			char bounce[256];
++
++			if (count > count2) {
++				count = count2;
++			}
++			if (count > bytes) {
++				count = bytes;
++			}
++			if (count > sizeof(bounce)) {
++				count = sizeof(bounce);
++			}
++			mp_disable_preemption();
++			cpu_num = cpu_number();
++			src_index = pmap_map_cpu_windows_copy(pn_src, VM_PROT_READ, wimg_bits_src);
++			tmp_src = (char *)(pmap_cpu_windows_copy_addr(cpu_num, src_index) + src_offset);
++			bcopy(tmp_src, bounce, count);
++			pmap_unmap_cpu_windows_copy(src_index);
++			mp_enable_preemption();
++			res = copyout(bounce, (user_addr_t)dst, count);
++			src += count;
++			dst += count;
++			bytes -= count;
++			continue;
++		}
++
+ 		if (use_copy_window_src || use_copy_window_dst) {
+ 			mp_disable_preemption();
+ 			cpu_num = cpu_number();

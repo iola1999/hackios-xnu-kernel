@@ -413,6 +413,7 @@ int main(void) {
 
     struct fastrpc_wire_msg init_msg;
     memcpy(&init_msg, g_tx_recs[0].payload, sizeof(init_msg));
+    assert(init_msg.client_id == ADSP_FASTRPC_CLIENT_ID);
     assert(init_msg.handle == ADSP_FASTRPC_INIT_HANDLE);
     assert(init_msg.sc == ADSP_FASTRPC_SCALARS(ADSP_FASTRPC_RMID_INIT_CREATE_STATIC, 3, 0));
     assert((init_msg.addr >> 32) == ADSP_FASTRPC_COMPUTE_SID);
@@ -600,7 +601,7 @@ int main(void) {
     assert(!adsp_fastrpc_assign_heap(0xcdc00000ULL));
     assert(g_tz_call_count == 4u);
 
-    /* 11. sensorspd 0x80000484 falls back to ROOT_PD INIT_ATTACH(0,0,0), then SENSORS_PD INIT_ATTACH_SNS(10,0,0), tracking active_pd. */
+    /* 11. sensorspd 0x80000484 falls back to ROOT_PD INIT_ATTACH(SCALARS(0, 1, 0), pidA=1), tracking active_pd. */
     init_mock_smmu();
     adsp_fastrpc_reset();
     g_tz_succeed_on_idx = 0u;
@@ -615,17 +616,27 @@ int main(void) {
     assert(adsp_fastrpc_stage == FASTRPC_STAGE_WAIT_INIT_STATIC);
     adsp_fastrpc_on_tx_done(g_tx_recs[g_tx_rec_count - 1u].iid, true);
 
-    /* Case 11a: sensorspd returns 0x80000484 -> ROOT_PD INIT_ATTACH succeeds -> listener uses ROOT_PD (0). */
+    /* Case 11a: sensorspd returns 0x80000484 -> ROOT_PD INIT_ATTACH(0,1,0) with pidA=1 succeeds -> listener uses ROOT_PD (0). */
     struct fastrpc_wire_rsp fb_rsp = { .ctx = adsp_fastrpc_inflight_ctx, .retval = (int32_t)0x80000484u };
     feed_adsp_msg(&fb_rsp, sizeof(fb_rsp));
     adsp_fastrpc_service();
     assert(adsp_fastrpc_stage == FASTRPC_STAGE_WAIT_INIT_ROOT);
     struct fastrpc_wire_msg wmsg;
     memcpy(&wmsg, g_tx_recs[g_tx_rec_count - 1u].payload, sizeof(wmsg));
+    assert(wmsg.client_id == ADSP_FASTRPC_CLIENT_ID);
     assert((wmsg.ctx & 0xffu) == ADSP_FASTRPC_ROOT_PD);
     assert(wmsg.handle == ADSP_FASTRPC_INIT_HANDLE);
-    assert(wmsg.sc == ADSP_FASTRPC_SCALARS(ADSP_FASTRPC_RMID_INIT_ATTACH, 0, 0));
-    assert(wmsg.addr == 0ULL && wmsg.size == 0ULL);
+    assert(wmsg.sc == ADSP_FASTRPC_SCALARS(ADSP_FASTRPC_RMID_INIT_ATTACH, 1, 0));
+    assert((wmsg.addr >> 32) == ADSP_FASTRPC_COMPUTE_SID && (wmsg.addr & 0xffffffffULL) == g_fake_buf_pa);
+    assert(wmsg.size == ADSP_FASTRPC_PAGE_SIZE);
+    const struct fastrpc_remote_buf *attach_pra = (const struct fastrpc_remote_buf *)g_invoke_mem;
+    const struct fastrpc_invoke_buf *attach_list = (const struct fastrpc_invoke_buf *)(attach_pra + 1);
+    const struct fastrpc_phy_page *attach_pages = (const struct fastrpc_phy_page *)(attach_list + 1);
+    assert(attach_pra[0].len == sizeof(int32_t) && attach_list[0].num == 1u && attach_list[0].pgidx == 0u);
+    assert((attach_pages[0].addr >> 32) == ADSP_FASTRPC_COMPUTE_SID && attach_pages[0].size == ADSP_FASTRPC_PAGE_SIZE);
+    int32_t pid_a = 0;
+    memcpy(&pid_a, g_invoke_mem + (uint32_t)(attach_pra[0].pv - (((uint64_t)ADSP_FASTRPC_COMPUTE_SID << 32) | g_fake_buf_pa)), sizeof(pid_a));
+    assert(pid_a == 1);
     adsp_fastrpc_on_tx_done(g_tx_recs[g_tx_rec_count - 1u].iid, true);
 
     fb_rsp = (struct fastrpc_wire_rsp){ .ctx = adsp_fastrpc_inflight_ctx, .retval = 0 };
@@ -634,6 +645,7 @@ int main(void) {
     assert(adsp_fastrpc_active_pd == ADSP_FASTRPC_ROOT_PD);
     assert(adsp_fastrpc_stage == FASTRPC_STAGE_WAIT_LISTENER_INIT2);
     memcpy(&wmsg, g_tx_recs[g_tx_rec_count - 1u].payload, sizeof(wmsg));
+    assert(wmsg.client_id == ADSP_FASTRPC_CLIENT_ID);
     assert((wmsg.ctx & 0xffu) == ADSP_FASTRPC_ROOT_PD && wmsg.handle == ADSP_FASTRPC_LISTENER_HANDLE);
     adsp_fastrpc_on_tx_done(g_tx_recs[g_tx_rec_count - 1u].iid, true);
 
@@ -642,9 +654,10 @@ int main(void) {
     adsp_fastrpc_service();
     assert(adsp_fastrpc_stage == FASTRPC_STAGE_WAIT_LISTENER_NEXT2);
     memcpy(&wmsg, g_tx_recs[g_tx_rec_count - 1u].payload, sizeof(wmsg));
+    assert(wmsg.client_id == ADSP_FASTRPC_CLIENT_ID);
     assert((wmsg.ctx & 0xffu) == ADSP_FASTRPC_ROOT_PD && wmsg.handle == ADSP_FASTRPC_LISTENER_HANDLE);
 
-    /* Case 11b: sensorspd fails, ROOT_PD fails -> SENSORS_PD INIT_ATTACH_SNS (method 10) succeeds -> listener uses SENSORS_PD (2). */
+    /* Case 11b: sensorspd fails and ROOT_PD INIT_ATTACH fails -> transitions directly to FASTRPC_STAGE_FAILED. */
     init_mock_smmu();
     adsp_fastrpc_reset();
     g_tx_rec_count = 0;
@@ -652,62 +665,21 @@ int main(void) {
     adsp_fastrpc_on_open_ack(ADSP_FASTRPC_OUR_CID);
     adsp_fastrpc_on_intent(11u, 205u, 512u);
     adsp_fastrpc_on_intent(11u, 206u, 512u);
-    adsp_fastrpc_on_intent(11u, 207u, 512u);
-    adsp_fastrpc_on_intent(11u, 208u, 512u);
-    adsp_fastrpc_on_intent(11u, 209u, 512u);
     adsp_fastrpc_service();
     adsp_fastrpc_on_tx_done(g_tx_recs[g_tx_rec_count - 1u].iid, true);
     fb_rsp = (struct fastrpc_wire_rsp){ .ctx = adsp_fastrpc_inflight_ctx, .retval = (int32_t)0x80000484u };
     feed_adsp_msg(&fb_rsp, sizeof(fb_rsp));
     adsp_fastrpc_service();
     assert(adsp_fastrpc_stage == FASTRPC_STAGE_WAIT_INIT_ROOT);
+    uint32_t tx_before_fail = g_tx_rec_count;
     adsp_fastrpc_on_tx_done(g_tx_recs[g_tx_rec_count - 1u].iid, true);
-
-    fb_rsp = (struct fastrpc_wire_rsp){ .ctx = adsp_fastrpc_inflight_ctx, .retval = (int32_t)0x80000410u };
-    feed_adsp_msg(&fb_rsp, sizeof(fb_rsp));
-    adsp_fastrpc_service();
-    assert(adsp_fastrpc_stage == FASTRPC_STAGE_WAIT_INIT_SNS);
-    memcpy(&wmsg, g_tx_recs[g_tx_rec_count - 1u].payload, sizeof(wmsg));
-    assert((wmsg.ctx & 0xffu) == ADSP_FASTRPC_SENSORS_PD);
-    assert(wmsg.handle == ADSP_FASTRPC_INIT_HANDLE);
-    assert(wmsg.sc == ADSP_FASTRPC_SCALARS(ADSP_FASTRPC_RMID_INIT_ATTACH_SNS, 0, 0));
-    adsp_fastrpc_on_tx_done(g_tx_recs[g_tx_rec_count - 1u].iid, true);
-
-    fb_rsp = (struct fastrpc_wire_rsp){ .ctx = adsp_fastrpc_inflight_ctx, .retval = 0 };
-    feed_adsp_msg(&fb_rsp, sizeof(fb_rsp));
-    adsp_fastrpc_service();
-    assert(adsp_fastrpc_active_pd == ADSP_FASTRPC_SENSORS_PD);
-    assert(adsp_fastrpc_stage == FASTRPC_STAGE_WAIT_LISTENER_INIT2);
-    memcpy(&wmsg, g_tx_recs[g_tx_rec_count - 1u].payload, sizeof(wmsg));
-    assert((wmsg.ctx & 0xffu) == ADSP_FASTRPC_SENSORS_PD && wmsg.handle == ADSP_FASTRPC_LISTENER_HANDLE);
-
-    /* Case 11c: both ROOT_PD and SENSORS_PD attach fail -> transitions to FASTRPC_STAGE_FAILED cleanly. */
-    init_mock_smmu();
-    adsp_fastrpc_reset();
-    g_tx_rec_count = 0;
-    adsp_fastrpc_on_open("fastrpcglink-apps-dsp", 11u);
-    adsp_fastrpc_on_open_ack(ADSP_FASTRPC_OUR_CID);
-    adsp_fastrpc_on_intent(11u, 210u, 512u);
-    adsp_fastrpc_on_intent(11u, 211u, 512u);
-    adsp_fastrpc_on_intent(11u, 212u, 512u);
-    adsp_fastrpc_service();
-    adsp_fastrpc_on_tx_done(g_tx_recs[g_tx_rec_count - 1u].iid, true);
-    fb_rsp = (struct fastrpc_wire_rsp){ .ctx = adsp_fastrpc_inflight_ctx, .retval = (int32_t)0x80000484u };
-    feed_adsp_msg(&fb_rsp, sizeof(fb_rsp));
-    adsp_fastrpc_service();
-    assert(adsp_fastrpc_stage == FASTRPC_STAGE_WAIT_INIT_ROOT);
-    adsp_fastrpc_on_tx_done(g_tx_recs[g_tx_rec_count - 1u].iid, true);
-    fb_rsp = (struct fastrpc_wire_rsp){ .ctx = adsp_fastrpc_inflight_ctx, .retval = (int32_t)0x80000410u };
-    feed_adsp_msg(&fb_rsp, sizeof(fb_rsp));
-    adsp_fastrpc_service();
-    assert(adsp_fastrpc_stage == FASTRPC_STAGE_WAIT_INIT_SNS);
-    adsp_fastrpc_on_tx_done(g_tx_recs[g_tx_rec_count - 1u].iid, true);
-    fb_rsp = (struct fastrpc_wire_rsp){ .ctx = adsp_fastrpc_inflight_ctx, .retval = (int32_t)0x80000410u };
+    fb_rsp = (struct fastrpc_wire_rsp){ .ctx = adsp_fastrpc_inflight_ctx, .retval = (int32_t)0x8000040eu };
     feed_adsp_msg(&fb_rsp, sizeof(fb_rsp));
     adsp_fastrpc_service();
     assert(adsp_fastrpc_stage == FASTRPC_STAGE_FAILED);
+    assert(g_tx_rec_count == tx_before_fail);
 
-    puts("PASS: annibale_adsp_fastrpc Stage 2 (SMMU, GLINK, INIT_CREATE/ATTACH fallbacks, apps_std, ASan+UBSan)");
+    puts("PASS: annibale_adsp_fastrpc Stage 2 (SMMU, GLINK, INIT_CREATE/ATTACH, apps_std, ASan+UBSan)");
     return 0;
 }
 """

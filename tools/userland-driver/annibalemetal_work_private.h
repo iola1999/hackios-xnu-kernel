@@ -129,5 +129,7 @@ static unsigned rw_g32_probe_limit(void);
 static void rw_g32_probe_tex_create(const struct rwa_texture_shape *shape, int has_surface);
 static void rw_g32_probe_tex_write(const struct rwa_texture_shape *shape, unsigned w, unsigned h,
 				   const void *bytes, size_t stride, int rc);
+static void rw_g32_probe_buf_tex(const struct rwa_texture_shape *shape, const void *buf_bytes,
+				 size_t buf_len, size_t offset, size_t row_bytes, int ok);
 
 #endif

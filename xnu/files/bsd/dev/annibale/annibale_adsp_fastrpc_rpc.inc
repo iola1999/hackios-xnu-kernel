@@ -27,14 +27,13 @@
 
 #define ADSP_FASTRPC_RMID_INIT_ATTACH        0u
 #define ADSP_FASTRPC_RMID_INIT_CREATE_STATIC 8u
-#define ADSP_FASTRPC_RMID_INIT_ATTACH_SNS    10u
 #define ADSP_FASTRPC_LISTENER_INIT2          3u
 #define ADSP_FASTRPC_LISTENER_NEXT2          4u
 #define ADSP_FASTRPC_LISTENER_GET_IN_BUFS2   5u
 
+#define ADSP_FASTRPC_CLIENT_ID      1
 #define ADSP_FASTRPC_ROOT_PD        0u
 #define ADSP_FASTRPC_USER_PD        1u
-#define ADSP_FASTRPC_SENSORS_PD     2u
 
 #define ADSP_FASTRPC_HEAP_SIZE      0x00c00000u /* 12 MiB, annibale.dts adsp_mem_heap */
 #define ADSP_FASTRPC_INVOKE_BUF_SZ  0x00010000u /* 64 KiB invoke + reverse-RPC staging */

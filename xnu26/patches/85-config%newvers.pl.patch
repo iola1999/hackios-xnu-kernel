@@ -1,0 +1,12 @@
+diff --git a/config/newvers.pl b/config/newvers.pl
+index 443e76d..c9fa8ed 100755
+--- a/config/newvers.pl
++++ b/config/newvers.pl
+@@ -161,6 +161,7 @@ $VERSION_LONG .= "$stage$VERSION_PRERELEASE_LEVEL" if (($stage ne "r") || ($VERS
+ # build artifacts).
+ $BUILD_DATE    = $ENV{'KERNEL_BUILD_DATE'}    ? $ENV{'KERNEL_BUILD_DATE'}    : $BUILD_DATE;
+ $BUILD_OBJROOT = $ENV{'KERNEL_BUILD_OBJROOT'} ? $ENV{'KERNEL_BUILD_OBJROOT'} : $BUILD_OBJROOT;
++$BUILDER       = $ENV{'KERNEL_BUILDER'}       ? $ENV{'KERNEL_BUILDER'}       : $BUILDER;
+ 
+ my $file;
+ foreach $file (@ARGV) {

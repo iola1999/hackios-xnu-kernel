@@ -579,6 +579,10 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 			 (unsigned long)bytesPerRow, (unsigned long)offset);
 	texture = mesa.texture_from_buffer([_owner mesaDevice], &shape, _mesa, offset,
 					   (unsigned)bytesPerRow, why, sizeof(why));
+	if (__builtin_expect(rw_g32_probe_limit() != 0, 0)) {
+		rw_g32_probe_buf_tex(&shape, [self contents], (size_t)[self length],
+				     (size_t)offset, (size_t)bytesPerRow, texture != NULL ? 1 : 0);
+	}
 	if (texture == NULL) {
 		rw_print("%s\n", why);
 		return nil;

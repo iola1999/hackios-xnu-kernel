@@ -32,7 +32,6 @@ enum adsp_fastrpc_stage {
 	FASTRPC_STAGE_IDLE = 0,
 	FASTRPC_STAGE_WAIT_INIT_STATIC,
 	FASTRPC_STAGE_WAIT_INIT_ROOT,
-	FASTRPC_STAGE_WAIT_INIT_SNS,
 	FASTRPC_STAGE_WAIT_LISTENER_INIT2,
 	FASTRPC_STAGE_WAIT_LISTENER_NEXT2,
 	FASTRPC_STAGE_FAILED,
@@ -270,7 +269,7 @@ adsp_fastrpc_send_invoke(uint32_t pd, uint32_t handle, uint32_t sc, uint32_t pkt
 	uint64_t sid_hi = (uint64_t)ADSP_FASTRPC_COMPUTE_SID << 32;
 
 	memset(&msg, 0, sizeof(msg));
-	msg.client_id = 0;
+	msg.client_id = ADSP_FASTRPC_CLIENT_ID;
 	msg.tid = 1;
 	msg.ctx = ctx;
 	msg.handle = handle;
@@ -380,7 +379,7 @@ static bool
 adsp_fastrpc_send_init_static(void)
 {
 	static const char pd_name[] = "sensorspd";
-	struct fastrpc_init_create_static_inbuf inbuf = { 1, sizeof(pd_name), 1u };
+	struct fastrpc_init_create_static_inbuf inbuf = { ADSP_FASTRPC_CLIENT_ID, sizeof(pd_name), 1u };
 	struct fastrpc_phy_page heap_pg = { adsp_fastrpc_heap_pa, ADSP_FASTRPC_HEAP_SIZE };
 	struct adsp_fastrpc_host_arg args[3] = {
 		{ &inbuf, NULL, sizeof(inbuf) },
@@ -402,14 +401,20 @@ adsp_fastrpc_send_init_static(void)
 }
 
 static bool
-adsp_fastrpc_send_attach(uint32_t pd, uint32_t rmid, enum adsp_fastrpc_stage next_stage)
+adsp_fastrpc_send_attach_root(void)
 {
-	uint32_t sc = ADSP_FASTRPC_SCALARS(rmid, 0, 0);
+	int32_t pid_a = ADSP_FASTRPC_CLIENT_ID;
+	struct adsp_fastrpc_host_arg arg = { &pid_a, NULL, sizeof(pid_a) };
+	uint32_t sc = ADSP_FASTRPC_SCALARS(ADSP_FASTRPC_RMID_INIT_ATTACH, 1, 0);
+	uint32_t pkt_sz = 0;
 
-	if (!adsp_fastrpc_send_invoke(pd, ADSP_FASTRPC_INIT_HANDLE, sc, 0u)) {
+	if (!adsp_fastrpc_build_invoke(sc, &arg, NULL, &pkt_sz)) {
 		return false;
 	}
-	adsp_fastrpc_stage = next_stage;
+	if (!adsp_fastrpc_send_invoke(ADSP_FASTRPC_ROOT_PD, ADSP_FASTRPC_INIT_HANDLE, sc, pkt_sz)) {
+		return false;
+	}
+	adsp_fastrpc_stage = FASTRPC_STAGE_WAIT_INIT_ROOT;
 	return true;
 }
 
@@ -470,23 +475,13 @@ adsp_fastrpc_handle_rsp(const struct fastrpc_wire_rsp *rsp)
 		if (rsp->retval == 0) {
 			adsp_fastrpc_active_pd = ADSP_FASTRPC_USER_PD;
 			(void)adsp_fastrpc_send_listener_init2();
-		} else if (!adsp_fastrpc_send_attach(ADSP_FASTRPC_ROOT_PD,
-		    ADSP_FASTRPC_RMID_INIT_ATTACH, FASTRPC_STAGE_WAIT_INIT_ROOT)) {
+		} else if (!adsp_fastrpc_send_attach_root()) {
 			adsp_fastrpc_stage = FASTRPC_STAGE_FAILED;
 		}
 	} else if (adsp_fastrpc_stage == FASTRPC_STAGE_WAIT_INIT_ROOT) {
 		say("fastrpc: INIT_ATTACH(root) -> retval=%d (%#x)\n", rsp->retval, (uint32_t)rsp->retval);
 		if (rsp->retval == 0) {
 			adsp_fastrpc_active_pd = ADSP_FASTRPC_ROOT_PD;
-			(void)adsp_fastrpc_send_listener_init2();
-		} else if (!adsp_fastrpc_send_attach(ADSP_FASTRPC_SENSORS_PD,
-		    ADSP_FASTRPC_RMID_INIT_ATTACH_SNS, FASTRPC_STAGE_WAIT_INIT_SNS)) {
-			adsp_fastrpc_stage = FASTRPC_STAGE_FAILED;
-		}
-	} else if (adsp_fastrpc_stage == FASTRPC_STAGE_WAIT_INIT_SNS) {
-		say("fastrpc: INIT_ATTACH_SNS -> retval=%d (%#x)\n", rsp->retval, (uint32_t)rsp->retval);
-		if (rsp->retval == 0) {
-			adsp_fastrpc_active_pd = ADSP_FASTRPC_SENSORS_PD;
 			(void)adsp_fastrpc_send_listener_init2();
 		} else {
 			adsp_fastrpc_stage = FASTRPC_STAGE_FAILED;
@@ -609,8 +604,7 @@ adsp_fastrpc_service(void)
 		}
 		(void)adsp_fastrpc_send_init_static();
 	} else if ((adsp_fastrpc_stage == FASTRPC_STAGE_WAIT_INIT_STATIC ||
-	    adsp_fastrpc_stage == FASTRPC_STAGE_WAIT_INIT_ROOT ||
-	    adsp_fastrpc_stage == FASTRPC_STAGE_WAIT_INIT_SNS) && adsp_fastrpc_inflight_ctx != 0 &&
+	    adsp_fastrpc_stage == FASTRPC_STAGE_WAIT_INIT_ROOT) && adsp_fastrpc_inflight_ctx != 0 &&
 	    adsp_fastrpc_now_us() - adsp_fastrpc_inflight_sent_us >= ADSP_FASTRPC_CTX_TIMEOUT_US) {
 		adsp_fastrpc_inflight_ctx = 0;
 		if (adsp_fastrpc_init_attempts < ADSP_FASTRPC_INIT_RETRIES) {

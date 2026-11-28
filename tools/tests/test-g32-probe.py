@@ -9,6 +9,9 @@ and verifies:
      primitive/count/index, blend/mask/scissor/viewport, ubo1[0x94] fp16 value, and first 4
      vertices of attr0 (float4) and attr3 (half4) with bounds checks.
   4. Rate limit (ANNIBALE_G32_PROBE=2) caps output at exactly 2 lines.
+  5. 256x1 RGBA16Float buffer-backed LUT sampling (rw_g32_format_buf_tex) with NaN/Inf count
+     and short-buffer OOB guard, plus multi-slot texture scanning (t3=256x1 LUT + t9=noise_tex),
+     ring-buffer fbuf5 (length > 16 + non-zero offset), and draw-time LUT buffer sampling.
 """
 import os
 import subprocess
@@ -31,6 +34,8 @@ HARNESS = r'''
 
 static void reset_probe_state(void) {
     rw_g32_limit_cache = -1;
+    rw_g32_filter_init = 0;
+    rw_g32_filter_cache = NULL;
     rw_g32_emitted = 0;
     rw_g32_tex_emitted = 0;
 }
@@ -82,10 +87,11 @@ int main(void) {
     uint8_t vbuf[24 * 4], ubo1[256];
     uint16_t ibuf[4];
     struct rw_g32_draw_info d;
-    char line[896];
+    char line[1536];
 
     /* 1. Default-off (unset and "0") */
     unsetenv("ANNIBALE_G32_PROBE");
+    unsetenv("ANNIBALE_G32_FILTER");
     reset_probe_state();
     make_sample_draw(&d, vbuf, sizeof(vbuf), ubo1, sizeof(ubo1), ibuf, sizeof(ibuf));
     assert(rw_g32_probe_limit() == 0);
@@ -146,7 +152,7 @@ int main(void) {
     assert(rw_g32_format_line(line, sizeof(line), &d) == 0);
     printf("  [PASS] rate limit + OOB buffer guards\n");
 
-    /* 4. 256x1 RGBA16Float LUT texture create/write + Timg* draw matching (tex0 / fbuf5) */
+    /* 4. 256x1 RGBA16Float LUT texture create/write/buf-tex + NaN/Inf detection */
     setenv("ANNIBALE_G32_PROBE", "1", 1);
     reset_probe_state();
     assert(rw_g32_format_tex_create(line, sizeof(line), 80u, 2u, 1206u, 2622u, 1) == 0);
@@ -156,36 +162,106 @@ int main(void) {
     uint16_t lut[256 * 4];
     memset(lut, 0, sizeof(lut));
     lut[0] = 0x3c00u; lut[1] = 0x3800u; lut[2] = 0x0000u; lut[3] = 0x3c00u;
+    lut[10 * 4 + 0] = 0x7e00u; /* NaN */
+    lut[11 * 4 + 1] = 0x7c00u; /* +Inf */
+    lut[12 * 4 + 2] = 0xfc00u; /* -Inf */
     lut[128 * 4 + 0] = 0x3800u; lut[128 * 4 + 3] = 0x3c00u;
     lut[255 * 4 + 2] = 0x3c00u; lut[255 * 4 + 3] = 0x3c00u;
     assert(rw_g32_format_tex_write(line, sizeof(line), 115u, 256u, 1u, 256u, 1u,
                                    lut, 2048u, 0) == 1);
-    assert(strstr(line, "g32-tex-wr #1 fmt=115 tex=256x1 wr=256x1 stride=2048 rc=0 nz=3/256") != NULL);
+    assert(strstr(line, "g32-tex-wr #1 fmt=115 tex=256x1 wr=256x1 stride=2048 rc=0 nz=6/256 nan=3") != NULL);
     assert(strstr(line, "nz0=(1.000,0.500,0.000,1.000)") != NULL);
 
-    struct rw_g32_draw_info timg = other;
-    timg.tex0_fmt = 115u; timg.tex0_w = 256u; timg.tex0_h = 1u;
+    /* Buffer-backed 256x1 fmt=115 LUT sampling (newTextureWithDescriptor:offset:bytesPerRow:) */
+    assert(rw_g32_format_buf_tex(line, sizeof(line), 80u, 512u, 512u, lut, sizeof(lut), 0u, 2048u, 1) == 0);
+    assert(rw_g32_format_buf_tex(line, sizeof(line), 115u, 256u, 1u, lut, sizeof(lut), 0u, 2048u, 1) == 1);
+    assert(strstr(line, "g32-buf-tex #2 fmt=115 tex=256x1 off=0/2048 stride=2048 ok=1 nz=6/256 nan=3") != NULL);
+    assert(strstr(line, "nz0=(1.000,0.500,0.000,1.000)") != NULL);
+    assert(strstr(line, "mid=(0.500,0.000,0.000,1.000)") != NULL);
+    assert(strstr(line, "last=(0.000,0.000,1.000,1.000)") != NULL);
+
+    /* Short/OOB buffer guard on rw_g32_format_buf_tex */
+    assert(rw_g32_format_buf_tex(line, sizeof(line), 115u, 256u, 1u, lut, 64u, 0u, 2048u, 1) == 1);
+    assert(strstr(line, "nz=1/8 nan=0") != NULL);
+    assert(rw_g32_format_buf_tex(line, sizeof(line), 115u, 256u, 1u, lut, 64u, 128u, 2048u, 0) == 1);
+    assert(strstr(line, "ok=0 nz=0/0 nan=0") != NULL);
+    printf("  [PASS] 256x1 RGBA16Float tex-wr & buf-tex LUT sampling + NaN/Inf + OOB guard\n");
+
+    /* 5. Multi-slot texture matching ([[texture(3)]] LUT + [[texture(9)]] noise_tex) + ring fbuf5 */
+    uint8_t ring[4096];
+    memset(ring, 0, sizeof(ring));
     uint16_t noise_scale = 0x3c00u; /* 1.0h */
-    timg.fbuf5_bytes = (const uint8_t *)&noise_scale;
-    timg.fbuf5_len = 2u;
-    timg.fbuf5_offset = 0u;
+    memcpy(ring + 0x104u, &noise_scale, 2u);
+
+    struct rw_g32_draw_info timg = other;
+    timg.fname = "TimgBdsoA2Xhfn_Isrc";
+    timg.tex_count = 10u;
+    timg.tex[3] = (struct rw_g32_tex_meta){ 115u, 256u, 1u };
+    timg.tex[9] = (struct rw_g32_tex_meta){ 70u, 128u, 128u };
+    timg.has_lut_buf = 1;
+    timg.lut_slot = 3u;
+    timg.lut_fmt = 115u;
+    timg.lut_w = 256u;
+    timg.lut_bytes = (const uint8_t *)lut;
+    timg.lut_len = sizeof(lut);
+    timg.lut_offset = 0u;
+    timg.fbuf5_bytes = ring;
+    timg.fbuf5_len = sizeof(ring); /* > 16: QuartzCore ring buffer */
+    timg.fbuf5_offset = 0x104u;
     timg.attr1 = (struct rw_g32_vattr_meta){ 29u, 0u, 0u, 24u };
     timg.attr1_bytes = vbuf; timg.attr1_len = sizeof(vbuf); timg.attr1_buf_off = 0;
     assert(rw_g32_format_line(line, sizeof(line), &timg) == 1);
-    assert(strstr(line, "f=TimgA2Xhfs_Isrc") != NULL);
-    assert(strstr(line, "tex0=fmt115:256x1 fbuf5=len2:0x3c00(1.0000)") != NULL);
+    assert(strstr(line, "f=TimgBdsoA2Xhfn_Isrc") != NULL);
+    assert(strstr(line, "tex=t3=fmt115:256x1,t9=fmt70:128x128") != NULL);
+    assert(strstr(line, "fbuf5=len4096+off260:0x3c00(1.0000)") != NULL);
+    assert(strstr(line, "lut=t3:nz=6/256,nan=3,nz0=(1.000,0.500,0.000,1.000)") != NULL);
     assert(strstr(line, "attr1=fmt=29/b0+0/s24[") != NULL);
 
-    /* Timg* with only fbuf5 (noiseScale) and non-LUT tex0 still matches */
+    /* Timg* with only small fbuf5 (noiseScale) and non-LUT tex0 still matches */
     struct rw_g32_draw_info fbuf5_only = other;
-    fbuf5_only.tex0_fmt = 80u; fbuf5_only.tex0_w = 512u; fbuf5_only.tex0_h = 512u;
+    fbuf5_only.tex_count = 1u;
+    fbuf5_only.tex[0] = (struct rw_g32_tex_meta){ 80u, 512u, 512u };
     fbuf5_only.fbuf5_bytes = (const uint8_t *)&noise_scale;
     fbuf5_only.fbuf5_len = 2u;
+    fbuf5_only.fbuf5_offset = 0u;
     assert(rw_g32_format_line(line, sizeof(line), &fbuf5_only) == 1);
-    assert(strstr(line, "tex0=fmt80:512x512 fbuf5=len2:0x3c00(1.0000)") != NULL);
-    printf("  [PASS] 256x1 RGBA16Float LUT texture + Timg*/fbuf5 draw matching\n");
+    assert(strstr(line, "tex=t0=fmt80:512x512 fbuf4=none fbuf5=len2+off0:0x3c00(1.0000)") != NULL);
+    printf("  [PASS] multi-slot texture (t3/t9) + ring-buffer fbuf5 + draw-time LUT sampling\n");
 
-    printf("G32 probe host tests: PASS (4/4)\n");
+    /* 6. ANNIBALE_G32_FILTER + fbuf4 (color_program half4 array + OOB guard) */
+    setenv("ANNIBALE_G32_PROBE", "4", 1);
+    setenv("ANNIBALE_G32_FILTER", "N3Oc3mtc4nlnlnl", 1);
+    reset_probe_state();
+    /* Lockscreen draw with 256x1 fmt=115 LUT must be skipped when filter does not match */
+    assert(rw_g32_format_line(line, sizeof(line), &timg) == 0);
+    assert(rw_g32_emitted == 0u);
+
+    uint16_t cp_ring[128]; /* 256 bytes */
+    memset(cp_ring, 0, sizeof(cp_ring));
+    /* Put 8 half4 entries starting at byte offset 16 (index 8 in uint16_t) */
+    for (unsigned i = 0; i < 8u; i++) {
+        cp_ring[8u + i * 4u + 0u] = 0x3c00u; /* 1.0 */
+        cp_ring[8u + i * 4u + 1u] = 0x3800u; /* 0.5 */
+        cp_ring[8u + i * 4u + 2u] = 0x0000u; /* 0.0 */
+        cp_ring[8u + i * 4u + 3u] = 0x3c00u; /* 1.0 */
+    }
+    struct rw_g32_draw_info cprog = timg;
+    cprog.fname = "TimgA2Xhfn_IsrcN3Oc3mtc4nlnlnl";
+    cprog.fbuf4_bytes = (const uint8_t *)cp_ring;
+    cprog.fbuf4_len = sizeof(cp_ring);
+    cprog.fbuf4_offset = 16u;
+    assert(rw_g32_format_line(line, sizeof(line), &cprog) == 1);
+    assert(strstr(line, "f=TimgA2Xhfn_IsrcN3Oc3mtc4nlnlnl") != NULL);
+    assert(strstr(line, "fbuf4=len256+off16[(1.000,0.500,0.000,1.000),(1.000,0.500,0.000,1.000)") != NULL);
+
+    /* OOB fbuf4 offset guard */
+    cprog.fbuf4_offset = 252u;
+    assert(rw_g32_format_line(line, sizeof(line), &cprog) == 1);
+    assert(strstr(line, "fbuf4=len256+off252:oob") != NULL);
+    unsetenv("ANNIBALE_G32_FILTER");
+    printf("  [PASS] ANNIBALE_G32_FILTER + fbuf4 half4 array & OOB guard\n");
+
+    printf("G32 probe host tests: PASS (6/6)\n");
     return 0;
 }
 '''

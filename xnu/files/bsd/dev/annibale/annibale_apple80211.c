@@ -943,7 +943,10 @@ post(uint32_t code, const void *data, uint32_t length)
 		message.dv[1].data_length = length;
 		message.dv[1].data_ptr = __DECONST(void *, data);
 	}
-	kev_post_msg(&message);
+	int error = kev_post_msg(&message);
+	if (error != 0) {
+		printf("apple80211: kev_post_msg(code %u, %u bytes) error %d\n", code, length, error);
+	}
 }
 
 static void

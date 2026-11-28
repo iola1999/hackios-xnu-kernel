@@ -77,18 +77,39 @@ static bool join_requested;
 static uint8_t event_filter[32];
 static bool event_filter_set;
 
+#define KEV_VENDOR_APPLE 1
+#define KEV_IEEE80211_CLASS 6
+#ifndef __DECONST
+#define __DECONST(type, var) ((type)(uintptr_t)(var))
+#endif
+struct kev_d_vectors { uint32_t data_length; void *data_ptr; };
+struct kev_msg {
+    uint32_t vendor_code, kev_class, kev_subclass, event_code;
+    struct kev_d_vectors dv[5];
+};
+static char interface_name[16] = "en0";
+static int fake_kev_error;
+static unsigned printf_calls;
+static void test_printf(const char *fmt, ...) { (void)fmt; printf_calls++; }
+#undef printf
+#define printf test_printf
+
 struct captured { uint32_t code, length; uint8_t data[0x1d8]; };
 static struct captured events[8];
 static unsigned event_count;
-''' + function("event_allowed", "static bool\n") + r'''
-static void post(uint32_t code, const void *data, uint32_t length) {
-    if (!event_allowed(code)) return;
+static int kev_post_msg(struct kev_msg *msg) {
+    assert(msg->vendor_code == KEV_VENDOR_APPLE && msg->kev_class == KEV_IEEE80211_CLASS && msg->kev_subclass == 1);
+    assert(msg->dv[0].data_length == 16 && memcmp(msg->dv[0].data_ptr, "en0", 4) == 0);
+    if (fake_kev_error != 0) return fake_kev_error;
     struct captured *event = &events[event_count];
-    assert(event_count < 8 && length <= sizeof(event->data));
+    assert(event_count < 8 && msg->dv[1].data_length <= sizeof(event->data));
     event_count++;
-    event->code = code; event->length = length;
-    if (length) memcpy(event->data, data, length);
+    event->code = msg->event_code;
+    event->length = msg->dv[1].data_length;
+    if (msg->dv[1].data_length) memcpy(event->data, msg->dv[1].data_ptr, msg->dv[1].data_length);
+    return 0;
 }
+''' + function("event_allowed", "static bool\n") + "\n" + function("post", "static void\n") + r'''
 ''' + "\n".join(declaration(name) for name in (
     "struct apple80211_ssid_changed {",
     "struct apple80211_bssid_changed {",
@@ -163,6 +184,14 @@ int main(void) {
         };
         assert(dv[0].len == 16u && memcmp(dv[0].ptr, "en0", 4) == 0);
         assert(dv[1].len == 0x1ccu && done.flags == 1u && done.result == 1u);
+
+        /* P21 kev_post_msg cluster boundary & error logging checks */
+        assert(24u + 16u + sizeof(struct apple80211_assoc_done) == 500u);
+        assert(24u + 16u + sizeof(struct apple80211_lqm_changed) == 512u);
+        printf_calls = 0; fake_kev_error = EMSGSIZE;
+        post(EVENT_ASSOC_DONE, &done, sizeof(done));
+        assert(printf_calls == 1u);
+        fake_kev_error = 0;
     }
 }
 '''
@@ -178,9 +207,19 @@ for marker in (
     "join_result = 0xffff;",
     "done.flags = 1;",
     "post(EVENT_ASSOC_DONE, &done, sizeof(done));",
+    "int error = kev_post_msg(&message);",
     "delay_for_interval(20, NSEC_PER_MSEC);",
 ):
     assert marker in a80211_text, f"missing expected P21 contract in annibale_apple80211.c: {marker}"
+
+patch83 = Path(__file__).resolve().parents[2] / "xnu26/patches/83-bsd%kern%kern_event.c.patch"
+patch83_text = patch83.read_text()
+for marker in (
+    "MCLBYTES - total_size",
+    "m_getcl(wait, MT_DATA, 0)",
+    "total_size > MLEN",
+):
+    assert marker in patch83_text, f"missing expected P21 contract in 83-bsd%kern%kern_event.c.patch: {marker}"
 
 with tempfile.TemporaryDirectory(prefix="annibale-apple80211-events-") as directory:
     src = Path(directory) / "check.c"
