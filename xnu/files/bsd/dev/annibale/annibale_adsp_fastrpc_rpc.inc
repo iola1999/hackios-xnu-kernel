@@ -34,6 +34,7 @@
 #define ADSP_FASTRPC_CLIENT_ID      1
 #define ADSP_FASTRPC_ROOT_PD        0u
 #define ADSP_FASTRPC_USER_PD        1u
+#define ADSP_FASTRPC_SENSORS_PD     2u
 
 #define ADSP_FASTRPC_HEAP_SIZE      0x00c00000u /* 12 MiB, annibale.dts adsp_mem_heap */
 #define ADSP_FASTRPC_INVOKE_BUF_SZ  0x00010000u /* 64 KiB invoke + reverse-RPC staging */
@@ -434,8 +435,14 @@ adsp_fastrpc_align_up(uint32_t v, uint32_t align)
 	return (v + align - 1u) & ~(align - 1u);
 }
 
+static inline uint64_t
+adsp_fastrpc_sid_hi(uint32_t pd)
+{
+	return (pd == ADSP_FASTRPC_SENSORS_PD) ? 0ULL : ((uint64_t)ADSP_FASTRPC_COMPUTE_SID << 32);
+}
+
 static bool
-adsp_fastrpc_build_invoke(uint32_t sc, const struct adsp_fastrpc_host_arg *args,
+adsp_fastrpc_build_invoke(uint32_t pd, uint32_t sc, const struct adsp_fastrpc_host_arg *args,
     uint32_t *out_offsets, uint32_t *pkt_size_out)
 {
 	uint32_t nscalars = ADSP_SC_INBUFS(sc) + ADSP_SC_OUTBUFS(sc) +
@@ -473,7 +480,7 @@ adsp_fastrpc_build_invoke(uint32_t sc, const struct adsp_fastrpc_host_arg *args,
 	struct fastrpc_remote_buf *rpra = (struct fastrpc_remote_buf *)(uintptr_t)adsp_fastrpc_buf_va;
 	struct fastrpc_invoke_buf *list = (struct fastrpc_invoke_buf *)(void *)(rpra + nscalars);
 	struct fastrpc_phy_page *pages = (struct fastrpc_phy_page *)(void *)(list + nscalars);
-	uint64_t sid_hi = (uint64_t)ADSP_FASTRPC_COMPUTE_SID << 32;
+	uint64_t sid_hi = adsp_fastrpc_sid_hi(pd);
 
 	for (uint32_t i = 0; i < nbufs; i++) {
 		uint32_t len = args[i].len;

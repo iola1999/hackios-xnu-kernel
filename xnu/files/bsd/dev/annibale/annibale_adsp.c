@@ -885,7 +885,7 @@ static void glink_poll_rx(void)
 
 		r = (uint32_t)(((uint64_t)r + step_bytes) % (uint64_t)glink_their_q_size);
 		smem_poke(glink_their_read_at, r);
-		if (ipcrtr_attach || ipcrtr_pkt != NULL || adsp_fastrpc_has_pending()) break;
+		if (ipcrtr_attach || ipcrtr_pkt != NULL || (adsp_fastrpc_has_pending() && !adsp_fastrpc_rx_has_space())) break;
 		smem_peek(glink_their_write_at, &w, 4);
 	}
 	lck_mtx_unlock(&glink_rx_lock);

@@ -376,6 +376,10 @@ public:
 	void settle(const uint8_t * swap, MiniIOSurface ** surfaces);
 	void reportFrameTimes(void);
 	void drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
+	void drawYuvLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst, bool clearBg);
+	void compositeLayerOver(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
+	void showLayers(const uint8_t * swap, MiniIOSurface ** surfaces, uint32_t set, bool report,
+	    uint32_t * layersOut, MiniIOSurface ** recordedOut, bool * clearedBlackOut);
 	bool drawDpuScaled(MiniIOSurface * s, int32_t sx, int32_t sy, int32_t sw, int32_t sh, int32_t px0, int32_t py0, int32_t px1, int32_t py1);
 	void runHelperRows(struct RowJob * job, uint32_t * blendRow);
 	void drawRows(const struct RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow);
@@ -567,6 +571,7 @@ IOMobileFramebuffer::defaultSurface(void)
 }
 
 #include "MiniFramebufferRows.inc"
+#include "MiniFramebufferYuv.inc"
 
 /*
  * Put a rectangle of a 32-bit surface on the screen. `dst` is in display coordinates; the
@@ -938,63 +943,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	fLastBufSeqBefore = fLastBufSeqAfter = fBufferSeq[flip.ready ? (flip.shown ^ 1) : 0];
 	fLastAllDirty = false;
 	noteLatch(copy_began);
-	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
-		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
-		int32_t src[4], dst[4];
-		MiniIOSurface * s;
-
-		layers |= sid != 0 ? 1u << layer : 0;
-		/* the frames' surfaces: is it a few, in turn? */
-		for (unsigned i = 0; layer == 0 && sid != 0 && i < 8; i++) {
-			if (fStatSurfaces[i] == 0 || fStatSurfaces[i] == sid) {
-				fStatSurfaces[i] = sid;
-				break;
-			}
-		}
-		if (sid == 0) {
-			/* the bottom layer taken away: nothing is shown, the screen is black */
-			if (layer == 0 && (set & 1) && fGraphics) {
-				flip_dpu_scale_fallback();
-				for (uint32_t y = 0; y < fPanelHeight; y++) {
-					bzero(fBase + (size_t) y * fRowBytes, (size_t) fPanelWidth * 4);
-				}
-				flip_whole();
-				fAllChangedSeq = ++fRowSeq;
-				fBufferSeq[flip.ready ? (flip.shown ^ 1) : 0] = fRowSeq;
-				cleared_black = true;
-				fLastBy0 = 0;
-				fLastBy1 = (int32_t) fPanelHeight;
-				fLastBufSeqAfter = fRowSeq;
-				fLastAllDirty = true;
-			}
-			continue;
-		}
-		memcpy(src, swap + SWAP_SOURCE(layer), sizeof(src));
-		memcpy(dst, swap + SWAP_DEST(layer), sizeof(dst));
-		s = surfaces[layer];
-		if (report) {
-			IOLog("MiniIOMobileFramebuffer: swap %u layer %u: surface %u%s (%ux%u '%c%c%c%c') "
-			    "from %d,%d %dx%d to %d,%d %dx%d, layers set 0x%x\n", swapWord(swap, SWAP_ID), layer, sid,
-			    s ? "" : " MISSING", s ? s->info.width : 0, s ? s->info.height : 0,
-			    s ? (int) (s->info.pixelFormat >> 24 & 0xff) : '?', s ? (int) (s->info.pixelFormat >> 16 & 0xff) : '?',
-			    s ? (int) (s->info.pixelFormat >> 8 & 0xff) : '?', s ? (int) (s->info.pixelFormat & 0xff) : '?',
-			    src[0], src[1], src[2], src[3], dst[0], dst[1], dst[2], dst[3], set);
-		}
-		if (s == NULL) {
-			continue;
-		}
-		if (s->info.bytesPerElement == 4 && s->info.planeCount == 0) {
-			if (!fGraphics) {
-				/* the first picture: the kernel's text console must stop drawing over it */
-				fGraphics = true;
-				PE_initialize_console(NULL, kPEGraphicsMode);
-			}
-			drawLayer(s, src, dst);
-			if (layer == 0) {
-				recorded = s;   /* (recorded once the frame is in the panel's memory: see below) */
-			}
-		}
-	}
+	showLayers(swap, surfaces, set, report, &layers, &recorded, &cleared_black);
 	drew_panel = flip.ready ? flip.drew : (layers != 0 || cleared_black);
 	flip_present(swapWord(swap, SWAP_ID));
 	drawn = mach_absolute_time();

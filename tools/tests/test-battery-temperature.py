@@ -44,6 +44,7 @@ def build(revision):
 #include <cstring>
 #include <string>
 #include <map>
+#include <vector>
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <IOKit/IOCFUnserialize.h>
@@ -60,10 +61,34 @@ struct OSNumber : OSObject {
         assert(bits == 32); auto p = new OSNumber; p->value = (uint32_t)n; return p;
     }
 };
-struct OSDictionary : OSObject {
-    static OSDictionary *withCapacity(unsigned) { return new OSDictionary; }
-    void setObject(const char *, OSObject *) {}
+struct OSData : OSObject {
+    std::vector<uint8_t> bytes;
+    static OSData *withBytes(const void *b, unsigned len) {
+        auto p = new OSData;
+        if (b && len) {
+            const uint8_t *u = (const uint8_t *)b;
+            p->bytes.assign(u, u + len);
+        }
+        return p;
+    }
 };
+struct OSDictionary : OSObject {
+    std::map<std::string, uint32_t> numbers;
+    std::map<std::string, std::vector<uint8_t>> datas;
+    std::map<std::string, OSDictionary> children;
+    static OSDictionary *withCapacity(unsigned) { return new OSDictionary; }
+    void setObject(const char *k, OSObject *v) {
+        if (auto *n = dynamic_cast<OSNumber *>(v)) {
+            numbers[k] = n->value;
+        } else if (auto *data = dynamic_cast<OSData *>(v)) {
+            datas[k] = data->bytes;
+        } else if (auto *d = dynamic_cast<OSDictionary *>(v)) {
+            children[k] = *d;
+        }
+    }
+    size_t count() const { return numbers.size() + datas.size() + children.size(); }
+};
+static std::map<std::string, OSDictionary> dict_properties;
 static OSObject false_object, true_object;
 #define kOSBooleanFalse (&false_object)
 #define kOSBooleanTrue (&true_object)
@@ -77,9 +102,14 @@ class AnnibaleBattery {
 public:
     void number(const char *, long long);
     void dicts(int32_t);
+    void placeholders(void);
     void report(const annibale_battery_state *);
     void flag(const char *, bool) {}
-    void object(const char *, OSObject *) {}
+    void object(const char *key, OSObject *value) {
+        if (auto *d = dynamic_cast<OSDictionary *>(value)) {
+            dict_properties[key] = *d;
+        }
+    }
     void setPSProperty(const OSSymbol *key, OSNumber *n) { properties[key->value] = n->value; }
     void setBatteryInstalled(bool) {} void setExternalConnected(bool) {}
     void setExternalChargeCapable(bool) {} void setIsCharging(bool) {}
@@ -89,8 +119,13 @@ public:
 };
 ''' + "\nvoid\n" + function(iokit, "AnnibaleBattery::number")
     code += "\nstatic unsigned\n" + function(iokit, "family_code")
+    if "set_u32(" in iokit:
+        code += "\nstatic void\n" + function(iokit, "set_u32")
+    if "set_data(" in iokit:
+        code += "\nstatic void\n" + function(iokit, "set_data")
     if "AnnibaleBattery::dicts(" in iokit:
         code += "\nvoid\n" + function(iokit, "AnnibaleBattery::dicts")
+        code += "\nvoid\n" + function(iokit, "AnnibaleBattery::placeholders")
     code += "\nvoid\n" + function(iokit, "AnnibaleBattery::report")
     code += r'''
 static annibale_battery_state published;
@@ -190,6 +225,33 @@ int main(int argc, char **argv) {
     const int degrees[] = {25, 35, 35, 45, 46, -5, 0, -40, 85};
     assert(annibale_battery_temperature() == -273 && reports == 0);
     assert(watch_locked());
+    {
+        AnnibaleBattery boot;
+        boot.placeholders();
+        assert(dict_properties.count("BatteryData") == 1 && dict_properties["BatteryData"].count() > 0);
+        assert(dict_properties.count("ChargerData") == 1 && dict_properties["ChargerData"].count() > 0);
+        auto &lt_boot = dict_properties["BatteryData"].children["LifetimeData"];
+        assert(lt_boot.count() > 0);
+        assert(lt_boot.numbers.count("TimeAtHighSoc") == 0);
+        assert(lt_boot.datas.count("TimeAtHighSoc") == 1 && lt_boot.datas["TimeAtHighSoc"].size() >= 4);
+        assert(dict_properties["ChargerData"].numbers["VacVoltageLimit"] >= 4335 &&
+               dict_properties["ChargerData"].numbers["VacVoltageLimit"] <= 4505);
+        dict_properties.clear();
+        annibale_battery_state rep = {};
+        rep.size = sizeof(rep);
+        rep.present = 1;
+        rep.percent_hundredths = 8000;
+        rep.voltage_uv = 4100000;
+        rep.cycles = 15;
+        boot.report(&rep);
+        assert(dict_properties["BatteryData"].numbers["CycleCount"] == 15);
+        auto &lt_rep = dict_properties["BatteryData"].children["LifetimeData"];
+        assert(lt_rep.count() > 0 && lt_rep.datas["TimeAtHighSoc"].size() >= 4);
+        assert(dict_properties["ChargerData"].numbers["VacVoltageLimit"] >= 4335 &&
+               dict_properties["ChargerData"].numbers["VacVoltageLimit"] <= 4505);
+        properties.clear();
+        dict_properties.clear();
+    }
     if (which < 9) {
         readings[3] = raw[which]; check_sample(expected[which], degrees[which]);
     } else if (which < 13) {

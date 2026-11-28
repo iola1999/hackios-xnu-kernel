@@ -32,6 +32,7 @@
 #include <IOKit/pwr_mgt/IOPM.h>
 #include <IOKit/pwr_mgt/IOPMPowerSource.h>
 #include <libkern/c++/OSBoolean.h>
+#include <libkern/c++/OSData.h>
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSSymbol.h>
@@ -123,13 +124,35 @@ family_code(int usb_type)
 	}
 }
 
+static void
+set_u32(OSDictionary * dict, const char * key, uint32_t value)
+{
+	OSNumber * n = OSNumber::withNumber((unsigned long long) value, 32);
+
+	if (n != NULL) {
+		dict->setObject(key, n);
+		n->release();
+	}
+}
+
+static void
+set_data(OSDictionary * dict, const char * key, const void * bytes, unsigned len)
+{
+	OSData * d = OSData::withBytes(bytes, len);
+
+	if (d != NULL) {
+		dict->setObject(key, d);
+		d->release();
+	}
+}
+
 /*
  * batteryintelligenced pulls BatteryData/ChargerData out of the registry
  * properties (IORegistryEntryCreateCFProperties on the first IOPMPowerSource
- * match); on real batteries the gauge publishes them. Only the dictionary
- * shape is checked — leaves it wants (AlgoChemID, Serial, VacVoltageLimit,
- * ...) we cannot supply become NSNull on its side, but a missing dict means
- * a nil smcKeys and an NSInvalidArgumentException abort.
+ * match): BatteryAlgorithmsInit requires non-empty BatteryData, ChargerData, and
+ * BatteryData["LifetimeData"], and OnDeviceACAM (BatteryAlgorithms.framework)
+ * expects TimeAtHighSoc as NSData (4-byte uint32 bins) and VacVoltageLimit in
+ * [4335, 4505] mV.
  */
 void
 AnnibaleBattery::dicts(int32_t cycles)
@@ -138,12 +161,15 @@ AnnibaleBattery::dicts(int32_t cycles)
 	OSDictionary * lifetime = OSDictionary::withCapacity(3);
 	OSDictionary * chargerData = OSDictionary::withCapacity(2);
 	if (battData != NULL && lifetime != NULL && chargerData != NULL) {
-		OSNumber * n;
-		if (cycles > 0 &&
-		    (n = OSNumber::withNumber((unsigned long long) cycles, 32)) != NULL) {
-			battData->setObject("CycleCount", n);
-			n->release();
+		uint32_t cycleCount = cycles > 0 ? (uint32_t) cycles : 0u;
+		uint32_t teqZero = 0u;
+		if (cycles > 0) {
+			set_u32(battData, "CycleCount", cycleCount);
 		}
+		set_u32(lifetime, "TotalOperatingTime", 0u);
+		set_u32(lifetime, "CycleCountLastQmax", cycleCount);
+		set_data(lifetime, "TimeAtHighSoc", &teqZero, sizeof(teqZero));
+		set_u32(chargerData, "VacVoltageLimit", 4400u);
 		battData->setObject("LifetimeData", lifetime);
 		object("BatteryData", battData);
 		object("ChargerData", chargerData);
