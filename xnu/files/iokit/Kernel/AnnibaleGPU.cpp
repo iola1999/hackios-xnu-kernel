@@ -71,7 +71,12 @@ bool annibale_gpu_map(uint64_t address, uint64_t phys, bool read_only);
 bool annibale_gpu_mapped(void);
 bool annibale_gpu_unmap(uint64_t address, uint64_t size);
 void annibale_gpu_to_memory(void * start, uint64_t size);
+int32_t annibale_gpu_context_acquire(uint32_t prio);
+void annibale_gpu_context_release(int32_t slot);
+bool annibale_gpu_context_healthy(int32_t slot);
+uint32_t annibale_gpu_context_faults(int32_t slot);
 uint32_t annibale_gpu_submit(const uint64_t * addresses, const uint32_t * words, uint32_t count);
+uint32_t annibale_gpu_submit_slot(int32_t slot, const uint64_t * addresses, const uint32_t * words, uint32_t count);
 extern uint32_t gpu_log;
 bool annibale_gpu_done(uint32_t fence);
 uint32_t annibale_gpu_retired(void);
@@ -80,6 +85,8 @@ bool annibale_gpu_progress(uint64_t * sig);
 uint32_t annibale_gpu_irqs(void);
 void annibale_gpu_pause(uint32_t seen, uint32_t poll_us, uint32_t longest_us);
 uint32_t annibale_gpu_last(void);
+uint32_t annibale_gpu_last_for(int32_t slot);
+uint32_t annibale_gpu_depth_target(int32_t slot, uint32_t depth);
 uint32_t adreno8_context_depth(void);
 void annibale_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
 void annibale_gpu_speed(uint32_t * mhz, uint32_t * changes);
@@ -230,6 +237,7 @@ struct annibale_worked {
 #define MSM_SUBMIT_FENCE_FD_OUT 0x20000000
 
 #define GPU_BUFFERS             8192            /* a client's, at most */
+#define GPU_CLIENT_QUEUES       16              /* active submitqueues per client */
 #define GPU_BUFFER_MAX          (256u << 20)
 #define GPU_SUBMIT_CMDS         128
 #define GPU_A830_SUBMIT_CMDS    82
@@ -784,6 +792,10 @@ struct gpu_kept {
 	uint64_t                        address, size, since;
 	uint32_t                        flags;
 };
+struct gpu_queue {
+	uint32_t                        id, prio;
+	int32_t                         slot;
+};
 #define GPU_KEPT_SMALL_TARGET   320             /* soft share when full: sizes under 64 KB are most gemNew requests */
 #define GPU_KEPT_MEDIUM_TARGET  128             /* 64 KB to 1 MB */
 #define GPU_KEPT_LARGE_TARGET   48              /* 1 MB to 8 MB */
@@ -800,6 +812,7 @@ class AnnibaleGPUUserClient : public IOUserClient
 	pid_t                   fPid;
 	struct gpu_buffer *     fBuffers;               /* handle n is fBuffers[n - 1] */
 	uint32_t                fNextQueue;
+	struct gpu_queue        fQueues[GPU_CLIENT_QUEUES];
 	uint32_t                fNextBuffer;            /* where the search for a free handle starts: one given back is not the next given */
 	uint32_t                fBufferCount;
 	uint64_t                fBufferBytes;
@@ -823,6 +836,10 @@ class AnnibaleGPUUserClient : public IOUserClient
 	IOReturn memoryBuffer(struct annibale_memory * request, struct gpu_io_stat * io);
 	IOReturn gemInfo(struct msm_gem_info * request);
 	IOReturn submit(struct msm_gem_submit * request, struct gpu_io_stat * io);
+	IOReturn submitQueueNew(struct msm_submitqueue * request);
+	IOReturn submitQueueClose(uint32_t id);
+	IOReturn submitQueueQuery(struct msm_submitqueue_query * query, uint64_t * faults);
+	int32_t submitQueueSlot(uint32_t queueId);
 	IOReturn show(const struct annibale_show * request);
 	IOReturn iogpuControlMethod(uint32_t selector, IOExternalMethodArguments * args);
 
@@ -1001,6 +1018,7 @@ AnnibaleGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 		struct msm_wait_fence waitFence;
 		struct msm_gem_madvise madvise;
 		struct msm_submitqueue queue;
+		uint32_t queueId;
 		struct msm_submitqueue_query query;
 		struct drm_gem_close close;
 		struct annibale_surface surface;
@@ -1055,7 +1073,9 @@ AnnibaleGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 		}
 		break;
 	case kMsmGemCpuFini:
+		break;
 	case kMsmSubmitQueueClose:
+		ret = submitQueueClose(size == sizeof(uint32_t) ? r.queueId : r.queue.id);
 		break;
 	case kMsmGemNew:
 		ret = gemNew(&r.gemNew.request, size == sizeof(r.gemNew) ? &r.gemNew.iova : NULL, &io);
@@ -1087,17 +1107,11 @@ AnnibaleGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 		r.madvise.retained = 1;
 		break;
 	case kMsmSubmitQueueNew:
-		if (annibale_platform_is_annibale()) {
-			uint64_t prios = 1;
-			gpuLockIoctl(kMsmSubmitQueueNew);
-			ret = !annibale_gpu_parameter(0x07, &prios) ? kIOReturnNotReady
-			    : (r.queue.flags != 0 || r.queue.prio >= prios) ? kIOReturnBadArgument : kIOReturnSuccess;
-			IOLockUnlock(gGPULock);
-		}
-		if (ret == kIOReturnSuccess) { r.queue.id = ++fNextQueue; }
+		ret = submitQueueNew(&r.queue);
 		break;
 	case kMsmSubmitQueueQuery:                      /* how often the GPU has faulted on this client's commands */
-		if (r.query.data != 0 && r.query.len >= sizeof(zero)) {
+		ret = submitQueueQuery(&r.query, &zero);
+		if (ret == kIOReturnSuccess && r.query.data != 0 && r.query.len >= sizeof(zero)) {
 			copyout(&zero, (user_addr_t) r.query.data, sizeof(zero));
 		}
 		break;

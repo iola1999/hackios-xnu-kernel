@@ -184,11 +184,11 @@ adreno8_retire_note(const uint32_t *msg)
 			clocked = true;
 		}
 
-		annibale_tl("tl: R %u sub %llu sop %llu eop %llu\n", msg[2], submitted * 10 / 192, sop * 10 / 192, eop * 10 / 192);
+		annibale_tl("tl: R %u ctx %u sub %llu sop %llu eop %llu\n", msg[2], msg[1], submitted * 10 / 192, sop * 10 / 192, eop * 10 / 192);
 	}
 
 	if (ticks * 10 / 192 >= LONG_SUBMISSION_US) {
-		printf("adreno8: submission %u ran %llu ms on the GPU\n", msg[2], ticks * 10 / 192 / 1000);
+		printf("adreno8: ctx %u submission %u ran %llu ms on the GPU\n", msg[1], msg[2], ticks * 10 / 192 / 1000);
 	}
 	while (bucket < 6 && ticks * 10 / 192 >= limits_us[bucket]) bucket++;
 	retired_by[bucket]++;
@@ -337,8 +337,12 @@ adreno8_hfi_pump(uint32_t request, bool *ack, unsigned *notices)
 				}
 				*ack = true;
 			} else if (type == 0 && (received_id == 100 || received_id == 150)) {
+				uint32_t ctx = words >= 2 ? resp[1] : 0;
+				uint32_t ts = words >= 3 ? resp[2] : 0;
+				uint32_t err = words >= 4 ? resp[3] : 0;
+
 				printf("adreno8: %u: HFI fatal message %u data %#x (%d words)\n",
-				    adreno8_step, received_id, words >= 2 ? resp[1] : 0, words);
+				    adreno8_step, received_id, ctx, words);
 				/* The whole message, eight words a line: for 150 (context bad) KGSL's
 				 * layout puts the context, timestamp and error code after the header,
 				 * and the error's own key/value payload after those. */
@@ -348,6 +352,11 @@ adreno8_hfi_pump(uint32_t request, bool *ack, unsigned *notices)
 					for (int i = at; i < words && i < at + 8; i++)
 						used += (unsigned)snprintf(line + used, sizeof(line) - used, " %08x", resp[i]);
 					printf("adreno8: %u: HFI %u word %d:%s\n", adreno8_step, received_id, at, line);
+				}
+				/* When preempt isolates a non-compositor app context, keep HFI alive for remaining contexts. */
+				if (received_id == 150 && !adreno8_direct_ring &&
+				    adreno8_context_record_fault(ctx, ts, err)) {
+					continue;
 				}
 				/* The GMU reports the hang here, often before any wait times out and while
 				 * GX is still up, so the CP state is read now. */

@@ -69,7 +69,7 @@ static struct {
 	uint32_t        offset[FLIP_PIPES];     /* where each pipe reads, from the start of a buffer */
 	uint64_t        pa[2];                  /* A, the boot framebuffer, and B */
 	uint8_t *       va[2];
-	uint32_t        bytes, rows;
+	uint32_t        bytes, slot_bytes, rows;
 	int             shown;                  /* the buffer the pipes were last pointed at */
 	bool            ready, needStart, pending, drew;
 	int32_t         band0, band1;           /* the panel rows this frame changed */
@@ -304,6 +304,7 @@ flip_point(int which)
 
 #include "MiniFramebufferDim.inc"
 #include "MiniFramebufferDCS.inc"
+#include "MiniFramebufferDpuScale.inc"
 
 /*
  * A stuck flip pointed again, in two writes: the flip itself first (a SRC write that never
@@ -343,8 +344,10 @@ flip_start(uint64_t fb, uint8_t * fbBase, uint32_t bytes, uint32_t rows)
 		return;
 	}
 	flip_look(fb);
-	b = (fb + bytes + 0xfffff) & ~0xfffffULL;
-	if (gFlip < 2 || fb < FLIP_SPLASH_PHYS || b + bytes > FLIP_SPLASH_PHYS + FLIP_SPLASH_SIZE) {
+	uint32_t slot_bytes = (gDpuScale != 0 && bytes < FLIP_DPU_SCALE_SLOT_BYTES) ? FLIP_DPU_SCALE_SLOT_BYTES : bytes;
+
+	b = (fb + slot_bytes + 0xfffff) & ~0xfffffULL;
+	if (gFlip < 2 || fb < FLIP_SPLASH_PHYS || b + slot_bytes > FLIP_SPLASH_PHYS + FLIP_SPLASH_SIZE) {
 		return;
 	}
 	/* the pipes that read A, or B where a kernel before this one left them */
@@ -352,7 +355,7 @@ flip_start(uint64_t fb, uint8_t * fbBase, uint32_t bytes, uint32_t rows)
 		uint32_t at = flip_rd(FLIP_MDP + flipPipe[p].base + FLIP_SSPP_SRC0_ADDR);
 
 		if (flip_rd(FLIP_MDP + flipPipe[p].base + FLIP_SSPP_SRC_SIZE) != 0 && at != 0 &&
-		    ((at >= fb && at < fb + bytes) || (at >= b && at < b + bytes))) {
+		    ((at >= fb && at < fb + slot_bytes) || (at >= b && at < b + slot_bytes))) {
 			flip.pipes |= 1u << p;
 			flip.flush |= flipPipe[p].flush;
 			flip.offset[p] = (uint32_t) (at - (at >= b ? b : fb));
@@ -366,7 +369,7 @@ flip_start(uint64_t fb, uint8_t * fbBase, uint32_t bytes, uint32_t rows)
 		return;
 	}
 	flip.intf = (flip_rd(FLIP_CTL(flip.ctl) + FLIP_CTL_INTF_ACTIVE) & (1u << 2)) != 0 ? 2 : 1;
-	for (uint64_t at = b; at < b + bytes; at += 0x100000) {
+	for (uint64_t at = fb + ((bytes + 0xfffffULL) & ~0xfffffULL); at < b + slot_bytes; at += 0x100000) {
 		if (pmap_valid_address(at)) {
 			IOLog("MiniIOMobileFramebuffer: flip: %#llx is the kernel's memory: no second buffer\n", at);
 			return;
@@ -375,13 +378,19 @@ flip_start(uint64_t fb, uint8_t * fbBase, uint32_t bytes, uint32_t rows)
 	flip.flush |= FLIP_CTL_FLUSH_CTL;
 	flip.pa[0] = fb;
 	flip.pa[1] = b;
-	flip.va[0] = fbBase;
-	flip.va[1] = (uint8_t *) ml_io_map_wcomb((vm_offset_t) b, bytes);
+	flip.va[0] = (gDpuScale != 0 && slot_bytes > bytes) ? (uint8_t *) ml_io_map_wcomb((vm_offset_t) fb, slot_bytes) : fbBase;
+	if (flip.va[0] == NULL) {
+		flip.va[0] = fbBase;
+		slot_bytes = bytes;
+	}
+	flip.va[1] = (uint8_t *) ml_io_map_wcomb((vm_offset_t) b, slot_bytes);
 	flip.bytes = bytes;
+	flip.slot_bytes = slot_bytes;
 	flip.rows = rows;
 	if (flip.va[1] == NULL) {
 		return;
 	}
+	dpu_scale_init();
 	/* A on screen, as the loader had it; does a flush alone get taken, or does each refresh need a start? */
 	flip_point(0);
 	if (!flip_taken(50000, true)) {
@@ -423,6 +432,11 @@ flip_band(int32_t * by0, int32_t * by1, int32_t py0, int32_t py1)
 {
 	if (!flip.ready) {
 		return;
+	}
+	if (dpuScale.active) {
+		flip_restore_boot_scale();
+		flip.stale0 = 0;
+		flip.stale1 = (int32_t) flip.rows;
 	}
 	flip.band0 = *by0 < flip.band0 ? *by0 : flip.band0;
 	flip.band1 = *by1 > flip.band1 ? *by1 : flip.band1;
@@ -476,6 +490,11 @@ MiniIOMobileFramebufferQuiesce(void)
 		return;
 	}
 	bool accepted = !flip.pending || flip_taken(40000, false);
+	if (flip_dpu_scale_quiesce(false)) {
+		loader_set_scanout_pa(0);
+		flip.ready = false;
+		return;
+	}
 	if (flip.shown == 1 && accepted) {
 		memcpy(flip.va[0], flip.va[1], flip.bytes);
 	}
@@ -497,10 +516,12 @@ MiniIOMobileFramebufferPowerOff(void)
 	dim_poweroff();
 	if (flip.ready) {
 		flip_taken(40000, false);
-		bzero(flip.va[0], flip.bytes);
-		bzero(flip.va[1], flip.bytes);
-		flip_point(0);
-		flip_taken(40000, false);
+		if (!flip_dpu_scale_quiesce(true)) {
+			bzero(flip.va[0], flip.bytes);
+			bzero(flip.va[1], flip.bytes);
+			flip_point(0);
+			flip_taken(40000, false);
+		}
 		flip.ready = false;
 	} else {
 		if (flip.va[0] != NULL && flip.bytes != 0) {

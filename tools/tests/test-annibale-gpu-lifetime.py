@@ -42,6 +42,7 @@ enum { kIOReturnSuccess, kIOReturnBadArgument, kIOReturnNoMemory,
        kIOReturnVMError, kIOReturnTimeout, kIOReturnNoResources, kIOReturnNoSpace };
 enum { GPU_REFUSE_NOT_READY = 1, GPU_REFUSE_NO_RANGE = 2, GPU_REFUSE_NO_TABLE = 3 };
 #define GPU_KEEP_FROM (256u << 10)
+#define GPU_CLIENT_QUEUES 16
 enum { kIOMemoryMapperNone, kIODirectionInOut = 1,
        kIOMemoryKernelUserShared = 2, kIOMapWriteCombineCache = 4, kIODirectionOut = 8 };
 constexpr IOReturn KERN_PROTECTION_FAILURE = 100;
@@ -193,9 +194,27 @@ static unsigned busy_for;                       /* annibale_gpu_done() says no s
 static bool (*done_hook)(uint32_t);
 static bool annibale_gpu_done(uint32_t f) { ++done_calls; return done_hook ? done_hook(f) : (fence_done && done_calls > busy_for); }
 static uint32_t annibale_gpu_last() { return 7; }
-static uint32_t retired_now, retired_slot1;
+static uint32_t retired_now, retired_slot1, retired_slots[16];
+static uint32_t unhealthy_slots, slot_last[16];
+static int32_t last_submit_slot = -1;
+static unsigned slot_releases;
+static bool annibale_gpu_context_healthy(int32_t slot) {
+    return ready && (slot < 0 || (slot < 16 && !(unhealthy_slots & (1u << slot))));
+}
+static void annibale_gpu_context_release(int32_t slot) { if (slot >= 0) ++slot_releases; }
+static uint32_t annibale_gpu_last_for(int32_t slot) {
+    return (slot >= 0 && slot < 16 && slot_last[slot]) ? slot_last[slot] : annibale_gpu_last();
+}
+static uint32_t annibale_gpu_depth_target(int32_t slot, uint32_t depth) {
+    uint32_t l = annibale_gpu_last_for(slot);
+    uint32_t r = l & 0x07ffffffu;
+    return (!depth || r < depth) ? 0u : ((l & 0xf8000000u) | (r - depth + 1u));
+}
 static uint32_t annibale_gpu_retired() { return retired_now; }
-static uint32_t annibale_gpu_retired_for(uint32_t f) { return (f & 0x80000000u) ? retired_slot1 : retired_now; }
+static uint32_t annibale_gpu_retired_for(uint32_t f) {
+    uint32_t s = (f >> 27) & 0xfu;
+    return s ? (retired_slots[s] ? retired_slots[s] : (s == 1 ? retired_slot1 : 0)) : retired_now;
+}
 static bool cp_progress_ok;
 static uint64_t cp_progress_sig;
 static uint64_t (*cp_progress_hook)(bool *ok);
@@ -207,6 +226,9 @@ static uint32_t context_depth = 4;
 static uint32_t adreno8_context_depth() { return context_depth; }
 static uint32_t annibale_gpu_submit(const uint64_t *, const uint32_t *, uint32_t count) {
     assert(count); ++submit_calls; return submit_answer;
+}
+static uint32_t annibale_gpu_submit_slot(int32_t slot, const uint64_t *a, const uint32_t *w, uint32_t count) {
+    last_submit_slot = slot; return annibale_gpu_submit(a, w, count);
 }
 static unsigned flush_calls;
 static void *last_flush_ptr;
@@ -240,7 +262,8 @@ static void reset() {
     map_calls = unmap_calls = freed_addresses = done_calls = submit_calls = map_fail_at = 0;
     releases_in_lock = drops_in_lock = 0;
     wrong_pages = busy_for = 0; context_depth = 4; done_hook = nullptr;
-    retired_now = retired_slot1 = 0;
+    retired_now = retired_slot1 = 0; unhealthy_slots = 0; last_submit_slot = -1; slot_releases = 0;
+    memset(retired_slots, 0, sizeof(retired_slots)); memset(slot_last, 0, sizeof(slot_last));
     cp_progress_ok = false; cp_progress_sig = 0; cp_progress_hook = nullptr;
     submit_answer = 17; next_address = 0x40000000; now = 0;
     gGPUReported = gGPUCached = gGPUCoherent = false; gGPUKeep = 0;
@@ -576,7 +599,7 @@ static void full_fleft_reap_before_wait() {
 static void cross_slot_last_use_and_stall() {
     static uint32_t s0_done, s1_done;
     auto check_done = [](uint32_t f) -> bool {
-        return (f & 0x80000000u) ? ((f & 0x7fffffffu) <= s1_done) : (f <= s0_done);
+        return (f & 0xf8000000u) ? ((f & 0x07ffffffu) <= s1_done) : (f <= s0_done);
     };
     reset();
     auto c = client();
@@ -588,41 +611,75 @@ static void cross_slot_last_use_and_stall() {
     auto *b = &c.fBuffers[req.handle - 1];
     done_hook = check_done;
 
-    /* Slot 0 pending (16) vs slot 1 retired (0x80000005) must not pick retired slot 1 fence. */
+    /* Slot 0 pending (16) vs slot 1 retired ((1<<27)|5) must not pick retired slot 1 fence. */
     s0_done = 10; s1_done = 10;
-    b->fence = 16u; s.drawn = 0x80000005u;
+    b->fence = 16u; s.drawn = (1u << 27) | 5u;
     assert(c.lastUse(req.handle) == 16u);
 
-    /* Slot 1 retired (0x80000005) vs slot 0 pending (16) must pick pending slot 0 drawn. */
-    b->fence = 0x80000005u; s.drawn = 16u;
+    /* Slot 1 retired ((1<<27)|5) vs slot 0 pending (16) must pick pending slot 0 drawn. */
+    b->fence = (1u << 27) | 5u; s.drawn = 16u;
     assert(c.lastUse(req.handle) == 16u);
 
-    /* Slot 1 pending (0x80000012) vs slot 0 retired (10) must pick pending slot 1 fence. */
-    b->fence = 0x80000012u; s.drawn = 10u;
-    assert(c.lastUse(req.handle) == 0x80000012u);
+    /* Slot 1 pending ((1<<27)|0x12) vs slot 0 retired (10) must pick pending slot 1 fence. */
+    b->fence = (1u << 27) | 0x12u; s.drawn = 10u;
+    assert(c.lastUse(req.handle) == ((1u << 27) | 0x12u));
 
-    /* Same-slot 31-bit wraparound still picks newer drawn timestamp. */
+    /* Cross-slot between dynamic slots 2 and 3 must not wrap-compare across different slots. */
+    s1_done = 20;
+    b->fence = (2u << 27) | 30u; s.drawn = (3u << 27) | 5u;
+    assert(c.lastUse(req.handle) == ((2u << 27) | 30u));
+
+    /* Same-slot 27-bit wraparound still picks newer drawn timestamp. */
     s1_done = 0;
-    b->fence = 0xffffffffu; s.drawn = 0x80000002u;
-    assert(c.lastUse(req.handle) == 0x80000002u);
+    b->fence = (1u << 27) | 0x07ffffffu; s.drawn = (1u << 27) | 2u;
+    assert(c.lastUse(req.handle) == ((1u << 27) | 2u));
 
     /* Per-slot stall detection: slot 1 advancing prevents false stall even when slot 0 retired_now is frozen. */
     done_hook = nullptr;
     fence_done = false;
-    retired_now = 99u; retired_slot1 = 0x80000001u;
+    retired_now = 99u; retired_slot1 = (1u << 27) | 1u;
     IOLockLock(gGPULock);
-    assert(!gpuWait(0x80000005u, 1000));
+    assert(!gpuWait((1u << 27) | 5u, 1000));
     assert(!gGPUReported);
     now += (uint64_t)(GPU_STALL_MS + 100) * NSEC_PER_MSEC;
-    retired_slot1 = 0x80000002u; /* slot 1 made progress -> resets stall timer */
-    assert(!gpuWait(0x80000005u, 1000));
+    retired_slot1 = (1u << 27) | 2u; /* slot 1 made progress -> resets stall timer */
+    assert(!gpuWait((1u << 27) | 5u, 1000));
     assert(!gGPUReported);
     /* Slot 0 advancing must NOT mask a stalled slot 1 past GPU_STALL_MS. */
     now += (uint64_t)(GPU_STALL_MS + 100) * NSEC_PER_MSEC;
     retired_now = 105u;
-    assert(!gpuWait(0x80000005u, 1000));
+    assert(!gpuWait((1u << 27) | 5u, 1000));
     assert(gGPUReported);
     IOLockUnlock(gGPULock);
+
+    /* Multi-context per-slot stall independence (slot 2 vs slot 3) & isolated non-zero slot skip gGPUReported. */
+    gGPUReported = false; a830 = true;
+    retired_slots[2] = (2u << 27) | 1u; retired_slots[3] = (3u << 27) | 1u;
+    IOLockLock(gGPULock);
+    assert(!gpuWait((2u << 27) | 5u, 1000));
+    assert(!gpuWait((3u << 27) | 5u, 1000));
+    unhealthy_slots = (1u << 2);
+    assert(!gpuWait((2u << 27) | 5u, 1000));
+    assert(!gGPUReported);
+    now += (uint64_t)(GPU_STALL_MS + 100) * NSEC_PER_MSEC;
+    retired_slots[3] = (3u << 27) | 2u; /* slot 3 advanced independently */
+    assert(!gpuWait((3u << 27) | 5u, 1000));
+    assert(!gGPUReported);
+    IOLockUnlock(gGPULock);
+
+    /* Per-queue submit routing & isolated slot refusal + multi-queue clientClose release. */
+    auto c2 = client(); auto *qb = allocate(c2);
+    c2.fQueues[0] = {1u, 1u, 2}; c2.fQueues[1] = {2u, 1u, 3};
+    msm_gem_submit_bo sbo{0, 1, 0}; msm_gem_submit_cmd scmd{MSM_SUBMIT_CMD_BUF, 0, 0, 4, 0, 0, 0};
+    msm_gem_submit sub{}; sub.flags = MSM_PIPE_3D0; sub.nr_bos = 1; sub.nr_cmds = 1;
+    sub.bos = reinterpret_cast<uint64_t>(&sbo); sub.cmds = reinterpret_cast<uint64_t>(&scmd);
+    sub.queueid = 1u;
+    assert(c2.submit(&sub, &io) == kIOReturnNotReady && !gGPUReported);
+    sub.queueid = 2u; submit_answer = (3u << 27) | 1u;
+    assert(c2.submit(&sub, &io) == kIOReturnSuccess && last_submit_slot == 3 && !gGPUReported);
+    fence_done = true; unhealthy_slots = 0; slot_last[3] = (3u << 27) | 1u;
+    assert(c2.clientClose() == kIOReturnSuccess && slot_releases == 2u);
+    c2.free(); (void)qb;
 
     gGPUReported = false; s.drawn = 0; b->fence = 0; fence_done = true;
     assert(c.gemClose(req.handle) == kIOReturnSuccess);
@@ -670,7 +727,8 @@ def unit(source, memory):
             + "\nIOReturn clientClose(); void free();\n};\n"
             + function(source, "gpuProgressSample") + function(source, "gpuWait") + function(source, "MiniIOSurfaceDrawn")
             + function(source, "MiniIOSurfaceGPUStopped")
-            + memory + function(source, "AnnibaleGPUUserClient::submit") + CASES)
+            + memory + function(source, "AnnibaleGPUUserClient::submitQueueSlot")
+            + function(source, "AnnibaleGPUUserClient::submit") + CASES)
 
 
 LEGACY_MODEL = r'''

@@ -24,7 +24,9 @@ static struct block adreno8_gmu;
 static vm_offset_t adreno8_hfi_view_table, adreno8_hfi_view_cmd;
 static vm_offset_t adreno8_hfi_view_resp, adreno8_hfi_view_debug;
 static unsigned adreno8_step, scenario, sleeps, failures, response_reads, barriers, diagnostic_calls;
-static unsigned memory_failures, feature_logs;
+static unsigned memory_failures, feature_logs, fault_calls;
+static uint32_t fault_ctx, fault_ts, fault_err;
+static bool fault_isolate;
 static bool adreno8_direct_ring;
 static bool publication_pending;
 static char feature_log[160];
@@ -158,6 +160,10 @@ static void thread_block(int continuation) { (void)continuation; assert(false); 
 #define NSEC_PER_MSEC 1000000ull
 static bool PE_parse_boot_argn(const char *name, void *out, int size) { return false; }
 void adreno8_gpu_hang_dump(void) {}
+static bool adreno8_context_record_fault(uint32_t ctx, uint32_t ts, uint32_t err) {
+    fault_calls++; fault_ctx = ctx; fault_ts = ts; fault_err = err;
+    return fault_isolate && ctx >= 2u;
+}
 ''' + FUNCTIONS + r'''
 static void reset(unsigned test) {
     memset(command, 0, sizeof(command)); memset(response, 0, sizeof(response));
@@ -170,7 +176,8 @@ static void reset(unsigned test) {
     adreno8_hfi_view_debug = (uintptr_t)debug;
     scenario = test; sleeps = failures = response_reads = barriers = diagnostic_calls = 0;
     publication_pending = false;
-    memory_failures = feature_logs = 0; feature_log[0] = 0;
+    memory_failures = feature_logs = fault_calls = 0; feature_log[0] = 0;
+    fault_ctx = fault_ts = fault_err = 0; fault_isolate = false;
     clock_ns = 0;
 }
 int main(void) {
@@ -261,7 +268,24 @@ int main(void) {
         reset(4); assert(adreno8_hfi_send(asynchronous[i], msg, 2, "async positive data"));
         reset(17); assert(!adreno8_hfi_send(asynchronous[i], msg, 2, "async failure"));
     }
-    puts("HFI layout, wrap, lengths, FEATURE_CTRL v5, ACK identity, async errors and bounded waits: PASS");
+    /* HFI 150 isolates non-compositor contexts (ctx >= 2) while killing HFI on compositor (ctx == 1). */
+    reset(0); fault_isolate = true; adreno8_direct_ring = false;
+    {
+        uint32_t retire[15] = {(15u << 8) | 133u, 3u, 9u};
+        uint32_t fault_app[4] = {(4u << 8) | 150u, 3u, 42u, 0xdeadbeefu};
+        append(1, retire, 15);
+        append(2, fault_app, 4);
+        assert(adreno8_hfi_poll());
+        assert(fault_calls == 1 && fault_ctx == 3u && fault_ts == 42u && fault_err == 0xdeadbeefu);
+        assert(!memory_failures && !failures);
+    }
+    {
+        uint32_t fault_comp[4] = {(4u << 8) | 150u, 1u, 7u, 0xbadu};
+        append(2, fault_comp, 4);
+        assert(!adreno8_hfi_poll());
+        assert(fault_calls == 2 && fault_ctx == 1u && memory_failures == 1 && failures == 1);
+    }
+    puts("HFI layout, wrap, lengths, FEATURE_CTRL v5, ACK identity, async errors, HFI 150 isolation and bounded waits: PASS");
 }
 '''
 STAGE_FUNCTIONS = DRIVER[DRIVER.index("bool\nadreno8_step_queues("):DRIVER.index("/* ---- step 16:")]

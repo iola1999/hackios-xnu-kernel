@@ -80,11 +80,11 @@ static uint32_t g_smmu_regs[0x40000 / 4];
 static uint32_t g_sticky_fsr_mask;
 static unsigned g_smmu_writes;
 
-static uint32_t g_hfi_ids[32];
-static uint32_t g_hfi_payloads[32][16];
-static uint32_t g_hfi_counts[32];
+static uint32_t g_hfi_ids[128];
+static uint32_t g_hfi_payloads[128][16];
+static uint32_t g_hfi_counts[128];
 static unsigned g_hfi_sent;
-static unsigned g_doorbells[32];
+static unsigned g_doorbells[128];
 static unsigned g_doorbell_count;
 
 static int adreno8_say(const char *fmt, ...) { (void)fmt; return 0; }
@@ -123,7 +123,7 @@ static void adreno8_wr(vm_offset_t addr, uint32_t val) {
     }
     if (addr == adreno8_gmu.base + GMU_HOST2GMU_SET) {
         g_gmu_regs[0] = val;
-        assert(g_doorbell_count < 32);
+        assert(g_doorbell_count < 128);
         g_doorbells[g_doorbell_count++] = val;
         auto_retire_context(val);
         return;
@@ -153,12 +153,12 @@ static uint32_t adreno8_pm4_scratch(uint32_t *ib, uint32_t max_w, uint32_t addr,
     return 6;
 }
 
-static struct adreno8_memory g_mem[16];
+static struct adreno8_memory g_mem[64];
 static unsigned g_mem_count;
 static bool g_auto_retire = true;
 
 static struct adreno8_memory *alloc_mem(const char *name, uint32_t size, uint32_t align, bool gpu, bool gmu) {
-    assert(g_mem_count < 16 && (align & (align - 1)) == 0);
+    assert(g_mem_count < 64 && (align & (align - 1)) == 0);
     unsigned idx = g_mem_count++;
     struct adreno8_memory *m = &g_mem[idx];
     m->name = name;
@@ -184,7 +184,7 @@ bool adreno8_memory_acquire(const struct adreno8_memory *m, uint32_t off, uint32
 bool adreno8_hfi_poll(void) { return true; }
 bool adreno8_hfi_send(uint32_t id, const uint32_t *payload, uint32_t count, const char *what) {
     (void)what;
-    assert(g_hfi_sent < 32 && count <= 16);
+    assert(g_hfi_sent < 128 && count <= 16);
     g_hfi_ids[g_hfi_sent] = id;
     g_hfi_counts[g_hfi_sent] = count;
     if (count) memcpy(g_hfi_payloads[g_hfi_sent], payload, count * sizeof(uint32_t));
@@ -217,6 +217,7 @@ bool adreno8_memory_reset_for_recovery(void) { return true; }
 void adreno8_memory_set_recover_armed(bool armed) { (void)armed; }
 bool adreno8_gpu_memory_verify(void) { return true; }
 bool adreno8_gpu_cp_init(void) { return true; }
+bool adreno8_gpu_cp_progress(uint64_t *sig) { *sig = 0; return false; }
 bool adreno8_gpu_secure_exit(void) { return true; }
 bool adreno8_gpu_scratch_test(void) { return true; }
 static bool adreno8_step_firmware(void) { return true; }
@@ -289,8 +290,8 @@ static void reset_all(bool preempt) {
 
 static uint32_t compute_depth_target(uint32_t depth, uint32_t last) {
     uint32_t target = 0;
-    uint32_t raw = last & 0x7fffffffu;
-    if (raw >= depth) target = (last & 0x80000000u) | (raw - depth + 1);
+    uint32_t raw = last & ADRENO8_CONTEXT_FENCE_TS_MASK;
+    if (raw >= depth) target = (last & ADRENO8_CONTEXT_FENCE_SLOT_MASK) | (raw - depth + 1);
     return target;
 }
 
@@ -323,7 +324,7 @@ int main(void) {
     assert(g_doorbells[0] == (1u << 2) && g_doorbells[1] == (1u << 2) && g_doorbells[2] == (1u << 3));
     assert(annibale_gpu_parameter(7, &val) && val == 2);
 
-    /* 3. Role routing in AnnibaleGPU: backboardd -> slot 0 (bit31=0), other apps -> slot 1 (bit31=1). */
+    /* 3. Role routing in AnnibaleGPU: backboardd -> slot 0 (tag 0), other apps -> slot 1 (tag 1). */
     reset_all(true);
     assert(adreno8_context_test());
     uint64_t ib_addr = 0x10002000ull;
@@ -331,15 +332,16 @@ int main(void) {
     snprintf(g_proc_name, sizeof(g_proc_name), "MobileSafari");
     uint32_t app_f1 = annibale_gpu_submit(&ib_addr, &ib_words, 1);
     uint32_t app_f2 = annibale_gpu_submit(&ib_addr, &ib_words, 1);
-    assert((app_f1 & CONTEXT_FENCE_SLOT_BIT) != 0 && (app_f2 & CONTEXT_FENCE_SLOT_BIT) != 0);
+    assert((app_f1 >> ADRENO8_CONTEXT_FENCE_SHIFT) == 1u && (app_f2 >> ADRENO8_CONTEXT_FENCE_SHIFT) == 1u);
     assert(annibale_gpu_last() == app_f2);
     assert(annibale_gpu_done(app_f1) && annibale_gpu_done(app_f2));
 
-    /* Check depth target stays on slot 1 even when bit31 is set. */
+    /* Check depth target stays on slot 1 with [31:27] slot tag. */
     uint32_t app_f3 = annibale_gpu_submit(&ib_addr, &ib_words, 1);
     uint32_t app_f4 = annibale_gpu_submit(&ib_addr, &ib_words, 1);
     uint32_t app_f5 = annibale_gpu_submit(&ib_addr, &ib_words, 1);
     assert(compute_depth_target(4, app_f5) == app_f2);
+    assert(annibale_gpu_depth_target(1, 4) == app_f2);
     (void)app_f3; (void)app_f4;
 
     /* backboardd routes to slot 0 independently and isn't throttled by slot 1's inflight fence count. */
@@ -348,38 +350,38 @@ int main(void) {
     uint32_t app_f6 = annibale_gpu_submit(&ib_addr, &ib_words, 1); /* slot 1 ts=6 */
     snprintf(g_proc_name, sizeof(g_proc_name), "backboardd");
     uint32_t bb_f = annibale_gpu_submit(&ib_addr, &ib_words, 1);   /* slot 0 ts=3 */
-    assert((bb_f & CONTEXT_FENCE_SLOT_BIT) == 0);
+    assert((bb_f >> ADRENO8_CONTEXT_FENCE_SHIFT) == 0u);
     assert(annibale_gpu_last() == bb_f);
     assert(!annibale_gpu_done(bb_f));
     /* Advancing slot 1 EOP to 6 (>= slot 0 ts=3) must NOT mark backboardd's slot 0 fence done. */
-    ((uint32_t *)context_slots[1].timestamp_view)[2] = app_f6 & CONTEXT_FENCE_TS_MASK;
+    ((uint32_t *)context_slots[1].timestamp_view)[2] = app_f6 & ADRENO8_CONTEXT_FENCE_TS_MASK;
     ((uint32_t *)context_slots[1].queue_view)[5] = ((uint32_t *)context_slots[1].queue_view)[6];
     assert(annibale_gpu_done(app_f6) && !annibale_gpu_done(bb_f));
     assert(annibale_gpu_retired_for(app_f6) == app_f6);
     assert(annibale_gpu_retired_for(bb_f) == 2u);
     snprintf(g_proc_name, sizeof(g_proc_name), "MobileSafari");
-    assert(((annibale_gpu_last() - annibale_gpu_retired_for(app_f5)) & 0x7fffffffu) == 0u);
-    ((uint32_t *)context_slots[1].timestamp_view)[2] = 0u; /* slot 1 EOP=0 while last=7 -> inflight=7, not 0x80000007 */
+    assert(((annibale_gpu_last() - annibale_gpu_retired_for(app_f5)) & ADRENO8_CONTEXT_FENCE_TS_MASK) == 0u);
+    ((uint32_t *)context_slots[1].timestamp_view)[2] = 0u; /* slot 1 EOP=0 while last=7 -> inflight=7 */
     assert(annibale_gpu_retired_for(app_f6) == 0u);
-    assert(((annibale_gpu_last() - annibale_gpu_retired_for(app_f5)) & 0x7fffffffu) == (app_f6 & CONTEXT_FENCE_TS_MASK));
-    ((uint32_t *)context_slots[1].timestamp_view)[2] = app_f6 & CONTEXT_FENCE_TS_MASK;
+    assert(((annibale_gpu_last() - annibale_gpu_retired_for(app_f5)) & ADRENO8_CONTEXT_FENCE_TS_MASK) == (app_f6 & ADRENO8_CONTEXT_FENCE_TS_MASK));
+    ((uint32_t *)context_slots[1].timestamp_view)[2] = app_f6 & ADRENO8_CONTEXT_FENCE_TS_MASK;
     snprintf(g_proc_name, sizeof(g_proc_name), "backboardd");
     assert(!adreno8_context_drained("slot 0 still running", 200));
     /* Advancing slot 0 EOP retires bb_f and completes drained/wait_idle. */
-    ((uint32_t *)context_slots[0].timestamp_view)[2] = bb_f & CONTEXT_FENCE_TS_MASK;
+    ((uint32_t *)context_slots[0].timestamp_view)[2] = bb_f & ADRENO8_CONTEXT_FENCE_TS_MASK;
     ((uint32_t *)context_slots[0].queue_view)[5] = ((uint32_t *)context_slots[0].queue_view)[6];
     assert(annibale_gpu_done(bb_f));
     assert(adreno8_context_drained("both idle", 200));
     assert(adreno8_context_wait_idle("preempt wait idle"));
 
-    /* 4. 31-bit wraparound on slot 1 keeps bit 31 set and preserves modular comparison. */
-    context_slots[1].last = CONTEXT_FENCE_TS_MASK;
-    ((uint32_t *)context_slots[1].timestamp_view)[2] = CONTEXT_FENCE_TS_MASK;
+    /* 4. 27-bit wraparound on slot 1 preserves [31:27] slot tag and modular comparison. */
+    context_slots[1].last = ADRENO8_CONTEXT_FENCE_TS_MASK;
+    ((uint32_t *)context_slots[1].timestamp_view)[2] = ADRENO8_CONTEXT_FENCE_TS_MASK;
     ((uint32_t *)context_slots[1].queue_view)[5] = ((uint32_t *)context_slots[1].queue_view)[6];
     g_auto_retire = true;
     snprintf(g_proc_name, sizeof(g_proc_name), "Camera");
     uint32_t wrapped = annibale_gpu_submit(&ib_addr, &ib_words, 1);
-    assert(wrapped == (CONTEXT_FENCE_SLOT_BIT | 1u));
+    assert(wrapped == ((1u << ADRENO8_CONTEXT_FENCE_SHIFT) | 1u));
     assert(annibale_gpu_done(wrapped));
 
     /* 5. adreno8_space_clear_fault W1C clears FSR_ALL bits, ignores non-fault 0x400, detects sticky bits. */
@@ -393,6 +395,73 @@ int main(void) {
     g_smmu_regs[cb0_fsr_idx] = 0x40au;
     assert(!adreno8_space_clear_fault(&adreno8_gpu_space) && g_smmu_regs[cb0_fsr_idx] == 0x402u);
     assert(!adreno8_space_clear_fault(NULL));
+
+    /* 6. Stage 3 multi-context slots 2..15: lazy pages, acquire/release/reuse, overflow to slot 1, RB0 reserved. */
+    reset_all(true);
+    assert(adreno8_context_test());
+    unsigned boot_mem = g_mem_count;
+    assert(boot_mem == 7u);
+    for (uint32_t i = 2; i < ADRENO8_CONTEXT_SLOTS; i++) {
+        assert(context_slots[i].state == CONTEXT_COLD && !context_slots[i].queue);
+    }
+    snprintf(g_proc_name, sizeof(g_proc_name), "AppClient");
+    int32_t acquired[14];
+    for (int i = 0; i < 14; i++) {
+        acquired[i] = annibale_gpu_context_acquire(i == 0 ? 0u : 1u);
+        assert(acquired[i] == 2 + i);
+    }
+    /* Non-compositor never acquires slot 0 even with prio=0; 15th concurrent client falls back to slot 1. */
+    assert(annibale_gpu_context_acquire(0u) == (int32_t)ADRENO8_CONTEXT_SLOT_NORMAL);
+    /* backboardd always keeps slot 0 even when all 14 dynamic slots are occupied. */
+    snprintf(g_proc_name, sizeof(g_proc_name), "backboardd");
+    assert(annibale_gpu_context_acquire(0u) == (int32_t)ADRENO8_CONTEXT_SLOT_HIGH);
+
+    /* Submit to slot 2 and slot 3; verify lazy allocation, HFI 128/134 registration, and fence slot tags. */
+    snprintf(g_proc_name, sizeof(g_proc_name), "AppClient");
+    g_hfi_sent = 0;
+    uint32_t s2_f1 = annibale_gpu_submit_slot(2, &ib_addr, &ib_words, 1);
+    uint32_t s3_f1 = annibale_gpu_submit_slot(3, &ib_addr, &ib_words, 1);
+    assert((s2_f1 >> ADRENO8_CONTEXT_FENCE_SHIFT) == 2u && (s3_f1 >> ADRENO8_CONTEXT_FENCE_SHIFT) == 3u);
+    assert(annibale_gpu_done(s2_f1) && annibale_gpu_done(s3_f1));
+    assert(g_mem_count == boot_mem + 6u);
+    assert(g_hfi_sent == 4u && g_hfi_ids[0] == 128 && g_hfi_payloads[0][0] == 3 &&
+           g_hfi_ids[1] == 134 && g_hfi_payloads[1][0] == 3 &&
+           g_hfi_ids[2] == 128 && g_hfi_payloads[2][0] == 4 &&
+           g_hfi_ids[3] == 134 && g_hfi_payloads[3][0] == 4);
+
+    /* Release slot 2 (HFI 129 unregister) and verify next acquire reuses slot 2 without extra allocations. */
+    g_hfi_sent = 0;
+    annibale_gpu_context_release(2);
+    assert(g_hfi_sent == 1u && g_hfi_ids[0] == 129 && g_hfi_payloads[0][0] == 3);
+    assert(context_slots[2].state == CONTEXT_PREPARED && !context_slots[2].in_use);
+    assert(annibale_gpu_context_acquire(1u) == 2);
+    uint32_t s2_f2 = annibale_gpu_submit_slot(2, &ib_addr, &ib_words, 1);
+    assert((s2_f2 >> ADRENO8_CONTEXT_FENCE_SHIFT) == 2u && (s2_f2 & ADRENO8_CONTEXT_FENCE_TS_MASK) == 2u);
+    assert(g_mem_count == boot_mem + 6u);
+
+    /* 7. Fault isolation: HFI fault on ctx 3 (slot 2) isolates slot 2 without poisoning slot 0 or slot 3. */
+    assert(adreno8_context_record_fault(3u, 2u, 0xdeadu));
+    assert(!annibale_gpu_context_healthy(2) && annibale_gpu_context_faults(2) == 1u);
+    assert(annibale_gpu_submit_slot(2, &ib_addr, &ib_words, 1) == 0u);
+    assert(annibale_gpu_ready() && !context_failed);
+    assert(annibale_gpu_context_healthy(0) && annibale_gpu_context_healthy(3));
+    snprintf(g_proc_name, sizeof(g_proc_name), "backboardd");
+    uint32_t bb_alive = annibale_gpu_submit_slot(0, &ib_addr, &ib_words, 1);
+    snprintf(g_proc_name, sizeof(g_proc_name), "AppB");
+    uint32_t s3_alive = annibale_gpu_submit_slot(3, &ib_addr, &ib_words, 1);
+    assert(bb_alive != 0u && s3_alive != 0u && annibale_gpu_done(bb_alive) && annibale_gpu_done(s3_alive));
+    assert(adreno8_context_drained("healthy slots drained", 200));
+    assert(adreno8_context_wait_idle("healthy wait idle"));
+    /* Releasing failed slot 2 prevents reuse until recovery reset; close succeeds skipping isolated slot 2. */
+    annibale_gpu_context_release(2);
+    assert(adreno8_context_close());
+    /* Compositor fault (ctx 1 / slot 0) cannot be isolated and falls back to global reset required. */
+    assert(!adreno8_context_record_fault(1u, 1u, 0xbadu));
+    /* Recovery clears isolated fault and rebinds only boot + active in-use slots. */
+    adreno8_context_reset_for_recovery();
+    assert(adreno8_context_rebind_for_recovery());
+    assert(annibale_gpu_context_healthy(2) && annibale_gpu_context_faults(2) == 0u);
+    assert(context_slots[3].state == CONTEXT_REGISTERED && context_slots[4].state == CONTEXT_COLD);
 
     printf("test-adreno8-preempt: ALL PASS\n");
     return 0;

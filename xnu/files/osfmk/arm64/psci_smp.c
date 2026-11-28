@@ -55,10 +55,15 @@
 #define PSCI_CPU_ON             0xC4000003u
 #define PSCI_AFFINITY_INFO      0xC4000004u
 #define PSCI_FEATURES           0x8400000Au
+#define PSCI_SET_SUSPEND_MODE   0x8400000Eu
+#define PSCI_SUSPEND_MODE_OSI   1u
 #define PSCI_CPU_SUSPEND        0xC4000001u
+#define PSCI_RET_DENIED         (-3)
 #define PSCI_C4_STATE_ID        0x00000004u     /* SM8750 MEDIUM_OFF_C4 / LARGE_OFF_C4 (StateType=0 retention) */
+#define PSCI_CL5_STATE_ID       0x01000054u     /* SM8750 LARGE_CLUSTER_PWR_DN (StateType=0 ret-pll-off) */
 #define PSCI_C4_MIN_RES_C0_US   560u            /* annibale.dts.gz: medium-cluster0-c4 min-residency-us = 0x230 */
 #define PSCI_C4_MIN_RES_C1_US   686u            /* annibale.dts.gz: large-cluster1-c4  min-residency-us = 0x2ae */
+#define PSCI_CL5_MIN_RES_C1_US  9144u           /* annibale.dts.gz: large-cluster-cl5 min-residency-us = 0x23b8 */
 #define PSCI_AFFINITY_OFF       1
 
 #define PSCI_SMP_START_SECONDS  5       /* how long a started core is waited for */
@@ -89,10 +94,19 @@ static bool     psci_smp_boot_wanted;           /* it was not the boot processor
 static bool     psci_smp_boot_busy;             /* ... and has begun to */
 static bool     psci_smp_stopping;              /* every other core switches itself off */
 static bool     psci_idle_enabled;              /* gated by psci_idle=1 and PSCI >= 1.0 CPU_SUSPEND support */
-static bool     psci_idle_disabled;             /* latched on first non-zero PSCI_CPU_SUSPEND return */
+static bool     psci_idle_disabled;             /* latched on non-transient C4 PSCI_CPU_SUSPEND error */
+static bool     psci_cl5_enabled;               /* gated by psci_idle=1, psci_cl5=1, OSI + ext_stateid, and SET_SUSPEND_MODE(OSI) */
+static bool     psci_cl5_disabled;              /* latched on non-transient CL5 error */
 static uint64_t psci_c4_min_ticks[2];           /* [0]=cluster0 (560 us), [1]=cluster1 (686 us) */
+static uint64_t psci_cl5_min_ticks;             /* cluster1 CL5 threshold (9144 us) */
+static uint32_t psci_c1_lock;                   /* spinlock around cluster1 idle mask and next wake deadlines */
+static uint32_t psci_c1_idle_mask;              /* bit (phys_id >> 8) & 1 for idle cluster1 cores */
+static uint64_t psci_c1_pop[2];                 /* next wake deadline per cluster1 core while idle */
 static uint64_t psci_c4_count[MAX_CPUS];
 static uint64_t psci_c4_err_count[MAX_CPUS];
+static uint64_t psci_cl5_count[MAX_CPUS];
+static uint64_t psci_cl5_denied_count[MAX_CPUS];
+static uint64_t psci_cl5_err_count[MAX_CPUS];
 
 static int64_t
 psci_call(uint64_t function, uint64_t arg1, uint64_t arg2, uint64_t arg3)
@@ -130,8 +144,8 @@ psci_smp_init(void)
 	void const *prop;
 	unsigned int size;
 	int64_t ver, feat;
-	uint32_t idle_arg = 0;
-	bool want_idle;
+	uint32_t idle_arg = 0, cl5_arg = 0;
+	bool want_idle, want_cl5;
 
 	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
 	    SecureDTGetProperty(chosen, "psci-method", &prop, &size) == kSuccess &&
@@ -139,10 +153,11 @@ psci_smp_init(void)
 		psci_smp_hvc = 1;
 	}
 	want_idle = PE_parse_boot_argn("psci_idle", &idle_arg, sizeof(idle_arg)) && idle_arg != 0;
+	want_cl5 = want_idle && PE_parse_boot_argn("psci_cl5", &cl5_arg, sizeof(cl5_arg)) && cl5_arg != 0;
 
 	ver = psci_call(PSCI_VERSION, 0, 0, 0);
 	if ((int32_t)ver < 0) {
-		printf("psci: method=%s version=err(%lld:%s) psci_idle=0\n",
+		printf("psci: method=%s version=err(%lld:%s) psci_idle=0 psci_cl5=0\n",
 		    psci_smp_hvc ? "hvc" : "smc", (long long)(int32_t)ver,
 		    psci_error((int32_t)ver));
 		return;
@@ -152,7 +167,7 @@ psci_smp_init(void)
 	if (major >= 1) {
 		feat = psci_call(PSCI_FEATURES, PSCI_CPU_SUSPEND, 0, 0);
 		if ((int32_t)feat < 0) {
-			printf("psci: method=%s version=%u.%u cpu_suspend=err(%lld:%s) psci_idle=0\n",
+			printf("psci: method=%s version=%u.%u cpu_suspend=err(%lld:%s) psci_idle=0 psci_cl5=0\n",
 			    psci_smp_hvc ? "hvc" : "smc", major, minor,
 			    (long long)(int32_t)feat, psci_error((int32_t)feat));
 		} else {
@@ -163,22 +178,62 @@ psci_smp_init(void)
 				nanoseconds_to_absolutetime((uint64_t)PSCI_C4_MIN_RES_C1_US * NSEC_PER_USEC,
 				    &psci_c4_min_ticks[1]);
 				os_atomic_store(&psci_idle_enabled, true, release);
+				if (want_cl5 && (f & 1u) != 0u && (f & 2u) != 0u) {
+					int64_t mode_ret = psci_call(PSCI_SET_SUSPEND_MODE, PSCI_SUSPEND_MODE_OSI, 0, 0);
+					if (mode_ret == 0) {
+						nanoseconds_to_absolutetime((uint64_t)PSCI_CL5_MIN_RES_C1_US * NSEC_PER_USEC,
+						    &psci_cl5_min_ticks);
+						os_atomic_store(&psci_cl5_enabled, true, release);
+					} else {
+						printf("psci: SET_SUSPEND_MODE(OSI) failed: %lld (%s); psci_cl5=0\n",
+						    mode_ret, psci_error(mode_ret));
+					}
+				}
 			}
-			printf("psci: method=%s version=%u.%u cpu_suspend=0x%x (osi=%u ext_stateid=%u) psci_idle=%u\n",
+			printf("psci: method=%s version=%u.%u cpu_suspend=0x%x (osi=%u ext_stateid=%u) psci_idle=%u psci_cl5=%u\n",
 			    psci_smp_hvc ? "hvc" : "smc", major, minor, f, f & 1u, (f >> 1) & 1u,
-			    want_idle ? 1u : 0u);
+			    want_idle ? 1u : 0u, os_atomic_load(&psci_cl5_enabled, relaxed) ? 1u : 0u);
 		}
 	} else {
-		printf("psci: method=%s version=%u.%u cpu_suspend=n/a psci_idle=0\n",
+		printf("psci: method=%s version=%u.%u cpu_suspend=n/a psci_idle=0 psci_cl5=0\n",
 		    psci_smp_hvc ? "hvc" : "smc", major, minor);
 	}
 }
 
+static inline void
+psci_c1_lock_acquire(void)
+{
+	while (os_atomic_xchg(&psci_c1_lock, 1u, acq_rel) != 0u) {
+	}
+}
+
+static inline void
+psci_c1_lock_release(void)
+{
+	os_atomic_store(&psci_c1_lock, 0u, release);
+}
+
+static uint32_t
+psci_c1_expected_mask(void)
+{
+	uint32_t mask = 0;
+	int max_cpu = ml_get_max_cpu_number();
+
+	for (int i = 0; i <= max_cpu && i < MAX_CPUS; i++) {
+		cpu_data_t *c = cpu_datap(i);
+
+		if (c != NULL && (c->cpu_phys_id & 0x10000u) != 0u) {
+			mask |= 1u << ((c->cpu_phys_id >> 8) & 1u);
+		}
+	}
+	return mask;
+}
+
 /*
- * Per-core C4 retention idle (0x00000004, StateType=0 standby/retention in PSCI 1.1 Extended
- * StateID format under default Platform-Coordinated mode). Off by default; falls back to WFI
- * when disabled, when remaining idle residency is below the cluster threshold, or permanently
- * on any non-zero PSCI return code.
+ * Per-core C4 retention idle (0x00000004) and, when psci_idle=1 && psci_cl5=1 with OSI mode
+ * active, coordinated cluster1 CL5 retention/PLL-off idle (0x01000054) on the last idle core
+ * when all online cluster1 cores have >= 9144 us remaining residency. Transient PSCI_DENIED (-3)
+ * falls back to C4/WFI for the current idle entry without latching psci_idle_disabled.
  */
 void
 psci_smp_cpu_idle(void)
@@ -200,12 +255,82 @@ psci_smp_cpu_idle(void)
 		return;
 	}
 	int cpu = cpu_number();
-	int64_t status = psci_call(PSCI_CPU_SUSPEND, PSCI_C4_STATE_ID, 0, 0);
+	uint32_t state_id = PSCI_C4_STATE_ID;
+	bool try_cl5 = false, c1_tracked = false;
+	uint32_t my_bit = 0;
+	unsigned sub = (cdp->cpu_phys_id >> 8) & 1u;
+
+	if (cluster == 1u &&
+	    os_atomic_load(&psci_cl5_enabled, acquire) &&
+	    !os_atomic_load(&psci_cl5_disabled, acquire)) {
+		uint32_t expected = psci_c1_expected_mask();
+
+		if (expected != 0u) {
+			my_bit = 1u << sub;
+			psci_c1_lock_acquire();
+			psci_c1_pop[sub] = pop;
+			psci_c1_idle_mask |= my_bit;
+			c1_tracked = true;
+			if ((psci_c1_idle_mask & expected) == expected) {
+				uint64_t earliest = pop;
+				for (unsigned b = 0; b < 2u; b++) {
+					if ((expected & (1u << b)) != 0u &&
+					    (psci_c1_pop[b] == 0u || psci_c1_pop[b] < earliest)) {
+						earliest = psci_c1_pop[b];
+					}
+				}
+				if (earliest > now && (earliest - now) >= psci_cl5_min_ticks) {
+					state_id = PSCI_CL5_STATE_ID;
+					try_cl5 = true;
+				}
+			}
+			psci_c1_lock_release();
+		}
+	}
+
+	int64_t status = psci_call(PSCI_CPU_SUSPEND, state_id, 0, 0);
+	if (try_cl5 && status != 0) {
+		if (status == PSCI_RET_DENIED) {
+			if (cpu >= 0 && cpu < MAX_CPUS) {
+				psci_cl5_denied_count[cpu]++;
+			}
+		} else {
+			if (cpu >= 0 && cpu < MAX_CPUS) {
+				psci_cl5_err_count[cpu]++;
+			}
+			if (!os_atomic_xchg(&psci_cl5_disabled, true, acq_rel)) {
+				printf("psci: cpu %d CL5 suspend failed: %lld (%s); falling back to C4\n",
+				    cpu, status, psci_error(status));
+			}
+		}
+		now = mach_absolute_time();
+		if (pop > now && (pop - now) >= psci_c4_min_ticks[cluster]) {
+			try_cl5 = false;
+			status = psci_call(PSCI_CPU_SUSPEND, PSCI_C4_STATE_ID, 0, 0);
+		} else {
+			if (c1_tracked) {
+				psci_c1_lock_acquire();
+				psci_c1_idle_mask &= ~my_bit;
+				psci_c1_pop[sub] = 0;
+				psci_c1_lock_release();
+			}
+			__builtin_arm_wfi();
+			return;
+		}
+	}
+
+	if (c1_tracked) {
+		psci_c1_lock_acquire();
+		psci_c1_idle_mask &= ~my_bit;
+		psci_c1_pop[sub] = 0;
+		psci_c1_lock_release();
+	}
+
 	if (status != 0) {
 		if (cpu >= 0 && cpu < MAX_CPUS) {
 			psci_c4_err_count[cpu]++;
 		}
-		if (!os_atomic_xchg(&psci_idle_disabled, true, acq_rel)) {
+		if (status != PSCI_RET_DENIED && !os_atomic_xchg(&psci_idle_disabled, true, acq_rel)) {
 			printf("psci: cpu %d C4 suspend failed: %lld (%s); falling back to WFI\n",
 			    cpu, status, psci_error(status));
 		}
@@ -213,7 +338,11 @@ psci_smp_cpu_idle(void)
 		return;
 	}
 	if (cpu >= 0 && cpu < MAX_CPUS) {
-		psci_c4_count[cpu]++;
+		if (try_cl5) {
+			psci_cl5_count[cpu]++;
+		} else {
+			psci_c4_count[cpu]++;
+		}
 	}
 }
 
@@ -358,6 +487,7 @@ psci_smp_stop_rest(void)
 	int me = cpu_number(), max_cpu = ml_get_max_cpu_number();
 
 	os_atomic_store(&psci_smp_stopping, true, release);
+	os_atomic_store(&psci_cl5_disabled, true, release);
 	__builtin_arm_dsb(DSB_SY);
 	for (int cpu = 0; cpu <= max_cpu; cpu++) {
 		cpu_data_t *cdp = cpu_datap(cpu);
@@ -485,8 +615,11 @@ int
 psci_smp_report(char *buf, size_t size)
 {
 	extern boolean_t idle_enable;
-	size_t n = (size_t)snprintf(buf, size, "idle_enable %d psci_idle %d\n",
+	size_t n = (size_t)snprintf(buf, size, "idle_enable %d psci_idle %d psci_cl5 %d\n",
 	    idle_enable, (os_atomic_load(&psci_idle_enabled, relaxed) &&
+	    !os_atomic_load(&psci_idle_disabled, relaxed)) ? 1 : 0,
+	    (os_atomic_load(&psci_cl5_enabled, relaxed) &&
+	    !os_atomic_load(&psci_cl5_disabled, relaxed) &&
 	    !os_atomic_load(&psci_idle_disabled, relaxed)) ? 1 : 0);
 
 	for (unsigned int cpu = 0; cpu <= (unsigned int)ml_get_max_cpu_number() && n < size; cpu++) {
@@ -499,11 +632,12 @@ psci_smp_report(char *buf, size_t size)
 
 		gic_v3_signal_kinds((int)cpu, kinds);
 		n += (size_t)snprintf(buf + n, size - n, "cpu %u phys %#llx signal %#x flags %#x irq %llu ipi %llu "
-		    "timer %llu wfe %llu c4 %llu c4_err %llu; ipi kinds nop %u maint %u xcall %u ast %u debug %u kppet %u imm %u "
+		    "timer %llu wfe %llu c4 %llu c4_err %llu cl5 %llu cl5_denied %llu cl5_err %llu; ipi kinds nop %u maint %u xcall %u ast %u debug %u kppet %u imm %u "
 		    "tlocal %u deferred %u\n", cpu, (unsigned long long)cdp->cpu_phys_id, (unsigned)cdp->cpu_signal,
 		    (unsigned)os_atomic_load(&cdp->cpu_flags, relaxed), cdp->cpu_stat.irq_ex_cnt,
 		    cdp->cpu_stat.ipi_cnt, cdp->cpu_stat.timer_cnt, cdp->wfe_count,
-		    psci_c4_count[cpu], psci_c4_err_count[cpu], kinds[GIC_SIGNAL_KINDS - 1],
+		    psci_c4_count[cpu], psci_c4_err_count[cpu], psci_cl5_count[cpu], psci_cl5_denied_count[cpu],
+		    psci_cl5_err_count[cpu], kinds[GIC_SIGNAL_KINDS - 1],
 		    kinds[0], kinds[2], kinds[3], kinds[4], kinds[8], kinds[9], kinds[10], kinds[11]);
 	}
 	return (int)(n < size ? n : size);

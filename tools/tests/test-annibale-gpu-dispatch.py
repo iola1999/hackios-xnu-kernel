@@ -39,7 +39,10 @@ bool adreno8_space_clear_fault(struct adreno8_gpu_space *s);
 bool adreno8_space_sync(struct adreno8_gpu_space *s);
 static uint32_t adreno8_gx_hz[17] = {0, 160000000, 222000000, 342000000};
 static unsigned adreno8_gx_count = 4;
-static unsigned legacy_calls, enable_calls, close_calls, stop_calls, cache_calls, submit_calls, publish_calls, ready_checks, speed_ticks, oob_release_calls;
+static unsigned legacy_calls, enable_calls, close_calls, stop_calls, cache_calls, submit_calls, publish_calls, ready_checks, speed_ticks, oob_release_calls, acquire_calls, release_calls;
+static uint32_t unhealthy_mask, slot_faults[16];
+static int32_t acquired_slot = 2;
+static uint32_t last_by_slot[16];
 static bool annibale_platform_is_annibale(void) { return annibale; }
 static int adreno8_say(const char *format, ...) { (void)format; return 0; }
 static bool PE_parse_boot_argn(const char *key, void *value, unsigned size) {
@@ -53,6 +56,7 @@ static void adreno8_to_memory(vm_offset_t address, uint64_t size) {
 #define NSEC_PER_USEC 1000ull
 static void delay_for_interval(uint32_t interval, uint64_t unit) { (void)interval; (void)unit; }
 static void proc_selfname(char *buf, int size) { snprintf(buf, (size_t)size, "testapp"); }
+static int proc_selfpid(void) { return 42; }
 static void adreno8_sleep_us(uint32_t us) { (void)us; }
 #endif
 '''
@@ -73,6 +77,18 @@ bool adreno8_bo_map(uint64_t address, uint64_t pa, bool ro) {
 bool adreno8_bo_commit(void) { return bo_open; }
 bool adreno8_bo_unmap(uint64_t address, uint64_t size) { assert(address == 0x10001000 && size == 4096); return bo_open; }
 bool adreno8_bo_release(uint64_t address, uint64_t size) { assert(address == 0x10001000 && size == 4096); return bo_open; }
+int32_t adreno8_context_acquire(uint32_t prio, bool allow_high, int pid) {
+    (void)prio; (void)pid; assert(bo_open); acquire_calls++;
+    return allow_high ? 0 : acquired_slot;
+}
+void adreno8_context_release(uint32_t slot) { (void)slot; release_calls++; }
+bool adreno8_context_healthy(uint32_t slot) { return bo_open && slot < 16u && !(unhealthy_mask & (1u << slot)); }
+uint32_t adreno8_context_faults(uint32_t slot) { return slot < 16u ? slot_faults[slot] : 0u; }
+uint32_t adreno8_context_depth_target(uint32_t slot, uint32_t depth) {
+    uint32_t last = slot < 16u ? last_by_slot[slot] : 0u;
+    uint32_t raw = last & ADRENO8_CONTEXT_FENCE_TS_MASK;
+    return (!depth || raw < depth) ? 0u : ((slot << ADRENO8_CONTEXT_FENCE_SHIFT) | (raw - depth + 1u));
+}
 uint32_t adreno8_context_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count) {
     assert(bo_open && count == 1 && *addresses == 0x10001000 && *words == 6); submit_calls++; return 17;
 }
@@ -81,9 +97,9 @@ uint32_t adreno8_context_submit_slot(uint32_t slot, const uint64_t *addresses, c
 }
 bool adreno8_context_done(uint32_t fence) { assert(bo_open && fence == 17); return true; }
 uint32_t adreno8_context_last(void) { return 17; }
-uint32_t adreno8_context_last_slot(uint32_t slot) { (void)slot; return 17; }
+uint32_t adreno8_context_last_slot(uint32_t slot) { return slot < 16u && last_by_slot[slot] ? last_by_slot[slot] : 17u; }
 uint32_t adreno8_context_retired(void) { return 17; }
-uint32_t adreno8_context_retired_for(uint32_t fence) { return (fence & 0x80000000u) ? (0x80000000u | 17u) : 17u; }
+uint32_t adreno8_context_retired_for(uint32_t fence) { return (fence & ADRENO8_CONTEXT_FENCE_SLOT_MASK) | 17u; }
 void adreno8_gpu_hang_dump(void) {}
 void adreno8_gpu_reset_for_recovery(void) {}
 void adreno8_gmu_reset_for_recovery(void) {}
@@ -199,6 +215,19 @@ int main(void) {
     annibale_gpu_to_memory(NULL, 0);
     assert(cache_calls == 2 && ready_checks == checked && !legacy_calls && !bo_open);
     bo_open = true;
+    adreno8_gpu8_preempt = true;
+    acquired_slot = 3; unhealthy_mask = (1u << 3); slot_faults[2] = 4u;
+    last_by_slot[2] = (2u << ADRENO8_CONTEXT_FENCE_SHIFT) | 9u;
+    assert(annibale_gpu_context_acquire(1u) == 3 && acquire_calls == 1u);
+    assert(annibale_gpu_context_healthy(2) && !annibale_gpu_context_healthy(3));
+    assert(annibale_gpu_context_faults(2) == 4u && annibale_gpu_context_faults(-1) == 0u);
+    assert(annibale_gpu_depth_target(2, 4u) == ((2u << ADRENO8_CONTEXT_FENCE_SHIFT) | 6u));
+    assert(annibale_gpu_last_for(2) == ((2u << ADRENO8_CONTEXT_FENCE_SHIFT) | 9u));
+    annibale_gpu_context_release(2);
+    assert(release_calls == 1u);
+    adreno8_gpu8_preempt = false;
+    assert(annibale_gpu_context_acquire(1u) == 0);
+    unhealthy_mask = 0; last_by_slot[2] = 0;
     const uint32_t params[] = {1,2,3,4,6,7,8,9,10,16,17,20};
     const uint64_t expected[] = {830,0xc00000,0x44050001,342000000,0x04000000,1,0,0,0,16,0,0x1fffffffff000ULL};
     for (unsigned i=0;i<sizeof(params)/sizeof(*params);i++) assert(annibale_gpu_parameter(params[i],&value) && value == expected[i]);
@@ -374,29 +403,71 @@ def main():
         print("A830 cache-only ABI: no BO/HFI readiness checks after close; polling mutation rejected: PASS")
         run(PUBLISHER+publisher+PUBLISH_CASES,target,"publisher")
         run(boundaries(source,fixture),target,"boundaries")
-        queue=source[source.index('\tcase kMsmSubmitQueueNew:'):source.index('\tcase kMsmSubmitQueueQuery:')]
+        queue_fns=(function(source,"AnnibaleGPUUserClient::submitQueueSlot")
+                   +function(source,"AnnibaleGPUUserClient::submitQueueNew")
+                   +function(source,"AnnibaleGPUUserClient::submitQueueClose")
+                   +function(source,"AnnibaleGPUUserClient::submitQueueQuery"))
+        queue_cases=source[source.index('\tcase kMsmSubmitQueueNew:'):source.index('\tcase kDrmGemClose:')]
+        queue_close=source[source.index('\tcase kMsmSubmitQueueClose:'):source.index('\tcase kMsmGemNew:')]
         worked=source[source.index('\tcase kAnnibaleGPUWorked:'):source.index('\tcase kAnnibaleSurface:')]
         set_param=source[source.index('\tcase kMsmSetParam:'):source.index('\tcase kMsmGemCpuFini:')]
-        queue_unit='''#include <cassert>\n#include <cstdint>\nstatic bool a830, gpu_ready=true, gpu_preempt; static bool annibale_platform_is_annibale(){return a830;}
-        enum { kMsmSubmitQueueNew, kAnnibaleGPUWorked, kMsmSetParam, kIOReturnSuccess, kIOReturnBadArgument, kIOReturnUnsupported, kIOReturnNotReady };
+        queue_unit='''#include <cassert>\n#include <cstdint>\n#include <cstring>\nstatic bool a830, gpu_ready=true, gpu_preempt; static bool annibale_platform_is_annibale(){return a830;}
+        enum { kMsmSubmitQueueNew, kMsmSubmitQueueClose, kMsmSubmitQueueQuery, kAnnibaleGPUWorked, kMsmSetParam, kIOReturnSuccess, kIOReturnBadArgument, kIOReturnUnsupported, kIOReturnNotReady, kIOReturnNoMemory };
         #define MSM_PARAM_COMM 0x0c
         #define MSM_PARAM_CMDLINE 0x0d
-        static unsigned depth; static void IOLockLock(void*){depth++;} static void gpuLockIoctl(uint32_t){assert(!depth);depth++;} static void IOLockUnlock(void*){assert(depth==1);depth--;}
+        #define GPU_CLIENT_QUEUES 16
+        using IOReturn = int; using user_addr_t = uint64_t;
+        struct msm_submitqueue { uint32_t flags, prio, id; };
+        struct msm_submitqueue_query { uint64_t data; uint32_t id, param, len, pad; };
+        struct gpu_queue { uint32_t id, prio; int32_t slot; };
+        static unsigned depth, release_calls; static int32_t mock_slot = 2; static uint32_t mock_faults[16], mock_last[16];
+        static void IOLockLock(void*){depth++;} static void gpuLockIoctl(uint32_t){assert(!depth);depth++;} static void IOLockUnlock(void*){assert(depth==1);depth--;}
         static void *gGPULock; static void annibale_gpu_worked(uint64_t*,uint32_t*,uint32_t*){assert(!a830);}
+        static bool annibale_gpu_ready(){return gpu_ready;}
+        static int32_t annibale_gpu_context_acquire(uint32_t){return gpu_ready ? mock_slot : -1;}
+        static void annibale_gpu_context_release(int32_t){release_calls++;}
+        static uint32_t annibale_gpu_last_for(int32_t s){return (s >= 0 && s < 16) ? mock_last[s] : 0;}
+        static uint32_t annibale_gpu_context_faults(int32_t s){return (s >= 0 && s < 16) ? mock_faults[s] : 0;}
+        static bool gpuWait(uint32_t, uint64_t){return true;}
+        static int copyout(const void *src, user_addr_t dst, size_t len){memcpy(reinterpret_cast<void*>(dst), src, len); return 0;}
         static bool annibale_gpu_parameter(uint32_t w,uint64_t *v){assert(depth==1);if(w==0x07&&gpu_ready){*v=gpu_preempt?2:1;return true;}return false;}
-        int call(unsigned selector,unsigned flags,unsigned prio) {
-        struct { struct{unsigned flags,prio,id;} queue; struct{uint64_t microseconds;uint32_t submissions,by[7];}worked; struct{unsigned param;} param;}r{};
-        r.param.param=flags;r.queue.flags=flags;r.queue.prio=prio;unsigned fNextQueue=0;int ret=kIOReturnSuccess;
-        switch(selector){'''+queue+worked+set_param+'''} if(selector==kMsmSubmitQueueNew&&ret==kIOReturnSuccess)assert(r.queue.id==1); return ret; }
+        struct AnnibaleGPUUserClient {
+            uint32_t fNextQueue = 0; struct gpu_queue fQueues[GPU_CLIENT_QUEUES]{};
+            int32_t submitQueueSlot(uint32_t queueId);
+            IOReturn submitQueueNew(struct msm_submitqueue *request);
+            IOReturn submitQueueClose(uint32_t id);
+            IOReturn submitQueueQuery(struct msm_submitqueue_query *query, uint64_t *faults);
+            int call(unsigned selector, unsigned flags, unsigned prio, uint32_t id = 0, uint64_t qdata = 0, uint32_t qparam = 0) {
+                struct { struct msm_submitqueue queue; uint32_t queueId; struct msm_submitqueue_query query;
+                         struct { uint64_t microseconds; uint32_t submissions, by[7]; } worked; struct { unsigned param; } param; } r{};
+                size_t size = sizeof(uint32_t); uint64_t zero = 0;
+                r.param.param = flags; r.queue.flags = flags; r.queue.prio = prio; r.queueId = id;
+                r.query.id = id; r.query.param = qparam; r.query.data = qdata; r.query.len = sizeof(zero);
+                int ret = kIOReturnSuccess;
+                switch(selector){'''+queue_cases+queue_close+worked+set_param+'''} return ret;
+            }
+        };
+        '''+queue_fns+'''
         int main(){for(unsigned platform=0;platform<2;platform++){a830=platform;
         for(unsigned pre=0;pre<2;pre++){gpu_preempt=pre; gpu_ready=true;
         unsigned max_prio=pre?2:1;
-        for(unsigned flags=0;flags<4;flags++)for(unsigned prio=0;prio<3;prio++)
-        assert(call(kMsmSubmitQueueNew,flags,prio)==((a830&&(flags||prio>=max_prio))?kIOReturnBadArgument:kIOReturnSuccess));assert(!depth);}
-        gpu_ready=false;assert(call(kMsmSubmitQueueNew,0,0)==(a830?kIOReturnNotReady:kIOReturnSuccess));assert(!depth);
-        assert(call(kAnnibaleGPUWorked,0,0)==(a830?kIOReturnUnsupported:kIOReturnSuccess));assert(!depth);
+        for(unsigned flags=0;flags<4;flags++)for(unsigned prio=0;prio<3;prio++){
+        AnnibaleGPUUserClient c;
+        assert(c.call(kMsmSubmitQueueNew,flags,prio)==((a830&&(flags||prio>=max_prio))?kIOReturnBadArgument:kIOReturnSuccess));assert(!depth);}}
+        AnnibaleGPUUserClient c;
+        gpu_ready=false;assert(c.call(kMsmSubmitQueueNew,0,0)==(a830?kIOReturnNotReady:kIOReturnSuccess));assert(!depth);
+        assert(c.call(kAnnibaleGPUWorked,0,0)==(a830?kIOReturnUnsupported:kIOReturnSuccess));assert(!depth);
         for(unsigned param=0;param<0x18;param++)
-        assert(call(kMsmSetParam,param,0)==((param==0x0c||param==0x0d)?kIOReturnSuccess:kIOReturnBadArgument));}}
+        assert(c.call(kMsmSetParam,param,0)==((param==0x0c||param==0x0d)?kIOReturnSuccess:kIOReturnBadArgument));}
+        a830=true; gpu_preempt=true; gpu_ready=true; AnnibaleGPUUserClient c;
+        struct msm_submitqueue q{0,1,0}; assert(c.submitQueueNew(&q)==kIOReturnSuccess && q.id==1 && c.submitQueueSlot(1)==2);
+        mock_faults[2]=3; uint64_t faults=0;
+        assert(c.call(kMsmSubmitQueueQuery,0,0,1,reinterpret_cast<uint64_t>(&faults),0)==kIOReturnSuccess && faults==3);
+        assert(c.call(kMsmSubmitQueueQuery,0,0,1,reinterpret_cast<uint64_t>(&faults),1)==kIOReturnUnsupported);
+        assert(c.call(kMsmSubmitQueueQuery,0,0,99,reinterpret_cast<uint64_t>(&faults),0)==kIOReturnBadArgument);
+        mock_last[2]=(2u<<27)|5u; assert(c.call(kMsmSubmitQueueClose,0,0,1)==kIOReturnSuccess && release_calls==1 && c.submitQueueSlot(1)==-1);
+        assert(c.call(kMsmSubmitQueueClose,0,0,1)==kIOReturnBadArgument);
+        }
         '''
         run(queue_unit,target,"queues")
         variants=[("publication_state",publisher.replace('return (getState() & (kIOServiceRegisteredState | kIOServiceInactiveState)) == kIOServiceRegisteredState;','return true;',1)),

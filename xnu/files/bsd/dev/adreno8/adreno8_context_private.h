@@ -14,13 +14,22 @@ bool adreno8_gpu_oob_acquire(void);
  * is off. */
 void adreno8_gpu_hang_dump(void);
 
-#define ADRENO8_CONTEXT_SLOTS 2u
+#define ADRENO8_CONTEXT_SLOTS 16u
 #define ADRENO8_CONTEXT_SLOT_HIGH 0u
 #define ADRENO8_CONTEXT_SLOT_NORMAL 1u
+#define ADRENO8_CONTEXT_FENCE_SHIFT 27u
+#define ADRENO8_CONTEXT_FENCE_SLOT_MASK 0xf8000000u
+#define ADRENO8_CONTEXT_FENCE_TS_MASK   0x07ffffffu
 
 /* Pages and aliases remain allocated until cold reset, including after close.
  * A confirmed close permits registration again; any failure closes this boot. */
 bool adreno8_context_prepare(void);
+int32_t adreno8_context_acquire(uint32_t prio, bool allow_high, int pid);
+void adreno8_context_release(uint32_t slot);
+bool adreno8_context_healthy(uint32_t slot);
+uint32_t adreno8_context_faults(uint32_t slot);
+bool adreno8_context_record_fault(uint32_t context_id, uint32_t timestamp, uint32_t error);
+uint32_t adreno8_context_depth_target(uint32_t slot, uint32_t depth);
 /* Addresses use the current 32-bit GPU VA space; lengths are dwords. Zero reports
  * failure and is never a fence. */
 uint32_t adreno8_context_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);

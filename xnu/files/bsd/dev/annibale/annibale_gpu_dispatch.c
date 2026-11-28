@@ -70,7 +70,7 @@ annibale_gpu_parameter(uint32_t which, uint64_t *value)
 	case 0x03: *value = 0x44050001; break;          /* CHIP_ID: running Android DT */
 	case 0x04: *value = adreno8_gx_hz[adreno8_gx_count - 1]; break; /* MAX_FREQ: the fastest speed of the table */
 	case 0x06: *value = 0x04000000; break;          /* GMEM_BASE: GPU setup */
-	case 0x07: *value = adreno8_gpu8_preempt ? ADRENO8_CONTEXT_SLOTS : 1; break; /* PRIORITIES */
+	case 0x07: *value = adreno8_gpu8_preempt ? 2 : 1; break; /* PRIORITIES: RB0 and RB1 */
 	case 0x08:                                      /* PP_PGTABLE */
 	case 0x09:                                      /* FAULTS: unhealthy state is rejected above */
 	case 0x0a:                                      /* SUSPENDS: no suspend transition */
@@ -134,29 +134,85 @@ annibale_gpu_to_memory(void *start, uint64_t size)
 	}
 }
 
-static uint32_t
-annibale_gpu_caller_slot(void)
+static bool
+annibale_gpu_caller_is_compositor(void)
 {
 	char who[24] = "";
 
+	proc_selfname(who, sizeof(who));
+	return strcmp(who, "backboardd") == 0;
+}
+
+static uint32_t
+annibale_gpu_caller_slot(void)
+{
 	if (!adreno8_gpu8_preempt) {
 		return ADRENO8_CONTEXT_SLOT_HIGH;
 	}
-	proc_selfname(who, sizeof(who));
-	return strcmp(who, "backboardd") == 0 ?
+	return annibale_gpu_caller_is_compositor() ?
 	    ADRENO8_CONTEXT_SLOT_HIGH : ADRENO8_CONTEXT_SLOT_NORMAL;
 }
 
+int32_t
+annibale_gpu_context_acquire(uint32_t prio)
+{
+	if (!annibale_platform_is_annibale() || !adreno8_bo_ready()) {
+		return -1;
+	}
+	if (!adreno8_gpu8_preempt) {
+		return (int32_t)ADRENO8_CONTEXT_SLOT_HIGH;
+	}
+	return adreno8_context_acquire(prio, annibale_gpu_caller_is_compositor(), proc_selfpid());
+}
+
+void
+annibale_gpu_context_release(int32_t slot)
+{
+	if (slot < 0 || !annibale_platform_is_annibale()) {
+		return;
+	}
+	adreno8_context_release((uint32_t)slot);
+}
+
+bool
+annibale_gpu_context_healthy(int32_t slot)
+{
+	if (!annibale_platform_is_annibale() || !adreno8_bo_ready()) {
+		return false;
+	}
+	if (slot < 0) {
+		return true;
+	}
+	return adreno8_context_healthy((uint32_t)slot);
+}
+
 uint32_t
-annibale_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
+annibale_gpu_context_faults(int32_t slot)
+{
+	if (slot < 0 || !annibale_platform_is_annibale()) {
+		return 0u;
+	}
+	return adreno8_context_faults((uint32_t)slot);
+}
+
+uint32_t
+annibale_gpu_submit_slot(int32_t slot, const uint64_t *addresses, const uint32_t *words, uint32_t count)
 {
 	if (!annibale_platform_is_annibale() || !adreno8_bo_ready()) {
 		return 0;
 	}
 	adreno8_speed_tick();
-	return adreno8_gpu8_preempt ?
-	    adreno8_context_submit_slot(annibale_gpu_caller_slot(), addresses, words, count) :
-	    adreno8_context_submit(addresses, words, count);
+	if (!adreno8_gpu8_preempt) {
+		return adreno8_context_submit(addresses, words, count);
+	}
+	uint32_t resolved = slot >= 0 ? (uint32_t)slot : annibale_gpu_caller_slot();
+	return adreno8_context_submit_slot(resolved, addresses, words, count);
+}
+
+uint32_t
+annibale_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
+{
+	return annibale_gpu_submit_slot(-1, addresses, words, count);
 }
 
 bool
@@ -200,14 +256,36 @@ annibale_gpu_progress(uint64_t *sig)
 }
 
 uint32_t
-annibale_gpu_last(void)
+annibale_gpu_last_for(int32_t slot)
 {
 	if (!annibale_platform_is_annibale()) {
 		return 0;
 	}
-	return adreno8_gpu8_preempt ?
-	    adreno8_context_last_slot(annibale_gpu_caller_slot()) :
-	    adreno8_context_last();
+	if (!adreno8_gpu8_preempt) {
+		return adreno8_context_last();
+	}
+	uint32_t resolved = slot >= 0 ? (uint32_t)slot : annibale_gpu_caller_slot();
+	return adreno8_context_last_slot(resolved);
+}
+
+uint32_t
+annibale_gpu_last(void)
+{
+	return annibale_gpu_last_for(-1);
+}
+
+uint32_t
+annibale_gpu_depth_target(int32_t slot, uint32_t depth)
+{
+	if (!annibale_platform_is_annibale() || !depth) {
+		return 0;
+	}
+	if (!adreno8_gpu8_preempt) {
+		uint32_t last = adreno8_context_last();
+		return last >= depth ? last - depth + 1u : 0u;
+	}
+	uint32_t resolved = slot >= 0 ? (uint32_t)slot : annibale_gpu_caller_slot();
+	return adreno8_context_depth_target(resolved, depth);
 }
 
 void

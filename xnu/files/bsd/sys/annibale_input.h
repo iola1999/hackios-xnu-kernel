@@ -121,12 +121,19 @@ bool annibale_gpu_mapped(void);
 /* True only after all requested PTEs are removed and TLB synchronization completes. */
 bool annibale_gpu_unmap(uint64_t address, uint64_t size);
 void annibale_gpu_to_memory(void *start, uint64_t size);
+int32_t annibale_gpu_context_acquire(uint32_t prio);
+void annibale_gpu_context_release(int32_t slot);
+bool annibale_gpu_context_healthy(int32_t slot);
+uint32_t annibale_gpu_context_faults(int32_t slot);
 uint32_t annibale_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
+uint32_t annibale_gpu_submit_slot(int32_t slot, const uint64_t *addresses, const uint32_t *words, uint32_t count);
 bool annibale_gpu_done(uint32_t fence);
 uint32_t annibale_gpu_irqs(void);                /* the GPU's completion interrupts so far; 0 where there are none */
 /* Between two looks at annibale_gpu_done(): until the next interrupt after `seen`, at most longest_us; without interrupts poll_us. */
 void annibale_gpu_pause(uint32_t seen, uint32_t poll_us, uint32_t longest_us);
 uint32_t annibale_gpu_last(void);
+uint32_t annibale_gpu_last_for(int32_t slot);
+uint32_t annibale_gpu_depth_target(int32_t slot, uint32_t depth);
 uint32_t annibale_gpu_retired(void);
 uint32_t annibale_gpu_retired_for(uint32_t fence);
 bool annibale_gpu_progress(uint64_t *sig);

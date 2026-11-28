@@ -1,13 +1,7 @@
 /*
  * MiniIOMobileFramebuffer: a stand-in for Apple's display driver family, as seen by
  * IOMobileFramebuffer.framework (and through it by CoreAnimation's window server).
- *
- * The display is the framebuffer the boot loader left us (the one the kernel's text console
- * draws on). There is no hardware behind it that we drive: a "swap" copies the pixels of the
- * surfaces of its layers into that memory, and "vsync" is a timer.
- *
- * The protocol (selectors and the layout of the swap request) was worked out from the
- * user-space side of iOS 16.5. Everything not implemented is logged once.
+ * Protocol selectors and swap layout were worked out from iOS 16.5; unimplemented selectors log once.
  */
 
 #include <IOKit/IOLib.h>
@@ -608,7 +602,11 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	if (px1 <= px0 || py1 <= py0) {
 		return;
 	}
-	/* (blending, a row of the picture mixed from two: room for it, for every one who draws rows) */
+	if (fSingleLayer && flip_dpu_scale_draw(fBase, s->pixels(), s->info.width, s->info.height,
+	    s->info.bytesPerRow, s->info.pixelFormat, sx, sy, sw, sh, px0, py0, px1, py1, fPanelWidth, fPanelHeight)) {
+		fRowHashRows = 0;
+		return;
+	}
 	if (filter && fBlendRowSize < (uint32_t) sw) {
 		if (fBlendRow != NULL) {
 			IODelete(fBlendRow, uint32_t, fBlendRowSize);

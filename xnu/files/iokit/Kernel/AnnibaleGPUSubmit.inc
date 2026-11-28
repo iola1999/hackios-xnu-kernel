@@ -1,3 +1,115 @@
+int32_t
+AnnibaleGPUUserClient::submitQueueSlot(uint32_t queueId)
+{
+	if (queueId != 0) {
+		for (uint32_t i = 0; i < GPU_CLIENT_QUEUES; i++) {
+			if (fQueues[i].id == queueId) {
+				return fQueues[i].slot;
+			}
+		}
+	}
+	return -1;
+}
+
+IOReturn
+AnnibaleGPUUserClient::submitQueueNew(struct msm_submitqueue * request)
+{
+	IOReturn ret = kIOReturnSuccess;
+	int32_t slot = -1;
+	uint32_t freeIdx = GPU_CLIENT_QUEUES;
+
+	gpuLockIoctl(kMsmSubmitQueueNew);
+	for (uint32_t i = 0; i < GPU_CLIENT_QUEUES; i++) {
+		if (fQueues[i].id == 0) {
+			freeIdx = i;
+			break;
+		}
+	}
+	if (freeIdx == GPU_CLIENT_QUEUES) {
+		IOLockUnlock(gGPULock);
+		return kIOReturnNoMemory;
+	}
+	if (annibale_platform_is_annibale()) {
+		uint64_t prios = 1;
+		ret = !annibale_gpu_parameter(0x07, &prios) ? kIOReturnNotReady
+		    : (request->flags != 0 || request->prio >= prios) ? kIOReturnBadArgument : kIOReturnSuccess;
+		if (ret == kIOReturnSuccess) {
+			slot = annibale_gpu_context_acquire(request->prio);
+			if (slot < 0) {
+				ret = kIOReturnNotReady;
+			}
+		}
+	}
+	if (ret == kIOReturnSuccess) {
+		uint32_t id = ++fNextQueue;
+		if (id == 0) {
+			id = ++fNextQueue;
+		}
+		fQueues[freeIdx].id = id;
+		fQueues[freeIdx].prio = request->prio;
+		fQueues[freeIdx].slot = slot;
+		request->id = id;
+	}
+	IOLockUnlock(gGPULock);
+	return ret;
+}
+
+IOReturn
+AnnibaleGPUUserClient::submitQueueClose(uint32_t id)
+{
+	int32_t slot = -1;
+	bool found = false;
+
+	if (id == 0) {
+		return kIOReturnBadArgument;
+	}
+	gpuLockIoctl(kMsmSubmitQueueClose);
+	for (uint32_t i = 0; i < GPU_CLIENT_QUEUES; i++) {
+		if (fQueues[i].id == id) {
+			slot = fQueues[i].slot;
+			fQueues[i] = {};
+			found = true;
+			break;
+		}
+	}
+	if (found && slot >= 2 && annibale_gpu_ready()) {
+		uint32_t tail = annibale_gpu_last_for(slot);
+		if (tail != 0) {
+			gpuWait(tail, 1000);
+		}
+		annibale_gpu_context_release(slot);
+	}
+	IOLockUnlock(gGPULock);
+	return found ? kIOReturnSuccess : kIOReturnBadArgument;
+}
+
+IOReturn
+AnnibaleGPUUserClient::submitQueueQuery(struct msm_submitqueue_query * query, uint64_t * faults)
+{
+	int32_t slot = -1;
+	bool found = false;
+
+	if (query->id == 0) {
+		return kIOReturnBadArgument;
+	}
+	gpuLockIoctl(kMsmSubmitQueueQuery);
+	for (uint32_t i = 0; i < GPU_CLIENT_QUEUES; i++) {
+		if (fQueues[i].id == query->id) {
+			slot = fQueues[i].slot;
+			found = true;
+			break;
+		}
+	}
+	if (!found) {
+		IOLockUnlock(gGPULock);
+		return kIOReturnBadArgument;
+	}
+	*faults = (query->param == 0 && annibale_platform_is_annibale() && slot >= 0) ?
+	    annibale_gpu_context_faults(slot) : 0;
+	IOLockUnlock(gGPULock);
+	return query->param == 0 ? kIOReturnSuccess : kIOReturnUnsupported;
+}
+
 /* Submission validation precedes cache maintenance and backend publication. */
 IOReturn
 AnnibaleGPUUserClient::submit(struct msm_gem_submit * request, struct gpu_io_stat * io)
@@ -18,6 +130,8 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request, struct gpu_io_sta
 	struct gpu_garbage garbage = {};
 	IOReturn ret = kIOReturnBadArgument;
 	const bool a830 = annibale_platform_is_annibale();
+	int32_t slot = -1;
+	bool slotIsolated = false;
 
 	if (a830 && ((request->flags & ~MSM_SUBMIT_NO_IMPLICIT) != MSM_PIPE_3D0 ||
 	    request->in_syncobjs || request->out_syncobjs || request->nr_in_syncobjs ||
@@ -55,16 +169,12 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request, struct gpu_io_sta
 	 * meanwhile are throttled by their own waits, and should more of them crowd in anyway, the
 	 * backend's own depth check (adreno8_context_submit) is the backstop.
 	 */
+	slot = submitQueueSlot(request->queueid);
 	{ /* (a scope of its own: the early exits above jump to the end of the function) */
 		uint32_t depth = a830 ? adreno8_context_depth() : 0, target = 0;
 
-		if (depth != 0 && !gGPUReported && annibale_gpu_ready()) {
-			uint32_t last = annibale_gpu_last();
-			uint32_t raw = last & 0x7fffffffu;
-
-			if (raw >= depth) {
-				target = (last & 0x80000000u) | (raw - depth + 1);
-			}
+		if (depth != 0 && !gGPUReported && annibale_gpu_context_healthy(slot)) {
+			target = annibale_gpu_depth_target(slot, depth);
 		}
 		uint64_t depthBegan = mach_absolute_time();
 		bool depthWaited = target != 0 && !annibale_gpu_done(target);
@@ -72,7 +182,7 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request, struct gpu_io_sta
 		if (depthWaited) {
 			depthWaitEntry(target, depth);
 		}
-		while (target != 0 && !gGPUReported && annibale_gpu_ready() && !annibale_gpu_done(target)) {
+		while (target != 0 && !gGPUReported && annibale_gpu_context_healthy(slot) && !annibale_gpu_done(target)) {
 			if (!gpuWait(target, GPU_PATIENCE_MS)) {
 				break;                          /* (the backend's own wait says what is wrong) */
 			}
@@ -83,7 +193,7 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request, struct gpu_io_sta
 	}
 	gGPUStat.rooming += mach_absolute_time() - roomed;
 	seg_room = mach_absolute_time();
-	if (gGPUReported || !annibale_gpu_ready()) {
+	if (gGPUReported || !annibale_gpu_context_healthy(slot)) {
 		ioUnlock(io, acq);
 		ret = kIOReturnNotReady;
 		goto out;
@@ -151,7 +261,7 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request, struct gpu_io_sta
 	gGPUStat.flushing += mach_absolute_time() - began;
 	seg_flush = mach_absolute_time();
 	gGPUStat.buffers += request->nr_bos;
-	request->fence = annibale_gpu_submit(addresses, words, count);
+	request->fence = annibale_gpu_submit_slot(slot, addresses, words, count);
 	if (request->fence != 0) {
 		gpuNoteSubmit(fPid);
 	}
@@ -161,17 +271,18 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request, struct gpu_io_sta
 	 * room for it. (A wait of a second or more notices a stopped core first, as a rule; this is
 	 * for a program that submits without waiting.)
 	 */
-	if (request->fence == 0 && !gGPUReported) {
+	slotIsolated = a830 && slot >= 1 && annibale_gpu_ready() && !annibale_gpu_context_healthy(slot);
+	if (request->fence == 0 && !gGPUReported && !slotIsolated) {
 		annibale_gpu_report("the ring is full");
 		gGPUReported = !annibale_gpu_recover();
 		if (!gGPUReported) {
-			request->fence = annibale_gpu_submit(addresses, words, count);
+			request->fence = annibale_gpu_submit_slot(slot, addresses, words, count);
 			if (request->fence != 0) {
 				gpuNoteSubmit(fPid);
 			}
 		}
 	}
-	if (request->fence == 0) {
+	if (request->fence == 0 && !slotIsolated) {
 		/* The backend may have published commands before the failure. Keep every mapped
 		 * descriptor, including buffers still carrying their previous fence. */
 		gGPUReported = true;
@@ -355,7 +466,7 @@ AnnibaleGPUUserClient::submit(struct msm_gem_submit * request, struct gpu_io_sta
 			    us[7] / 1000, at / 1000);
 		}
 	}
-	ret = request->fence != 0 ? kIOReturnSuccess : kIOReturnTimeout;
+	ret = request->fence != 0 ? kIOReturnSuccess : (slotIsolated ? kIOReturnNotReady : kIOReturnTimeout);
 out:
 	if (bos != NULL) {
 		IODelete(bos, struct msm_gem_submit_bo, request->nr_bos);

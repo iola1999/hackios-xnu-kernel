@@ -25,11 +25,16 @@ gpuProgressSample(uint32_t fence, uint64_t began, uint64_t now, uint32_t *stalle
 static bool
 gpuWait(uint32_t fence, uint64_t milliseconds)
 {
-	static uint32_t stalledAt;
-	static uint64_t stalledSince, cpSig;
-	static bool stalledArmed, cpValid;
+	static struct {
+		uint32_t stalledAt;
+		uint64_t stalledSince, cpSig;
+		bool stalledArmed, cpValid;
+	} gGPUStall[16];
+	uint32_t stallSlot = (fence >> 27) & 0xfu;
+	auto *st = &gGPUStall[stallSlot];
 	uint64_t began = mach_absolute_time(), now, patience, step, nextSample, stalled;
 	bool wasReady = !gGPUReported && annibale_gpu_ready();
+	bool wasSlotHealthy = wasReady && annibale_gpu_context_healthy((int32_t)stallSlot);
 
 	nanoseconds_to_absolutetime(milliseconds * NSEC_PER_MSEC, &patience);
 	nanoseconds_to_absolutetime(5000ULL * NSEC_PER_MSEC, &step);
@@ -43,17 +48,18 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 				gGPUStat.waits++;
 				gGPUStat.waiting += now - began;
 			}
-			stalledArmed = false;
-			stalledSince = 0;
-			cpValid = false;
+			st->stalledArmed = false;
+			st->stalledSince = 0;
+			st->cpValid = false;
 			return true;
 		}
-		if (now - began >= patience || gGPUReported || !annibale_gpu_ready()) {
-			break;                  /* (a GPU that has stopped answering is not waited for again) */
+		if (now - began >= patience || gGPUReported || !annibale_gpu_ready() ||
+		    (stallSlot >= 1 && !annibale_gpu_context_healthy((int32_t)stallSlot))) {
+			break;                  /* (a GPU or isolated slot that has stopped answering is not waited for again) */
 		}
 		if (milliseconds >= 1000 && now >= nextSample) {
-			gpuProgressSample(fence, began, now, &stalledAt, &stalledSince, &cpSig,
-			    &stalledArmed, &cpValid);
+			gpuProgressSample(fence, began, now, &st->stalledAt, &st->stalledSince, &st->cpSig,
+			    &st->stalledArmed, &st->cpValid);
 			nextSample = now + step;
 		}
 		IOLockUnlock(gGPULock);
@@ -64,25 +70,23 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 	 * A faulted wait or a multi-second wait whose retired timestamp and CP IB1/IB2 progress
 	 * stood still for GPU_STALL_MS triggers diagnostics and, with gpu_recover=1, resets the core.
 	 */
-	if (wasReady && !gGPUReported && !annibale_gpu_ready()) {
+	if (stallSlot >= 1 && wasSlotHealthy && !gGPUReported && annibale_gpu_ready() &&
+	    !annibale_gpu_context_healthy((int32_t)stallSlot)) {
+		*st = {};
+	} else if (wasReady && !gGPUReported && !annibale_gpu_ready()) {
 		annibale_gpu_report("faulted");
 		gGPUReported = !annibale_gpu_recover();
-		stalledAt = 0;
-		stalledSince = 0;
-		stalledArmed = false;
-		cpValid = false;
-	} else if (milliseconds >= 1000 && !gGPUReported && annibale_gpu_ready()) {
+		*st = {};
+	} else if (milliseconds >= 1000 && !gGPUReported && annibale_gpu_ready() &&
+	    (stallSlot == 0 || annibale_gpu_context_healthy((int32_t)stallSlot))) {
 		now = mach_absolute_time();
-		gpuProgressSample(fence, began, now, &stalledAt, &stalledSince, &cpSig,
-		    &stalledArmed, &cpValid);
-		absolutetime_to_nanoseconds(now - stalledSince, &stalled);
+		gpuProgressSample(fence, began, now, &st->stalledAt, &st->stalledSince, &st->cpSig,
+		    &st->stalledArmed, &st->cpValid);
+		absolutetime_to_nanoseconds(now - st->stalledSince, &stalled);
 		if (stalled >= (uint64_t) GPU_STALL_MS * NSEC_PER_MSEC) {
 			annibale_gpu_report("no answer");
 			gGPUReported = !annibale_gpu_recover();
-			stalledAt = 0;
-			stalledSince = 0;
-			stalledArmed = false;
-			cpValid = false;
+			*st = {};
 		}
 	}
 	return false;

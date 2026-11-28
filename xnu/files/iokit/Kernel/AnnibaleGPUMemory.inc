@@ -192,7 +192,19 @@ AnnibaleGPUUserClient::clientClose(void)
 		IOLockLock(gGPULock);
 		/* what the client had the GPU do last may still be going on, in these buffers */
 		if (annibale_gpu_ready()) {
-			gpuWait(annibale_gpu_last(), 1000);
+			bool waited = false;
+			for (uint32_t i = 0; i < GPU_CLIENT_QUEUES; i++) {
+				if (fQueues[i].id != 0 && fQueues[i].slot >= 0) {
+					uint32_t tail = annibale_gpu_last_for(fQueues[i].slot);
+					if (tail != 0) {
+						gpuWait(tail, 1000);
+					}
+					waited = true;
+				}
+			}
+			if (!waited) {
+				gpuWait(annibale_gpu_last(), 1000);
+			}
 		}
 		for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
 			if (fBuffers[i].memory != NULL) {
@@ -205,6 +217,14 @@ AnnibaleGPUUserClient::clientClose(void)
 		}
 		if (fLeftCount != 0) {
 			IOLog("AnnibaleGPU: the GPU is not done with %u buffers of a program that is gone: they stay its own\n", fLeftCount);
+		}
+		for (uint32_t i = 0; i < GPU_CLIENT_QUEUES; i++) {
+			if (fQueues[i].id != 0) {
+				if (fQueues[i].slot >= 0) {
+					annibale_gpu_context_release(fQueues[i].slot);
+				}
+				fQueues[i] = {};
+			}
 		}
 		IOLockUnlock(gGPULock);
 		gpuGarbageFlush(&garbage);
@@ -266,8 +286,8 @@ AnnibaleGPUUserClient::lastUse(uint32_t handle)
 	if (fence == 0) {
 		return drawn;
 	}
-	if (((drawn ^ fence) & 0x80000000u) == 0) {
-		if ((int32_t) ((uint32_t) (drawn - fence) << 1) > 0) {
+	if (((drawn ^ fence) & 0xf8000000u) == 0) {
+		if ((int32_t) ((uint32_t) (drawn - fence) << 5) > 0) {
 			fence = drawn;
 		}
 		return fence;
