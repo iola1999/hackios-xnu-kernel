@@ -67,6 +67,9 @@ struct rw_g32_draw_info {
 	const uint8_t *lut_bytes;
 	size_t lut_len;
 	size_t lut_offset;
+	const uint8_t *fbuf2_bytes;
+	size_t fbuf2_len;
+	size_t fbuf2_offset;
 	const uint8_t *fbuf4_bytes;
 	size_t fbuf4_len;
 	size_t fbuf4_offset;
@@ -492,7 +495,7 @@ rw_g32_format_line(char *out, size_t out_sz, const struct rw_g32_draw_info *d)
 	if (seq >= limit) {
 		return 0;
 	}
-	char sc_buf[48], vp_buf[64], ubo_buf[32], tex_buf[160], fb4_buf[256], fb5_buf[64], lut_buf[200];
+	char sc_buf[48], vp_buf[64], ubo_buf[32], tex_buf[160], fb2_buf[48], fb4_buf[704], fb5_buf[64], lut_buf[200];
 	char a0_buf[160], a1_buf[160], a3_buf[160];
 	if (d->has_scissor) {
 		snprintf(sc_buf, sizeof(sc_buf), "%u,%u,%u,%u",
@@ -514,11 +517,22 @@ rw_g32_format_line(char *out, size_t out_sz, const struct rw_g32_draw_info *d)
 		snprintf(ubo_buf, sizeof(ubo_buf), "none");
 	}
 	rw_g32_fmt_textures(tex_buf, sizeof(tex_buf), d);
+	if (d->fbuf2_bytes != NULL && d->fbuf2_offset + 4u <= d->fbuf2_len) {
+		float lod = 0.0f;
+		memcpy(&lod, d->fbuf2_bytes + d->fbuf2_offset, 4u);
+		snprintf(fb2_buf, sizeof(fb2_buf), "len%zu+off%zu:%.3f",
+		         d->fbuf2_len, d->fbuf2_offset, lod);
+	} else if (d->fbuf2_len > 0u) {
+		snprintf(fb2_buf, sizeof(fb2_buf), "len%zu+off%zu:oob",
+		         d->fbuf2_len, d->fbuf2_offset);
+	} else {
+		snprintf(fb2_buf, sizeof(fb2_buf), "none");
+	}
 	if (d->fbuf4_bytes != NULL && d->fbuf4_offset + 8u <= d->fbuf4_len) {
 		size_t avail = d->fbuf4_len - d->fbuf4_offset;
 		unsigned n_h4 = (unsigned)(avail / 8u);
-		if (n_h4 > 8u) {
-			n_h4 = 8u;
+		if (n_h4 > 21u) {
+			n_h4 = 21u;
 		}
 		int p = snprintf(fb4_buf, sizeof(fb4_buf), "len%zu+off%zu[",
 		                 d->fbuf4_len, d->fbuf4_offset);
@@ -575,7 +589,7 @@ rw_g32_format_line(char *out, size_t out_sz, const struct rw_g32_draw_info *d)
 	                d->attr3_len, d->attr3_buf_off, d);
 	snprintf(out, out_sz,
 	         "g32-probe #%u v=%s f=%s label=%s prim=%u start=%u count=%u idx=%s(%zu) "
-	         "blend=%u mask=%#x rgb=%u/%u/%u a=%u/%u/%u sc=%s vp=%s tex=%s fbuf4=%s fbuf5=%s "
+	         "blend=%u mask=%#x rgb=%u/%u/%u a=%u/%u/%u sc=%s vp=%s tex=%s fbuf2=%s fbuf4=%s fbuf5=%s "
 	         "lut=%s ubo1_94=%s attr0=%s attr1=%s attr3=%s\n",
 	         seq, d->vname ? d->vname : "-", d->fname ? d->fname : "-",
 	         d->label ? d->label : "-", d->primitive, d->vertex_start, d->vertex_count,
@@ -583,7 +597,7 @@ rw_g32_format_line(char *out, size_t out_sz, const struct rw_g32_draw_info *d)
 	         d->indexed ? d->index_offset : (size_t)0,
 	         d->blend_enabled, d->write_mask,
 	         d->src_rgb, d->dst_rgb, d->op_rgb, d->src_a, d->dst_a, d->op_a,
-	         sc_buf, vp_buf, tex_buf, fb4_buf, fb5_buf, lut_buf, ubo_buf, a0_buf, a1_buf, a3_buf);
+	         sc_buf, vp_buf, tex_buf, fb2_buf, fb4_buf, fb5_buf, lut_buf, ubo_buf, a0_buf, a1_buf, a3_buf);
 	return 1;
 }
 
@@ -654,6 +668,12 @@ rw_g32_probe_draw(AnnibaleMetalRenderPipeline *pipeline, const AnnibaleMetalWork
 			d.tex[i].w = (unsigned)[work->textures[i] width];
 			d.tex[i].h = (unsigned)[work->textures[i] height];
 		}
+	}
+	if (work->count > 2u && work->buffers[2] != nil &&
+	    [work->buffers[2] respondsToSelector:@selector(contents)]) {
+		d.fbuf2_bytes = (const uint8_t *)[work->buffers[2] contents];
+		d.fbuf2_len = (size_t)[work->buffers[2] length];
+		d.fbuf2_offset = work->bufferOffsets[2];
 	}
 	if (work->count > 4u && work->buffers[4] != nil &&
 	    [work->buffers[4] respondsToSelector:@selector(contents)]) {
@@ -750,7 +770,7 @@ rw_g32_probe_draw(AnnibaleMetalRenderPipeline *pipeline, const AnnibaleMetalWork
 			d.attr3_buf_off = work->vertexBufferOffsets[m3->buffer_index];
 		}
 	}
-	char line[1536];
+	char line[2048];
 	if (rw_g32_format_line(line, sizeof(line), &d)) {
 		rw_print("%s", line);
 	}

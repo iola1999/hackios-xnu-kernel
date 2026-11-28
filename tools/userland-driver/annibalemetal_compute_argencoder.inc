@@ -751,12 +751,12 @@
 		}
 		return NO;
 	}
-	NSUInteger maxSlots = _layout.encoded_length / 8u;
 	for (unsigned i = 0; i < _layout.member_count; i++) {
-		if ((NSUInteger)_layout.members[i].id + 1u > maxSlots) {
-			maxSlots = (NSUInteger)_layout.members[i].id + 1u;
+		if (_layout.members[i].id == (unsigned)index) {
+			return YES;
 		}
 	}
+	NSUInteger maxSlots = _layout.encoded_length / 8u;
 	if (maxSlots > RWA_MAX_ARGBUF_MEMBERS) {
 		maxSlots = RWA_MAX_ARGBUF_MEMBERS;
 	}
@@ -867,17 +867,10 @@
 }
 
 /*
- * -constantDataAtIndex: is where an application writes a VALUE member -- an `int` or a
- * `float4` inside the set rather than a descriptor -- and it is answered with the real
- * bytes of the argument buffer at that member's place, which is what Metal answers.
- *
- * Nothing of this driver ever reads those bytes, and that is said here because it is the
- * kind of silence that costs a day: a shader that reads a value out of a set is refused
- * when it is TRANSLATED ("a value read out of the set instead of a descriptor",
- * docs/air.md 8.2.1), so an application writing here is writing into memory no shader of
- * ours will be compiled to read. Answering a real pointer is still the right answer --
- * the write lands in the application's own buffer and nothing is corrupted -- while
- * answering NULL would be a crash in the application's memcpy.
+ * -constantDataAtIndex: returns the destination buffer bytes for an inline constant
+ * member (`air.indirect_constant`, kind == RWA_ARGBUF_CONSTANT) at its real struct
+ * byte offset from rwa_module_argbufs(), matching the UBO offset read by air_argbuf.inc
+ * and air_metal_argbuf.inc.
  */
 - (void *)constantDataAtIndex:(NSUInteger)index
 {
@@ -889,11 +882,30 @@
 	if (bytes == NULL) {
 		return NULL;
 	}
-	RW_ONCE("-constantDataAtIndex: hands back the argument buffer's own "
-		"bytes, and nothing in this driver reads them: a shader that reads a VALUE "
-		"out of an argument buffer is refused when it is translated, because every "
-		"member this frontend binds is a descriptor\n");
-	return (char *)bytes + _offset + 8 * index;
+	const struct rwa_argbuf_member *found = NULL;
+	for (unsigned i = 0; i < _layout.member_count; i++) {
+		if (_layout.members[i].id == (unsigned)index &&
+		    _layout.members[i].kind == RWA_ARGBUF_CONSTANT) {
+			found = &_layout.members[i];
+			break;
+		}
+	}
+	if (found == NULL) {
+		rw_print("-constantDataAtIndex:%lu names no inline constant member in "
+		         "argument buffer at Metal buffer index %u\n",
+		         (unsigned long)index, _layout.metal_index);
+		return NULL;
+	}
+	NSUInteger destLen = [_destination length];
+	uint64_t end = (uint64_t)_offset + (uint64_t)found->offset + (uint64_t)found->size;
+	if (end > (uint64_t)destLen) {
+		rw_print("-constantDataAtIndex:%lu (offset %u + %u, size %u) exceeds "
+		         "destination buffer length %lu\n",
+		         (unsigned long)index, (unsigned)_offset, found->offset,
+		         found->size, (unsigned long)destLen);
+		return NULL;
+	}
+	return (char *)bytes + _offset + found->offset;
 }
 
 /*

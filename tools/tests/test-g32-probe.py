@@ -225,10 +225,10 @@ int main(void) {
     fbuf5_only.fbuf5_len = 2u;
     fbuf5_only.fbuf5_offset = 0u;
     assert(rw_g32_format_line(line, sizeof(line), &fbuf5_only) == 1);
-    assert(strstr(line, "tex=t0=fmt80:512x512 fbuf4=none fbuf5=len2+off0:0x3c00(1.0000)") != NULL);
+    assert(strstr(line, "tex=t0=fmt80:512x512 fbuf2=none fbuf4=none fbuf5=len2+off0:0x3c00(1.0000)") != NULL);
     printf("  [PASS] multi-slot texture (t3/t9) + ring-buffer fbuf5 + draw-time LUT sampling\n");
 
-    /* 6. ANNIBALE_G32_FILTER + fbuf4 (color_program half4 array + OOB guard) */
+    /* 6. ANNIBALE_G32_FILTER + fbuf2 (lod_bias) + fbuf4 (21 half4 entries + OOB guard) */
     setenv("ANNIBALE_G32_PROBE", "4", 1);
     setenv("ANNIBALE_G32_FILTER", "N3Oc3mtc4nlnlnl", 1);
     reset_probe_state();
@@ -236,30 +236,39 @@ int main(void) {
     assert(rw_g32_format_line(line, sizeof(line), &timg) == 0);
     assert(rw_g32_emitted == 0u);
 
+    char long_line[2048];
+    float lod_bias = -0.5f;
     uint16_t cp_ring[128]; /* 256 bytes */
     memset(cp_ring, 0, sizeof(cp_ring));
-    /* Put 8 half4 entries starting at byte offset 16 (index 8 in uint16_t) */
-    for (unsigned i = 0; i < 8u; i++) {
-        cp_ring[8u + i * 4u + 0u] = 0x3c00u; /* 1.0 */
+    /* Put 21 half4 entries starting at byte offset 16 (index 8 in uint16_t); mark entry 20 distinctly */
+    for (unsigned i = 0; i < 21u; i++) {
+        cp_ring[8u + i * 4u + 0u] = (i == 20u) ? 0x4000u : 0x3c00u; /* 2.0 on #20, 1.0 elsewhere */
         cp_ring[8u + i * 4u + 1u] = 0x3800u; /* 0.5 */
         cp_ring[8u + i * 4u + 2u] = 0x0000u; /* 0.0 */
         cp_ring[8u + i * 4u + 3u] = 0x3c00u; /* 1.0 */
     }
     struct rw_g32_draw_info cprog = timg;
     cprog.fname = "TimgA2Xhfn_IsrcN3Oc3mtc4nlnlnl";
+    cprog.fbuf2_bytes = (const uint8_t *)&lod_bias;
+    cprog.fbuf2_len = sizeof(lod_bias);
+    cprog.fbuf2_offset = 0u;
     cprog.fbuf4_bytes = (const uint8_t *)cp_ring;
     cprog.fbuf4_len = sizeof(cp_ring);
     cprog.fbuf4_offset = 16u;
-    assert(rw_g32_format_line(line, sizeof(line), &cprog) == 1);
-    assert(strstr(line, "f=TimgA2Xhfn_IsrcN3Oc3mtc4nlnlnl") != NULL);
-    assert(strstr(line, "fbuf4=len256+off16[(1.000,0.500,0.000,1.000),(1.000,0.500,0.000,1.000)") != NULL);
+    assert(rw_g32_format_line(long_line, sizeof(long_line), &cprog) == 1);
+    assert(strstr(long_line, "f=TimgA2Xhfn_IsrcN3Oc3mtc4nlnlnl") != NULL);
+    assert(strstr(long_line, "fbuf2=len4+off0:-0.500") != NULL);
+    assert(strstr(long_line, "fbuf4=len256+off16[(1.000,0.500,0.000,1.000),") != NULL);
+    assert(strstr(long_line, ",(2.000,0.500,0.000,1.000)]") != NULL);
 
-    /* OOB fbuf4 offset guard */
+    /* OOB fbuf2 & fbuf4 offset guard */
+    cprog.fbuf2_offset = 2u;
     cprog.fbuf4_offset = 252u;
-    assert(rw_g32_format_line(line, sizeof(line), &cprog) == 1);
-    assert(strstr(line, "fbuf4=len256+off252:oob") != NULL);
+    assert(rw_g32_format_line(long_line, sizeof(long_line), &cprog) == 1);
+    assert(strstr(long_line, "fbuf2=len4+off2:oob") != NULL);
+    assert(strstr(long_line, "fbuf4=len256+off252:oob") != NULL);
     unsetenv("ANNIBALE_G32_FILTER");
-    printf("  [PASS] ANNIBALE_G32_FILTER + fbuf4 half4 array & OOB guard\n");
+    printf("  [PASS] ANNIBALE_G32_FILTER + fbuf2 lod_bias + fbuf4[0..20] & OOB guard\n");
 
     printf("G32 probe host tests: PASS (6/6)\n");
     return 0;

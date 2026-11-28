@@ -35,6 +35,43 @@
 - (id)initWithArrayLength:(NSUInteger)length elementType:(NSUInteger)element
                   stride:(NSUInteger)stride pixelFormat:(NSUInteger)format
                  aluType:(NSUInteger)aluType details:(id)details;
+- (void)setIsIndirectArgumentBuffer:(BOOL)isArgumentBuffer;
+- (id)initWithDataType:(NSUInteger)dataType textureType:(NSUInteger)textureType
+                access:(NSUInteger)access isDepthTexture:(BOOL)isDepthTexture;
+- (id)initWithElementType:(NSUInteger)elementType elementTypeDescription:(id)elementTypeDescription
+                   access:(NSUInteger)access alignment:(NSUInteger)alignment
+                 dataSize:(NSUInteger)dataSize
+elementIsIndirectArgumentBuffer:(BOOL)elementIsIndirectArgumentBuffer
+         isConstantBuffer:(BOOL)isConstantBuffer doRetain:(BOOL)doRetain;
+@end
+
+@interface AnnibaleMetalRenderReflection : MTLRenderPipelineReflection {
+   NSArray *_vertexBindings;
+   NSArray *_fragmentBindings;
+}
+- (id)initWithVertexBindings:(NSArray *)vertexBindings fragmentBindings:(NSArray *)fragmentBindings;
+@end
+
+@implementation AnnibaleMetalRenderReflection
+- (id)initWithVertexBindings:(NSArray *)vertexBindings fragmentBindings:(NSArray *)fragmentBindings
+{
+   self = [super init];
+   if (self) {
+      _vertexBindings = vertexBindings ? [vertexBindings copy] : [@[] retain];
+      _fragmentBindings = fragmentBindings ? [fragmentBindings copy] : [@[] retain];
+   }
+   return self;
+}
+- (NSArray *)vertexBindings { return _vertexBindings; }
+- (NSArray *)vertexArguments { return _vertexBindings; }
+- (NSArray *)fragmentBindings { return _fragmentBindings; }
+- (NSArray *)fragmentArguments { return _fragmentBindings; }
+- (void)dealloc
+{
+   [_vertexBindings release];
+   [_fragmentBindings release];
+   [super dealloc];
+}
 @end
 
 @interface AnnibaleMetalComputeReflection : MTLComputePipelineReflection {
@@ -102,7 +139,8 @@ rw_reflection_type(const struct rwa_reflection_type *type, NSString **why)
          if (member)
             member = [member initWithName:fieldName
                                   offset:field->offset dataType:field->type->data_type
-                             pixelFormat:0 aluType:0 indirectArgumentIndex:0
+                             pixelFormat:0 aluType:0
+                   indirectArgumentIndex:field->indirect_argument_index
                            render_target:UINT32_MAX raster_order_group:UINT32_MAX
                                  details:details];
          [details release];
@@ -126,6 +164,9 @@ rw_reflection_type(const struct rwa_reflection_type *type, NSString **why)
          result = [result initWithMembers:objects count:type->member_count
                                 typeName:typeName];
       free(objects);
+      if (result && type->is_argument_buffer &&
+          [result respondsToSelector:@selector(setIsIndirectArgumentBuffer:)])
+         [result setIsIndirectArgumentBuffer:YES];
       if (!result && !*why)
          *why = @"Metal could not construct a struct type";
       return result;
@@ -146,6 +187,47 @@ rw_reflection_type(const struct rwa_reflection_type *type, NSString **why)
          *why = @"Metal could not construct an array type";
       return result;
    }
+   if (type->data_type == MTLDataTypeTexture) {
+      id result = rw_reflection_alloc("MTLTextureReferenceTypeInternal",
+         @selector(initWithDataType:textureType:access:isDepthTexture:), why);
+      if (result)
+         result = [result initWithDataType:type->texture_data_type ? type->texture_data_type : MTLDataTypeFloat
+                               textureType:type->texture_type
+                                    access:type->access
+                            isDepthTexture:type->depth_texture != 0];
+      if (!result && !*why)
+         *why = @"Metal could not construct a texture reference type";
+      return result;
+   }
+   if (type->data_type == MTLDataTypePointer) {
+      const struct rwa_reflection_type *elem = type->element;
+      NSUInteger elemType = elem ? elem->data_type : MTLDataTypeNone;
+      NSUInteger elemAlign = elem && elem->alignment ? elem->alignment : 1;
+      NSUInteger elemSize = elem ? elem->data_size : 0;
+      id elemDesc = nil;
+      if (elem && (elem->data_type == MTLDataTypeStruct || elem->data_type == MTLDataTypeArray)) {
+         elemDesc = rw_reflection_type(elem, why);
+         if (*why)
+            return nil;
+      }
+      id result = rw_reflection_alloc("MTLPointerTypeInternal",
+         @selector(initWithElementType:elementTypeDescription:access:alignment:dataSize:elementIsIndirectArgumentBuffer:isConstantBuffer:doRetain:), why);
+      if (result)
+         result = [result initWithElementType:elemType
+                       elementTypeDescription:elemDesc
+                                       access:type->access
+                                    alignment:elemAlign
+                                     dataSize:elemSize
+              elementIsIndirectArgumentBuffer:NO
+                             isConstantBuffer:type->constant_buffer != 0
+                                     doRetain:YES];
+      [elemDesc release];
+      if (!result && !*why)
+         *why = @"Metal could not construct a pointer type";
+      return result;
+   }
+   if (type->data_type == MTLDataTypeSampler)
+      return nil;
    if (!((type->data_type >= MTLDataTypeFloat && type->data_type <= MTLDataTypeBool4) ||
          (type->data_type >= MTLDataTypeLong && type->data_type <= MTLDataTypeULong4)))
       *why = @"unsupported Metal reflection data type";
@@ -167,7 +249,7 @@ rw_reflection_argument(const struct rwa_reflection_argument *arg, NSString **why
                         locationIndex:arg->index arraySize:arg->array_length
                              dataType:arg->texture_data_type textureType:arg->texture_type
                        isDepthTexture:arg->depth_texture];
-   } else if (arg->type == MTLBindingTypeSampler) {
+   } else if (arg->type == MTLBindingTypeSampler || (arg->type >= 24 && arg->type <= 27)) {
       result = rw_reflection_alloc("MTLBindingInternal",
          @selector(initWithName:type:access:index:active:arrayLength:), why);
       if (result)
@@ -186,8 +268,8 @@ rw_reflection_argument(const struct rwa_reflection_argument *arg, NSString **why
          *why = @"Metal buffer reflection size or alignment exceeds the native representation";
          return nil;
       }
-      /* GraphSPI constant inputs have an opaque pointee in native reflection. */
-      BOOL opaque = arg->type == MTLBindingTypeBuffer && arg->constant_buffer &&
+      /* GraphSPI constant inputs and untyped void* buffers have an opaque pointee in native reflection. */
+      BOOL opaque = arg->type == MTLBindingTypeBuffer &&
                     type->data_type == MTLDataTypeNone && type->data_size == 0;
       id details = opaque ? nil : rw_reflection_type(type, why);
       if (*why)
@@ -238,10 +320,11 @@ rw_reflection_argument(const struct rwa_reflection_argument *arg, NSString **why
    return result;
 }
 
-static id
-rw_compute_reflection(const struct rwa_compute_reflection *metadata, NSString **why)
+static NSArray *
+rw_reflection_bindings(const struct rwa_compute_reflection *metadata, NSString **why)
 {
-   *why = nil;
+   if (!metadata)
+      return [@[] retain];
    NSMutableArray *arguments = [NSMutableArray arrayWithCapacity:metadata->argument_count];
    for (unsigned i = 0; i < metadata->argument_count; i++) {
       id argument = rw_reflection_argument(&metadata->arguments[i], why);
@@ -250,5 +333,40 @@ rw_compute_reflection(const struct rwa_compute_reflection *metadata, NSString **
       [arguments addObject:argument];
       [argument release];
    }
-   return [[AnnibaleMetalComputeReflection alloc] initWithBindings:arguments];
+   return [arguments retain];
+}
+
+static id
+rw_compute_reflection(const struct rwa_compute_reflection *metadata, NSString **why)
+{
+   *why = nil;
+   NSArray *arguments = rw_reflection_bindings(metadata, why);
+   if (!arguments)
+      return nil;
+   id result = [[AnnibaleMetalComputeReflection alloc] initWithBindings:arguments];
+   [arguments release];
+   return result;
+}
+
+static id
+rw_render_reflection(const struct rwa_render_reflection *metadata, NSString **why)
+{
+   *why = nil;
+   if (!metadata) {
+      *why = @"render reflection metadata is missing";
+      return nil;
+   }
+   NSArray *vertexBindings = rw_reflection_bindings(metadata->vertex, why);
+   if (!vertexBindings)
+      return nil;
+   NSArray *fragmentBindings = rw_reflection_bindings(metadata->fragment, why);
+   if (!fragmentBindings) {
+      [vertexBindings release];
+      return nil;
+   }
+   id result = [[AnnibaleMetalRenderReflection alloc] initWithVertexBindings:vertexBindings
+                                                            fragmentBindings:fragmentBindings];
+   [vertexBindings release];
+   [fragmentBindings release];
+   return result;
 }

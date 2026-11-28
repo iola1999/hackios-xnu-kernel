@@ -91,16 +91,176 @@
 							      fromModule:NO];
 }
 
-/* Direct buffer reflection supplies a declared type and byte layout. An argument
- * encoder also needs argument-buffer member IDs, read through the function path.
- */
+static unsigned
+rw_mtl_data_type_size(NSUInteger dt)
+{
+	switch (dt) {
+	case MTLDataTypeFloat: case MTLDataTypeInt: case MTLDataTypeUInt: return 4;
+	case MTLDataTypeFloat2: case MTLDataTypeInt2: case MTLDataTypeUInt2: return 8;
+	case MTLDataTypeFloat3: case MTLDataTypeInt3: case MTLDataTypeUInt3: return 16;
+	case MTLDataTypeFloat4: case MTLDataTypeInt4: case MTLDataTypeUInt4: return 16;
+	case MTLDataTypeFloat2x2: return 16;
+	case MTLDataTypeFloat2x3: case MTLDataTypeFloat2x4: return 32;
+	case MTLDataTypeFloat3x2: return 24;
+	case MTLDataTypeFloat3x3: case MTLDataTypeFloat3x4: return 48;
+	case MTLDataTypeFloat4x2: return 32;
+	case MTLDataTypeFloat4x3: case MTLDataTypeFloat4x4: return 64;
+	case MTLDataTypeHalf: case MTLDataTypeShort: case MTLDataTypeUShort: return 2;
+	case MTLDataTypeHalf2: case MTLDataTypeShort2: case MTLDataTypeUShort2: return 4;
+	case MTLDataTypeHalf3: case MTLDataTypeShort3: case MTLDataTypeUShort3: return 8;
+	case MTLDataTypeHalf4: case MTLDataTypeShort4: case MTLDataTypeUShort4: return 8;
+	case MTLDataTypeHalf2x2: return 8;
+	case MTLDataTypeHalf2x3: case MTLDataTypeHalf2x4: return 16;
+	case MTLDataTypeHalf3x2: return 12;
+	case MTLDataTypeHalf3x3: case MTLDataTypeHalf3x4: return 24;
+	case MTLDataTypeHalf4x2: return 16;
+	case MTLDataTypeHalf4x3: case MTLDataTypeHalf4x4: return 32;
+	case MTLDataTypeChar: case MTLDataTypeUChar: case MTLDataTypeBool: return 1;
+	case MTLDataTypeChar2: case MTLDataTypeUChar2: case MTLDataTypeBool2: return 2;
+	case MTLDataTypeChar3: case MTLDataTypeUChar3: case MTLDataTypeBool3: return 4;
+	case MTLDataTypeChar4: case MTLDataTypeUChar4: case MTLDataTypeBool4: return 4;
+	case 81: case 85: return 8;   /* Long, ULong */
+	case 82: case 86: return 16;  /* Long2, ULong2 */
+	case 83: case 87: case 84: case 88: return 32; /* Long3/4, ULong3/4 */
+	default: return 8;
+	}
+}
+
+static BOOL
+rw_add_argbuf_layout_member(struct rwa_argbuf_layout *layout, unsigned id, unsigned kind,
+			    unsigned offset, unsigned size, NSString *name, unsigned *maxEnd)
+{
+	if (offset + size > *maxEnd)
+		*maxEnd = offset + size;
+	for (unsigned i = 0; i < layout->member_count; i++) {
+		if (layout->members[i].id == id) {
+			if (layout->members[i].kind == RWA_ARGBUF_CONSTANT &&
+			    kind == RWA_ARGBUF_CONSTANT) {
+				unsigned start = layout->members[i].offset < offset ?
+				    layout->members[i].offset : offset;
+				unsigned curEnd = layout->members[i].offset + layout->members[i].size;
+				unsigned newEnd = offset + size;
+				unsigned end = curEnd > newEnd ? curEnd : newEnd;
+				layout->members[i].offset = start;
+				layout->members[i].size = end - start;
+			}
+			return YES;
+		}
+	}
+	if (layout->member_count >= RWA_MAX_ARGBUF_MEMBERS) {
+		rw_print("-newArgumentEncoderWithBufferBinding: exceeded %u members\n",
+		         RWA_MAX_ARGBUF_MEMBERS);
+		return NO;
+	}
+	struct rwa_argbuf_member *dst = &layout->members[layout->member_count++];
+	memset(dst, 0, sizeof(*dst));
+	dst->id = id;
+	dst->kind = kind;
+	dst->index = ~0u;
+	dst->offset = offset;
+	dst->size = size;
+	if (name != nil)
+		snprintf(dst->name, sizeof(dst->name), "%s", [name UTF8String]);
+	return YES;
+}
+
+static BOOL
+rw_flatten_argbuf_struct(MTLStructType *st, unsigned baseOffset,
+			 struct rwa_argbuf_layout *layout, unsigned *maxEnd, unsigned depth)
+{
+	if (st == nil || depth > 32)
+		return depth <= 32;
+	for (MTLStructMember *m in [st members]) {
+		unsigned off = baseOffset + (unsigned)[m offset];
+		unsigned argId = (unsigned)[m argumentIndex];
+		NSUInteger dt = [m dataType];
+		if ([m textureReferenceType] != nil || dt == MTLDataTypeTexture) {
+			if (!rw_add_argbuf_layout_member(layout, argId, RWA_ARGBUF_TEXTURE,
+							 off, 8, [m name], maxEnd))
+				return NO;
+		} else if (dt == MTLDataTypeSampler) {
+			if (!rw_add_argbuf_layout_member(layout, argId, RWA_ARGBUF_SAMPLER,
+							 off, 8, [m name], maxEnd))
+				return NO;
+		} else if ([m pointerType] != nil || dt == MTLDataTypePointer) {
+			if (!rw_add_argbuf_layout_member(layout, argId, RWA_ARGBUF_BUFFER,
+							 off, 8, [m name], maxEnd))
+				return NO;
+		} else if (dt == MTLDataTypeStruct && [m structType] != nil) {
+			if (!rw_flatten_argbuf_struct([m structType], off, layout, maxEnd, depth + 1))
+				return NO;
+		} else if (dt == MTLDataTypeArray && [m arrayType] != nil) {
+			MTLArrayType *arr = [m arrayType];
+			NSUInteger len = [arr arrayLength];
+			NSUInteger stride = [arr stride];
+			NSUInteger et = [arr elementType];
+			if (et == MTLDataTypeStruct && [arr elementStructType] != nil) {
+				for (NSUInteger k = 0; k < len; k++) {
+					if (!rw_flatten_argbuf_struct([arr elementStructType],
+								      off + (unsigned)(k * stride),
+								      layout, maxEnd, depth + 1))
+						return NO;
+				}
+			} else if (et == MTLDataTypeTexture || et == MTLDataTypeSampler ||
+				   et == MTLDataTypePointer) {
+				unsigned kind = et == MTLDataTypeTexture ? RWA_ARGBUF_TEXTURE :
+						et == MTLDataTypeSampler ? RWA_ARGBUF_SAMPLER :
+						RWA_ARGBUF_BUFFER;
+				unsigned esz = stride ? (unsigned)stride : 8u;
+				for (NSUInteger k = 0; k < len; k++) {
+					if (!rw_add_argbuf_layout_member(layout, argId + (unsigned)k,
+									 kind, off + (unsigned)(k * esz),
+									 esz, [m name], maxEnd))
+						return NO;
+				}
+			} else {
+				unsigned sz = (unsigned)(len * (stride ? stride : rw_mtl_data_type_size(et)));
+				if (!rw_add_argbuf_layout_member(layout, argId, RWA_ARGBUF_CONSTANT,
+								 off, sz, [m name], maxEnd))
+					return NO;
+			}
+		} else {
+			unsigned sz = rw_mtl_data_type_size(dt);
+			if (!rw_add_argbuf_layout_member(layout, argId, RWA_ARGBUF_CONSTANT,
+							 off, sz, [m name], maxEnd))
+				return NO;
+		}
+	}
+	return YES;
+}
+
 - (id)newArgumentEncoderWithBufferBinding:(id)binding
 {
-	(void)binding;
-	rw_print("-newArgumentEncoderWithBufferBinding: requires argument-buffer member IDs; "
-	         "ask a function for an encoder (-newArgumentEncoderWithBufferIndex:) or "
-	         "describe the set with MTLArgumentDescriptors\n");
-	return nil;
+	if (mesa.argbuf_encode_buffer == NULL) {
+		rw_print("-newArgumentEncoderWithBufferBinding: compiler library has no argument buffers\n");
+		return nil;
+	}
+	if (binding == nil || ![binding respondsToSelector:@selector(bufferStructType)]) {
+		rw_print("-newArgumentEncoderWithBufferBinding: binding has no bufferStructType\n");
+		return nil;
+	}
+	MTLStructType *st = [binding bufferStructType];
+	if (st == nil) {
+		rw_print("-newArgumentEncoderWithBufferBinding: bufferStructType is nil\n");
+		return nil;
+	}
+	struct rwa_argbuf_layout layout = { 0 };
+	layout.metal_index = [binding respondsToSelector:@selector(index)] ?
+	    (unsigned)[binding index] : ~0u;
+	NSUInteger ba = [binding respondsToSelector:@selector(bufferAlignment)] ?
+	    [binding bufferAlignment] : 8;
+	layout.alignment = ba > 8 ? (unsigned)ba : 8u;
+	unsigned maxEnd = 0;
+	if (!rw_flatten_argbuf_struct(st, 0, &layout, &maxEnd, 0))
+		return nil;
+	NSUInteger bs = [binding respondsToSelector:@selector(bufferDataSize)] ?
+	    [binding bufferDataSize] : 0;
+	unsigned len = (unsigned)bs > maxEnd ? (unsigned)bs : maxEnd;
+	if (len < 8u)
+		len = 8u;
+	layout.encoded_length = (len + 7u) & ~7u;
+	return [[AnnibaleMetalArgumentEncoder alloc] initWithAnnibaleDevice:self layout:&layout
+							      fromModule:NO];
 }
 
 /* The function path reads the argument-buffer layout from the function's bitcode. */

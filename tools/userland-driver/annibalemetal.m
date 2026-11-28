@@ -152,12 +152,15 @@ enum rwa_argbuf_kind {
 	RWA_ARGBUF_BUFFER = 0,
 	RWA_ARGBUF_TEXTURE = 1,
 	RWA_ARGBUF_SAMPLER = 2,
+	RWA_ARGBUF_CONSTANT = 3,
 };
 struct rwa_argbuf_member {
 	unsigned id;             /* Metal's [[id(n)]], which the application names */
 	unsigned kind;           /* enum rwa_argbuf_kind */
 	unsigned index;          /* the flat index the frontend allocated */
 	unsigned write;
+	unsigned offset;         /* byte offset for RWA_ARGBUF_CONSTANT; 0 otherwise */
+	unsigned size;           /* byte size for RWA_ARGBUF_CONSTANT; 0 otherwise */
 	char name[48];
 };
 struct rwa_argbuf_layout {

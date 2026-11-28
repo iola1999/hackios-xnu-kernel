@@ -550,11 +550,32 @@ rw_image_uuid(const void *addr, char *out, size_t out_size)
 				reflection:(id *)reflection
 				     error:(NSError **)error
 {
-	(void)options;
 	if (reflection != NULL) {
-		*reflection = nil;   /* reflection is Metal's compiler's, and ours is nil */
+		*reflection = nil;
 	}
-	return [self newRenderPipelineStateWithDescriptor:descriptor error:error];
+	id state = [self newRenderPipelineStateWithDescriptor:descriptor error:error];
+	if (state == nil || reflection == NULL ||
+	    !(options & (MTLPipelineOptionBindingInfo | MTLPipelineOptionBufferTypeInfo))) {
+		return state;
+	}
+	if (mesa.render_get_reflection == NULL) {
+		return state;
+	}
+	struct rwa_render_reflection metadata = { 0 };
+	char why[512] = { 0 };
+	if (mesa.render_get_reflection([state render], &metadata, why, sizeof(why)) != 0) {
+		rw_print("render reflection unavailable: %s\n", why);
+		return state;
+	}
+	NSString *reason = nil;
+	id result = rw_render_reflection(&metadata, &reason);
+	if (result == nil) {
+		rw_print("render reflection construction failed: %s\n",
+		         reason ? [reason UTF8String] : "unknown");
+		return state;
+	}
+	*reflection = [result autorelease];
+	return state;
 }
 
 /*

@@ -12,6 +12,7 @@ extern "C" {
 #endif
 
 struct rwa_compute;
+struct rwa_render;
 struct rwa_bindings;
 struct rwa_buffer_bind;
 struct rwa_reflection_type;
@@ -19,12 +20,14 @@ struct rwa_reflection_type;
 struct rwa_reflection_member {
    const char *name;
    unsigned offset;
+   unsigned indirect_argument_index;
    const struct rwa_reflection_type *type;
 };
 
 /* data_type uses MTLDataType values. A struct has members; an array has an
- * element, length and byte stride. Scalar and vector types have neither.
- * data_size and alignment describe the declared type in bytes.
+ * element, length and byte stride; a pointer (60) carries its pointee type in
+ * element. Scalar and vector types have neither. data_size and alignment
+ * describe the declared type in bytes.
  */
 struct rwa_reflection_type {
    unsigned data_type;
@@ -36,6 +39,12 @@ struct rwa_reflection_type {
    unsigned array_length;
    unsigned array_stride;
    const struct rwa_reflection_type *element;
+   unsigned texture_type;
+   unsigned texture_data_type;
+   unsigned depth_texture;
+   unsigned access;
+   unsigned constant_buffer;
+   unsigned is_argument_buffer;
 };
 
 /* type and access use MTLBindingType and MTLBindingAccess values. Builtins,
@@ -61,6 +70,11 @@ struct rwa_compute_reflection {
    const struct rwa_reflection_argument *arguments;
 };
 
+struct rwa_render_reflection {
+   const struct rwa_compute_reflection *vertex;
+   const struct rwa_compute_reflection *fragment;
+};
+
 /* Returns 0 and immutable metadata owned by compute, valid until its destroy.
  * Returns -1 and a reason if the complete argument declaration or layout cannot
  * be described. out is set to NULL on failure; no partial array is returned.
@@ -68,6 +82,15 @@ struct rwa_compute_reflection {
 __attribute__((visibility("default")))
 int rwa_compute_get_reflection(struct rwa_compute *compute,
                               const struct rwa_compute_reflection **out,
+                              char *why, size_t why_size);
+
+/* Returns 0 and immutable stage metadata owned by render, valid until its destroy.
+ * Depth-only pipelines leave out->fragment NULL and generated-vertex pipelines leave
+ * out->vertex NULL. Returns -1 and a reason when a supplied stage has no reflection.
+ */
+__attribute__((visibility("default")))
+int rwa_render_get_reflection(struct rwa_render *render,
+                              struct rwa_render_reflection *out,
                               char *why, size_t why_size);
 
 __attribute__((visibility("default")))
