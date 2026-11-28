@@ -701,6 +701,16 @@ rw_prewarm_thread(void *arg)
 			const void *vair = rec.vair_len != 0 ? rec.vair : NULL;
 			const void *fair = rec.fair_len != 0 ? rec.fair : NULL;
 
+			/* Step aside briefly when a foreground commit is active so prewarm does
+			 * not contend for CPU cores with SpringBoard/backboardd frame submission;
+			 * zero wait when commit_in_flight == 0. */
+			for (unsigned tries = 0;
+			     tries < 4u &&
+			     __builtin_expect(__atomic_load_n(&commit_in_flight, __ATOMIC_ACQUIRE) != 0, 0);
+			     tries++) {
+				usleep(2000);
+			}
+
 			if (rec.num_linked != 0 && mesa.render_create_linked == NULL) {
 				/* a record with a linked graph cannot be built without the linked
 				 * entry point: caching the graphless build under the graph's key

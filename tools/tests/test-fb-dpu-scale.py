@@ -56,6 +56,7 @@ static struct {
     uint32_t pipes;
     uint32_t offset[FLIP_PIPES];
     uint8_t *va[2];
+    uint64_t pa_mock;
     uint32_t bytes, slot_bytes, rows;
     int shown;
     bool ready, drew;
@@ -92,6 +93,21 @@ static bool flip_taken(uint32_t limit_us, bool may_sleep) {
     (void)limit_us;
     (void)may_sleep;
     return true;
+}
+
+static uint64_t gScanoutPa = ~0ULL;
+static uint32_t gScanoutW = 99u, gScanoutH = 99u, gScanoutStride = 99u, gScanoutFmt = 99u;
+
+static void loader_set_scanout_mode(uint64_t pa, uint32_t w, uint32_t h, uint32_t stride, uint32_t fmt) {
+    gScanoutPa = pa;
+    gScanoutW = w;
+    gScanoutH = h;
+    gScanoutStride = stride;
+    gScanoutFmt = fmt;
+}
+
+static void loader_set_scanout_pa(uint64_t pa) {
+    loader_set_scanout_mode(pa, 0, 0, 0, 0);
 }
 
 #include "MiniFramebufferDpuScale.inc"
@@ -301,11 +317,81 @@ static void test_guards_and_quiesce(void) {
     printf("  [PASS] fallback guards, raw copy, l10r quiesce conversion, poweroff clear\n");
 }
 
+static void test_scanout_mode_and_striped_copy(void) {
+    seed_k90_boot_regs();
+    const uint32_t sw = 1206u, sh = 2622u, stride = 4864u;
+    size_t panel_bytes = (size_t)1156u * 4u * 2510u;
+    size_t surf_bytes = (size_t)stride * sh;
+    uint8_t *bufA = (uint8_t *)calloc(1, panel_bytes);
+    uint8_t *bufB = (uint8_t *)calloc(1, surf_bytes);
+    uint8_t *surf = (uint8_t *)calloc(1, surf_bytes);
+    assert(bufA && bufB && surf);
+    memset(bufA, 0x11, panel_bytes);
+    for (size_t i = 0; i < surf_bytes; i++) {
+        surf[i] = (uint8_t)((i * 37u + 13u) & 0xffu);
+    }
+
+    flip.va[0] = bufA;
+    flip.va[1] = bufB;
+    flip.pa_mock = 0;
+    flip.bytes = (uint32_t)panel_bytes;
+    flip.slot_bytes = (uint32_t)surf_bytes;
+    flip.rows = 2510u;
+    flip.shown = 0;
+
+    gDpuScale = 1;
+    dpu_scale_init();
+    assert(dpuScale.capable);
+
+    /* Whole-surface 1206x2622 padded stride (4864) striped across 3 worker ranges */
+    uint32_t copy_stride = 0;
+    bool whole = false;
+    assert(flip_dpu_scale_prepare(bufB, surf, sw, sh, stride, FLIP_FOURCC_L10R,
+        0, 0, (int32_t)sw, (int32_t)sh, 0, 0, 1156, 2510, 1156, 2510, &copy_stride, &whole));
+    assert(whole && copy_stride == 4864u);
+    dpu_scale_copy_rows(bufB, surf, stride, copy_stride, 0, 0, 0, 874, whole);
+    dpu_scale_copy_rows(bufB, surf, stride, copy_stride, 0, 0, 874, 1748, whole);
+    dpu_scale_copy_rows(bufB, surf, stride, copy_stride, 0, 0, 1748, (int32_t)sh, whole);
+    flip_dpu_scale_finish();
+    assert(memcmp(bufB, surf, surf_bytes) == 0);
+
+    dpu_scale_report_scanout(0xfd400000ULL);
+    assert(gScanoutPa == 0xfd400000ULL && gScanoutW == 1206u && gScanoutH == 2622u &&
+           gScanoutStride == 4864u && gScanoutFmt == FLIP_FOURCC_L10R);
+
+    /* Cropped sub-rect (sx=2, sy=10, sw=1180, sh=2600) striped copy -> packed stride 4720 */
+    memset(bufB, 0x00, surf_bytes);
+    assert(flip_dpu_scale_prepare(bufB, surf, sw, sh, stride, FLIP_FOURCC_BGRA,
+        2, 10, 1180, 2600, 0, 0, 1156, 2510, 1156, 2510, &copy_stride, &whole));
+    assert(!whole && copy_stride == 1180u * 4u);
+    dpu_scale_copy_rows(bufB, surf, stride, copy_stride, 2, 10, 0, 1300, whole);
+    dpu_scale_copy_rows(bufB, surf, stride, copy_stride, 2, 10, 1300, 2600, whole);
+    flip_dpu_scale_finish();
+    for (int y = 0; y < 2600; y++) {
+        assert(memcmp(bufB + (size_t)y * copy_stride, surf + (size_t)(10 + y) * stride + 8u, copy_stride) == 0);
+    }
+
+    dpu_scale_report_scanout(0xfd400000ULL);
+    assert(gScanoutW == 1180u && gScanoutH == 2600u && gScanoutStride == 4720u && gScanoutFmt == FLIP_FOURCC_BGRA);
+
+    assert(flip_dpu_scale_fallback());
+    assert(!dpuScale.active);
+    dpu_scale_report_scanout(0xfc800000ULL);
+    assert(gScanoutPa == 0xfc800000ULL && gScanoutW == 0u && gScanoutH == 0u &&
+           gScanoutStride == 0u && gScanoutFmt == 0u);
+    assert(!flip_dpu_scale_fallback());
+    free(bufA);
+    free(bufB);
+    free(surf);
+    printf("  [PASS] live scanout metadata + striped dpu_scale_copy_rows + fallback\n");
+}
+
 int main(void) {
     test_default_off();
     test_bgra_and_l10r_programming();
     test_guards_and_quiesce();
-    printf("MiniFramebufferDpuScale host tests: PASS (3/3)\n");
+    test_scanout_mode_and_striped_copy();
+    printf("MiniFramebufferDpuScale host tests: PASS (4/4)\n");
     return 0;
 }
 '''

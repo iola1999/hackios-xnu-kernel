@@ -32,6 +32,7 @@ HARNESS = r'''
 static void reset_probe_state(void) {
     rw_g32_limit_cache = -1;
     rw_g32_emitted = 0;
+    rw_g32_tex_emitted = 0;
 }
 
 static void make_sample_draw(struct rw_g32_draw_info *d,
@@ -81,7 +82,7 @@ int main(void) {
     uint8_t vbuf[24 * 4], ubo1[256];
     uint16_t ibuf[4];
     struct rw_g32_draw_info d;
-    char line[640];
+    char line[896];
 
     /* 1. Default-off (unset and "0") */
     unsetenv("ANNIBALE_G32_PROBE");
@@ -145,7 +146,46 @@ int main(void) {
     assert(rw_g32_format_line(line, sizeof(line), &d) == 0);
     printf("  [PASS] rate limit + OOB buffer guards\n");
 
-    printf("G32 probe host tests: PASS (3/3)\n");
+    /* 4. 256x1 RGBA16Float LUT texture create/write + Timg* draw matching (tex0 / fbuf5) */
+    setenv("ANNIBALE_G32_PROBE", "1", 1);
+    reset_probe_state();
+    assert(rw_g32_format_tex_create(line, sizeof(line), 80u, 2u, 1206u, 2622u, 1) == 0);
+    assert(rw_g32_format_tex_create(line, sizeof(line), 115u, 2u, 256u, 1u, 0) == 1);
+    assert(strstr(line, "g32-tex-new #0 fmt=115 type=2 256x1 surf=0") != NULL);
+
+    uint16_t lut[256 * 4];
+    memset(lut, 0, sizeof(lut));
+    lut[0] = 0x3c00u; lut[1] = 0x3800u; lut[2] = 0x0000u; lut[3] = 0x3c00u;
+    lut[128 * 4 + 0] = 0x3800u; lut[128 * 4 + 3] = 0x3c00u;
+    lut[255 * 4 + 2] = 0x3c00u; lut[255 * 4 + 3] = 0x3c00u;
+    assert(rw_g32_format_tex_write(line, sizeof(line), 115u, 256u, 1u, 256u, 1u,
+                                   lut, 2048u, 0) == 1);
+    assert(strstr(line, "g32-tex-wr #1 fmt=115 tex=256x1 wr=256x1 stride=2048 rc=0 nz=3/256") != NULL);
+    assert(strstr(line, "nz0=(1.000,0.500,0.000,1.000)") != NULL);
+
+    struct rw_g32_draw_info timg = other;
+    timg.tex0_fmt = 115u; timg.tex0_w = 256u; timg.tex0_h = 1u;
+    uint16_t noise_scale = 0x3c00u; /* 1.0h */
+    timg.fbuf5_bytes = (const uint8_t *)&noise_scale;
+    timg.fbuf5_len = 2u;
+    timg.fbuf5_offset = 0u;
+    timg.attr1 = (struct rw_g32_vattr_meta){ 29u, 0u, 0u, 24u };
+    timg.attr1_bytes = vbuf; timg.attr1_len = sizeof(vbuf); timg.attr1_buf_off = 0;
+    assert(rw_g32_format_line(line, sizeof(line), &timg) == 1);
+    assert(strstr(line, "f=TimgA2Xhfs_Isrc") != NULL);
+    assert(strstr(line, "tex0=fmt115:256x1 fbuf5=len2:0x3c00(1.0000)") != NULL);
+    assert(strstr(line, "attr1=fmt=29/b0+0/s24[") != NULL);
+
+    /* Timg* with only fbuf5 (noiseScale) and non-LUT tex0 still matches */
+    struct rw_g32_draw_info fbuf5_only = other;
+    fbuf5_only.tex0_fmt = 80u; fbuf5_only.tex0_w = 512u; fbuf5_only.tex0_h = 512u;
+    fbuf5_only.fbuf5_bytes = (const uint8_t *)&noise_scale;
+    fbuf5_only.fbuf5_len = 2u;
+    assert(rw_g32_format_line(line, sizeof(line), &fbuf5_only) == 1);
+    assert(strstr(line, "tex0=fmt80:512x512 fbuf5=len2:0x3c00(1.0000)") != NULL);
+    printf("  [PASS] 256x1 RGBA16Float LUT texture + Timg*/fbuf5 draw matching\n");
+
+    printf("G32 probe host tests: PASS (4/4)\n");
     return 0;
 }
 '''

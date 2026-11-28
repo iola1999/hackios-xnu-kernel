@@ -31,6 +31,7 @@
 enum adsp_fastrpc_stage {
 	FASTRPC_STAGE_IDLE = 0,
 	FASTRPC_STAGE_WAIT_INIT_STATIC,
+	FASTRPC_STAGE_WAIT_INIT_ROOT,
 	FASTRPC_STAGE_WAIT_INIT_SNS,
 	FASTRPC_STAGE_WAIT_LISTENER_INIT2,
 	FASTRPC_STAGE_WAIT_LISTENER_NEXT2,
@@ -63,6 +64,7 @@ static struct adsp_fastrpc_rx_slot adsp_fastrpc_rx_ring[ADSP_FASTRPC_RX_RING_SZ]
 static uint32_t adsp_fastrpc_rx_head, adsp_fastrpc_rx_tail;
 
 static enum adsp_fastrpc_stage adsp_fastrpc_stage;
+static uint32_t adsp_fastrpc_active_pd = ADSP_FASTRPC_USER_PD;
 static uint32_t adsp_fastrpc_ctx_seq;
 static uint64_t adsp_fastrpc_inflight_ctx;
 static uint64_t adsp_fastrpc_inflight_sent_us;
@@ -127,6 +129,7 @@ adsp_fastrpc_reset(void)
 	adsp_fastrpc_rx_count = 0;
 	adsp_fastrpc_intent_logs = 0;
 	adsp_fastrpc_stage = FASTRPC_STAGE_IDLE;
+	adsp_fastrpc_active_pd = ADSP_FASTRPC_USER_PD;
 	adsp_fastrpc_ctx_seq = 0;
 	adsp_fastrpc_inflight_ctx = 0;
 	adsp_fastrpc_inflight_sent_us = 0;
@@ -399,20 +402,14 @@ adsp_fastrpc_send_init_static(void)
 }
 
 static bool
-adsp_fastrpc_send_attach_sns(void)
+adsp_fastrpc_send_attach(uint32_t pd, uint32_t rmid, enum adsp_fastrpc_stage next_stage)
 {
-	int32_t client_id = 1;
-	struct adsp_fastrpc_host_arg args[1] = { { &client_id, NULL, sizeof(client_id) } };
-	uint32_t sc = ADSP_FASTRPC_SCALARS(ADSP_FASTRPC_RMID_INIT_ATTACH, 1, 0);
-	uint32_t pkt_sz = 0;
+	uint32_t sc = ADSP_FASTRPC_SCALARS(rmid, 0, 0);
 
-	if (!adsp_fastrpc_build_invoke(sc, args, NULL, &pkt_sz)) {
+	if (!adsp_fastrpc_send_invoke(pd, ADSP_FASTRPC_INIT_HANDLE, sc, 0u)) {
 		return false;
 	}
-	if (!adsp_fastrpc_send_invoke(ADSP_FASTRPC_SENSORS_PD, ADSP_FASTRPC_INIT_HANDLE, sc, pkt_sz)) {
-		return false;
-	}
-	adsp_fastrpc_stage = FASTRPC_STAGE_WAIT_INIT_SNS;
+	adsp_fastrpc_stage = next_stage;
 	return true;
 }
 
@@ -420,7 +417,7 @@ static bool
 adsp_fastrpc_send_listener_init2(void)
 {
 	uint32_t sc = ADSP_FASTRPC_SCALARS(ADSP_FASTRPC_LISTENER_INIT2, 0, 0);
-	if (!adsp_fastrpc_send_invoke(ADSP_FASTRPC_USER_PD, ADSP_FASTRPC_LISTENER_HANDLE, sc, 0u)) {
+	if (!adsp_fastrpc_send_invoke(adsp_fastrpc_active_pd, ADSP_FASTRPC_LISTENER_HANDLE, sc, 0u)) {
 		return false;
 	}
 	adsp_fastrpc_stage = FASTRPC_STAGE_WAIT_LISTENER_INIT2;
@@ -453,7 +450,7 @@ adsp_fastrpc_send_listener_next2(void)
 	adsp_fastrpc_next2_out0_off = offs[2];
 	adsp_fastrpc_next2_out1_off = offs[3];
 	adsp_fastrpc_next2_out1_cap = cap;
-	if (!adsp_fastrpc_send_invoke(ADSP_FASTRPC_USER_PD, ADSP_FASTRPC_LISTENER_HANDLE, sc, pkt_sz)) {
+	if (!adsp_fastrpc_send_invoke(adsp_fastrpc_active_pd, ADSP_FASTRPC_LISTENER_HANDLE, sc, pkt_sz)) {
 		return false;
 	}
 	adsp_fastrpc_stage = FASTRPC_STAGE_WAIT_LISTENER_NEXT2;
@@ -471,13 +468,25 @@ adsp_fastrpc_handle_rsp(const struct fastrpc_wire_rsp *rsp)
 		say("fastrpc: INIT_CREATE_STATIC(sensorspd) -> retval=%d (%#x)\n",
 		    rsp->retval, (uint32_t)rsp->retval);
 		if (rsp->retval == 0) {
+			adsp_fastrpc_active_pd = ADSP_FASTRPC_USER_PD;
 			(void)adsp_fastrpc_send_listener_init2();
-		} else {
-			(void)adsp_fastrpc_send_attach_sns();
+		} else if (!adsp_fastrpc_send_attach(ADSP_FASTRPC_ROOT_PD,
+		    ADSP_FASTRPC_RMID_INIT_ATTACH, FASTRPC_STAGE_WAIT_INIT_ROOT)) {
+			adsp_fastrpc_stage = FASTRPC_STAGE_FAILED;
+		}
+	} else if (adsp_fastrpc_stage == FASTRPC_STAGE_WAIT_INIT_ROOT) {
+		say("fastrpc: INIT_ATTACH(root) -> retval=%d (%#x)\n", rsp->retval, (uint32_t)rsp->retval);
+		if (rsp->retval == 0) {
+			adsp_fastrpc_active_pd = ADSP_FASTRPC_ROOT_PD;
+			(void)adsp_fastrpc_send_listener_init2();
+		} else if (!adsp_fastrpc_send_attach(ADSP_FASTRPC_SENSORS_PD,
+		    ADSP_FASTRPC_RMID_INIT_ATTACH_SNS, FASTRPC_STAGE_WAIT_INIT_SNS)) {
+			adsp_fastrpc_stage = FASTRPC_STAGE_FAILED;
 		}
 	} else if (adsp_fastrpc_stage == FASTRPC_STAGE_WAIT_INIT_SNS) {
 		say("fastrpc: INIT_ATTACH_SNS -> retval=%d (%#x)\n", rsp->retval, (uint32_t)rsp->retval);
 		if (rsp->retval == 0) {
+			adsp_fastrpc_active_pd = ADSP_FASTRPC_SENSORS_PD;
 			(void)adsp_fastrpc_send_listener_init2();
 		} else {
 			adsp_fastrpc_stage = FASTRPC_STAGE_FAILED;
@@ -600,6 +609,7 @@ adsp_fastrpc_service(void)
 		}
 		(void)adsp_fastrpc_send_init_static();
 	} else if ((adsp_fastrpc_stage == FASTRPC_STAGE_WAIT_INIT_STATIC ||
+	    adsp_fastrpc_stage == FASTRPC_STAGE_WAIT_INIT_ROOT ||
 	    adsp_fastrpc_stage == FASTRPC_STAGE_WAIT_INIT_SNS) && adsp_fastrpc_inflight_ctx != 0 &&
 	    adsp_fastrpc_now_us() - adsp_fastrpc_inflight_sent_us >= ADSP_FASTRPC_CTX_TIMEOUT_US) {
 		adsp_fastrpc_inflight_ctx = 0;

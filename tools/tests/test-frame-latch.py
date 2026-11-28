@@ -75,6 +75,7 @@ static uint32_t flip_rd(uint32_t off)
 }
 
 static void dim_quiesce(void) {}
+static bool flip_dpu_scale_quiesce(bool poweroff) { (void)poweroff; return false; }
 static void loader_set_scanout_pa(uint64_t pa) { (void)pa; }
 static void flip_point(int which) { flip.shown = which; }
 ''' + routines + r'''

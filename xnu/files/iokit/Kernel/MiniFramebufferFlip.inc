@@ -24,6 +24,8 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern "C" boolean_t pmap_valid_address(uint64_t pa);
 extern "C" void loader_set_scanout_pa(uint64_t pa);
+extern "C" void loader_set_scanout_mode(uint64_t pa, uint32_t width, uint32_t height, uint32_t stride, uint32_t format);
+static void dpu_scale_report_scanout(uint64_t pa);
 
 static TUNABLE(uint32_t, gFlip, "fb_flip", 0);
 
@@ -299,7 +301,7 @@ flip_point(int which)
 		flip_wr(FLIP_CTL(flip.ctl) + FLIP_CTL_START, 1);
 	}
 	flip.shown = which;
-	loader_set_scanout_pa(flip.pa[which]);
+	dpu_scale_report_scanout(flip.pa[which]);
 }
 
 #include "MiniFramebufferDim.inc"

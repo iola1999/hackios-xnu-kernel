@@ -352,6 +352,11 @@ struct kernel_live {
 	uint64_t inbox_seq;             /* ours to write, after the file and inbox_len */
 	uint64_t magic5;                /* "XNULIVE5": active scanout framebuffer address follows */
 	uint64_t scanout_pa;            /* physical address of the active scanout buffer, 0 for SCREEN.base */
+	uint64_t magic6;                /* "XNULIVE6": active scanout geometry follows */
+	uint32_t scanout_width;
+	uint32_t scanout_height;
+	uint32_t scanout_stride;
+	uint32_t scanout_format;        /* 'BGRA' (0x42475241) or 'l10r' (0x6c313072), 0 = boot BGRA */
 };
 
 /*
@@ -422,6 +427,7 @@ static uint64_t sound_len;
 #define KERNEL_LIVE_MAGIC3      0x334556494c554e58ULL
 #define KERNEL_LIVE_MAGIC4      0x344556494c554e58ULL
 #define KERNEL_LIVE_MAGIC5      0x354556494c554e58ULL
+#define KERNEL_LIVE_MAGIC6      0x364556494c554e58ULL
 #define KERNEL_LIVE_MAGIC       0x214556494c554e58ULL
 #define START_SECONDS           5
 #define SILENCE_SECONDS         50

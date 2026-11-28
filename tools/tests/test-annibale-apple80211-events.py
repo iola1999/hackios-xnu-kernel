@@ -30,19 +30,27 @@ def function(name, prefix="void\n"):
 source = r'''
 #include <assert.h>
 #include <errno.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 #define Z_WAITOK 1
 #define Z_ZERO 2
+#define NSEC_PER_MSEC 1000000ULL
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define printf(...) ((void)0)
 
 typedef uint64_t clock_sec_t;
 typedef uint32_t clock_usec_t;
 static clock_sec_t fake_sec = 10;
+static clock_usec_t fake_usec = 0;
 static void clock_get_system_microtime(clock_sec_t *sec, clock_usec_t *usec) {
-    *sec = fake_sec; *usec = 0;
+    *sec = fake_sec; *usec = fake_usec;
+}
+static unsigned delay_calls;
+static void delay_for_interval(uint32_t interval, uint64_t scale) {
+    assert(interval == 20u && scale == NSEC_PER_MSEC);
+    delay_calls++;
 }
 
 enum annibale_sta_event { ANNIBALE_STA_POWER, ANNIBALE_STA_SCAN_DONE, ANNIBALE_STA_JOIN_DONE, ANNIBALE_STA_LINK };
@@ -63,12 +71,18 @@ static int apple80211_lock;
 static void lck_mtx_lock(int *lock) { assert(lock == &apple80211_lock); }
 static void lck_mtx_unlock(int *lock) { assert(lock == &apple80211_lock); }
 static struct { uint64_t data; unsigned next; } result_readers[16];
-static uint32_t join_result;
+static uint32_t join_result = 0xffffu;
+static uint64_t join_requested_usec;
+static bool join_requested;
+static uint8_t event_filter[32];
+static bool event_filter_set;
 
 struct captured { uint32_t code, length; uint8_t data[0x1d8]; };
 static struct captured events[8];
 static unsigned event_count;
+''' + function("event_allowed", "static bool\n") + r'''
 static void post(uint32_t code, const void *data, uint32_t length) {
+    if (!event_allowed(code)) return;
     struct captured *event = &events[event_count];
     assert(event_count < 8 && length <= sizeof(event->data));
     event_count++;
@@ -119,13 +133,62 @@ int main(void) {
     reset(); fake_sec = 21; post_lqm(0); check_codes(lqm_code, 1);
     memcpy(&lqm, events[0].data, sizeof(lqm));
     assert(lqm.rssi_known == 1 && lqm.rssi == -55);
+
+    {
+        struct assoc_done_check {
+            uint8_t unused[0x1c0];
+            uint32_t status, result, flags;
+        };
+        _Static_assert(sizeof(struct assoc_done_check) == 0x1cc, "assoc done size");
+        _Static_assert(offsetof(struct assoc_done_check, status) == 0x1c0, "status offset");
+        _Static_assert(offsetof(struct assoc_done_check, result) == 0x1c4, "result offset");
+        _Static_assert(offsetof(struct assoc_done_check, flags) == 0x1c8, "flags offset");
+
+        uint8_t filter[32] = {0};
+        uint32_t jr = 0xffffu;
+        assert(jr == 0xffffu);
+
+        /* bit (code - 1): EVENT_ASSOC_DONE (9) -> byte 1+1=2, bit 0; EVENT_LQM_CHANGED (39) -> byte 1+4=5, bit 6 */
+        filter[0] = 0;
+        filter[1 + ((9u - 1u) >> 3)] |= (uint8_t)(1u << ((9u - 1u) & 7u));
+        assert((filter[2] & 0x01u) != 0);
+        assert((filter[5] & 0x40u) == 0);
+
+        struct kev_dv { uint32_t len; const void *ptr; };
+        char ifname[16] = "en0";
+        struct assoc_done_check done = { .status = 1u, .result = 1u, .flags = 1u };
+        struct kev_dv dv[2] = {
+            { (uint32_t)sizeof(ifname), ifname },
+            { (uint32_t)sizeof(done), &done },
+        };
+        assert(dv[0].len == 16u && memcmp(dv[0].ptr, "en0", 4) == 0);
+        assert(dv[1].len == 0x1ccu && done.flags == 1u && done.result == 1u);
+    }
 }
 '''
+
+a80211_src = Path(__file__).resolve().parents[2] / "xnu/files/bsd/dev/annibale/annibale_apple80211.c"
+a80211_text = a80211_src.read_text()
+assert len(a80211_text.splitlines()) <= 1200, f"annibale_apple80211.c exceeds 1200 lines"
+for marker in (
+    "static uint32_t join_result = 0xffff;",
+    "static uint8_t event_filter[32];",
+    "event_allowed(uint32_t code)",
+    "request->req_len < sizeof(mask)",
+    "join_result = 0xffff;",
+    "done.flags = 1;",
+    "post(EVENT_ASSOC_DONE, &done, sizeof(done));",
+    "delay_for_interval(20, NSEC_PER_MSEC);",
+):
+    assert marker in a80211_text, f"missing expected P21 contract in annibale_apple80211.c: {marker}"
 
 with tempfile.TemporaryDirectory(prefix="annibale-apple80211-events-") as directory:
     src = Path(directory) / "check.c"
     binary = Path(directory) / "check"
     src.write_text(source)
-    subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", str(src), "-o", str(binary)], check=True)
+    subprocess.run(
+        ["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined", str(src), "-o", str(binary)],
+        check=True,
+    )
     subprocess.run([str(binary)], check=True)
-print("Annibale Apple80211 LQM event layout and ordering: PASS")
+print("Annibale Apple80211 events, filter mask, and assoc completion contract: PASS")

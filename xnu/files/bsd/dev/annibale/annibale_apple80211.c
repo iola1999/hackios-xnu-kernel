@@ -267,7 +267,11 @@ static struct {
 	user_addr_t data;
 	unsigned next;
 } result_readers[16];
-static uint32_t join_result;                    /* of the last join asked for: 0 while it runs, then Apple80211's number */
+static uint32_t join_result = 0xffff;           /* of the last join asked for: 0xffff while it runs, then Apple80211's number */
+static uint64_t join_requested_usec;
+static bool join_requested;
+static uint8_t event_filter[32];
+static bool event_filter_set;
 
 /* ---- channels ---------------------------------------------------------------------------------------- */
 
@@ -496,7 +500,7 @@ get(struct apple80211req *request)
 		kfree_data(answer, sizeof(*answer));
 		return error;
 	}
-	case 21:                                /* how the last join went (0: not over yet) */
+	case 21:                                /* how the last join went (0xffff: not over yet) */
 		lck_mtx_lock(&apple80211_lock);
 		request->req_val = (int32_t)join_result;
 		lck_mtx_unlock(&apple80211_lock);
@@ -779,10 +783,24 @@ set_join(const struct apple80211req *request, char *said, size_t said_size)
 		error = EINVAL;
 		goto out;
 	}
-	lck_mtx_lock(&apple80211_lock);
-	join_result = 0;
-	lck_mtx_unlock(&apple80211_lock);
+	{
+		clock_sec_t sec = 0;
+		clock_usec_t usec = 0;
+
+		clock_get_system_microtime(&sec, &usec);
+		lck_mtx_lock(&apple80211_lock);
+		join_result = 0xffff;
+		join_requested_usec = (uint64_t)sec * 1000000ULL + (uint64_t)usec;
+		join_requested = true;
+		lck_mtx_unlock(&apple80211_lock);
+	}
 	error = annibale_sta_ask_join(what);
+	if (error != 0) {
+		lck_mtx_lock(&apple80211_lock);
+		join_result = error == ETIMEDOUT ? 9 : error == EAUTH ? 21 : 2;
+		join_requested = false;
+		lck_mtx_unlock(&apple80211_lock);
+	}
 out:
 	if (asked != NULL) {
 		memset_s(asked, sizeof(*asked), 0, sizeof(*asked));
@@ -821,8 +839,25 @@ set(const struct apple80211req *request, char *said, size_t said_size)
 	case 10:
 		return set_scan(request, said, said_size);
 	case 564: {                             /* Apple80211FilterMonitoringEvent (32-byte event mask) */
-		struct annibale_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
+		struct annibale_sta_state *state;
+		uint8_t mask[32];
+		int error;
 
+		if (request->req_len > 0) {
+			if (request->req_len < sizeof(mask)) {
+				return EINVAL;
+			}
+			error = copyin(request->req_data, mask, sizeof(mask));
+			if (error != 0) {
+				return error;
+			}
+			lck_mtx_lock(&apple80211_lock);
+			memcpy(event_filter, mask, sizeof(event_filter));
+			event_filter_set = true;
+			lck_mtx_unlock(&apple80211_lock);
+			snprintf(said, said_size, " (event filter: all=%u)", mask[0]);
+		}
+		state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
 		if (state != NULL) {
 			annibale_sta_state(state);
 			if (state->phase == ANNIBALE_STA_JOINED) {
@@ -876,6 +911,21 @@ set(const struct apple80211req *request, char *said, size_t said_size)
 
 /* ---- events -------------------------------------------------------------------------------------------- */
 
+static bool
+event_allowed(uint32_t code)
+{
+	bool allowed = true;
+
+	lck_mtx_lock(&apple80211_lock);
+	if (event_filter_set && event_filter[0] == 0) {
+		uint32_t bit = code - 1;
+		allowed = code != 0 && (bit >> 3) < sizeof(event_filter) - 1 &&
+		    (event_filter[1 + (bit >> 3)] & (1u << (bit & 7))) != 0;
+	}
+	lck_mtx_unlock(&apple80211_lock);
+	return allowed;
+}
+
 static void
 post(uint32_t code, const void *data, uint32_t length)
 {
@@ -883,6 +933,9 @@ post(uint32_t code, const void *data, uint32_t length)
 		                   .event_code = code };
 	char name[16];
 
+	if (!event_allowed(code)) {
+		return;
+	}
 	memcpy(name, interface_name, sizeof(name));
 	message.dv[0].data_length = sizeof(name);
 	message.dv[0].data_ptr = name;
@@ -938,13 +991,30 @@ annibale_apple80211_event(enum annibale_sta_event event, int status)
 		break;
 	case ANNIBALE_STA_JOIN_DONE: {
 		struct apple80211_assoc_done done = { 0 };
+		uint64_t requested_usec;
+		bool requested;
 
 		lck_mtx_lock(&apple80211_lock);
 		join_result = status == 0 ? 1 : status == EAUTH ? 21 : status == ETIMEDOUT ? 9 : 2;
 		done.status = join_result;
 		done.result = join_result;
-		done.flags = 0;
+		done.flags = 1;
+		requested = join_requested;
+		requested_usec = join_requested_usec;
+		join_requested = false;
 		lck_mtx_unlock(&apple80211_lock);
+		if (requested) {
+			/* IO80211 _performAssociation records [x27,#0x158] after set 20 returns; delay instant hits so _eventRead keeps EVENT_ASSOC_DONE. */
+			clock_sec_t sec = 0;
+			clock_usec_t usec = 0;
+			uint64_t now_usec;
+
+			clock_get_system_microtime(&sec, &usec);
+			now_usec = (uint64_t)sec * 1000000ULL + (uint64_t)usec;
+			if (now_usec >= requested_usec && now_usec - requested_usec < 20000ULL) {
+				delay_for_interval(20, NSEC_PER_MSEC);
+			}
+		}
 		post(EVENT_ASSOC_DONE, &done, sizeof(done));
 		break;
 	}

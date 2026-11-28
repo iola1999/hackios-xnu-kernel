@@ -40,6 +40,7 @@ extern uint64_t kvtophys(vm_offset_t va);
 extern kern_return_t thread_terminate(thread_t thread);
 extern const uint8_t *annibale_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 extern bool annibale_ufs_fat16_fw_read(const char *name, uint64_t *size_out, volatile void *dst_buf, uint64_t dst_cap);
+extern bool annibale_ufs_fat16_path_read(const char *path, uint64_t *size_out, volatile void *dst_buf, uint64_t dst_cap);
 
 static LCK_GRP_DECLARE(annibale_ipc_lock_group, "annibale-ipc");
 LCK_MTX_DECLARE(annibale_aop_mailbox_lock, &annibale_ipc_lock_group);
@@ -607,6 +608,7 @@ static void handle_incoming_gpr(const uint8_t *data, uint32_t len)
 static void glink_poll_rx(void);
 #include "annibale_adsp_intents.inc"
 #include "annibale_adsp_ipcrtr.inc"
+#include "annibale_tftp.inc"
 #include "annibale_adsp_fastrpc.inc"
 
 static int adsp_pmic_glink_tx(const void *data, uint32_t len)
@@ -1169,9 +1171,11 @@ static void annibale_adsp_boot_thread(void *arg __unused, wait_result_t w __unus
 		thread_terminate(current_thread());
 		return;
 	}
+	annibale_tftp_start(TFTP_INST_ADSP);
 	for (;;) {
 		glink_poll_rx();
 		adsp_fastrpc_service();
+		annibale_tftp_poll(glink_poll_rx);
 		sleep_ms(annibale_audio_reach_is_active() ? 1 : (glink_gpr_our_cid == 0 ? 5 : 20));
 	}
 }

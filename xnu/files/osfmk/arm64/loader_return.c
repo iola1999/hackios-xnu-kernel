@@ -109,9 +109,15 @@ struct loader_live {
 	volatile uint64_t inbox_seq;    /* the loader's to write, after the file and inbox_len */
 	uint64_t magic5;                /* "XNULIVE5": active scanout framebuffer address follows */
 	volatile uint64_t scanout_pa;   /* physical address of the active scanout buffer, 0 for SCREEN.base */
+	uint64_t magic6;                /* "XNULIVE6": active scanout geometry follows */
+	volatile uint32_t scanout_width;
+	volatile uint32_t scanout_height;
+	volatile uint32_t scanout_stride;
+	volatile uint32_t scanout_format; /* 'BGRA' (0x42475241) or 'l10r' (0x6c313072), 0 = boot BGRA */
 };
 extern struct loader_live loader_live;
 void loader_set_scanout_pa(uint64_t pa);
+void loader_set_scanout_mode(uint64_t pa, uint32_t width, uint32_t height, uint32_t stride, uint32_t format);
 
 void loader_panic_sync_ufs(const char *reason, uint32_t flags);
 
@@ -540,14 +546,32 @@ struct loader_live loader_live = {
 	.magic3 = 0x334556494c554e58ULL,
 	.magic4 = 0x344556494c554e58ULL, .inbox = loader_inbox, .inbox_size = LOADER_INBOX_SIZE,
 	.magic5 = 0x354556494c554e58ULL,
+	.magic6 = 0x364556494c554e58ULL,
 };
+
+void
+loader_set_scanout_mode(uint64_t pa, uint32_t width, uint32_t height, uint32_t stride, uint32_t format)
+{
+	uintptr_t start = (uintptr_t)&loader_live.scanout_pa & ~(uintptr_t)63u;
+	uintptr_t end = (uintptr_t)(&loader_live.scanout_format + 1);
+
+	loader_live.scanout_width = width;
+	loader_live.scanout_height = height;
+	loader_live.scanout_stride = stride;
+	loader_live.scanout_format = format;
+	__asm__ volatile ("dmb ish" ::: "memory");
+	loader_live.scanout_pa = pa;
+	__asm__ volatile ("dmb ish" ::: "memory");
+	for (uintptr_t line = start; line < end; line += 64u) {
+		__asm__ volatile ("dc cvac, %0" : : "r" (line) : "memory");
+	}
+	__asm__ volatile ("dsb ish" ::: "memory");
+}
 
 void
 loader_set_scanout_pa(uint64_t pa)
 {
-	__asm__ volatile ("dmb ish" ::: "memory");
-	loader_live.scanout_pa = pa;
-	__asm__ volatile ("dc cvac, %0\ndsb ish" : : "r" ((uintptr_t)&loader_live.scanout_pa) : "memory");
+	loader_set_scanout_mode(pa, 0, 0, 0, 0);
 }
 
 /* The last file the host pushed and its sequence number, 0 before the first. */

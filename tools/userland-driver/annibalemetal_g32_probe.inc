@@ -42,14 +42,25 @@ struct rw_g32_draw_info {
 	const uint8_t *attr0_bytes;
 	size_t attr0_len;
 	size_t attr0_buf_off;
+	struct rw_g32_vattr_meta attr1;
+	const uint8_t *attr1_bytes;
+	size_t attr1_len;
+	size_t attr1_buf_off;
 	struct rw_g32_vattr_meta attr3;
 	const uint8_t *attr3_bytes;
 	size_t attr3_len;
 	size_t attr3_buf_off;
+	unsigned tex0_fmt;
+	unsigned tex0_w;
+	unsigned tex0_h;
+	const uint8_t *fbuf5_bytes;
+	size_t fbuf5_len;
+	size_t fbuf5_offset;
 };
 
 static int rw_g32_limit_cache = -1;
 static unsigned rw_g32_emitted = 0;
+static unsigned rw_g32_tex_emitted = 0;
 
 static unsigned
 rw_g32_probe_limit(void)
@@ -80,6 +91,36 @@ rw_g32_name_matches(const char *vname, const char *fname, const char *label)
 	if (label != NULL &&
 	    (strstr(label, "Lln") != NULL || strstr(label, "Tcma") != NULL ||
 	     strstr(label, "Gradient") != NULL)) {
+		return 1;
+	}
+	return 0;
+}
+
+static int
+rw_g32_tex_matches(unsigned pixel_format, unsigned width, unsigned height)
+{
+	if (width == 0u || height == 0u) {
+		return 0;
+	}
+	if (height == 1u) {
+		return 1;
+	}
+	if (pixel_format == 115u && width == 256u && height <= 4u) {
+		return 1;
+	}
+	return 0;
+}
+
+static int
+rw_g32_draw_matches(const struct rw_g32_draw_info *d)
+{
+	if (rw_g32_name_matches(d->vname, d->fname, d->label)) {
+		return 1;
+	}
+	if (rw_g32_tex_matches(d->tex0_fmt, d->tex0_w, d->tex0_h)) {
+		return 1;
+	}
+	if (d->fbuf5_len > 0u && d->fbuf5_len <= 16u) {
 		return 1;
 	}
 	return 0;
@@ -194,12 +235,102 @@ rw_g32_fmt_attr(char *dst, size_t dst_sz, const struct rw_g32_vattr_meta *meta,
 	}
 }
 
+static void
+rw_g32_fmt_half4(char *dst, size_t dst_sz, const uint8_t *p)
+{
+	uint16_t h[4];
+	memcpy(h, p, sizeof(h));
+	snprintf(dst, dst_sz, "(%.3f,%.3f,%.3f,%.3f)",
+	         rw_g32_f16_to_f32(h[0]), rw_g32_f16_to_f32(h[1]),
+	         rw_g32_f16_to_f32(h[2]), rw_g32_f16_to_f32(h[3]));
+}
+
+static int
+rw_g32_format_tex_create(char *out, size_t out_sz, unsigned fmt, unsigned type,
+                         unsigned w, unsigned h, int has_surface)
+{
+	unsigned limit = rw_g32_probe_limit();
+	if (limit == 0u || !rw_g32_tex_matches(fmt, w, h)) {
+		return 0;
+	}
+	if (__atomic_load_n(&rw_g32_tex_emitted, __ATOMIC_RELAXED) >= limit) {
+		return 0;
+	}
+	unsigned seq = __atomic_fetch_add(&rw_g32_tex_emitted, 1u, __ATOMIC_RELAXED);
+	if (seq >= limit) {
+		return 0;
+	}
+	snprintf(out, out_sz, "g32-tex-new #%u fmt=%u type=%u %ux%u surf=%d\n",
+	         seq, fmt, type, w, h, has_surface);
+	return 1;
+}
+
+static int
+rw_g32_format_tex_write(char *out, size_t out_sz, unsigned fmt, unsigned tex_w, unsigned tex_h,
+                        unsigned w, unsigned h, const void *bytes, size_t stride, int rc)
+{
+	unsigned limit = rw_g32_probe_limit();
+	if (limit == 0u || !rw_g32_tex_matches(fmt, tex_w, tex_h)) {
+		return 0;
+	}
+	if (__atomic_load_n(&rw_g32_tex_emitted, __ATOMIC_RELAXED) >= limit) {
+		return 0;
+	}
+	unsigned seq = __atomic_fetch_add(&rw_g32_tex_emitted, 1u, __ATOMIC_RELAXED);
+	if (seq >= limit) {
+		return 0;
+	}
+	char first_nz[48] = "none", mid_buf[48] = "none", last_buf[48] = "none";
+	unsigned nz = 0u, scan = w > 256u ? 256u : w;
+	if (bytes != NULL && scan > 0u && fmt == 115u) {
+		const uint8_t *p = (const uint8_t *)bytes;
+		int got_nz = 0;
+		for (unsigned i = 0; i < scan; i++) {
+			uint64_t raw = 0;
+			memcpy(&raw, p + (size_t)i * 8u, 8u);
+			if (raw != 0u) {
+				nz++;
+				if (!got_nz) {
+					rw_g32_fmt_half4(first_nz, sizeof(first_nz),
+					                 p + (size_t)i * 8u);
+					got_nz = 1;
+				}
+			}
+		}
+		rw_g32_fmt_half4(mid_buf, sizeof(mid_buf), p + (size_t)(scan / 2u) * 8u);
+		rw_g32_fmt_half4(last_buf, sizeof(last_buf), p + (size_t)(scan - 1u) * 8u);
+	} else if (bytes != NULL && scan > 0u && (fmt == 80u || fmt == 70u || fmt == 81u || fmt == 71u)) {
+		const uint8_t *p = (const uint8_t *)bytes;
+		int got_nz = 0;
+		for (unsigned i = 0; i < scan; i++) {
+			uint32_t raw = 0;
+			memcpy(&raw, p + (size_t)i * 4u, 4u);
+			if (raw != 0u) {
+				nz++;
+				if (!got_nz) {
+					snprintf(first_nz, sizeof(first_nz), "0x%08x", raw);
+					got_nz = 1;
+				}
+			}
+		}
+		uint32_t mid_v = 0, last_v = 0;
+		memcpy(&mid_v, p + (size_t)(scan / 2u) * 4u, 4u);
+		memcpy(&last_v, p + (size_t)(scan - 1u) * 4u, 4u);
+		snprintf(mid_buf, sizeof(mid_buf), "0x%08x", mid_v);
+		snprintf(last_buf, sizeof(last_buf), "0x%08x", last_v);
+	}
+	snprintf(out, out_sz,
+	         "g32-tex-wr #%u fmt=%u tex=%ux%u wr=%ux%u stride=%zu rc=%d nz=%u/%u "
+	         "nz0=%s mid=%s last=%s\n",
+	         seq, fmt, tex_w, tex_h, w, h, stride, rc, nz, scan, first_nz, mid_buf, last_buf);
+	return 1;
+}
+
 static int
 rw_g32_format_line(char *out, size_t out_sz, const struct rw_g32_draw_info *d)
 {
 	unsigned limit = rw_g32_probe_limit();
-	if (limit == 0 || d->primitive == 1u ||
-	    !rw_g32_name_matches(d->vname, d->fname, d->label)) {
+	if (limit == 0 || d->primitive == 1u || !rw_g32_draw_matches(d)) {
 		return 0;
 	}
 	if (__atomic_load_n(&rw_g32_emitted, __ATOMIC_RELAXED) >= limit) {
@@ -209,7 +340,8 @@ rw_g32_format_line(char *out, size_t out_sz, const struct rw_g32_draw_info *d)
 	if (seq >= limit) {
 		return 0;
 	}
-	char sc_buf[48], vp_buf[64], ubo_buf[32], a0_buf[160], a3_buf[160];
+	char sc_buf[48], vp_buf[64], ubo_buf[32], tex_buf[40], fb5_buf[48];
+	char a0_buf[160], a1_buf[160], a3_buf[160];
 	if (d->has_scissor) {
 		snprintf(sc_buf, sizeof(sc_buf), "%u,%u,%u,%u",
 		         d->scissor[0], d->scissor[1], d->scissor[2], d->scissor[3]);
@@ -229,25 +361,69 @@ rw_g32_format_line(char *out, size_t out_sz, const struct rw_g32_draw_info *d)
 	} else {
 		snprintf(ubo_buf, sizeof(ubo_buf), "none");
 	}
+	if (d->tex0_w > 0u && d->tex0_h > 0u) {
+		snprintf(tex_buf, sizeof(tex_buf), "fmt%u:%ux%u", d->tex0_fmt, d->tex0_w, d->tex0_h);
+	} else {
+		snprintf(tex_buf, sizeof(tex_buf), "none");
+	}
+	if (d->fbuf5_bytes != NULL && d->fbuf5_offset + 2u <= d->fbuf5_len) {
+		uint16_t raw = 0;
+		memcpy(&raw, d->fbuf5_bytes + d->fbuf5_offset, 2u);
+		snprintf(fb5_buf, sizeof(fb5_buf), "len%zu:0x%04x(%.4f)",
+		         d->fbuf5_len, raw, rw_g32_f16_to_f32(raw));
+	} else if (d->fbuf5_len > 0u) {
+		snprintf(fb5_buf, sizeof(fb5_buf), "len%zu", d->fbuf5_len);
+	} else {
+		snprintf(fb5_buf, sizeof(fb5_buf), "none");
+	}
 	rw_g32_fmt_attr(a0_buf, sizeof(a0_buf), &d->attr0, d->attr0_bytes,
 	                d->attr0_len, d->attr0_buf_off, d);
+	rw_g32_fmt_attr(a1_buf, sizeof(a1_buf), &d->attr1, d->attr1_bytes,
+	                d->attr1_len, d->attr1_buf_off, d);
 	rw_g32_fmt_attr(a3_buf, sizeof(a3_buf), &d->attr3, d->attr3_bytes,
 	                d->attr3_len, d->attr3_buf_off, d);
 	snprintf(out, out_sz,
 	         "g32-probe #%u v=%s f=%s label=%s prim=%u start=%u count=%u idx=%s(%zu) "
-	         "blend=%u mask=%#x rgb=%u/%u/%u a=%u/%u/%u sc=%s vp=%s ubo1_94=%s "
-	         "attr0=%s attr3=%s\n",
+	         "blend=%u mask=%#x rgb=%u/%u/%u a=%u/%u/%u sc=%s vp=%s tex0=%s fbuf5=%s "
+	         "ubo1_94=%s attr0=%s attr1=%s attr3=%s\n",
 	         seq, d->vname ? d->vname : "-", d->fname ? d->fname : "-",
 	         d->label ? d->label : "-", d->primitive, d->vertex_start, d->vertex_count,
 	         d->indexed ? (d->index_type == 1u ? "u32" : "u16") : "none",
 	         d->indexed ? d->index_offset : (size_t)0,
 	         d->blend_enabled, d->write_mask,
 	         d->src_rgb, d->dst_rgb, d->op_rgb, d->src_a, d->dst_a, d->op_a,
-	         sc_buf, vp_buf, ubo_buf, a0_buf, a3_buf);
+	         sc_buf, vp_buf, tex_buf, fb5_buf, ubo_buf, a0_buf, a1_buf, a3_buf);
 	return 1;
 }
 
 #ifndef ANNIBALE_G32_PROBE_HOST_TEST
+static void
+rw_g32_probe_tex_create(const struct rwa_texture_shape *shape, int has_surface)
+{
+	char line[256];
+	if (shape == NULL) {
+		return;
+	}
+	if (rw_g32_format_tex_create(line, sizeof(line), shape->pixel_format, shape->type,
+	                             shape->width, shape->height, has_surface)) {
+		rw_print("%s", line);
+	}
+}
+
+static void
+rw_g32_probe_tex_write(const struct rwa_texture_shape *shape, unsigned w, unsigned h,
+                       const void *bytes, size_t stride, int rc)
+{
+	char line[384];
+	if (shape == NULL) {
+		return;
+	}
+	if (rw_g32_format_tex_write(line, sizeof(line), shape->pixel_format,
+	                            shape->width, shape->height, w, h, bytes, stride, rc)) {
+		rw_print("%s", line);
+	}
+}
+
 static void
 rw_g32_probe_draw(AnnibaleMetalRenderPipeline *pipeline, const AnnibaleMetalWork *work)
 {
@@ -262,7 +438,19 @@ rw_g32_probe_draw(AnnibaleMetalRenderPipeline *pipeline, const AnnibaleMetalWork
 	d.vname = (vn != nil && [vn length] > 0) ? [vn UTF8String] : NULL;
 	d.fname = (fn != nil && [fn length] > 0) ? [fn UTF8String] : NULL;
 	d.label = (lb != nil && [lb length] > 0) ? [lb UTF8String] : NULL;
-	if (!rw_g32_name_matches(d.vname, d.fname, d.label)) {
+	if (work->textureCount > 0u && work->textures[0] != nil &&
+	    [work->textures[0] respondsToSelector:@selector(pixelFormat)]) {
+		d.tex0_fmt = (unsigned)[work->textures[0] pixelFormat];
+		d.tex0_w = (unsigned)[work->textures[0] width];
+		d.tex0_h = (unsigned)[work->textures[0] height];
+	}
+	if (work->count > 5u && work->buffers[5] != nil &&
+	    [work->buffers[5] respondsToSelector:@selector(contents)]) {
+		d.fbuf5_bytes = (const uint8_t *)[work->buffers[5] contents];
+		d.fbuf5_len = (size_t)[work->buffers[5] length];
+		d.fbuf5_offset = work->bufferOffsets[5];
+	}
+	if (!rw_g32_draw_matches(&d)) {
 		return;
 	}
 	d.primitive = work->primitive;
@@ -308,6 +496,17 @@ rw_g32_probe_draw(AnnibaleMetalRenderPipeline *pipeline, const AnnibaleMetalWork
 			d.attr0_buf_off = work->vertexBufferOffsets[m0->buffer_index];
 		}
 	}
+	const struct rw_g32_vattr_meta *m1 = [pipeline vertexAttrMeta:1];
+	if (m1 != NULL) {
+		d.attr1 = *m1;
+		if (m1->buffer_index < work->vertexBufferCount &&
+		    work->vertexBuffers[m1->buffer_index] != nil &&
+		    [work->vertexBuffers[m1->buffer_index] respondsToSelector:@selector(contents)]) {
+			d.attr1_bytes = (const uint8_t *)[work->vertexBuffers[m1->buffer_index] contents];
+			d.attr1_len = (size_t)[work->vertexBuffers[m1->buffer_index] length];
+			d.attr1_buf_off = work->vertexBufferOffsets[m1->buffer_index];
+		}
+	}
 	const struct rw_g32_vattr_meta *m3 = [pipeline vertexAttrMeta:3];
 	if (m3 != NULL) {
 		d.attr3 = *m3;
@@ -319,7 +518,7 @@ rw_g32_probe_draw(AnnibaleMetalRenderPipeline *pipeline, const AnnibaleMetalWork
 			d.attr3_buf_off = work->vertexBufferOffsets[m3->buffer_index];
 		}
 	}
-	char line[640];
+	char line[896];
 	if (rw_g32_format_line(line, sizeof(line), &d)) {
 		rw_print("%s", line);
 	}

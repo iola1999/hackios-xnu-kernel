@@ -36,6 +36,7 @@ PRELUDE = r'''
 #define KERNEL_LIVE_MAGIC3 0x334556494c554e58ULL
 #define KERNEL_LIVE_MAGIC4 0x344556494c554e58ULL
 #define KERNEL_LIVE_MAGIC5 0x354556494c554e58ULL
+#define KERNEL_LIVE_MAGIC6 0x364556494c554e58ULL
 #define EFI_ERROR(x) ((x) != 0)
 typedef uint64_t efi_status;
 struct kernel_live {
@@ -44,6 +45,8 @@ struct kernel_live {
 	char cmd[120];
 	uint64_t magic4, inbox, inbox_size, inbox_len, inbox_seq;
 	uint64_t magic5, scanout_pa;
+	uint64_t magic6;
+	uint32_t scanout_width, scanout_height, scanout_stride, scanout_format;
 };
 typedef struct { uint32_t media_id; int read_only; } efi_block_media;
 typedef struct efi_block_io {
@@ -138,6 +141,41 @@ main(int argc, char **argv)
 		if (screenshot_base(&live, fb, len) != fb) return 24;
 		live.scanout_pa = fb + SPLASH_REGION_BYTES - len + 4096ULL; /* out of splash bounds */
 		if (screenshot_base(&live, fb, len) != fb) return 25;
+
+		/* Live geometry: missing magic6 or zero dimensions fall back to boot 1156x2510 BGRA */
+		uint32_t sw = 0, sh = 0, ss = 0, sfmt = 0;
+		uint64_t stage_bytes = 0;
+		live.scanout_pa = 0xfd400000ULL;
+		live.scanout_width = 1206;
+		live.scanout_height = 2622;
+		live.scanout_stride = 4864;
+		live.scanout_format = 0x6c313072u; /* 'l10r' */
+		screenshot_info(&live, fb, 1156, 2510, 4624, &sw, &sh, &ss, &sfmt);
+		if (sw != 1156 || sh != 2510 || ss != 4624 || sfmt != 0x42475241u) return 26;
+
+		live.magic6 = KERNEL_LIVE_MAGIC6;
+		screenshot_info(&live, fb, 1156, 2510, 4624, &sw, &sh, &ss, &sfmt);
+		if (sw != 1206 || sh != 2622 || ss != 4864 || sfmt != 0x6c313072u) return 27;
+		if (screenshot_stage(&live, fb, 1156, 2510, 4624, &stage_bytes) != 0xfd400000ULL ||
+		    stage_bytes != (uint64_t)4864 * 2622) return 28;
+
+		live.scanout_format = 0; /* 0 = boot BGRA */
+		screenshot_info(&live, fb, 1156, 2510, 4624, &sw, &sh, &ss, &sfmt);
+		if (sfmt != 0x42475241u) return 29;
+
+		live.scanout_format = 0x52474241u; /* unknown fourcc rejected */
+		screenshot_info(&live, fb, 1156, 2510, 4624, &sw, &sh, &ss, &sfmt);
+		if (sw != 1156 || sh != 2510 || ss != 4624 || sfmt != 0x42475241u) return 30;
+		live.scanout_format = 0x42475241u;
+
+		live.scanout_stride = 1206 * 4 - 4; /* narrower than width*4 */
+		screenshot_info(&live, fb, 1156, 2510, 4624, &sw, &sh, &ss, &sfmt);
+		if (sw != 1156) return 31;
+		live.scanout_stride = 4864;
+
+		live.scanout_pa = 0; /* scanout_pa == 0 uses boot SCREEN */
+		screenshot_info(&live, fb, 1156, 2510, 4624, &sw, &sh, &ss, &sfmt);
+		if (sw != 1156 || sh != 2510 || ss != 4624) return 32;
 		return 0;
 	}
 	f = fopen(argv[1], "rb");
@@ -187,7 +225,7 @@ def check_image(img):
 def main():
     funcs = ''.join(function(SOURCE, n) for n in (
         'nvram_chrp_sum', 'nvram_chrp_header', 'nvram_adler', 'build_nvram_image', 'nvram_bank_whole', 'nvram_load',
-        'nvram_fastboot_set', 'nvram_fastboot_consume', 'screenshot_base'))
+        'nvram_fastboot_set', 'nvram_fastboot_consume', 'screenshot_info', 'screenshot_base', 'screenshot_stage'))
     defines = '\n'.join(re.findall(r'#define (?:NVRAM_BANKS|NVRAM_FASTBOOT_AT|NVRAM_FASTBOOT_MAGIC|SPLASH_REGION_BYTES) [^\n]+', SOURCE))
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)

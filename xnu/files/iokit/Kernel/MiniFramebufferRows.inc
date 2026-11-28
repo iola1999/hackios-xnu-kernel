@@ -34,14 +34,15 @@ l10r_to_bgra(uint32_t p)
 }
 
 struct RowJob {
+	uint8_t *       dstBase;
 	const uint8_t * pixels;
-	uint32_t        stride;
+	uint32_t        stride, copyStride;
 	uint32_t        pixelFormat;
 	int32_t         sx, sy, sw, sh, px0, py0, px1, py1, cx0, cx1;
 	int32_t         by0, by1;       /* the panel rows this frame draws (dirtyBand), within py0..py1 */
 	uint32_t        bufferSeq;      /* fRowSeq when the target panel buffer was last updated */
 	uint32_t        drawWork;       /* upper bound on rows needing pixel work in drawRows() */
-	bool            filter, unscaled, allDirty, hashPhase, hashKnown;
+	bool            filter, unscaled, allDirty, hashPhase, hashKnown, dpuScaleCopy, dpuScaleWhole;
 	int32_t         hashFirst[8], hashLast[8], hashCount[8];
 };
 
@@ -172,8 +173,13 @@ IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
 			rows = job->by1 - job->by0;
 			y0 = job->by0 + (int32_t) ((int64_t) rows * (index + 1) / fb->fThreads);
 			y1 = job->by0 + (int32_t) ((int64_t) rows * (index + 2) / fb->fThreads);
-			blend = fb->fHelperBlend[index];
-			fb->drawRows(job, y0, y1, blend);
+			if (job->dpuScaleCopy) {
+				dpu_scale_copy_rows(job->dstBase, job->pixels, job->stride, job->copyStride,
+				    job->sx, job->sy, y0, y1, job->dpuScaleWhole);
+			} else {
+				blend = fb->fHelperBlend[index];
+				fb->drawRows(job, y0, y1, blend);
+			}
 		}
 		IOLockLock(fb->fHelperLock);
 		fb->fHelpersBusy--;
@@ -410,5 +416,68 @@ IOMobileFramebuffer::dirtyBand(RowJob * job)
 		job->drawWork = (uint32_t) changed + (flip.ready ? fLastChangedRows : 0u);
 	}
 	fLastChangedRows = (uint32_t) changed;
+	return true;
+}
+
+void
+IOMobileFramebuffer::runHelperRows(RowJob * job, uint32_t * blendRow)
+{
+	int32_t y0 = job->by0;
+	int32_t y1 = y0 + (int32_t) ((int64_t) (job->by1 - y0) / fThreads);
+
+	IOLockLock(fHelperLock);
+	fHelperJob = job;
+	fHelpersBusy = fThreads - 1;
+	fHelperGeneration++;
+	IOLockWakeup(fHelperLock, &fHelperGeneration, false);
+	IOLockUnlock(fHelperLock);
+	if (job->dpuScaleCopy) {
+		dpu_scale_copy_rows(job->dstBase, job->pixels, job->stride, job->copyStride,
+		    job->sx, job->sy, y0, y1, job->dpuScaleWhole);
+	} else {
+		drawRows(job, y0, y1, blendRow);
+	}
+	IOLockLock(fHelperLock);
+	while (fHelpersBusy != 0) {
+		IOLockSleep(fHelperLock, &fHelpersBusy, THREAD_UNINT);
+	}
+	IOLockUnlock(fHelperLock);
+}
+
+bool
+IOMobileFramebuffer::drawDpuScaled(MiniIOSurface * s, int32_t sx, int32_t sy, int32_t sw, int32_t sh,
+    int32_t px0, int32_t py0, int32_t px1, int32_t py1)
+{
+	uint32_t copyStride = 0;
+	bool wholeSurf = false;
+
+	if (!flip_dpu_scale_prepare(fBase, s->pixels(), s->info.width, s->info.height,
+	    s->info.bytesPerRow, s->info.pixelFormat, sx, sy, sw, sh, px0, py0, px1, py1,
+	    fPanelWidth, fPanelHeight, &copyStride, &wholeSurf)) {
+		if (flip_dpu_scale_fallback()) {
+			fRowHashRows = 0;
+			fAllChangedSeq = ++fRowSeq;
+		}
+		return false;
+	}
+	if (fThreads > 1 && fHelpersStarted + 1 == fThreads && sh >= DRAW_MIN_PARALLEL_ROWS) {
+		RowJob job = {};
+
+		job.dstBase = fBase;
+		job.pixels = s->pixels();
+		job.stride = s->info.bytesPerRow;
+		job.copyStride = copyStride;
+		job.sx = sx;
+		job.sy = sy;
+		job.by0 = 0;
+		job.by1 = sh;
+		job.dpuScaleCopy = true;
+		job.dpuScaleWhole = wholeSurf;
+		runHelperRows(&job, NULL);
+	} else {
+		dpu_scale_copy_rows(fBase, s->pixels(), s->info.bytesPerRow, copyStride,
+		    sx, sy, 0, sh, wholeSurf);
+	}
+	flip_dpu_scale_finish();
 	return true;
 }

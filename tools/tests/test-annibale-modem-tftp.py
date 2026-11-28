@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Host test of the TFTP service MPSS uses (annibale_modem_tftp.inc): the production file compiled with a stub QRTR."""
+"""Host test of the dual-instance TFTP service (annibale_tftp.inc) compiled with stub QRTR."""
 from pathlib import Path
 import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-SOURCE = (ROOT / "xnu/files/bsd/dev/annibale/annibale_modem_tftp.inc").read_text()
+SOURCE = (ROOT / "xnu/files/bsd/dev/annibale/annibale_tftp.inc").read_text()
 
 HARNESS = r'''
+#define ANNIBALE_TFTP_HOST_TEST
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -19,20 +20,34 @@ HARNESS = r'''
 #define Z_ZERO 1
 static void *kalloc_data(size_t size, int flags) { return (flags & Z_ZERO) ? calloc(1, size) : malloc(size); }
 static void kfree_data(void *p, size_t size) { (void)size; free(p); }
+static int tftp_lock, tftp_init_lock;
+static void lck_mtx_lock(int *l) { assert(l == &tftp_lock || l == &tftp_init_lock); }
+static void lck_mtx_unlock(int *l) { assert(l == &tftp_lock || l == &tftp_init_lock); }
+static size_t strlcpy_host(char *dst, const char *src, size_t sz) {
+    size_t len = strlen(src);
+    if (sz != 0) {
+        size_t copy = len < sz - 1 ? len : sz - 1;
+        memcpy(dst, src, copy);
+        dst[copy] = '\0';
+    }
+    return len;
+}
+#undef strlcpy
+#define strlcpy strlcpy_host
 struct annibale_qrtr_port { int unused; };
 typedef void (*annibale_qrtr_receive_t)(void *, uint32_t, uint32_t, const void *, size_t);
 static struct annibale_qrtr_port the_port;
 static uint8_t sent[64][8192];
 static size_t sent_size[64];
-static unsigned sent_count, published_service, published_instance;
+static unsigned sent_count, published_count;
+static uint32_t published_services[8], published_instances[8];
 /* paced: a block over 1000 bytes needs the one big intent, which a poll of the link gives back. */
 static bool paced, big_intent;
 static unsigned link_polls, refused;
-static void mpss_glink_poll_rx(void);
 static void link_poll(void) { link_polls++; big_intent = true; }
-static void modem_sleep_ms(uint32_t ms) { assert(ms == 1); }
+static void tftp_sleep_ms(unsigned ms) { assert(ms == 1); }
 static int stub_send(struct annibale_qrtr_port *port, uint32_t node, uint32_t to_port, const void *data, size_t length) {
-    assert(port == &the_port && node == 0 && to_port != 0 && length <= 8192 - 32 && sent_count < 64);
+    assert(port == &the_port && (node == 0 || node == 5u) && to_port != 0 && length <= 8192 - 32 && sent_count < 64);
     if (paced && length > 1000) {
         if (!big_intent) { refused++; return 35; }
         big_intent = false;
@@ -45,7 +60,10 @@ static struct annibale_qrtr_port *stub_open(annibale_qrtr_receive_t receive, voi
 static const struct { struct annibale_qrtr_port *(*open)(annibale_qrtr_receive_t, void *, void *);
     int (*send)(struct annibale_qrtr_port *, uint32_t, uint32_t, const void *, size_t); } annibale_qrtr = { stub_open, stub_send };
 static int annibale_qrtr_publish(struct annibale_qrtr_port *port, uint32_t service, uint32_t version, uint32_t instance) {
-    assert(port == &the_port && version == 1); published_service = service; published_instance = instance; return 0;
+    assert(port == &the_port && version == 1 && published_count < 8);
+    published_services[published_count] = service;
+    published_instances[published_count++] = instance;
+    return 0;
 }
 typedef size_t vm_size_t;
 static uint8_t volume_file[30000];
@@ -58,10 +76,42 @@ static bool annibale_ufs_fat16_path_read(const char *path, uint64_t *size_out, v
     assert(cap >= sizeof(volume_file)); volume_reads++;
     memcpy((void *)dst, volume_file, sizeof(volume_file)); return true;
 }
+static const char k_sns_reg[] = "version=1\nsensor=gls6151\n";
+static const char k_sns_list[] = "ambient_light\n";
+static const char k_hlos_sns[] = "{\"sns\":\"reg\"}\n";
+static bool tftp_image_read(const char *rel, uint8_t **data_out, uint32_t *size_out, uint32_t *room_out, bool *borrowed_out) {
+    if (strcmp(rel, "sensors/sensors_list.txt") == 0) {
+        *data_out = (uint8_t *)(uintptr_t)k_sns_list;
+        *size_out = (uint32_t)(sizeof(k_sns_list) - 1u);
+        *room_out = 0; *borrowed_out = true;
+        return true;
+    }
+    if (strcmp(rel, "sensors/hwMisList.txt") == 0) {
+        *data_out = (uint8_t *)(uintptr_t)"";
+        *size_out = 0; *room_out = 0; *borrowed_out = true;
+        return true;
+    }
+    if (strcmp(rel, "hlos_rfs/shared/sensors/sns_reg_config") == 0) {
+        *data_out = (uint8_t *)(uintptr_t)k_hlos_sns;
+        *size_out = (uint32_t)(sizeof(k_hlos_sns) - 1u);
+        *room_out = 0; *borrowed_out = true;
+        return true;
+    }
+    return false;
+}
+static bool tftp_vfs_read(const char *path, uint8_t **data_out, uint32_t *size_out, uint32_t *room_out, bool *borrowed_out) {
+    if (strcmp(path, "/vendor/etc/sensors/sns_reg_config") == 0) {
+        *data_out = (uint8_t *)(uintptr_t)strdup(k_sns_reg);
+        *size_out = (uint32_t)(sizeof(k_sns_reg) - 1u);
+        *room_out = *size_out + 1u;
+        *borrowed_out = false;
+        return true;
+    }
+    return false;
+}
 #define printf(...) ((void)0)
 @SOURCE@
 #undef printf
-static void mpss_glink_poll_rx(void) { link_poll(); }
 
 static size_t request(uint8_t *out, unsigned opcode, const char *name, const char *options[], unsigned pairs) {
     size_t n = 2; out[0] = 0; out[1] = (uint8_t)opcode;
@@ -70,7 +120,8 @@ static size_t request(uint8_t *out, unsigned opcode, const char *name, const cha
     for (unsigned i = 0; i < pairs * 2; i++) n += (size_t)snprintf((char *)out + n, 256, "%s", options[i]) + 1;
     return n;
 }
-static void rx(uint32_t port, const uint8_t *data, size_t size) { svc_tftp_rx(NULL, 0, port, data, size); }
+static void rx_node(uint32_t node, uint32_t port, const uint8_t *data, size_t size) { svc_tftp_rx(NULL, node, port, data, size); }
+static void rx(uint32_t port, const uint8_t *data, size_t size) { rx_node(0, port, data, size); }
 static void ack(uint32_t port, unsigned block) { uint8_t p[4] = { 0, 4, (uint8_t)(block >> 8), (uint8_t)block }; rx(port, p, 4); }
 static void data_block(uint32_t port, unsigned block, const uint8_t *bytes, size_t n) {
     static uint8_t p[8192]; p[0] = 0; p[1] = 3; p[2] = (uint8_t)(block >> 8); p[3] = (uint8_t)block;
@@ -89,8 +140,12 @@ int main(void) {
     uint8_t pkt[512];
     static uint8_t body[20000];
     for (unsigned i = 0; i < sizeof(body); i++) body[i] = (uint8_t)(i * 7 + 3);
-    modem_start_tftp();
-    assert(published_service == 0x1000 && published_instance == 0);
+    annibale_tftp_start(TFTP_INST_ADSP);
+    annibale_tftp_start(TFTP_INST_ADSP); /* idempotent */
+    annibale_tftp_start(TFTP_INST_MPSS);
+    assert(published_count == 2u);
+    assert(published_services[0] == 0x1000u && published_instances[0] == 2u);
+    assert(published_services[1] == 0x1000u && published_instances[1] == 0u);
 
     /* What MPSS sends first: the server check, with its options. */
     const char *mpss[] = { "blksize", "15872", "timeoutms", "5000", "wsize", "10" };
@@ -175,14 +230,14 @@ int main(void) {
     sent_count = 0; n = request(pkt, 1, "/readonly/firmware/image/modem_pr/mcfg/a.mbn", whole, 2); rx(80, pkt, n);
     assert(sent_count == 1 && sent[0][1] == 6);
     sent_count = 0; ack(80, 0); assert(sent_count == 0 && refused == 1);
-    modem_tftp_poll();
+    annibale_tftp_poll(link_poll);
     assert(sent_count == 5 && link_polls == 5 && sent_size[4] == 4 + 30000 - 4 * 7168);
     for (unsigned i = 0; i < 5; i++) assert(sent[i][3] == i + 1 && !memcmp(sent[i] + 4, volume_file + i * 7168, sent_size[i] - 4));
-    sent_count = 0; modem_tftp_poll(); assert(sent_count == 0 && link_polls == 5);
+    sent_count = 0; annibale_tftp_poll(link_poll); assert(sent_count == 0 && link_polls == 5);
     /* An acknowledgement of an older block: from the one after it again. */
-    ack(80, 2); modem_tftp_poll();
+    ack(80, 2); annibale_tftp_poll(link_poll);
     assert(sent_count == 3 && sent[0][3] == 3 && sent[2][3] == 5);
-    sent_count = 0; ack(80, 5); modem_tftp_poll(); assert(sent_count == 0);
+    sent_count = 0; ack(80, 5); annibale_tftp_poll(link_poll); assert(sent_count == 0);
     paced = false;
     /* Data nobody asked for is dropped; a file over the limit ends with error 3. */
     sent_count = 0; data_block(99, 1, body, 10); ack(99, 1); assert(sent_count == 0);
@@ -190,7 +245,31 @@ int main(void) {
     n = request(pkt, 2, "/readwrite/huge", huge, 1); rx(46, pkt, n);
     for (unsigned block = 1; block <= 147; block++) { sent_count = 0; data_block(46, block, body, 7168); }
     assert(sent_count == 1 && sent[0][1] == 5 && sent[0][3] == 3);
-    puts("TFTP: server check, windows, read-back, rsize/seek, the firmware volume, sends put off for an intent, refusals and the size limit: PASS");
+
+    /* ADSP node 5 sensor RO/RW paths + zero-byte sensor file. */
+    sent_count = 0; n = request(pkt, 1, "/readonly/vendor/etc/sensors/sns_reg_config", NULL, 0); rx_node(5u, 110, pkt, n);
+    assert(sent_count == 1 && sent[0][1] == 3 && sent_size[0] == 4 + sizeof(k_sns_reg) - 1u);
+    assert(memcmp(sent[0] + 4, k_sns_reg, sizeof(k_sns_reg) - 1u) == 0);
+
+    sent_count = 0; n = request(pkt, 1, "/readonly/hlos_rfs/shared/sensors/sns_reg_config", NULL, 0); rx_node(5u, 111, pkt, n);
+    assert(sent_count == 1 && sent[0][1] == 3 && sent_size[0] == 4 + sizeof(k_hlos_sns) - 1u);
+    assert(memcmp(sent[0] + 4, k_hlos_sns, sizeof(k_hlos_sns) - 1u) == 0);
+
+    sent_count = 0; n = request(pkt, 1, "/readonly/vendor/etc/sensors/config/sensors_list.txt", NULL, 0); rx_node(5u, 112, pkt, n);
+    assert(sent_count == 1 && sent[0][1] == 3 && sent_size[0] == 4 + sizeof(k_sns_list) - 1u);
+
+    sent_count = 0; n = request(pkt, 1, "/readonly/sensors/hwMisList.txt", NULL, 0); rx_node(5u, 113, pkt, n);
+    assert(sent_count == 1 && sent[0][1] == 3 && sent_size[0] == 4);
+
+    sent_count = 0; n = request(pkt, 2, "/mnt/vendor/persist/sensors/cam_registry_dump.txt", NULL, 0); rx_node(5u, 114, pkt, n);
+    assert(sent_count == 1 && sent[0][1] == 4);
+    uint8_t wr[4 + 5] = { 0, 3, 0, 1, 's', 'n', 's', 'o', 'k' };
+    sent_count = 0; rx_node(5u, 114, wr, sizeof(wr));
+    assert(sent_count == 1 && sent[0][1] == 4 && sent[0][3] == 1);
+    sent_count = 0; n = request(pkt, 1, "/mnt/vendor/persist/sensors/cam_registry_dump.txt", NULL, 0); rx_node(5u, 115, pkt, n);
+    assert(sent_count == 1 && sent[0][1] == 3 && sent_size[0] == 4 + 5 && memcmp(sent[0] + 4, "snsok", 5) == 0);
+
+    puts("TFTP: dual-instance (0+2), server check, windows, rsize/seek, firmware/sensor RO+RW, intent polling, and limits: PASS");
     return 0;
 }
 '''

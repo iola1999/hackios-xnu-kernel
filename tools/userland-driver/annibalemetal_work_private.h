@@ -125,4 +125,9 @@ static unsigned hb_commit;                      /* -commit entries this second *
 static unsigned hb_wait;                        /* -waitUntilCompleted entries this second */
 static unsigned hb_texwrite;                    /* -replaceRegion: entries this second */
 
+static unsigned rw_g32_probe_limit(void);
+static void rw_g32_probe_tex_create(const struct rwa_texture_shape *shape, int has_surface);
+static void rw_g32_probe_tex_write(const struct rwa_texture_shape *shape, unsigned w, unsigned h,
+				   const void *bytes, size_t stride, int rc);
+
 #endif

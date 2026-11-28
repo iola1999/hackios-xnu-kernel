@@ -97,6 +97,9 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 	_shape = *shape;
 	_iosurface = surface ? CFRetain(surface) : NULL;
 	_iosurfacePlane = plane;
+	if (__builtin_expect(rw_g32_probe_limit() != 0, 0)) {
+		rw_g32_probe_tex_create(&_shape, _iosurface != NULL ? 1 : 0);
+	}
 	return self;
 }
 
@@ -234,9 +237,13 @@ region_words_suspect(const void *texture, const uint64_t *word, const void *byte
 	/* Counted here because rwa_texture_write lives in the compiler library, which this round
 	 * does not touch; this method is its only caller. */
 	__atomic_add_fetch(&hb_texwrite, 1, __ATOMIC_RELAXED);
-	if (mesa.texture_write(_texture, (unsigned)level, (unsigned)slice, origin, size, bytes,
-			       stride, why, sizeof(why)) != 0) {
+	int rc = mesa.texture_write(_texture, (unsigned)level, (unsigned)slice, origin, size, bytes,
+				    stride, why, sizeof(why));
+	if (rc != 0) {
 		rw_print("writing texels: %s\n", why);
+	}
+	if (__builtin_expect(rw_g32_probe_limit() != 0, 0)) {
+		rw_g32_probe_tex_write(&_shape, size[0], size[1], bytes, stride, rc);
 	}
 }
 

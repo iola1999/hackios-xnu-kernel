@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Verify double-buffered MiniIOMobileFramebuffer row tracking and rw_pipe_key graph hashing."""
 from pathlib import Path
+import os
 import subprocess
 import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 SCALE_H = ROOT / "xnu/files/iokit/Kernel/MiniFramebufferScale.h"
+DPU_SCALE_INC = ROOT / "xnu/files/iokit/Kernel/MiniFramebufferDpuScale.inc"
 ROWS_INC = ROOT / "xnu/files/iokit/Kernel/MiniFramebufferRows.inc"
 FB_CPP = ROOT / "xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp"
 PIPECACHE_INC = ROOT / "tools/userland-driver/annibalemetal_pipecache.inc"
@@ -17,23 +19,54 @@ ADRENO8_BO_C = ROOT / "xnu/files/bsd/dev/adreno8/adreno8_bo.c"
 
 FB_HARNESS = r"""
 #include <assert.h>
+#include <atomic>
+#include <condition_variable>
 #include <limits.h>
+#include <mutex>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <thread>
+#include <vector>
 #include "MiniFramebufferScale.h"
 
+#define FOURCC(a, b, c, d) (((uint32_t)(uint8_t)(a) << 24) | ((uint32_t)(uint8_t)(b) << 16) | \
+    ((uint32_t)(uint8_t)(c) << 8) | (uint32_t)(uint8_t)(d))
 #define NSEC_PER_MSEC 1000000ULL
 #define THREAD_UNINT 0
 typedef int wait_result_t;
 typedef int IOLock;
-static uint32_t gHelperWakeups = 0;
-static inline void IOLockLock(IOLock *l) { (void)l; }
-static inline void IOLockUnlock(IOLock *l) { (void)l; }
-static inline void IOLockSleep(IOLock *l, void *e, int m) { (void)l; (void)e; (void)m; }
-static inline void IOLockWakeup(IOLock *l, void *e, bool o) { (void)l; (void)e; (void)o; gHelperWakeups++; }
+static std::atomic<uint32_t> gHelperWakeups{0};
+static bool gRealHelperPool = false;
+static std::atomic<bool> gStopHelpers{false};
+static std::mutex gRealMtx;
+static std::condition_variable gRealCv;
+static inline void IOLockLock(IOLock *l) { (void)l; if (gRealHelperPool) gRealMtx.lock(); }
+static inline void IOLockUnlock(IOLock *l) { (void)l; if (gRealHelperPool) gRealMtx.unlock(); }
+static inline void IOLockSleep(IOLock *l, void *e, int m) {
+    (void)l; (void)m;
+    if (!gRealHelperPool) return;
+    std::unique_lock<std::mutex> lk(gRealMtx, std::adopt_lock);
+    if (gStopHelpers.load()) {
+        lk.unlock();
+        pthread_exit(nullptr);
+    }
+    gRealCv.wait(lk);
+    if (gStopHelpers.load()) {
+        lk.unlock();
+        pthread_exit(nullptr);
+    }
+    lk.release();
+    (void)e;
+}
+static inline void IOLockWakeup(IOLock *l, void *e, bool o) {
+    (void)l; (void)e; (void)o;
+    gHelperWakeups.fetch_add(1);
+    if (gRealHelperPool) gRealCv.notify_all();
+}
 #define IONew(type, count) ((type *)calloc((count), sizeof(type)))
 #define IODelete(ptr, type, count) free(ptr)
 #define bzero(p, n) memset((p), 0, (n))
@@ -47,7 +80,7 @@ static uint32_t gFilter = 1;
 static bool fFilterFrame = true;
 
 struct MiniSurfaceInfo {
-    uint32_t width, height, bytesPerRow;
+    uint32_t width, height, bytesPerRow, pixelFormat;
 };
 struct MiniIOSurface {
     MiniSurfaceInfo info;
@@ -122,11 +155,51 @@ public:
     uint32_t *fHelperBlend[7] = { NULL };
 
     void drawLayer(MiniIOSurface *s, const int32_t *src, const int32_t *dst);
+    bool drawDpuScaled(MiniIOSurface *s, int32_t sx, int32_t sy, int32_t sw, int32_t sh,
+                       int32_t px0, int32_t py0, int32_t px1, int32_t py1);
+    void runHelperRows(struct RowJob *job, uint32_t *blendRow);
     void drawRows(const struct RowJob *job, int32_t y0, int32_t y1, uint32_t *blendRow);
     void hashRows(struct RowJob *job, unsigned share, unsigned shares);
     bool dirtyBand(struct RowJob *job);
     static void helperMain(void *self, wait_result_t result);
 };
+
+static bool gMockDpuCapable = false;
+static bool gMockDpuActive = false;
+static uint32_t gMockDpuFrames = 0;
+
+static bool flip_dpu_scale_prepare(uint8_t *dst_buf, const uint8_t *pixels, uint32_t surf_w, uint32_t surf_h,
+    uint32_t stride, uint32_t fmt, int32_t sx, int32_t sy, int32_t sw, int32_t sh,
+    int32_t px0, int32_t py0, int32_t px1, int32_t py1, uint32_t panel_w, uint32_t panel_h,
+    uint32_t *copy_stride_out, bool *whole_surf_out) {
+    (void)fmt;
+    if (!gMockDpuCapable || !flip.ready || !dst_buf || !pixels ||
+        px0 != 0 || py0 != 0 || px1 != (int32_t)panel_w || py1 != (int32_t)panel_h ||
+        sw <= 0 || sh <= 0 || sx < 0 || sy < 0 ||
+        (uint32_t)(sx + sw) > surf_w || (uint32_t)(sy + sh) > surf_h) {
+        return false;
+    }
+    bool whole = (sx == 0 && sy == 0 && (uint32_t)sw == surf_w);
+    *whole_surf_out = whole;
+    *copy_stride_out = whole ? stride : (uint32_t)sw * 4u;
+    gMockDpuActive = true;
+    return true;
+}
+
+__DPU_COPY_ROWS__
+
+static void flip_dpu_scale_finish(void) {
+    flip.band0 = 0;
+    flip.band1 = (int32_t)flip.rows;
+    flip.drew = true;
+    gMockDpuFrames++;
+}
+
+static bool flip_dpu_scale_fallback(void) {
+    if (!gMockDpuActive) return false;
+    gMockDpuActive = false;
+    return true;
+}
 
 __ROWS_INC__
 __DRAW_LAYER__
@@ -346,6 +419,76 @@ int main(void) {
     assert(fb.fStatUnhashed <= ROWS_UNHASHED);
     assert(fb.fStatUnchanged >= 1);
 
+    /* 8. Parallel fb_threads copy in drawDpuScaled via real helperMain worker threads. */
+    {
+        const uint32_t dw = 240, dh = 260, dstride = 1024; /* padded stride > dw*4 */
+        uint8_t *dbuf = (uint8_t *)calloc(dh, dstride);
+        uint8_t *dsurf = (uint8_t *)calloc(dh, dstride);
+        for (size_t i = 0; i < (size_t)dh * dstride; i++) {
+            dsurf[i] = (uint8_t)((i * 73u + 19u) & 0xffu);
+        }
+        MiniIOSurface dpuSurf = {};
+        dpuSurf.info.width = dw;
+        dpuSurf.info.height = dh;
+        dpuSurf.info.bytesPerRow = dstride;
+        dpuSurf.info.pixelFormat = FOURCC('l', '1', '0', 'r');
+        dpuSurf.buf = dsurf;
+
+        fb.fBase = dbuf;
+        fb.fThreads = 3;
+        fb.fHelpersStarted = 0;
+        fb.fHelperGeneration = 0;
+        fb.fHelpersBusy = 0;
+        gMockDpuCapable = true;
+        gMockDpuActive = false;
+        gMockDpuFrames = 0;
+        gHelperWakeups.store(0);
+        gStopHelpers.store(false);
+        gRealHelperPool = true;
+
+        {
+            std::thread t0([&]() { IOMobileFramebuffer::helperMain(&fb, 0); });
+            std::thread t1([&]() { IOMobileFramebuffer::helperMain(&fb, 0); });
+            for (;;) {
+                gRealMtx.lock();
+                unsigned ready = fb.fHelpersStarted;
+                gRealMtx.unlock();
+                if (ready == 2) break;
+                std::this_thread::yield();
+            }
+            int32_t dsrc[4] = { 0, 0, (int32_t)dw, (int32_t)dh };
+            int32_t ddst[4] = { 0, 0, (int32_t)sw, (int32_t)sh };
+            fb.drawLayer(&dpuSurf, dsrc, ddst);
+            assert(gMockDpuActive && gMockDpuFrames == 1);
+            assert(gHelperWakeups.load() >= 1);
+            assert(memcmp(dbuf, dsurf, (size_t)dh * dstride) == 0);
+
+            /* Cropped sub-rect parallel copy (px/py cover full panel, sx=8 sy=10 sw=200 sh=220 >= 128) */
+            memset(dbuf, 0, (size_t)dh * dstride);
+            int32_t csrc[4] = { 8, 10, 200, 220 };
+            fb.drawLayer(&dpuSurf, csrc, ddst);
+            for (int y = 0; y < 220; y++) {
+                assert(memcmp(dbuf + (size_t)y * 200u * 4u, dsurf + (size_t)(10 + y) * dstride + 8u * 4u, 200u * 4u) == 0);
+            }
+
+            /* Partial dst triggers flip_dpu_scale_fallback() before software drawRows */
+            fb.drawLayer(&surf, fullSrc, insetDst);
+            assert(!gMockDpuActive);
+
+            gRealMtx.lock();
+            gStopHelpers.store(true);
+            fb.fHelperGeneration++;
+            gRealCv.notify_all();
+            gRealMtx.unlock();
+            t0.join();
+            t1.join();
+        }
+        gRealHelperPool = false;
+        gMockDpuCapable = false;
+        free(dbuf);
+        free(dsurf);
+    }
+
     free(surf.buf);
     free(bufA);
     free(bufB);
@@ -430,6 +573,12 @@ def extract_draw_layer(cpp_text: str) -> str:
     start = cpp_text.index("void\nIOMobileFramebuffer::drawLayer(")
     end = cpp_text.index("\n/*\n * How evenly the frames", start)
     return cpp_text[start:end]
+
+
+def extract_dpu_copy_rows(dpu_text: str) -> str:
+    start = dpu_text.index("static void\ndpu_scale_copy_rows(")
+    end = dpu_text.index("\nstatic void\nflip_dpu_scale_finish(", start)
+    return dpu_text[start:end]
 
 
 IOVA_HARNESS = r"""
@@ -613,16 +762,25 @@ def run_iova_case(priv_text: str, smmu_text: str, bo_text: str) -> subprocess.Co
         return subprocess.run([str(exe)], capture_output=True, text=True)
 
 
-def run_fb_case(rows_text: str, draw_text: str) -> subprocess.CompletedProcess:
+def run_fb_case(rows_text: str, draw_text: str, dpu_copy_text: str) -> subprocess.CompletedProcess:
     with tempfile.TemporaryDirectory() as tmp:
         td = Path(tmp)
         (td / "MiniFramebufferScale.h").write_text(SCALE_H.read_text())
-        code = FB_HARNESS.replace("__ROWS_INC__", rows_text).replace("__DRAW_LAYER__", draw_text)
+        code = (
+            FB_HARNESS.replace("__DPU_COPY_ROWS__", dpu_copy_text)
+            .replace("__ROWS_INC__", rows_text)
+            .replace("__DRAW_LAYER__", draw_text)
+        )
         src = td / "test_fb.cpp"
         exe = td / "test_fb"
         src.write_text(code)
-        subprocess.run(["clang++", "-std=c++17", "-O2", f"-I{td}", str(src), "-o", str(exe)], check=True)
-        return subprocess.run([str(exe)], capture_output=True, text=True)
+        subprocess.run(
+            ["clang++", "-std=c++17", "-O2", "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+             f"-I{td}", str(src), "-o", str(exe)],
+            check=True,
+        )
+        return subprocess.run([str(exe)], capture_output=True, text=True,
+                              env={**os.environ, "ASAN_OPTIONS": "detect_leaks=0"})
 
 
 def run_pipe_case(pipecache_text: str) -> subprocess.CompletedProcess:
@@ -643,8 +801,9 @@ def run_pipe_case(pipecache_text: str) -> subprocess.CompletedProcess:
 def main() -> None:
     rows_text = ROWS_INC.read_text()
     draw_text = extract_draw_layer(FB_CPP.read_text())
+    dpu_copy_text = extract_dpu_copy_rows(DPU_SCALE_INC.read_text())
 
-    res = run_fb_case(rows_text, draw_text)
+    res = run_fb_case(rows_text, draw_text, dpu_copy_text)
     if res.returncode != 0:
         sys.stderr.write(res.stderr)
         sys.exit(1)
@@ -653,7 +812,7 @@ def main() -> None:
     # Mutation 1: simulate uninitialized stack garbage in job.bufferSeq (the G23/G24 regression).
     mut1_draw = draw_text.replace("job.bufferSeq = fBufferSeq[targetBuf];", "job.bufferSeq = 0xfffffe00u;")
     assert mut1_draw != draw_text, "mutation 1 target missing"
-    assert run_fb_case(rows_text, mut1_draw).returncode != 0, "mutation 1 unexpectedly passed"
+    assert run_fb_case(rows_text, mut1_draw, dpu_copy_text).returncode != 0, "mutation 1 unexpectedly passed"
 
     # Mutation 2: drop fAllChangedSeq > job->bufferSeq check in dirtyBand.
     mut2_rows = rows_text.replace(
@@ -661,7 +820,7 @@ def main() -> None:
         "job->allDirty = !known;",
     )
     assert mut2_rows != rows_text, "mutation 2 target missing"
-    assert run_fb_case(mut2_rows, draw_text).returncode != 0, "mutation 2 unexpectedly passed"
+    assert run_fb_case(mut2_rows, draw_text, dpu_copy_text).returncode != 0, "mutation 2 unexpectedly passed"
 
     pipecache_text = PIPECACHE_INC.read_text()
     pres = run_pipe_case(pipecache_text)

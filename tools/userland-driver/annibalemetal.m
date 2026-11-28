@@ -1104,6 +1104,7 @@ struct rw_g32_vattr_meta;
 		     iosurface:(void *)surface;
 @end
 
+static volatile unsigned commit_in_flight;   /* defined in annibalemetal_commandbuffer.inc */
 #include "annibalemetal_stitch.inc"
 #include "annibalemetal_pipecache.inc"
 #include "annibalemetal_prewarm.inc"   /* pipeline harvest and the boot-time replay of it */
@@ -1114,7 +1115,6 @@ struct rw_g32_vattr_meta;
 #include "annibalemetal_device_caps.inc"
 #include "annibalemetal_heap.inc"   /* -newHeapWithDescriptor: and the two size answers */
 #include "annibalemetal_residency.inc"
-static volatile unsigned commit_in_flight;   /* defined in annibalemetal_commandbuffer.inc */
 #include "annibalemetal_buffer_pipeline.inc"
 #include "annibalemetal_work.inc"
 #include "annibalemetal_blit.inc"

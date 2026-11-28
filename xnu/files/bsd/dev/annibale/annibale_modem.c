@@ -368,7 +368,8 @@ modem_sync_sysctls(void)
 
 #include "annibale_modem_boot.inc"
 #include "annibale_modem_svc.inc"
-#include "annibale_modem_tftp.inc"
+extern void annibale_tftp_start(uint32_t instance);
+extern void annibale_tftp_poll(void (*rx_poll)(void));
 
 /* ---- SMEM GLINK IPCRTR transport with MPSS (partition 0 <-> 1) ------------------------------------- */
 
@@ -979,7 +980,7 @@ modem_worker_thread(__unused void *arg, __unused wait_result_t wres)
 
 	modem_open_qmi_clients();
 	modem_start_local_services();
-	modem_start_tftp();
+	annibale_tftp_start(0u);
 	modem_bringup_sequence();
 	bool smp2p_seen = false;
 	uint32_t smp2p_last_val = 0, smp2p_last_flags = 0;
@@ -1022,7 +1023,7 @@ modem_worker_thread(__unused void *arg, __unused wait_result_t wres)
 
 		if (is_open) {
 			annibale_qrtr_fresh();
-			modem_tftp_poll();
+			annibale_tftp_poll(mpss_glink_poll_rx);
 		}
 		modem_sleep_ms(is_open ? 25 : 200);
 	}

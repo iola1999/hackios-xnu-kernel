@@ -376,6 +376,8 @@ public:
 	void settle(const uint8_t * swap, MiniIOSurface ** surfaces);
 	void reportFrameTimes(void);
 	void drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
+	bool drawDpuScaled(MiniIOSurface * s, int32_t sx, int32_t sy, int32_t sw, int32_t sh, int32_t px0, int32_t py0, int32_t px1, int32_t py1);
+	void runHelperRows(struct RowJob * job, uint32_t * blendRow);
 	void drawRows(const struct RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow);
 	void hashRows(struct RowJob * job, unsigned share, unsigned shares);
 	bool dirtyBand(struct RowJob * job);
@@ -602,10 +604,13 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	if (px1 <= px0 || py1 <= py0) {
 		return;
 	}
-	if (fSingleLayer && flip_dpu_scale_draw(fBase, s->pixels(), s->info.width, s->info.height,
-	    s->info.bytesPerRow, s->info.pixelFormat, sx, sy, sw, sh, px0, py0, px1, py1, fPanelWidth, fPanelHeight)) {
+	if (fSingleLayer && drawDpuScaled(s, sx, sy, sw, sh, px0, py0, px1, py1)) {
 		fRowHashRows = 0;
 		return;
+	}
+	if (!fSingleLayer && flip_dpu_scale_fallback()) {
+		fRowHashRows = 0;
+		fAllChangedSeq = ++fRowSeq;
 	}
 	if (filter && fBlendRowSize < (uint32_t) sw) {
 		if (fBlendRow != NULL) {
@@ -696,19 +701,7 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 		fLastBufSeqAfter = fRowSeq;
 		return;
 	}
-	/* shared out: the helpers take their rows, this thread the first share, then waits for them */
-	IOLockLock(fHelperLock);
-	fHelperJob = &job;
-	fHelpersBusy = fThreads - 1;
-	fHelperGeneration++;
-	IOLockWakeup(fHelperLock, &fHelperGeneration, false);
-	IOLockUnlock(fHelperLock);
-	drawRows(&job, job.by0, job.by0 + (int32_t) ((int64_t) (job.by1 - job.by0) / fThreads), fBlendRow);
-	IOLockLock(fHelperLock);
-	while (fHelpersBusy != 0) {
-		IOLockSleep(fHelperLock, &fHelpersBusy, THREAD_UNINT);
-	}
-	IOLockUnlock(fHelperLock);
+	runHelperRows(&job, fBlendRow);
 	fBufferSeq[targetBuf] = fRowSeq;
 	fLastBufSeqAfter = fRowSeq;
 }
@@ -961,6 +954,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		if (sid == 0) {
 			/* the bottom layer taken away: nothing is shown, the screen is black */
 			if (layer == 0 && (set & 1) && fGraphics) {
+				flip_dpu_scale_fallback();
 				for (uint32_t y = 0; y < fPanelHeight; y++) {
 					bzero(fBase + (size_t) y * fRowBytes, (size_t) fPanelWidth * 4);
 				}

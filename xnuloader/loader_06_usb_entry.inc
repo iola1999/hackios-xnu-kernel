@@ -709,9 +709,10 @@ fb_command(char *cmd)
 			} else if (str_eq(var, "has-slot:boot")) {
 				fb_reply("OKAY", "yes");
 			} else if (str_eq(var, "screen") && SCREEN.base != 0) {
-				/* width height bytes-per-row */
-				uint32_t mark = log_len;
-				print("%d %d %d", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, (uint64_t)SCREEN.stride);
+				/* width height bytes-per-row format */
+				uint32_t w, h, stride, fmt, mark = log_len;
+				screenshot_info(running_live, SCREEN.base, SCREEN.width, SCREEN.height, SCREEN.stride, &w, &h, &stride, &fmt);
+				print(fmt == 0x6c313072u ? "%d %d %d l10r" : "%d %d %d bgra", (uint64_t)w, (uint64_t)h, (uint64_t)stride);
 				log_buf[log_len] = 0;
 				fb_reply("OKAY", log_buf + mark);
 				log_len = mark;
@@ -830,8 +831,7 @@ fb_command(char *cmd)
 				fb_reply("FAIL", "no display");
 				return;
 			}
-			staged_len = (uint64_t)SCREEN.stride * SCREEN.height;
-			staged_data = (const char *)(uintptr_t)screenshot_base(running_live, SCREEN.base, staged_len);
+			staged_data = (const char *)(uintptr_t)screenshot_stage(running_live, SCREEN.base, SCREEN.width, SCREEN.height, SCREEN.stride, &staged_len);
 			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "oem stage ")) {
 			/* stage LENGTH bytes at ADDRESS (both hex) of the kernel's memory window, also while it

@@ -1,99 +1,312 @@
-#ifndef _ANNIBALE_MODEM_TFTP_INC_
-#define _ANNIBALE_MODEM_TFTP_INC_
+#ifndef _ANNIBALE_TFTP_INC_
+#define _ANNIBALE_TFTP_INC_
 
 /*
- * The TFTP service MPSS keeps its files through (QRTR service 4096, version 1; the protocol is
- * RFC 1350 with the options of RFC 2347/2348/2349/7440 and Qualcomm's rsize and seek, as
- * tqftpserv serves it). MPSS first writes /readwrite/server_check.txt and goes on only when that
- * works.
+ * Dual-instance QRTR TFTP file server (QRTR service 0x1000, version 1):
+ *   instance 0: MPSS (/readonly/firmware/... -> FAT16, /readwrite/... -> memory)
+ *   instance 2: ADSP sensors/audio/haptics (/readonly/..., /vendor/etc/sensors/...,
+ *               /mnt/vendor/persist/..., /persist/..., /hlos_rfs/..., /readwrite/...)
  *
- *   /readwrite/...          files in memory, gone at the next boot; nothing is written to storage
- *   /readonly/firmware/...  the modem firmware volume (FAT16, annibale_ufs_fat16_path_read), read whole
- *                           into memory and kept while the next requests name the same file: MPSS
- *                           reads a file with one request per piece (rsize and seek)
- *   anything else           "file not found", with the name logged
- *
- * A data block needs a receive intent of its size from MPSS (mpss_qrtr_send answers EAGAIN and
- * asks for one when there is none), so a read is sent as far as the intents go and carried on from
- * the modem thread's loop (modem_tftp_poll). All of it runs on that one thread: no lock.
+ * Implements RFC 1350 + RFC 2347/2348/2349/7440 + Qualcomm rsize/seek options.
+ * Independent of modem locks/sleep/poll; callers pass their transport RX poll
+ * callback into annibale_tftp_poll().
  */
-static void mpss_glink_poll_rx(void);
+#ifndef ANNIBALE_TFTP_HOST_TEST
+#include <sys/annibale_qrtr.h>
+extern int annibale_qrtr_publish(struct annibale_qrtr_port *port, uint32_t service, uint32_t version, uint32_t instance);
+#endif
+
+void annibale_tftp_start(uint32_t instance);
+void annibale_tftp_poll(void (*rx_poll)(void));
+
 #define QRTR_SVC_TFTP                   0x1000u
+#define TFTP_INST_MPSS                  0u
+#define TFTP_INST_ADSP                  2u
 #define TFTP_RRQ                        1u
 #define TFTP_WRQ                        2u
 #define TFTP_DATA                       3u
 #define TFTP_ACK                        4u
 #define TFTP_ERROR                      5u
 #define TFTP_OACK                       6u
-#define TFTP_BLOCK_MAX                  7168u           /* a block and its headers fit a QRTR datagram */
+#define TFTP_BLOCK_MAX                  7168u
 #define TFTP_FILES                      16u
 #define TFTP_FILE_MAX                   (1024u * 1024u)
 #define TFTP_SESSIONS                   8u
 #define TFTP_NAME                       160u
-#define TFTP_FIRMWARE                   4u              /* files of the firmware volume kept in memory */
+#define TFTP_FIRMWARE                   4u
 #define TFTP_FIRMWARE_MAX               (64u * 1024u * 1024u)
 
 struct tftp_file {
 	char     name[TFTP_NAME];
 	uint8_t *data;
 	uint32_t size, room;
+	bool     borrowed;
 };
 
 struct tftp_session {
 	bool     active, writing, sent_last;
 	uint32_t node, port;
 	struct tftp_file *file;
-	uint32_t blksize, wsize, block;         /* block: the last one written */
-	uint32_t start, limit;                  /* a read: from this offset, up to this one */
-	uint32_t next, window_end;              /* a read: the next block to send, the last one allowed */
+	uint32_t blksize, wsize, block;
+	uint32_t start, limit;
+	uint32_t next, window_end;
 };
 
+#ifndef ANNIBALE_TFTP_HOST_TEST
+static LCK_GRP_DECLARE(tftp_lck_grp, "annibale-tftp");
+static LCK_MTX_DECLARE(tftp_lock, &tftp_lck_grp);
+static LCK_MTX_DECLARE(tftp_init_lock, &tftp_lck_grp);
+
+static void
+tftp_sleep_ms(unsigned ms)
+{
+	delay_for_interval(ms, NSEC_PER_MSEC);
+}
+
+static bool
+tftp_vfs_read(const char *path, uint8_t **data_out, uint32_t *size_out, uint32_t *room_out, bool *borrowed_out)
+{
+	if (rootvnode == NULLVP || path == NULL || path[0] != '/') {
+		return false;
+	}
+	vfs_context_t ctx = vfs_context_kernel();
+	vnode_t vp = NULLVP;
+	struct vnode_attr va;
+	if (vnode_lookup(path, 0, &vp, ctx) != 0) {
+		return false;
+	}
+	VATTR_INIT(&va);
+	VATTR_WANTED(&va, va_data_size);
+	VATTR_WANTED(&va, va_type);
+	if (vnode_getattr(vp, &va, ctx) != 0 || va.va_type != VREG || va.va_data_size > TFTP_FIRMWARE_MAX) {
+		vnode_put(vp);
+		return false;
+	}
+	if (va.va_data_size == 0) {
+		vnode_put(vp);
+		*data_out = __DECONST(uint8_t *, "");
+		*size_out = 0;
+		*room_out = 0;
+		*borrowed_out = true;
+		return true;
+	}
+	uint32_t sz = (uint32_t)va.va_data_size;
+	uint8_t *buf = kalloc_data(sz, Z_WAITOK);
+	if (buf == NULL) {
+		vnode_put(vp);
+		return false;
+	}
+	int resid = 0;
+	int err = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)sz, 0, UIO_SYSSPACE, 0,
+	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
+	vnode_put(vp);
+	if (err != 0 || resid != 0) {
+		kfree_data(buf, sz);
+		return false;
+	}
+	*data_out = buf;
+	*size_out = sz;
+	*room_out = sz;
+	*borrowed_out = false;
+	return true;
+}
+
+static bool
+tftp_image_read(const char *rel, uint8_t **data_out, uint32_t *size_out, uint32_t *room_out, bool *borrowed_out)
+{
+	uint64_t sz = 0;
+	const uint8_t *img = annibale_image_file("fw", rel, &sz, NULL);
+
+	if (img == NULL || sz > TFTP_FIRMWARE_MAX) {
+		return false;
+	}
+	*data_out = sz == 0 ? __DECONST(uint8_t *, "") : __DECONST(uint8_t *, img);
+	*size_out = (uint32_t)sz;
+	*room_out = 0;
+	*borrowed_out = true;
+	return true;
+}
+#endif
+
 static struct annibale_qrtr_port *svc_tftp_port;
-static LCK_MTX_DECLARE(tftp_lock, &modem_lck_grp);
+static uint32_t tftp_published_mask;
 static struct tftp_file tftp_files[TFTP_FILES];
 static struct tftp_file tftp_firmware[TFTP_FIRMWARE];
 static struct tftp_session tftp_sessions[TFTP_SESSIONS];
 static uint32_t tftp_logged, tftp_firmware_next;
 static uint8_t tftp_block[4u + TFTP_BLOCK_MAX];
 
-/* A file of the firmware volume, read in whole; the slot of one nobody is reading is taken for it. */
+static bool
+tftp_is_writable_path(const char *name)
+{
+	return strncmp(name, "/readwrite/", 11) == 0 ||
+	       strncmp(name, "/mnt/vendor/persist/", 20) == 0 ||
+	       strncmp(name, "/persist/", 9) == 0;
+}
+
+static bool
+tftp_is_readonly_path(const char *name)
+{
+	return strncmp(name, "/readonly/", 10) == 0 ||
+	       strncmp(name, "/vendor/etc/", 12) == 0 ||
+	       strncmp(name, "/mnt/vendor/persist/", 20) == 0 ||
+	       strncmp(name, "/persist/", 9) == 0 ||
+	       strncmp(name, "/hlos_rfs/", 10) == 0;
+}
+
+static const char *
+tftp_strip_sensor_root(const char *sub, bool *is_hlos_out)
+{
+	static const char *const prefixes[] = {
+		"/vendor/etc/sensors/config/",
+		"/vendor/etc/sensors/",
+		"/mnt/vendor/persist/sensors/registry/",
+		"/mnt/vendor/persist/sensors/",
+		"/persist/sensors/registry/",
+		"/persist/sensors/",
+		"/hlos_rfs/shared/sensors/",
+		"/hlos_rfs/shared/",
+		"/sensors/",
+		"/audio/",
+		"/haptics/",
+		"/dsp/",
+	};
+
+	*is_hlos_out = strncmp(sub, "/hlos_rfs/", 10) == 0;
+	for (unsigned i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+		size_t plen = strlen(prefixes[i]);
+		if (strncmp(sub, prefixes[i], plen) == 0) {
+			return sub + plen;
+		}
+	}
+	return sub[0] == '/' ? sub + 1 : sub;
+}
+
+static bool
+tftp_try_adsp_readonly(const char *name, uint8_t **data_out, uint32_t *size_out, uint32_t *room_out, bool *borrowed_out)
+{
+	static const char *const fw_dirs[] = {
+		"", "sensors/", "sensors/registry/", "sensors/registry/registry/",
+		"hlos_rfs/shared/sensors/", "hlos_rfs/shared/", "audio/", "haptics/",
+	};
+	static const char *const vfs_roots[] = {
+		"/annibale/fw-sensors/", "/fw-sensors/", "/annibale/fw/", "/fw/",
+	};
+	const char *sub = strncmp(name, "/readonly/", 10) == 0 ? name + 9 : name;
+	bool is_hlos = false;
+	const char *rel = tftp_strip_sensor_root(sub, &is_hlos);
+	char cand[256];
+
+	if (sub[0] == '/' && sub[1] != '\0' &&
+	    tftp_image_read(sub + 1, data_out, size_out, room_out, borrowed_out)) {
+		return true;
+	}
+	if (tftp_vfs_read(sub, data_out, size_out, room_out, borrowed_out)) {
+		return true;
+	}
+	for (unsigned r = 0; r < sizeof(vfs_roots) / sizeof(vfs_roots[0]); r++) {
+		if (sub[0] == '/' && sub[1] != '\0') {
+			int n = snprintf(cand, sizeof(cand), "%s%s", vfs_roots[r], sub + 1);
+			if (n > 0 && (size_t)n < sizeof(cand) &&
+			    tftp_vfs_read(cand, data_out, size_out, room_out, borrowed_out)) {
+				return true;
+			}
+		}
+	}
+	if (rel[0] != '\0') {
+		for (unsigned i = 0; i < sizeof(fw_dirs) / sizeof(fw_dirs[0]); i++) {
+			int n = snprintf(cand, sizeof(cand), "%s%s", fw_dirs[i], rel);
+			if (n > 0 && (size_t)n < sizeof(cand) &&
+			    tftp_image_read(cand, data_out, size_out, room_out, borrowed_out)) {
+				return true;
+			}
+		}
+	}
+	for (unsigned r = 0; r < sizeof(vfs_roots) / sizeof(vfs_roots[0]); r++) {
+		if (rel[0] != '\0') {
+			for (unsigned i = 0; i < sizeof(fw_dirs) / sizeof(fw_dirs[0]); i++) {
+				int n = snprintf(cand, sizeof(cand), "%s%s%s", vfs_roots[r], fw_dirs[i], rel);
+				if (n > 0 && (size_t)n < sizeof(cand) &&
+				    tftp_vfs_read(cand, data_out, size_out, room_out, borrowed_out)) {
+					return true;
+				}
+			}
+		}
+	}
+	if (!is_hlos && rel[0] != '\0') {
+		static const char *const sns_roots[] = {
+			"/vendor/etc/sensors/config/",
+			"/vendor/etc/sensors/",
+			"/mnt/vendor/persist/sensors/registry/",
+			"/mnt/vendor/persist/sensors/registry/registry/",
+		};
+		for (unsigned i = 0; i < sizeof(sns_roots) / sizeof(sns_roots[0]); i++) {
+			int n = snprintf(cand, sizeof(cand), "%s%s", sns_roots[i], rel);
+			if (n > 0 && (size_t)n < sizeof(cand) &&
+			    tftp_vfs_read(cand, data_out, size_out, room_out, borrowed_out)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+static void
+tftp_release_firmware_slot(struct tftp_file *slot)
+{
+	if (!slot->borrowed && slot->data != NULL && slot->room > 0) {
+		kfree_data(slot->data, slot->room);
+	}
+	memset(slot, 0, sizeof(*slot));
+}
+
 static struct tftp_file *
 tftp_firmware_file(const char *name)
 {
-	struct tftp_file *slot = NULL;
-	uint64_t size = 0;
+	struct tftp_file *slot;
+	uint8_t *data = NULL;
+	uint32_t sz = 0, room = 0;
+	bool borrowed = false;
 
 	for (unsigned i = 0; i < TFTP_FIRMWARE; i++) {
 		if (tftp_firmware[i].data != NULL && strncmp(tftp_firmware[i].name, name, TFTP_NAME) == 0) {
 			return &tftp_firmware[i];
 		}
 	}
-	slot = &tftp_firmware[tftp_firmware_next];
-	/* "/readonly/firmware/image/x" is image/x on the volume */
-	if (!annibale_ufs_fat16_path_read(name + 19, &size, NULL, 0) || size > TFTP_FIRMWARE_MAX) {
+	if (strncmp(name, "/readonly/firmware/", 19) == 0) {
+		uint64_t fsz = 0;
+		if (!annibale_ufs_fat16_path_read(name + 19, &fsz, NULL, 0) || fsz == 0 || fsz > TFTP_FIRMWARE_MAX) {
+			return NULL;
+		}
+		data = kalloc_data((vm_size_t)fsz, Z_WAITOK);
+		if (data == NULL) {
+			return NULL;
+		}
+		room = (uint32_t)fsz;
+		if (!annibale_ufs_fat16_path_read(name + 19, &fsz, data, room)) {
+			kfree_data(data, room);
+			return NULL;
+		}
+		sz = (uint32_t)fsz;
+		borrowed = false;
+	} else if (!tftp_try_adsp_readonly(name, &data, &sz, &room, &borrowed)) {
 		return NULL;
 	}
+
+	slot = &tftp_firmware[tftp_firmware_next];
 	tftp_firmware_next = (tftp_firmware_next + 1u) % TFTP_FIRMWARE;
 	if (slot->data != NULL) {
-		for (unsigned i = 0; i < TFTP_SESSIONS; i++) {  /* MPSS reads one file at a time: these are stale */
+		for (unsigned i = 0; i < TFTP_SESSIONS; i++) {
 			if (tftp_sessions[i].file == slot) {
 				tftp_sessions[i].active = false;
 			}
 		}
-		kfree_data(slot->data, slot->room);
-		memset(slot, 0, sizeof(*slot));
+		tftp_release_firmware_slot(slot);
 	}
-	slot->data = kalloc_data((vm_size_t)size, Z_WAITOK);
-	if (slot->data == NULL) {
-		return NULL;
-	}
-	slot->room = (uint32_t)size;
-	if (!annibale_ufs_fat16_path_read(name + 19, &size, slot->data, slot->room)) {
-		kfree_data(slot->data, slot->room);
-		memset(slot, 0, sizeof(*slot));
-		return NULL;
-	}
-	slot->size = (uint32_t)size;
+	slot->data = data;
+	slot->size = sz;
+	slot->room = room;
+	slot->borrowed = borrowed;
 	strlcpy(slot->name, name, TFTP_NAME);
 	return slot;
 }
@@ -163,7 +376,7 @@ tftp_session_of(uint32_t node, uint32_t port, bool make)
 		return NULL;
 	}
 	if (spare == NULL) {
-		spare = &tftp_sessions[0];              /* (MPSS runs one or two at a time: the oldest slot is stale) */
+		spare = &tftp_sessions[0];
 	}
 	memset(spare, 0, sizeof(*spare));
 	spare->active = true;
@@ -205,7 +418,7 @@ tftp_pump(struct tftp_session *s)
 			memcpy(tftp_block + 4, s->file->data + at, n);
 		}
 		if (annibale_qrtr.send(svc_tftp_port, s->node, s->port, tftp_block, 4u + n) != 0) {
-			return;                                 /* (no intent yet: modem_tftp_poll comes back to it) */
+			return;
 		}
 		s->next++;
 		s->sent_last = n < s->blksize;
@@ -224,9 +437,9 @@ tftp_pending(void)
 	return false;
 }
 
-/* From the modem thread's loop: carries on the reads that wait for an intent, for 20 ms at most. */
-static void
-modem_tftp_poll(void)
+/* Carries on read transfers waiting for remote intents, for up to 20 ms. */
+void
+annibale_tftp_poll(void (*rx_poll)(void))
 {
 	for (unsigned turn = 0; turn < 20u; turn++) {
 		bool more;
@@ -244,8 +457,10 @@ modem_tftp_poll(void)
 		if (!more) {
 			break;
 		}
-		modem_sleep_ms(1);
-		mpss_glink_poll_rx();                   /* the intent, or the one in use given back */
+		tftp_sleep_ms(1);
+		if (rx_poll != NULL) {
+			rx_poll();
+		}
 	}
 }
 
@@ -330,8 +545,8 @@ tftp_request(uint32_t opcode, uint32_t node, uint32_t port, const uint8_t *buf, 
 	size_t name_len = strnlen(name, size - 2u);
 	struct tftp_options o = { 0 };
 	struct tftp_session *s;
-	struct tftp_file *file;
-	bool ours, firmware;
+	struct tftp_file *file = NULL;
+	bool writable, readonly, from_ro = false;
 
 	if (2u + name_len + 1u >= size || name_len >= TFTP_NAME) {
 		tftp_send_error(node, port, 4, "bad request");
@@ -339,21 +554,28 @@ tftp_request(uint32_t opcode, uint32_t node, uint32_t port, const uint8_t *buf, 
 	}
 	mode = name + name_len + 1u;
 	tftp_parse_options((const uint8_t *)mode + strnlen(mode, (size_t)(end - (const uint8_t *)mode)) + 1u, end, &o);
-	ours = strncmp(name, "/readwrite/", 11) == 0;
-	firmware = opcode == TFTP_RRQ && strncmp(name, "/readonly/firmware/", 19) == 0;
-	file = ours ? tftp_file_named(name, opcode == TFTP_WRQ) : firmware ? tftp_firmware_file(name) : NULL;
-	if (tftp_logged++ < 400u) {
-		printf("annibale-modem: tftp %s %s from %u:%u blksize=%u wsize=%u tsize=%u rsize=%u seek=%u -> %s\n",
-		    opcode == TFTP_WRQ ? "WRQ" : "RRQ", name, node, port, o.blksize, o.wsize, o.tsize, o.rsize, o.seek,
-		    file == NULL ? (ours || firmware ? "not there" : "not served") : firmware ? "the firmware volume" : "memory");
+	writable = tftp_is_writable_path(name);
+	readonly = opcode == TFTP_RRQ && tftp_is_readonly_path(name);
+	if (writable) {
+		file = tftp_file_named(name, opcode == TFTP_WRQ);
 	}
+	if (file == NULL && readonly) {
+		file = tftp_firmware_file(name);
+		from_ro = file != NULL;
+	}
+	if (tftp_logged++ < 400u) {
+		printf("annibale-tftp: %s %s from %u:%u blksize=%u wsize=%u tsize=%u rsize=%u seek=%u -> %s\n",
+		    opcode == TFTP_WRQ ? "WRQ" : "RRQ", name, node, port, o.blksize, o.wsize, o.tsize, o.rsize, o.seek,
+		    file == NULL ? (writable || readonly ? "not there" : "not served") : from_ro ? "readonly" : "memory");
+	}
+	(void)from_ro;
 	if (file == NULL) {
 		tftp_send_error(node, port, 1, "file not found");
 		return;
 	}
 	s = tftp_session_of(node, port, false);
 	if (s != NULL) {
-		s->active = false;                      /* the request again, from the same port */
+		s->active = false;
 	}
 	s = tftp_session_of(node, port, true);
 	s->file = file;
@@ -373,7 +595,7 @@ tftp_request(uint32_t opcode, uint32_t node, uint32_t port, const uint8_t *buf, 
 	s->limit = o.has_rsize ? MIN(file->size, s->start + o.rsize) : file->size;
 	s->next = 1;
 	if (o.any) {
-		tftp_send_oack(s, &o, file->size);      /* the client acknowledges block 0 and the data follows */
+		tftp_send_oack(s, &o, file->size);
 	} else {
 		s->window_end = 1;
 		tftp_pump(s);
@@ -418,7 +640,7 @@ svc_tftp_rx_locked(uint32_t from_node, uint32_t from_port, const void *data, siz
 		}
 		if (n < s->blksize && block == s->block) {
 			if (tftp_logged++ < 400u) {
-				printf("annibale-modem: tftp %s written, %u bytes\n", s->file->name, s->file->size);
+				printf("annibale-tftp: %s written, %u bytes\n", s->file->name, s->file->size);
 			}
 			s->active = false;
 		}
@@ -426,14 +648,14 @@ svc_tftp_rx_locked(uint32_t from_node, uint32_t from_port, const void *data, siz
 		if (s->sent_last && block + 1u == s->next) {
 			s->active = false;
 		} else {
-			s->next = block + 1u;                   /* (an older block acknowledged: from there again) */
+			s->next = block + 1u;
 			s->sent_last = false;
 			s->window_end = block + s->wsize;
 			tftp_pump(s);
 		}
 	} else if (opcode == TFTP_ERROR) {
 		if (tftp_logged++ < 400u) {
-			printf("annibale-modem: tftp %s: the client ends it with error %u\n", s->file->name, block);
+			printf("annibale-tftp: %s: client ended with error %u\n", s->file->name, block);
 		}
 		s->active = false;
 	}
@@ -448,15 +670,21 @@ svc_tftp_rx(void *context, uint32_t from_node, uint32_t from_port, const void *d
 	lck_mtx_unlock(&tftp_lock);
 }
 
-static void
-modem_start_tftp(void)
+void
+annibale_tftp_start(uint32_t instance)
 {
+	uint32_t bit = instance < 32u ? (1u << instance) : 0u;
+
+	lck_mtx_lock(&tftp_init_lock);
 	if (svc_tftp_port == NULL) {
 		svc_tftp_port = annibale_qrtr.open(svc_tftp_rx, NULL, NULL);
-		if (svc_tftp_port != NULL) {
-			(void)annibale_qrtr_publish(svc_tftp_port, QRTR_SVC_TFTP, 1u, 0u);
+	}
+	if (svc_tftp_port != NULL && (bit == 0u || (tftp_published_mask & bit) == 0u)) {
+		if (annibale_qrtr_publish(svc_tftp_port, QRTR_SVC_TFTP, 1u, instance) == 0 && bit != 0u) {
+			tftp_published_mask |= bit;
 		}
 	}
+	lck_mtx_unlock(&tftp_init_lock);
 }
 
-#endif /* _ANNIBALE_MODEM_TFTP_INC_ */
+#endif /* _ANNIBALE_TFTP_INC_ */

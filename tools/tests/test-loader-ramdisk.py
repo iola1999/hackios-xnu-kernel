@@ -95,6 +95,11 @@ static inline void ui_progress(uint64_t done, uint64_t total) { (void)done; (voi
 /* "oem sh": tools/test-loader-shell.py */
 static const char *menu_enter_fastboot(void) { assert(0); return "unexpected recovery"; }
 static void oem_shell(const char *text) { (void)text; }
+static void screenshot_info(const struct kernel_live *live, uint64_t fb_base,
+    uint32_t def_w, uint32_t def_h, uint32_t def_stride,
+    uint32_t *w, uint32_t *h, uint32_t *stride, uint32_t *fmt) {
+    (void)live; (void)fb_base; *w = def_w; *h = def_h; *stride = def_stride; *fmt = 0x42475241u;
+}
 /* the host-silence watchdog clock and "oem push" into a running kernel's inbox: not what this test checks */
 static uint64_t host_last_cmd;
 #define READ_SYSREG(name) 0ULL

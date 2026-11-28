@@ -335,10 +335,31 @@ flip_restore_boot_scale(void)
 	dpuScale.src_w = dpuScale.src_h = dpuScale.stride = dpuScale.fmt = 0;
 }
 
+static void
+dpu_scale_report_scanout(uint64_t pa)
+{
+	if (dpuScale.active) {
+		loader_set_scanout_mode(pa, dpuScale.src_w, dpuScale.src_h, dpuScale.stride, dpuScale.fmt);
+	} else {
+		loader_set_scanout_pa(pa);
+	}
+}
+
 static bool
-flip_dpu_scale_draw(uint8_t * dst_buf, const uint8_t * pixels, uint32_t surf_w, uint32_t surf_h,
+flip_dpu_scale_fallback(void)
+{
+	if (!dpuScale.active) {
+		return false;
+	}
+	flip_restore_boot_scale();
+	return true;
+}
+
+static bool
+flip_dpu_scale_prepare(uint8_t * dst_buf, const uint8_t * pixels, uint32_t surf_w, uint32_t surf_h,
     uint32_t stride, uint32_t fmt, int32_t sx, int32_t sy, int32_t sw, int32_t sh,
-    int32_t px0, int32_t py0, int32_t px1, int32_t py1, uint32_t panel_w, uint32_t panel_h)
+    int32_t px0, int32_t py0, int32_t px1, int32_t py1, uint32_t panel_w, uint32_t panel_h,
+    uint32_t * copy_stride_out, bool * whole_surf_out)
 {
 	if (gDpuScale == 0 || !flip.ready || !dpuScale.capable || dst_buf == NULL || pixels == NULL) {
 		return false;
@@ -356,18 +377,53 @@ flip_dpu_scale_draw(uint8_t * dst_buf, const uint8_t * pixels, uint32_t surf_w, 
 	if (!flip_config_scale((uint32_t) sw, (uint32_t) sh, copy_stride, fmt)) {
 		return false;
 	}
+	*copy_stride_out = copy_stride;
+	*whole_surf_out = whole_surf;
+	return true;
+}
+
+static void
+dpu_scale_copy_rows(uint8_t * dst_buf, const uint8_t * pixels, uint32_t stride, uint32_t copy_stride,
+    int32_t sx, int32_t sy, int32_t r0, int32_t r1, bool whole_surf)
+{
+	if (r1 <= r0) {
+		return;
+	}
 	if (whole_surf) {
-		memcpy(dst_buf, pixels, (size_t) sh * (size_t) stride);
+		memcpy(dst_buf + (size_t) r0 * (size_t) stride,
+		    pixels + (size_t) r0 * (size_t) stride,
+		    (size_t) (r1 - r0) * (size_t) stride);
 	} else {
-		for (int32_t y = 0; y < sh; y++) {
-			memcpy(dst_buf + (size_t) y * copy_stride,
-			    pixels + (size_t) (sy + y) * stride + (size_t) sx * 4u, copy_stride);
+		for (int32_t y = r0; y < r1; y++) {
+			memcpy(dst_buf + (size_t) y * (size_t) copy_stride,
+			    pixels + (size_t) (sy + y) * (size_t) stride + (size_t) sx * 4u, copy_stride);
 		}
 	}
+}
+
+static void
+flip_dpu_scale_finish(void)
+{
 	flip.band0 = 0;
 	flip.band1 = (int32_t) flip.rows;
 	flip.drew = true;
 	dpuScale.frames++;
+}
+
+static bool
+flip_dpu_scale_draw(uint8_t * dst_buf, const uint8_t * pixels, uint32_t surf_w, uint32_t surf_h,
+    uint32_t stride, uint32_t fmt, int32_t sx, int32_t sy, int32_t sw, int32_t sh,
+    int32_t px0, int32_t py0, int32_t px1, int32_t py1, uint32_t panel_w, uint32_t panel_h)
+{
+	uint32_t copy_stride = 0;
+	bool whole_surf = false;
+
+	if (!flip_dpu_scale_prepare(dst_buf, pixels, surf_w, surf_h, stride, fmt,
+	    sx, sy, sw, sh, px0, py0, px1, py1, panel_w, panel_h, &copy_stride, &whole_surf)) {
+		return false;
+	}
+	dpu_scale_copy_rows(dst_buf, pixels, stride, copy_stride, sx, sy, 0, sh, whole_surf);
+	flip_dpu_scale_finish();
 	return true;
 }
 

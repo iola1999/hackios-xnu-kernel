@@ -76,10 +76,11 @@ static void dummy_rx(void *ctx, uint32_t n, uint32_t p, const void *d, size_t s)
 }
 
 int main(void) {
-    /* Case 1: publish TFTP (0x1000) BEFORE attaching node 5 -> HELLO from node 5 announces TFTP. */
+    /* Case 1: publish dual TFTP (0x1000 inst 0+2) BEFORE attaching node 5 -> HELLO from node 5 announces both. */
     struct annibale_qrtr_port *tftp = annibale_qrtr.open(dummy_rx, NULL, NULL);
     assert(tftp != NULL);
     assert(annibale_qrtr_publish(tftp, 0x1000u, 1u, 0u) == 0);
+    assert(annibale_qrtr_publish(tftp, 0x1000u, 1u, 2u) == 0);
     annibale_qrtr_attach_node(5u, fake_node5_send);
     assert(node5_hellos == 1u);
     uint8_t hello_pkt[sizeof(struct qrtr_header) + sizeof(struct qrtr_control)];
@@ -92,7 +93,7 @@ int main(void) {
     memcpy(hello_pkt + sizeof(hh), &hc, sizeof(hc));
     annibale_qrtr_input(hello_pkt, sizeof(hello_pkt));
     assert(node5_hellos == 2u);
-    assert(node5_new_srv_tftp == 1u);
+    assert(node5_new_srv_tftp == 2u);
 
     /* Case 2: publish SERVREG_LOC (0x40) AFTER node 5 HELLO -> broadcast immediately to node 5. */
     struct annibale_qrtr_port *servreg = annibale_qrtr.open(dummy_rx, NULL, NULL);
@@ -100,7 +101,7 @@ int main(void) {
     assert(annibale_qrtr_publish(servreg, 0x40u, 1u, 1u) == 0);
     assert(node5_new_srv_servreg == 1u);
 
-    /* Case 3: node 5 sends QRTR_NEW_LOOKUP for TFTP (0x1000) -> gets matching server + zero terminator. */
+    /* Case 3: node 5 sends QRTR_NEW_LOOKUP for TFTP (0x1000) -> gets matching servers + zero terminator. */
     uint8_t pkt[sizeof(struct qrtr_header) + sizeof(struct qrtr_control)];
     struct qrtr_header h = {
         .version = 1, .type = QRTR_NEW_LOOKUP, .from_node = 5u, .from_port = 99u,
@@ -108,6 +109,13 @@ int main(void) {
     };
     struct qrtr_control c = { .command = QRTR_NEW_LOOKUP, .words = { 0x1000u, 0u, 0u, 0u } };
     memcpy(pkt, &h, sizeof(h));
+    memcpy(pkt + sizeof(h), &c, sizeof(c));
+    annibale_qrtr_input(pkt, sizeof(pkt));
+    assert(node5_lookup_hits == 2u && node5_lookup_end == 1u);
+
+    /* Case 4: lookup filtered specifically to instance=2 (wire = ver | (2 << 8)) returns 1 hit + end. */
+    node5_lookup_hits = node5_lookup_end = 0;
+    c.words[1] = 1u | (2u << 8);
     memcpy(pkt + sizeof(h), &c, sizeof(c));
     annibale_qrtr_input(pkt, sizeof(pkt));
     assert(node5_lookup_hits == 1u && node5_lookup_end == 1u);

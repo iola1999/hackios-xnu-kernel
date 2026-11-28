@@ -589,6 +589,45 @@ nvram_fastboot_consume(void)
 	return 1;
 }
 
+static void
+screenshot_info(const struct kernel_live *live, uint64_t fb_base,
+    uint32_t def_w, uint32_t def_h, uint32_t def_stride,
+    uint32_t *w_out, uint32_t *h_out, uint32_t *stride_out, uint32_t *fmt_out)
+{
+	*w_out = def_w;
+	*h_out = def_h;
+	*stride_out = def_stride;
+	*fmt_out = 0x42475241u; /* 'BGRA' */
+	if (fb_base == 0 || live == NULL || live->magic2 != KERNEL_LIVE_MAGIC2 ||
+	    live->magic3 != KERNEL_LIVE_MAGIC3 || live->magic4 != KERNEL_LIVE_MAGIC4 ||
+	    live->magic5 != KERNEL_LIVE_MAGIC5 || live->magic6 != KERNEL_LIVE_MAGIC6) {
+		return;
+	}
+	flush_dcache((uint64_t)(uintptr_t)&live->scanout_pa,
+	    (uint64_t)(uintptr_t)(&live->scanout_format + 1));
+	uint64_t pa = *(const volatile uint64_t *)&live->scanout_pa;
+	uint32_t w = *(const volatile uint32_t *)&live->scanout_width;
+	uint32_t h = *(const volatile uint32_t *)&live->scanout_height;
+	uint32_t stride = *(const volatile uint32_t *)&live->scanout_stride;
+	uint32_t fmt = *(const volatile uint32_t *)&live->scanout_format;
+
+	if (w == 0 || h == 0 || w > 4096u || h > 4096u || (stride & 3u) != 0 || stride < w * 4u) {
+		return;
+	}
+	uint64_t bytes = (uint64_t)stride * (uint64_t)h;
+	if (bytes > SPLASH_REGION_BYTES || pa < fb_base || (pa & 0xfffULL) != 0 ||
+	    pa - fb_base > SPLASH_REGION_BYTES - bytes) {
+		return;
+	}
+	if (fmt != 0 && fmt != 0x42475241u && fmt != 0x6c313072u) {
+		return;
+	}
+	*w_out = w;
+	*h_out = h;
+	*stride_out = stride;
+	*fmt_out = fmt != 0 ? fmt : 0x42475241u;
+}
+
 static uint64_t
 screenshot_base(const struct kernel_live *live, uint64_t fb_base, uint64_t fb_bytes)
 {
@@ -611,4 +650,15 @@ screenshot_base(const struct kernel_live *live, uint64_t fb_base, uint64_t fb_by
 	}
 	flush_dcache(pa, pa + fb_bytes);
 	return pa;
+}
+
+static uint64_t
+screenshot_stage(const struct kernel_live *live, uint64_t fb_base,
+    uint32_t def_w, uint32_t def_h, uint32_t def_stride, uint64_t *bytes_out)
+{
+	uint32_t w, h, stride, fmt;
+
+	screenshot_info(live, fb_base, def_w, def_h, def_stride, &w, &h, &stride, &fmt);
+	*bytes_out = (uint64_t)stride * (uint64_t)h;
+	return screenshot_base(live, fb_base, *bytes_out);
 }
